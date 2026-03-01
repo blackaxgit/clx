@@ -1,0 +1,190 @@
+# Release pipeline for CLX — builds macOS binaries and publishes a GitHub Release.
+#
+# Trigger:  push of any tag matching v* (e.g. v0.1.0, v1.2.3-rc1)
+# Platforms:
+#   macos-latest — Apple Silicon ARM64 (M-series, default since late 2024)
+#   macos-13     — last Intel x86_64 macOS runner
+#
+# Jobs:
+#   build   — compile release binaries and produce a signed tarball + SHA256 (matrix)
+#   release — download artifacts from both matrix legs and attach to a GitHub Release
+#
+# Permissions: only contents:write is needed; GITHUB_TOKEN is sufficient.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Grant the workflow token permission to create releases and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Disable incremental compilation for reproducible, hermetic release builds.
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # build: compile the workspace in release mode, package binaries, and upload
+  # the tarball + checksum as Actions artifacts so the release job can attach them.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon — macos-latest resolves to an M-series ARM64 runner.
+          - runner: macos-latest
+            arch: aarch64
+
+          # Intel x86_64 — macos-13 is the last Intel macOS runner in GHA.
+          - runner: macos-13
+            arch: x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache ~/.cargo/registry, ~/.cargo/git, and the target directory.
+      # The cache key includes Cargo.lock so a lockfile change busts the cache.
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Build all three binary crates in a single workspace compile.
+      # The resulting binaries land in target/release/{clx,clx-hook,clx-mcp}.
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      # Verify the actual CPU architecture matches the matrix expectation.
+      # This guards against silent runner reclassification by GitHub.
+      - name: Verify architecture
+        run: |
+          ACTUAL_ARCH=$(uname -m)
+          echo "Runner reports architecture: $ACTUAL_ARCH"
+          if [[ "$ACTUAL_ARCH" != "${{ matrix.arch }}" ]]; then
+            # arm64 is macOS's name for aarch64; treat them as equivalent.
+            if [[ "$ACTUAL_ARCH" == "arm64" && "${{ matrix.arch }}" == "aarch64" ]]; then
+              echo "arm64 == aarch64, continuing"
+            else
+              echo "ERROR: expected ${{ matrix.arch }}, got $ACTUAL_ARCH" >&2
+              exit 1
+            fi
+          fi
+
+      # Bundle all three binaries and the pre-built install script into one tarball.
+      # The tarball layout mirrors what scripts/package.sh produces locally:
+      #
+      #   clx-{arch}-apple-darwin/
+      #     install.sh          ← drop-in installer (no Rust required)
+      #     bin/
+      #       clx
+      #       clx-hook
+      #       clx-mcp
+      - name: Create distribution tarball
+        run: |
+          TARBALL_STEM="clx-${{ matrix.arch }}-apple-darwin"
+          STAGE_DIR="${TARBALL_STEM}"
+
+          mkdir -p "${STAGE_DIR}/bin"
+
+          # Copy the three binary crates.
+          cp target/release/clx          "${STAGE_DIR}/bin/"
+          cp target/release/clx-hook     "${STAGE_DIR}/bin/"
+          cp target/release/clx-mcp      "${STAGE_DIR}/bin/"
+
+          # Copy the installer script from the repository root.
+          cp install.sh "${STAGE_DIR}/install.sh"
+          chmod +x "${STAGE_DIR}/install.sh"
+
+          # Produce the tarball.
+          tar -czf "${TARBALL_STEM}.tar.gz" "${STAGE_DIR}"
+
+          # SHA256 checksum — one file, no path prefix (matches standard tooling expectations).
+          shasum -a 256 "${TARBALL_STEM}.tar.gz" > "${TARBALL_STEM}.tar.gz.sha256"
+
+          echo "TARBALL_STEM=${TARBALL_STEM}" >> "$GITHUB_ENV"
+          echo "Created ${TARBALL_STEM}.tar.gz"
+          cat "${TARBALL_STEM}.tar.gz.sha256"
+
+      # Upload both artefacts so the release job can download them.
+      # Each matrix leg uploads to a uniquely named artifact to avoid collisions.
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clx-${{ matrix.arch }}-apple-darwin
+          path: |
+            ${{ env.TARBALL_STEM }}.tar.gz
+            ${{ env.TARBALL_STEM }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # release: collect artifacts from all build legs and publish a GitHub Release.
+  # Runs after both matrix builds have completed successfully.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      # Checkout is needed for the tag context; softprops/action-gh-release reads
+      # it for the tag name and auto-generated notes.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so release notes can reference the commit range.
+          fetch-depth: 0
+
+      # Download every artifact uploaded by the build matrix into ./artifacts/.
+      # Each artifact lands in its own subdirectory keyed by the artifact name.
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Flatten the nested subdirectories so all tarballs and checksums sit
+      # side-by-side at artifacts/*.tar.gz and artifacts/*.tar.gz.sha256.
+      - name: Flatten artifact directories
+        run: |
+          find artifacts -type f | sort
+          mkdir -p release-assets
+          find artifacts -type f -exec mv {} release-assets/ \;
+          echo "--- Release assets ---"
+          ls -lh release-assets/
+
+      # Derive the human-readable version from the Git tag (strips the leading 'v').
+      - name: Set release version
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Publishing release for ${VERSION}"
+
+      # Create the GitHub Release and attach all macOS tarballs + checksums.
+      # generate_release_notes: true fills the body with a commit-range changelog
+      # automatically generated by GitHub (no template required).
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "CLX ${{ env.RELEASE_VERSION }}"
+          # Auto-generate the changelog from commits since the previous tag.
+          generate_release_notes: true
+          # Mark pre-release if the tag contains a hyphen (e.g. v1.0.0-rc1).
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
