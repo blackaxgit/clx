@@ -1,0 +1,34 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: clx-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+    # GPU support for Linux (NVIDIA)
+    # Uncomment the following lines if running on Linux with NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    # Note: macOS Docker Desktop does not support GPU passthrough.
+    # Ollama will run in CPU-only mode on macOS, which is sufficient for
+    # qwen3:1.7b and qwen3-embedding:0.6b models.
+
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  ollama_data:
+    name: clx_ollama_data

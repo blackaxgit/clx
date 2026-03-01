@@ -1,0 +1,132 @@
+# CI pipeline for CLX — Rust workspace with 4 crates.
+#
+# Jobs:
+#   check  — Format + lint validation (fast gate, runs on ubuntu only)
+#   test   — Run full test suite (matrix: ubuntu + macos)
+#   build  — Compile release binaries (matrix: ubuntu + macos)
+#   audit  — Check dependencies for known vulnerabilities (ubuntu only)
+#
+# Caching: Swatinem/rust-cache caches ~/.cargo/registry, ~/.cargo/git,
+# and the target directory keyed on Cargo.lock + OS + toolchain.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ensure incremental compilation is disabled in CI for reproducible builds.
+  CARGO_INCREMENTAL: 0
+  # Fail on any rustc warning that slips past clippy.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # check: fast validation — fmt + clippy
+  # Runs on a single host (ubuntu) because style checks are platform-neutral.
+  # ---------------------------------------------------------------------------
+  check:
+    name: Check (fmt + clippy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (with rustfmt + clippy components)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # -D warnings turns every clippy warning into an error.
+      # The workspace Cargo.toml already sets clippy::pedantic + unsafe_code = "deny",
+      # so this enforces those rules unconditionally.
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # test: run the full test suite on both Linux and macOS
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: check
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # build: compile release binaries to verify the workspace builds cleanly
+  # on both target platforms.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: check
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+  # ---------------------------------------------------------------------------
+  # audit: check dependencies for known vulnerabilities
+  # Runs on ubuntu only — advisory database is platform-neutral.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --quiet
+
+      - name: Run cargo audit
+        run: cargo audit

@@ -1,0 +1,41 @@
+# Rust
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/logs/
+
+# Build artifacts / distribution
+/dist/
+/install/
+
+# Test artifacts
+*.profraw
+
+# Databases
+*.db
+*.sqlite
+
+# Environment
+.env
+.env.*
+
+# Internal docs / research / notes
+/docs/
+/todo/
+SPEC.md
+
+# Personal orchestration (not part of CLX)
+/claude/
+/.claude/

@@ -1,0 +1,89 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/clx-core",
+    "crates/clx-hook",
+    "crates/clx-mcp",
+    "crates/clx",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+authors = ["CLX Contributors"]
+description = "Intelligent command validation and context persistence for Claude Code"
+repository = "https://github.com/blackaxgit/clx"
+homepage = "https://github.com/blackaxgit/clx"
+readme = "README.md"
+keywords = ["claude-code", "cli", "security", "validation", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled", "load_extension"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# Progress indicators
+indicatif = "0.17"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+colored = "2"
+
+# Secure storage
+keyring = "2"
+
+# Internal crates
+clx-core = { path = "crates/clx-core" }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Documentation lints - too noisy for current codebase maturity
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Module naming - types intentionally match module names
+module_name_repetitions = "allow"
+# Function length - many functions are inherently long (UI rendering, setup)
+too_many_lines = "allow"
+# Cast safety - numeric casts are intentional in statistics/display code
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+# Struct design - bools in config structs are appropriate
+struct_excessive_bools = "allow"
+# Match arms with identical bodies - often intentional for clarity
+match_same_arms = "allow"
+# Items after statements - sometimes clearer for local helper functions
+items_after_statements = "allow"
+# Similar names - false positives on domain terms
+similar_names = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
