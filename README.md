@@ -30,26 +30,46 @@ Intelligent command validation and context persistence for Claude Code.
 
 ## Quick Start
 
+### Prerequisites
+
+1. **macOS** (ARM64/Apple Silicon)
+2. **Rust 1.85+** — install via [rustup](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+3. **[Ollama](https://ollama.com)** — download from website or `brew install ollama`
+
 ### For Humans
 
 ```bash
+# Clone and build
 git clone https://github.com/blackaxgit/clx.git
 cd clx
 cargo build --release
+
+# Install CLX (configures hooks, MCP server, copies binaries to ~/.clx/bin/)
 ./target/release/clx install
+
+# Pull required Ollama models
+ollama pull qwen3:1.7b
+ollama pull qwen3-embedding:0.6b
+
+# Add CLX to your PATH (add to ~/.zshrc to persist)
+export PATH="$HOME/.clx/bin:$PATH"
 ```
 
-**Requirements:** macOS, Rust 1.85+, [Ollama](https://ollama.com) with `qwen3:1.7b` and `qwen3-embedding:0.6b`.
+**Restart Claude Code**, then verify:
+
+```bash
+clx dashboard    # Opens interactive dashboard with session history and system status
+```
 
 ### For Claude Code
 
-Paste this prompt:
+Paste this prompt and Claude will do everything for you:
 
 ```
 Install CLX for me: clone https://github.com/blackaxgit/clx, build with cargo build --release, then run ./target/release/clx install. After that, pull Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b. Tell me to restart Claude Code when done.
 ```
 
-See [INSTALL.md](INSTALL.md) for detailed instructions and troubleshooting.
+See [INSTALL.md](INSTALL.md) for more options and troubleshooting.
 
 ## Usage
 
