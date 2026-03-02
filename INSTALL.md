@@ -3,10 +3,14 @@
 ## Prerequisites
 
 - **macOS** (ARM64/Apple Silicon recommended)
-- **Rust** toolchain (edition 2024, rustc 1.85+) - install via [rustup](https://rustup.rs/)
-- **[Ollama](https://ollama.com)** with models:
-  - `qwen3:1.7b` for risk assessment
-  - `qwen3-embedding:0.6b` for embeddings
+- **Rust** toolchain (edition 2024, rustc 1.85+) — install via [rustup](https://rustup.rs/):
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+- **[Ollama](https://ollama.com)** — download from the website or install via Homebrew:
+  ```bash
+  brew install ollama
+  ```
 
 ## Quick Install
 
@@ -40,32 +44,52 @@ ollama pull qwen3:1.7b
 ollama pull qwen3-embedding:0.6b
 ```
 
+### Add to PATH
+
+`clx install` copies all binaries to `~/.clx/bin/`. Add this to your `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+export PATH="$HOME/.clx/bin:$PATH"
+```
+
+Then reload your shell:
+
+```bash
+source ~/.zshrc
+```
+
 ## What `clx install` Does
 
 The install command sets up everything CLX needs to work with Claude Code:
 
 1. **Creates `~/.clx/` directory** with subdirectories for config, data, logs, rules, and prompts
-2. **Copies binaries** (`clx-hook`, `clx-mcp`) to `~/.clx/bin/`
+2. **Copies binaries** (`clx`, `clx-hook`, `clx-mcp`) to `~/.clx/bin/`
 3. **Initializes SQLite database** for session storage and context persistence
 4. **Configures Claude Code hooks** in `~/.claude/settings.json`:
-   - `PreToolUse` - validates commands before execution
-   - `PostToolUse` - logs command results
-   - `PreCompact` - snapshots context before compression
-   - `SessionStart` / `SessionEnd` - tracks session lifecycle
-   - `SubagentStart` - monitors subagent activity
-   - `UserPromptSubmit` - injects context on user prompts
+   - `PreToolUse` — validates commands before execution
+   - `PostToolUse` — logs command results
+   - `PreCompact` — snapshots context before compression
+   - `SessionStart` / `SessionEnd` — tracks session lifecycle
+   - `SubagentStart` — monitors subagent activity
+   - `UserPromptSubmit` — injects context on user prompts
 5. **Registers MCP server** (`clx-mcp`) so Claude can use CLX tools
 6. **Injects CLX section** into `~/.claude/CLAUDE.md` with tool documentation
 
 ## After Installation
 
-Restart Claude Code to load the new hooks and MCP server:
+1. **Restart Claude Code** to load the new hooks and MCP server.
+2. **Verify** CLX is working:
 
 ```bash
 clx dashboard
 ```
 
 This opens an interactive dashboard showing session history, validation stats, and system status.
+
+You should see:
+- Session tracking active (new sessions appear in the dashboard)
+- Ollama status: connected
+- Hook status: all hooks configured
 
 ## Uninstall
 
@@ -78,6 +102,15 @@ clx uninstall --purge
 ```
 
 ## Troubleshooting
+
+### `clx: command not found`
+
+Ensure `~/.clx/bin` is in your PATH:
+
+```bash
+echo 'export PATH="$HOME/.clx/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
 
 ### Ollama not running
 
@@ -101,7 +134,7 @@ ollama pull qwen3-embedding:0.6b
 Check that `~/.claude/settings.json` contains the CLX hooks:
 
 ```bash
-cat ~/.claude/settings.json | grep clx
+grep clx ~/.claude/settings.json
 ```
 
 If not, re-run `clx install`.

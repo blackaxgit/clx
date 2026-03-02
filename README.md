@@ -28,9 +28,49 @@ Intelligent command validation and context persistence for Claude Code.
   - `clx_checkpoint` - Create manual snapshots
   - `clx_rules` - Manage validation rules
 
-## Quick Start
+## Install with Claude Code
 
-### For Humans
+> Let Claude handle the entire setup. You just need macOS, [Ollama](https://ollama.com), and [Rust](https://rustup.rs/) installed.
+
+**1.** Make sure Ollama is running:
+
+```bash
+ollama serve
+```
+
+**2.** Paste this prompt into Claude Code:
+
+```
+Install CLX for me:
+1. Clone https://github.com/blackaxgit/clx and build with cargo build --release
+2. Run ./target/release/clx install
+3. Pull Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b
+4. Add ~/.clx/bin to my PATH by appending 'export PATH="$HOME/.clx/bin:$PATH"' to ~/.zshrc
+5. Tell me to restart Claude Code when done
+```
+
+**3.** Restart Claude Code.
+
+**Done.** Hooks are validating commands, context is being persisted, and MCP tools are available.
+
+---
+
+## Manual Install
+
+> Full control over every step. Requires macOS (ARM64), Rust 1.85+, and Ollama.
+
+**1. Install prerequisites:**
+
+```bash
+# Rust (if not installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Ollama (if not installed) — or download from https://ollama.com
+brew install ollama
+ollama serve   # start the server
+```
+
+**2. Build and install CLX:**
 
 ```bash
 git clone https://github.com/blackaxgit/clx.git
@@ -39,17 +79,29 @@ cargo build --release
 ./target/release/clx install
 ```
 
-**Requirements:** macOS, Rust 1.85+, [Ollama](https://ollama.com) with `qwen3:1.7b` and `qwen3-embedding:0.6b`.
+**3. Pull the required Ollama models:**
 
-### For Claude Code
-
-Paste this prompt:
-
-```
-Install CLX for me: clone https://github.com/blackaxgit/clx, build with cargo build --release, then run ./target/release/clx install. After that, pull Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b. Tell me to restart Claude Code when done.
+```bash
+ollama pull qwen3:1.7b
+ollama pull qwen3-embedding:0.6b
 ```
 
-See [INSTALL.md](INSTALL.md) for detailed instructions and troubleshooting.
+**4. Add CLX to your PATH:**
+
+```bash
+echo 'export PATH="$HOME/.clx/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**5. Restart Claude Code**, then verify:
+
+```bash
+clx dashboard
+```
+
+You should see the interactive dashboard with session history and system status.
+
+See [INSTALL.md](INSTALL.md) for troubleshooting.
 
 ## Usage
 

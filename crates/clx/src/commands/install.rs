@@ -476,7 +476,7 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
 
     // Step 5: Copy/link binaries to ~/.clx/bin/
     let bin_dir = clx_core::paths::bin_dir();
-    let binaries = ["clx-hook", "clx-mcp"];
+    let binaries = ["clx", "clx-hook", "clx-mcp"];
 
     for binary_name in &binaries {
         match find_binary(binary_name) {
