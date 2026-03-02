@@ -36,7 +36,22 @@ Intelligent command validation and context persistence for Claude Code.
 2. **Rust 1.85+** — install via [rustup](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 3. **[Ollama](https://ollama.com)** — download from website or `brew install ollama`
 
-### For Humans
+### Let Claude Code Do It
+
+Copy this prompt into Claude Code — it handles the full setup:
+
+```
+Install CLX for me:
+1. Clone https://github.com/blackaxgit/clx and build with cargo build --release
+2. Run ./target/release/clx install
+3. Pull Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b
+4. Add ~/.clx/bin to my PATH by appending 'export PATH="$HOME/.clx/bin:$PATH"' to ~/.zshrc
+5. Tell me to restart Claude Code when done
+```
+
+After restarting Claude Code, CLX is active — hooks validate commands, context is persisted, and MCP tools are available.
+
+### Manual Install
 
 ```bash
 # Clone and build
@@ -58,15 +73,7 @@ export PATH="$HOME/.clx/bin:$PATH"
 **Restart Claude Code**, then verify:
 
 ```bash
-clx dashboard    # Opens interactive dashboard with session history and system status
-```
-
-### For Claude Code
-
-Paste this prompt and Claude will do everything for you:
-
-```
-Install CLX for me: clone https://github.com/blackaxgit/clx, build with cargo build --release, then run ./target/release/clx install. After that, pull Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b. Tell me to restart Claude Code when done.
+clx dashboard    # Interactive dashboard with session history and system status
 ```
 
 See [INSTALL.md](INSTALL.md) for more options and troubleshooting.
