@@ -4,13 +4,16 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use super::app::{App, DashboardTab, InputMode};
+use super::app::{App, DashboardTab, ExitTarget, InputMode};
 use super::settings::config_bridge;
 use super::settings::fields::{self, FieldWidget};
 use super::ui;
 
 pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     loop {
+        // Auto-clear timed messages before each render
+        app.settings_clear_timed_messages();
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         let timeout = app
@@ -92,17 +95,50 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_settings_nav(app: &mut App, key: KeyEvent) {
-    // Handle confirm-reset dialog first
+    // Handle dirty-exit guard prompt first
+    if let Some(target) = app.settings_exit_pending {
+        match key.code {
+            KeyCode::Char('s') => {
+                app.settings_save();
+                app.settings_exit_pending = None;
+                app.execute_exit_target(target);
+            }
+            KeyCode::Char('x') => {
+                app.settings_discard_changes();
+                app.settings_exit_pending = None;
+                app.execute_exit_target(target);
+            }
+            KeyCode::Esc => {
+                app.settings_exit_pending = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Handle reload confirmation when dirty
+    if app.settings_reload_confirm {
+        match key.code {
+            KeyCode::Char('y') => {
+                app.settings_reload_confirm = false;
+                app.settings_reload();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.settings_reload_confirm = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Handle confirm-reset dialog
     if app.settings_confirm_reset {
         match key.code {
             KeyCode::Char('y') => {
-                // Revert editing to original
-                if let Some(orig) = &app.settings_original_config {
-                    app.settings_editing_config = Some(orig.clone());
-                }
-                app.settings_is_dirty = false;
+                app.settings_discard_changes();
                 app.settings_confirm_reset = false;
                 app.settings_edit_error = None;
+                app.settings_edit_error_time = None;
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 app.settings_confirm_reset = false;
@@ -114,16 +150,37 @@ fn handle_settings_nav(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
-            app.current_tab = DashboardTab::Sessions;
+            if app.settings_is_dirty {
+                app.settings_exit_pending = Some(ExitTarget::Quit);
+            } else {
+                app.input_mode = InputMode::Normal;
+                app.current_tab = DashboardTab::Sessions;
+            }
         }
         KeyCode::Tab => {
-            app.next_tab();
-            on_tab_switch(app);
+            if app.settings_is_dirty {
+                // Compute next tab
+                let idx = app.current_tab.index();
+                let next = (idx + 1) % DashboardTab::ALL.len();
+                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::ALL[next]));
+            } else {
+                app.next_tab();
+                on_tab_switch(app);
+            }
         }
         KeyCode::BackTab => {
-            app.prev_tab();
-            on_tab_switch(app);
+            if app.settings_is_dirty {
+                let idx = app.current_tab.index();
+                let prev = if idx == 0 {
+                    DashboardTab::ALL.len() - 1
+                } else {
+                    idx - 1
+                };
+                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::ALL[prev]));
+            } else {
+                app.prev_tab();
+                on_tab_switch(app);
+            }
         }
         KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
         KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
@@ -138,22 +195,52 @@ fn handle_settings_nav(app: &mut App, key: KeyEvent) {
             app.settings_next_section();
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
-            handle_settings_edit_field(app);
+            // Don't allow editing if config failed to load
+            if app.settings_load_error.is_none() {
+                handle_settings_edit_field(app);
+            }
         }
         KeyCode::Char('s') => {
             app.settings_save();
         }
         KeyCode::Char('d') => {
-            handle_settings_reset_field(app);
+            if app.settings_load_error.is_none() {
+                handle_settings_reset_field(app);
+            }
         }
         KeyCode::Char('R') => {
             if app.settings_is_dirty {
                 app.settings_confirm_reset = true;
             }
         }
-        KeyCode::Char('1') => switch_to_tab(app, DashboardTab::Sessions),
-        KeyCode::Char('2') => switch_to_tab(app, DashboardTab::AuditLog),
-        KeyCode::Char('3') => switch_to_tab(app, DashboardTab::Rules),
+        KeyCode::Char('r') => {
+            if app.settings_is_dirty {
+                app.settings_reload_confirm = true;
+            } else {
+                app.settings_reload();
+            }
+        }
+        KeyCode::Char('1') => {
+            if app.settings_is_dirty {
+                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::Sessions));
+            } else {
+                switch_to_tab(app, DashboardTab::Sessions);
+            }
+        }
+        KeyCode::Char('2') => {
+            if app.settings_is_dirty {
+                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::AuditLog));
+            } else {
+                switch_to_tab(app, DashboardTab::AuditLog);
+            }
+        }
+        KeyCode::Char('3') => {
+            if app.settings_is_dirty {
+                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::Rules));
+            } else {
+                switch_to_tab(app, DashboardTab::Rules);
+            }
+        }
         KeyCode::Char('4') => {} // Already on Settings
         _ => {}
     }
@@ -177,6 +264,10 @@ fn handle_settings_edit_field(app: &mut App) {
         return;
     }
 
+    // Clear any timed edit error when starting a new edit
+    app.settings_edit_error = None;
+    app.settings_edit_error_time = None;
+
     match &field_def.widget {
         FieldWidget::Toggle => {
             // Check for trust_mode warning before toggling
@@ -184,6 +275,7 @@ fn handle_settings_edit_field(app: &mut App) {
             if config_bridge::is_trust_mode_enabling(config, section, field) {
                 app.settings_edit_error =
                     Some("WARNING: Trust mode auto-allows ALL commands!".to_owned());
+                app.settings_edit_error_time = Some(std::time::Instant::now());
             }
             config_bridge::toggle_field(
                 app.settings_editing_config.as_mut().unwrap(),
@@ -213,6 +305,7 @@ fn handle_settings_edit_field(app: &mut App) {
             app.settings_edit_buffer =
                 config_bridge::get_field_value(config, section, field);
             app.settings_edit_error = None;
+            app.settings_edit_error_time = None;
             app.input_mode = InputMode::SettingsEdit;
         }
         FieldWidget::ReadOnlyList => {}
@@ -242,6 +335,7 @@ fn handle_settings_edit(app: &mut App, key: KeyEvent) {
                     }
                     Err(e) => {
                         app.settings_edit_error = Some(e);
+                        app.settings_edit_error_time = Some(std::time::Instant::now());
                     }
                 }
             }

@@ -1,11 +1,12 @@
 /// Widget type for a configuration field.
 ///
 /// Determines edit behavior: toggles flip in-place, cycle-selects rotate
-/// through options, and text/number fields open a popup (Phase 3).
+/// through options, and text/number fields open a popup.
 ///
-/// Variant fields carry validation metadata used in Phase 3 for editing popups.
-// Some variant fields (max_len, decimals, options) are structural metadata
-// used by future phases (Phase 4+ polish) but not yet read in code paths.
+/// Variant fields carry validation metadata used by editing popups.
+// Variant fields `max_len` and `decimals` are structural metadata reserved
+// for future use (e.g. input length limiting, display formatting) but not
+// yet read in current code paths.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum FieldWidget {

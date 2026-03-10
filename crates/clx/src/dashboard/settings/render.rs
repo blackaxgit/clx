@@ -1,3 +1,4 @@
+use clx_core::config::Config;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
@@ -9,12 +10,55 @@ use super::fields::{fields_for_section, FieldWidget};
 use super::sections::SECTIONS;
 use crate::dashboard::app::{App, InputMode};
 
+/// Truncate a string to fit within `max_width`, appending "..." if truncated.
+fn truncate_value(s: &str, max_width: usize) -> String {
+    if s.len() <= max_width {
+        s.to_owned()
+    } else if max_width <= 3 {
+        ".".repeat(max_width)
+    } else {
+        format!("{}...", &s[..max_width - 3])
+    }
+}
+
 /// Render the Settings tab with a two-panel layout.
 ///
 /// Left panel: section list (22 columns).
 /// Right panel: field table showing name, value, and default.
 /// Overlays: edit popup when in `SettingsEdit` mode, confirm dialog for reset.
 pub fn render_settings_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Show load error if config failed to load
+    if let Some(err) = &app.settings_load_error {
+        let panels = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(area);
+        render_section_list(frame, app, panels[0]);
+
+        let config_path_display = Config::config_file_path()
+            .map_or_else(|_| "~/.clx/config.yaml".to_owned(), |p| p.display().to_string());
+        let block = Block::bordered().title(format!(" Settings - {config_path_display} "));
+        let inner = block.inner(panels[1]);
+        frame.render_widget(block, panels[1]);
+
+        let lines = vec![
+            Line::from(Span::styled(
+                "Failed to load configuration",
+                Style::default().fg(Color::Red).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Editing is disabled. Fix the config file manually or press [r] to retry.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, inner);
+        return;
+    }
+
     let panels = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(area);
 
     render_section_list(frame, app, panels[0]);
@@ -28,6 +72,16 @@ pub fn render_settings_tab(frame: &mut Frame, app: &mut App, area: Rect) {
     // Overlay: reset confirmation dialog
     if app.settings_confirm_reset {
         render_confirm_reset(frame, area);
+    }
+
+    // Overlay: reload confirmation dialog
+    if app.settings_reload_confirm {
+        render_reload_confirm(frame, area);
+    }
+
+    // Overlay: dirty-exit guard prompt
+    if app.settings_exit_pending.is_some() {
+        render_exit_guard(frame, area);
     }
 }
 
@@ -71,6 +125,10 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .get(app.settings_section_idx)
         .map_or("Fields", |s| s.title);
 
+    // Config file path in panel title
+    let config_path_display = Config::config_file_path()
+        .map_or_else(|_| "~/.clx/config.yaml".to_owned(), |p| p.display().to_string());
+
     let header = Row::new(vec![
         Cell::from("Field").style(Style::default().bold()),
         Cell::from("Value").style(Style::default().bold()),
@@ -78,7 +136,11 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .bottom_margin(1);
 
-    let rows: Vec<Row> = if fields.is_empty() {
+    // Compute max value column width for truncation (area minus label and default columns, borders, padding)
+    let value_max_width = area.width.saturating_sub(24 + 24 + 6) as usize;
+    let value_max_width = value_max_width.max(10);
+
+    let mut rows: Vec<Row> = if fields.is_empty() {
         vec![Row::new(vec![Cell::from(Span::styled(
             "No fields",
             Style::default().fg(Color::DarkGray).italic(),
@@ -97,14 +159,44 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::Yellow)
                 };
 
+                let truncated_value = truncate_value(&value, value_max_width);
+                let truncated_default = truncate_value(&default, 24);
+
                 Row::new(vec![
                     Cell::from(field_def.label),
-                    Cell::from(value).style(value_style),
-                    Cell::from(default).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(truncated_value).style(value_style),
+                    Cell::from(truncated_default).style(Style::default().fg(Color::DarkGray)),
                 ])
             })
             .collect()
     };
+
+    // For MCP Tools section (section 7), append command_tools entries as read-only rows
+    if app.settings_section_idx == 7 {
+        let command_tools = &config.mcp_tools.command_tools;
+        if !command_tools.is_empty() {
+            // Separator row
+            rows.push(Row::new(vec![Cell::from(Span::styled(
+                "--- command_tools [read-only] ---",
+                Style::default().fg(Color::DarkGray).italic(),
+            ))]));
+
+            for tool in command_tools {
+                let pattern_display = truncate_value(&tool.tool_pattern, value_max_width);
+                rows.push(Row::new(vec![
+                    Cell::from("  pattern").style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(pattern_display).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from("").style(Style::default().fg(Color::DarkGray)),
+                ]));
+                let command_display = truncate_value(&tool.command_field, value_max_width);
+                rows.push(Row::new(vec![
+                    Cell::from("  command_field").style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(command_display).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from("").style(Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+        }
+    }
 
     let widths = [
         Constraint::Length(24),
@@ -112,7 +204,7 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(24),
     ];
 
-    let title = format!(" {section_title} ");
+    let title = format!(" {section_title} - {config_path_display} ");
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::bordered().title(title))
@@ -241,6 +333,62 @@ fn render_confirm_reset(frame: &mut Frame, area: Rect) {
 
     let lines = vec![
         Line::from("Revert all changes to last saved?"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[y] Yes   [n/Esc] No",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+/// Render the dirty-exit guard prompt.
+fn render_exit_guard(frame: &mut Frame, area: Rect) {
+    let popup_width = 52u16;
+    let popup_height = 5u16;
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::bordered()
+        .title(" Unsaved Changes ")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let lines = vec![
+        Line::from("You have unsaved changes."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[s] Save   [x] Discard   [Esc] Stay",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+/// Render the reload confirmation dialog (when dirty).
+fn render_reload_confirm(frame: &mut Frame, area: Rect) {
+    let popup_width = 48u16;
+    let popup_height = 5u16;
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::bordered()
+        .title(" Reload from Disk ")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let lines = vec![
+        Line::from("Unsaved changes will be lost. Reload?"),
         Line::from(""),
         Line::from(Span::styled(
             "[y] Yes   [n/Esc] No",

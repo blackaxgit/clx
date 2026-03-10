@@ -11,6 +11,13 @@ pub enum DashboardTab {
     Settings,
 }
 
+/// Where the user intended to go when leaving the Settings tab with unsaved changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitTarget {
+    Tab(DashboardTab),
+    Quit,
+}
+
 impl DashboardTab {
     pub const ALL: [DashboardTab; 4] = [Self::Sessions, Self::AuditLog, Self::Rules, Self::Settings];
 
@@ -63,8 +70,13 @@ pub struct App {
     pub settings_is_dirty: bool,
     pub settings_edit_buffer: String,
     pub settings_edit_error: Option<String>,
+    pub settings_edit_error_time: Option<Instant>,
     pub settings_save_result: Option<String>,
+    pub settings_save_result_time: Option<Instant>,
     pub settings_confirm_reset: bool,
+    pub settings_exit_pending: Option<ExitTarget>,
+    pub settings_reload_confirm: bool,
+    pub settings_load_error: Option<String>,
 }
 
 impl App {
@@ -93,8 +105,13 @@ impl App {
             settings_is_dirty: false,
             settings_edit_buffer: String::new(),
             settings_edit_error: None,
+            settings_edit_error_time: None,
             settings_save_result: None,
+            settings_save_result_time: None,
             settings_confirm_reset: false,
+            settings_exit_pending: None,
+            settings_reload_confirm: false,
+            settings_load_error: None,
         }
     }
 
@@ -344,19 +361,83 @@ impl App {
     pub fn on_enter_settings_tab(&mut self) {
         // Only load if not already loaded (avoids overwriting edits on re-entry)
         if self.settings_original_config.is_none() {
-            let config: Config = match Config::load_from_file_only() {
-                Ok(c) => c,
-                Err(e) => {
-                    self.settings_save_result = Some(format!("Load error: {e}"));
-                    Config::default()
+            match Config::load_from_file_only() {
+                Ok(config) => {
+                    self.settings_editing_config = Some(config.clone());
+                    self.settings_original_config = Some(config);
+                    self.settings_load_error = None;
                 }
-            };
-            self.settings_editing_config = Some(config.clone());
-            self.settings_original_config = Some(config);
+                Err(e) => {
+                    self.settings_load_error = Some(format!("Failed to load config: {e}"));
+                    // Still provide defaults so the UI renders, but mark as non-editable
+                    self.settings_editing_config = None;
+                    self.settings_original_config = None;
+                }
+            }
         }
         self.settings_field_table_state
             .select(Some(self.settings_field_idx));
         self.input_mode = InputMode::SettingsNav;
+    }
+
+    /// Reload settings from disk, replacing any in-memory state.
+    pub fn settings_reload(&mut self) {
+        match Config::load_from_file_only() {
+            Ok(config) => {
+                self.settings_editing_config = Some(config.clone());
+                self.settings_original_config = Some(config);
+                self.settings_is_dirty = false;
+                self.settings_load_error = None;
+                self.settings_save_result = Some("Reloaded from disk".to_owned());
+                self.settings_save_result_time = Some(Instant::now());
+            }
+            Err(e) => {
+                self.settings_save_result = Some(format!("Reload error: {e}"));
+                self.settings_save_result_time = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Auto-clear timed messages (save result after 3s, edit error after 5s).
+    pub fn settings_clear_timed_messages(&mut self) {
+        if let Some(t) = self.settings_save_result_time
+            && t.elapsed() >= Duration::from_secs(3)
+        {
+            self.settings_save_result = None;
+            self.settings_save_result_time = None;
+        }
+        if let Some(t) = self.settings_edit_error_time
+            && t.elapsed() >= Duration::from_secs(5)
+        {
+            self.settings_edit_error = None;
+            self.settings_edit_error_time = None;
+        }
+    }
+
+    /// Execute a pending exit after save or discard.
+    pub fn execute_exit_target(&mut self, target: ExitTarget) {
+        match target {
+            ExitTarget::Quit => {
+                self.input_mode = InputMode::Normal;
+                self.should_quit = true;
+            }
+            ExitTarget::Tab(tab) => {
+                self.current_tab = tab;
+                if tab == DashboardTab::Settings {
+                    self.input_mode = InputMode::SettingsNav;
+                } else {
+                    self.input_mode = InputMode::Normal;
+                }
+            }
+        }
+    }
+
+    /// Discard unsaved changes by reverting editing config to original.
+    pub fn settings_discard_changes(&mut self) {
+        if let Some(orig) = &self.settings_original_config {
+            self.settings_editing_config = Some(orig.clone());
+        }
+        self.settings_is_dirty = false;
     }
 
     /// Save the editing config to disk atomically.
@@ -376,6 +457,7 @@ impl App {
             Ok(d) => d,
             Err(e) => {
                 self.settings_save_result = Some(format!("Error: {e}"));
+                self.settings_save_result_time = Some(Instant::now());
                 return;
             }
         };
@@ -387,18 +469,21 @@ impl App {
             Ok(y) => y,
             Err(e) => {
                 self.settings_save_result = Some(format!("Serialize error: {e}"));
+                self.settings_save_result_time = Some(Instant::now());
                 return;
             }
         };
 
         if let Err(e) = std::fs::write(&tmp_path, &yaml) {
             self.settings_save_result = Some(format!("Write error: {e}"));
+            self.settings_save_result_time = Some(Instant::now());
             let _ = std::fs::remove_file(&tmp_path);
             return;
         }
 
         if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
             self.settings_save_result = Some(format!("Rename error: {e}"));
+            self.settings_save_result_time = Some(Instant::now());
             let _ = std::fs::remove_file(&tmp_path);
             return;
         }
@@ -406,6 +491,7 @@ impl App {
         self.settings_original_config = Some(editing.clone());
         self.settings_is_dirty = false;
         self.settings_save_result = Some("Saved".to_owned());
+        self.settings_save_result_time = Some(Instant::now());
     }
 }
 

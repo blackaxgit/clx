@@ -81,6 +81,15 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         InputMode::SettingsEdit => {
             "Type to edit | [Enter] Confirm | [Esc] Cancel | [Ctrl+U] Clear".to_owned()
         }
+        InputMode::SettingsNav if app.settings_exit_pending.is_some() => {
+            "[s] Save  [x] Discard  [Esc] Stay".to_owned()
+        }
+        InputMode::SettingsNav if app.settings_reload_confirm => {
+            "Reload from disk? [y] Yes  [n/Esc] No".to_owned()
+        }
+        InputMode::SettingsNav if app.settings_confirm_reset => {
+            "Reset all changes? [y] Yes  [n/Esc] No".to_owned()
+        }
         InputMode::SettingsNav => {
             let save_hint = if app.settings_is_dirty {
                 " [s]Save [R]Reset"
@@ -88,7 +97,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ""
             };
             format!(
-                "h/l:section j/k:field Space/Enter:edit [d]Default{save_hint} q:quit Tab:switch"
+                "h/l:section j/k:field Space/Enter:edit [d]Default [r]Reload{save_hint} q:quit Tab:switch"
             )
         }
         _ => "q:quit Tab:switch /:filter s:sort S:reverse PgUp/Dn g/G:top/bottom r:refresh"
