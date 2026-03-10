@@ -1,20 +1,34 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table};
+use ratatui::widgets::{
+    Block, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    Wrap,
+};
 
 use super::config_bridge::{get_default_value, get_field_value};
-use super::fields::fields_for_section;
+use super::fields::{fields_for_section, FieldWidget};
 use super::sections::SECTIONS;
-use crate::dashboard::app::App;
+use crate::dashboard::app::{App, InputMode};
 
 /// Render the Settings tab with a two-panel layout.
 ///
 /// Left panel: section list (22 columns).
 /// Right panel: field table showing name, value, and default.
+/// Overlays: edit popup when in `SettingsEdit` mode, confirm dialog for reset.
 pub fn render_settings_tab(frame: &mut Frame, app: &mut App, area: Rect) {
     let panels = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(area);
 
     render_section_list(frame, app, panels[0]);
     render_field_table(frame, app, panels[1]);
+
+    // Overlay: edit popup
+    if app.input_mode == InputMode::SettingsEdit {
+        render_edit_popup(frame, app, area);
+    }
+
+    // Overlay: reset confirmation dialog
+    if app.settings_confirm_reset {
+        render_confirm_reset(frame, area);
+    }
 }
 
 /// Render the section list in the left panel.
@@ -114,4 +128,126 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .begin_symbol(Some("\u{2191}"))
         .end_symbol(Some("\u{2193}"));
     frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+}
+
+/// Create a centered `Rect` within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(x, y, w, h)
+}
+
+/// Render the edit popup for text/number fields.
+fn render_edit_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let fields = fields_for_section(app.settings_section_idx);
+    let Some(field_def) = fields.get(app.settings_field_idx) else {
+        return;
+    };
+
+    let popup_width = 50u16;
+    let popup_height = 12u16;
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" Edit: {} ", field_def.label);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    // Build popup content lines
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Description
+    lines.push(Line::from(Span::styled(
+        field_def.description,
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    // Edit buffer with cursor indicator
+    let buffer_display = format!("Value: [{}|]", app.settings_edit_buffer);
+    lines.push(Line::from(Span::styled(
+        buffer_display,
+        Style::default().fg(Color::White).bold(),
+    )));
+    lines.push(Line::from(""));
+
+    // Range / constraint info
+    let range_info = match &field_def.widget {
+        FieldWidget::NumberU64 { min, max } => Some(format!("Range: {min} - {max}")),
+        FieldWidget::NumberU32 { min, max } => Some(format!("Range: {min} - {max}")),
+        FieldWidget::NumberI64 { min, max } => Some(format!("Range: {min} - {max}")),
+        FieldWidget::NumberF64 { min, max, .. } => Some(format!("Range: {min} - {max}")),
+        FieldWidget::NumberF32 { min, max, .. } => Some(format!("Range: {min} - {max}")),
+        FieldWidget::NumberUsize { min, max } => Some(format!("Range: {min} - {max}")),
+        FieldWidget::TextInput { .. } => Some("Non-empty string".to_owned()),
+        _ => None,
+    };
+    if let Some(info) = range_info {
+        lines.push(Line::from(Span::styled(
+            info,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Default value
+    let default_val = get_default_value(app.settings_section_idx, app.settings_field_idx);
+    lines.push(Line::from(Span::styled(
+        format!("Default: {default_val}"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    // Validation error
+    if let Some(err) = &app.settings_edit_error {
+        lines.push(Line::from(Span::styled(
+            err.as_str(),
+            Style::default().fg(Color::Red).bold(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    // Key hints
+    lines.push(Line::from(Span::styled(
+        "[Enter] Confirm   [Esc] Cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
+}
+
+/// Render the reset confirmation dialog.
+fn render_confirm_reset(frame: &mut Frame, area: Rect) {
+    let popup_width = 40u16;
+    let popup_height = 5u16;
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::bordered()
+        .title(" Reset All Changes ")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let lines = vec![
+        Line::from("Revert all changes to last saved?"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[y] Yes   [n/Esc] No",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }

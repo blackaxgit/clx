@@ -61,11 +61,9 @@ pub struct App {
     pub settings_editing_config: Option<Config>,
     // Settings editing state
     pub settings_is_dirty: bool,
-    #[allow(dead_code)]
     pub settings_edit_buffer: String,
     pub settings_edit_error: Option<String>,
     pub settings_save_result: Option<String>,
-    #[allow(dead_code)]
     pub settings_confirm_reset: bool,
 }
 
@@ -346,7 +344,7 @@ impl App {
     pub fn on_enter_settings_tab(&mut self) {
         // Only load if not already loaded (avoids overwriting edits on re-entry)
         if self.settings_original_config.is_none() {
-            let config: Config = match Config::load() {
+            let config: Config = match Config::load_from_file_only() {
                 Ok(c) => c,
                 Err(e) => {
                     self.settings_save_result = Some(format!("Load error: {e}"));
@@ -359,6 +357,55 @@ impl App {
         self.settings_field_table_state
             .select(Some(self.settings_field_idx));
         self.input_mode = InputMode::SettingsNav;
+    }
+
+    /// Save the editing config to disk atomically.
+    ///
+    /// Writes to a temp file first, then renames to `config.yaml`.
+    /// On success, updates original config and clears dirty flag.
+    pub fn settings_save(&mut self) {
+        if !self.settings_is_dirty {
+            return;
+        }
+
+        let Some(editing) = &self.settings_editing_config else {
+            return;
+        };
+
+        let config_dir = match Config::config_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                self.settings_save_result = Some(format!("Error: {e}"));
+                return;
+            }
+        };
+
+        let config_path = config_dir.join("config.yaml");
+        let tmp_path = config_dir.join("config.yaml.tmp");
+
+        let yaml = match serde_yml::to_string(editing) {
+            Ok(y) => y,
+            Err(e) => {
+                self.settings_save_result = Some(format!("Serialize error: {e}"));
+                return;
+            }
+        };
+
+        if let Err(e) = std::fs::write(&tmp_path, &yaml) {
+            self.settings_save_result = Some(format!("Write error: {e}"));
+            let _ = std::fs::remove_file(&tmp_path);
+            return;
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
+            self.settings_save_result = Some(format!("Rename error: {e}"));
+            let _ = std::fs::remove_file(&tmp_path);
+            return;
+        }
+
+        self.settings_original_config = Some(editing.clone());
+        self.settings_is_dirty = false;
+        self.settings_save_result = Some("Saved".to_owned());
     }
 }
 

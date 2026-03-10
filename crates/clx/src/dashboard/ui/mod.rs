@@ -78,14 +78,17 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let key_hints = match app.input_mode {
-        InputMode::SettingsNav | InputMode::SettingsEdit => {
+        InputMode::SettingsEdit => {
+            "Type to edit | [Enter] Confirm | [Esc] Cancel | [Ctrl+U] Clear".to_owned()
+        }
+        InputMode::SettingsNav => {
             let save_hint = if app.settings_is_dirty {
-                " [s]Save"
+                " [s]Save [R]Reset"
             } else {
                 ""
             };
             format!(
-                "h/l:section j/k:field Space/Enter:edit{save_hint} q:quit Tab:switch"
+                "h/l:section j/k:field Space/Enter:edit [d]Default{save_hint} q:quit Tab:switch"
             )
         }
         _ => "q:quit Tab:switch /:filter s:sort S:reverse PgUp/Dn g/G:top/bottom r:refresh"
@@ -97,8 +100,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         None => String::new(),
     };
 
+    let save_result = match &app.settings_save_result {
+        Some(msg) => format!(" | {msg}"),
+        None => String::new(),
+    };
+
     let status = format!(
-        " {} | Refresh {}s | Sessions: {} | Commands: {}{}{}{} | {}",
+        " {} | Refresh {}s | Sessions: {} | Commands: {}{}{}{}{} | {}",
         now,
         refresh_secs,
         app.data.total_sessions,
@@ -106,6 +114,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         filter_info,
         error_info,
         settings_error,
+        save_result,
         key_hints,
     );
 

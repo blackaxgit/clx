@@ -4,6 +4,8 @@
 /// through options, and text/number fields open a popup (Phase 3).
 ///
 /// Variant fields carry validation metadata used in Phase 3 for editing popups.
+// Some variant fields (max_len, decimals, options) are structural metadata
+// used by future phases (Phase 4+ polish) but not yet read in code paths.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum FieldWidget {
@@ -23,8 +25,7 @@ pub enum FieldWidget {
 pub struct FieldDef {
     /// Display label (matches YAML key)
     pub label: &'static str,
-    /// Short description shown in the edit popup (Phase 3)
-    #[allow(dead_code)]
+    /// Short description shown in the edit popup
     pub description: &'static str,
     /// Widget type determining edit behavior
     pub widget: FieldWidget,

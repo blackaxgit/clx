@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
 use super::app::{App, DashboardTab, InputMode};
@@ -39,7 +39,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         InputMode::Normal => handle_normal_mode(app, key),
         InputMode::Filter => handle_filter_mode(app, key),
         InputMode::SettingsNav => handle_settings_nav(app, key),
-        InputMode::SettingsEdit => {} // Phase 3
+        InputMode::SettingsEdit => handle_settings_edit(app, key),
     }
 }
 
@@ -92,6 +92,26 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_settings_nav(app: &mut App, key: KeyEvent) {
+    // Handle confirm-reset dialog first
+    if app.settings_confirm_reset {
+        match key.code {
+            KeyCode::Char('y') => {
+                // Revert editing to original
+                if let Some(orig) = &app.settings_original_config {
+                    app.settings_editing_config = Some(orig.clone());
+                }
+                app.settings_is_dirty = false;
+                app.settings_confirm_reset = false;
+                app.settings_edit_error = None;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.settings_confirm_reset = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.input_mode = InputMode::Normal;
@@ -119,6 +139,17 @@ fn handle_settings_nav(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
             handle_settings_edit_field(app);
+        }
+        KeyCode::Char('s') => {
+            app.settings_save();
+        }
+        KeyCode::Char('d') => {
+            handle_settings_reset_field(app);
+        }
+        KeyCode::Char('R') => {
+            if app.settings_is_dirty {
+                app.settings_confirm_reset = true;
+            }
         }
         KeyCode::Char('1') => switch_to_tab(app, DashboardTab::Sessions),
         KeyCode::Char('2') => switch_to_tab(app, DashboardTab::AuditLog),
@@ -169,15 +200,73 @@ fn handle_settings_edit_field(app: &mut App) {
             );
             config_bridge::recompute_dirty(app);
         }
-        // Phase 3: TextInput, Number*, ReadOnlyList
+        // Text/Number fields: open popup editor
         FieldWidget::TextInput { .. }
         | FieldWidget::NumberU64 { .. }
         | FieldWidget::NumberU32 { .. }
         | FieldWidget::NumberI64 { .. }
         | FieldWidget::NumberF64 { .. }
         | FieldWidget::NumberF32 { .. }
-        | FieldWidget::NumberUsize { .. }
-        | FieldWidget::ReadOnlyList => {}
+        | FieldWidget::NumberUsize { .. } => {
+            // Copy current value into edit buffer
+            let config = app.settings_editing_config.as_ref().unwrap();
+            app.settings_edit_buffer =
+                config_bridge::get_field_value(config, section, field);
+            app.settings_edit_error = None;
+            app.input_mode = InputMode::SettingsEdit;
+        }
+        FieldWidget::ReadOnlyList => {}
+    }
+}
+
+/// Handle `SettingsEdit` mode key events (popup is open).
+fn handle_settings_edit(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.settings_edit_buffer.clear();
+            app.settings_edit_error = None;
+            app.input_mode = InputMode::SettingsNav;
+        }
+        KeyCode::Enter => {
+            let section = app.settings_section_idx;
+            let field = app.settings_field_idx;
+            let raw = app.settings_edit_buffer.clone();
+
+            if let Some(config) = app.settings_editing_config.as_mut() {
+                match config_bridge::set_field_value(config, section, field, &raw) {
+                    Ok(()) => {
+                        config_bridge::recompute_dirty(app);
+                        app.settings_edit_buffer.clear();
+                        app.settings_edit_error = None;
+                        app.input_mode = InputMode::SettingsNav;
+                    }
+                    Err(e) => {
+                        app.settings_edit_error = Some(e);
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.settings_edit_buffer.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.settings_edit_buffer.clear();
+        }
+        KeyCode::Char(c) => {
+            app.settings_edit_buffer.push(c);
+        }
+        _ => {}
+    }
+}
+
+/// Reset the currently selected field to its default value.
+fn handle_settings_reset_field(app: &mut App) {
+    let section = app.settings_section_idx;
+    let field = app.settings_field_idx;
+
+    if let Some(config) = app.settings_editing_config.as_mut() {
+        config_bridge::reset_field_to_default(config, section, field);
+        config_bridge::recompute_dirty(app);
     }
 }
 

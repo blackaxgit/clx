@@ -2,6 +2,260 @@ use clx_core::config::{Config, ContextPressureMode, DefaultDecision};
 
 use crate::dashboard::app::App;
 
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+fn validate_u64(s: &str, min: u64, max: u64) -> Result<u64, String> {
+    let v: u64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("Not a valid integer: '{s}'"))?;
+    if v < min || v > max {
+        return Err(format!("Must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn validate_u32(s: &str, min: u32, max: u32) -> Result<u32, String> {
+    let v: u32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("Not a valid integer: '{s}'"))?;
+    if v < min || v > max {
+        return Err(format!("Must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn validate_i64(s: &str, min: i64, max: i64) -> Result<i64, String> {
+    let v: i64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("Not a valid integer: '{s}'"))?;
+    if v < min || v > max {
+        return Err(format!("Must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn validate_f64(s: &str, min: f64, max: f64) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("Not a valid number: '{s}'"))?;
+    if v < min || v > max {
+        return Err(format!("Must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn validate_f32(s: &str, min: f32, max: f32) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("Not a valid number: '{s}'"))?;
+    if v < min || v > max {
+        return Err(format!("Must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn validate_usize(s: &str, min: usize, max: usize) -> Result<usize, String> {
+    let v: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("Not a valid integer: '{s}'"))?;
+    if v < min || v > max {
+        return Err(format!("Must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn validate_nonempty_string(s: &str) -> Result<(), String> {
+    if s.trim().is_empty() {
+        return Err("Value cannot be empty".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_url(s: &str) -> Result<(), String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("URL cannot be empty".to_owned());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("URL must start with http:// or https://".to_owned());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// set_field_value — parse + validate + apply
+// ---------------------------------------------------------------------------
+
+/// Apply an edited string value back to config.
+///
+/// Returns `Ok(())` on success, or `Err(message)` with a human-readable
+/// validation error.
+pub fn set_field_value(
+    config: &mut Config,
+    section: usize,
+    field: usize,
+    raw: &str,
+) -> Result<(), String> {
+    match (section, field) {
+        // Section 0: Validator
+        (0, 2) => {
+            config.validator.layer1_timeout_ms = validate_u64(raw, 100, 300_000)?;
+        }
+
+        // Section 1: Context
+        (1, 2) => {
+            validate_nonempty_string(raw)?;
+            raw.trim()
+                .clone_into(&mut config.context.embedding_model);
+        }
+
+        // Section 2: Ollama
+        (2, 0) => {
+            validate_url(raw)?;
+            raw.trim().clone_into(&mut config.ollama.host);
+        }
+        (2, 1) => {
+            validate_nonempty_string(raw)?;
+            raw.trim().clone_into(&mut config.ollama.model);
+        }
+        (2, 2) => {
+            validate_nonempty_string(raw)?;
+            raw.trim()
+                .clone_into(&mut config.ollama.embedding_model);
+        }
+        (2, 3) => {
+            config.ollama.embedding_dim = validate_usize(raw, 1, 65536)?;
+        }
+        (2, 4) => {
+            config.ollama.timeout_ms = validate_u64(raw, 100, 600_000)?;
+        }
+        (2, 5) => {
+            config.ollama.max_retries = validate_u32(raw, 0, 10)?;
+        }
+        (2, 6) => {
+            config.ollama.retry_delay_ms = validate_u64(raw, 0, 60_000)?;
+        }
+        (2, 7) => {
+            config.ollama.retry_backoff = validate_f32(raw, 1.0, 10.0)?;
+        }
+
+        // Section 3: User Learning
+        (3, 1) => {
+            config.user_learning.auto_whitelist_threshold = validate_u32(raw, 1, 100)?;
+        }
+        (3, 2) => {
+            config.user_learning.auto_blacklist_threshold = validate_u32(raw, 1, 100)?;
+        }
+
+        // Section 4: Logging
+        (4, 1) => {
+            validate_nonempty_string(raw)?;
+            raw.trim().clone_into(&mut config.logging.file);
+        }
+        (4, 2) => {
+            config.logging.max_size_mb = validate_u32(raw, 1, 1000)?;
+        }
+        (4, 3) => {
+            config.logging.max_files = validate_u32(raw, 1, 100)?;
+        }
+
+        // Section 5: Context Pressure
+        (5, 1) => {
+            config.context_pressure.context_window_size = validate_i64(raw, 1000, 2_000_000)?;
+        }
+        (5, 2) => {
+            config.context_pressure.threshold = validate_f64(raw, 0.1, 1.0)?;
+        }
+
+        // Section 6: Session Recovery
+        (6, 1) => {
+            config.session_recovery.stale_hours = validate_u32(raw, 1, 168)?;
+        }
+
+        _ => return Err("Field is not editable".to_owned()),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// reset_field_to_default — reset a single field to its Config::default() value
+// ---------------------------------------------------------------------------
+
+/// Reset a single field to its `Config::default()` value.
+///
+/// Returns `true` if the field was reset, `false` if the field is not resettable.
+pub fn reset_field_to_default(config: &mut Config, section: usize, field: usize) -> bool {
+    let defaults = Config::default();
+    match (section, field) {
+        // Section 0: Validator
+        (0, 0) => config.validator.enabled = defaults.validator.enabled,
+        (0, 1) => config.validator.layer1_enabled = defaults.validator.layer1_enabled,
+        (0, 2) => config.validator.layer1_timeout_ms = defaults.validator.layer1_timeout_ms,
+        (0, 3) => config.validator.default_decision = defaults.validator.default_decision,
+        (0, 4) => config.validator.trust_mode = defaults.validator.trust_mode,
+        (0, 5) => config.validator.auto_allow_reads = defaults.validator.auto_allow_reads,
+
+        // Section 1: Context
+        (1, 0) => config.context.enabled = defaults.context.enabled,
+        (1, 1) => config.context.auto_snapshot = defaults.context.auto_snapshot,
+        (1, 2) => config.context.embedding_model = defaults.context.embedding_model,
+
+        // Section 2: Ollama
+        (2, 0) => config.ollama.host = defaults.ollama.host,
+        (2, 1) => config.ollama.model = defaults.ollama.model,
+        (2, 2) => config.ollama.embedding_model = defaults.ollama.embedding_model,
+        (2, 3) => config.ollama.embedding_dim = defaults.ollama.embedding_dim,
+        (2, 4) => config.ollama.timeout_ms = defaults.ollama.timeout_ms,
+        (2, 5) => config.ollama.max_retries = defaults.ollama.max_retries,
+        (2, 6) => config.ollama.retry_delay_ms = defaults.ollama.retry_delay_ms,
+        (2, 7) => config.ollama.retry_backoff = defaults.ollama.retry_backoff,
+
+        // Section 3: User Learning
+        (3, 0) => config.user_learning.enabled = defaults.user_learning.enabled,
+        (3, 1) => {
+            config.user_learning.auto_whitelist_threshold =
+                defaults.user_learning.auto_whitelist_threshold;
+        }
+        (3, 2) => {
+            config.user_learning.auto_blacklist_threshold =
+                defaults.user_learning.auto_blacklist_threshold;
+        }
+
+        // Section 4: Logging
+        (4, 0) => config.logging.level = defaults.logging.level,
+        (4, 1) => config.logging.file = defaults.logging.file,
+        (4, 2) => config.logging.max_size_mb = defaults.logging.max_size_mb,
+        (4, 3) => config.logging.max_files = defaults.logging.max_files,
+
+        // Section 5: Context Pressure
+        (5, 0) => config.context_pressure.mode = defaults.context_pressure.mode,
+        (5, 1) => {
+            config.context_pressure.context_window_size =
+                defaults.context_pressure.context_window_size;
+        }
+        (5, 2) => config.context_pressure.threshold = defaults.context_pressure.threshold,
+
+        // Section 6: Session Recovery
+        (6, 0) => config.session_recovery.enabled = defaults.session_recovery.enabled,
+        (6, 1) => config.session_recovery.stale_hours = defaults.session_recovery.stale_hours,
+
+        // Section 7: MCP Tools
+        (7, 0) => config.mcp_tools.enabled = defaults.mcp_tools.enabled,
+        (7, 1) => config.mcp_tools.default_decision = defaults.mcp_tools.default_decision,
+
+        _ => return false,
+    }
+    true
+}
+
 /// Extract the current string value of a field for display.
 ///
 /// Returns the value as a human-readable string. For unknown section/field
@@ -401,5 +655,280 @@ mod tests {
         let config = Config::default();
         assert!(!is_trust_mode_enabling(&config, 0, 0));
         assert!(!is_trust_mode_enabling(&config, 1, 4));
+    }
+
+    // --- Phase 3: validator tests ---
+
+    #[test]
+    fn test_validate_u64_valid() {
+        assert_eq!(validate_u64("100", 100, 300_000).unwrap(), 100);
+        assert_eq!(validate_u64("300000", 100, 300_000).unwrap(), 300_000);
+        assert_eq!(validate_u64("5000", 100, 300_000).unwrap(), 5000);
+    }
+
+    #[test]
+    fn test_validate_u64_out_of_range() {
+        assert!(validate_u64("99", 100, 300_000).is_err());
+        assert!(validate_u64("300001", 100, 300_000).is_err());
+    }
+
+    #[test]
+    fn test_validate_u64_invalid() {
+        assert!(validate_u64("abc", 100, 300_000).is_err());
+        assert!(validate_u64("", 100, 300_000).is_err());
+        assert!(validate_u64("-1", 100, 300_000).is_err());
+    }
+
+    #[test]
+    fn test_validate_u32_valid() {
+        assert_eq!(validate_u32("1", 1, 100).unwrap(), 1);
+        assert_eq!(validate_u32("100", 1, 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_validate_u32_out_of_range() {
+        assert!(validate_u32("0", 1, 100).is_err());
+        assert!(validate_u32("101", 1, 100).is_err());
+    }
+
+    #[test]
+    fn test_validate_i64_valid() {
+        assert_eq!(validate_i64("1000", 1000, 2_000_000).unwrap(), 1000);
+        assert_eq!(validate_i64("2000000", 1000, 2_000_000).unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn test_validate_i64_out_of_range() {
+        assert!(validate_i64("999", 1000, 2_000_000).is_err());
+        assert!(validate_i64("2000001", 1000, 2_000_000).is_err());
+    }
+
+    #[test]
+    fn test_validate_f64_valid() {
+        let v = validate_f64("0.5", 0.1, 1.0).unwrap();
+        assert!((v - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_validate_f64_out_of_range() {
+        assert!(validate_f64("0.05", 0.1, 1.0).is_err());
+        assert!(validate_f64("1.1", 0.1, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_validate_f32_valid() {
+        let v = validate_f32("2.5", 1.0, 10.0).unwrap();
+        assert!((v - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_validate_f32_out_of_range() {
+        assert!(validate_f32("0.5", 1.0, 10.0).is_err());
+        assert!(validate_f32("10.1", 1.0, 10.0).is_err());
+    }
+
+    #[test]
+    fn test_validate_usize_valid() {
+        assert_eq!(validate_usize("1024", 1, 65536).unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_validate_usize_out_of_range() {
+        assert!(validate_usize("0", 1, 65536).is_err());
+        assert!(validate_usize("65537", 1, 65536).is_err());
+    }
+
+    #[test]
+    fn test_validate_nonempty_string_valid() {
+        assert!(validate_nonempty_string("hello").is_ok());
+        assert!(validate_nonempty_string("  x  ").is_ok());
+    }
+
+    #[test]
+    fn test_validate_nonempty_string_empty() {
+        assert!(validate_nonempty_string("").is_err());
+        assert!(validate_nonempty_string("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_url_valid() {
+        assert!(validate_url("http://localhost:11434").is_ok());
+        assert!(validate_url("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_invalid() {
+        assert!(validate_url("").is_err());
+        assert!(validate_url("ftp://example.com").is_err());
+        assert!(validate_url("localhost:11434").is_err());
+    }
+
+    // --- Phase 3: set_field_value tests ---
+
+    #[test]
+    fn test_set_field_value_u64_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 0, 2, "5000").unwrap();
+        assert_eq!(config.validator.layer1_timeout_ms, 5000);
+        assert_eq!(get_field_value(&config, 0, 2), "5000");
+    }
+
+    #[test]
+    fn test_set_field_value_u64_rejects_out_of_range() {
+        let mut config = Config::default();
+        assert!(set_field_value(&mut config, 0, 2, "50").is_err());
+        // Verify value unchanged
+        assert_eq!(config.validator.layer1_timeout_ms, 30000);
+    }
+
+    #[test]
+    fn test_set_field_value_string_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 1, 2, "custom-model").unwrap();
+        assert_eq!(config.context.embedding_model, "custom-model");
+    }
+
+    #[test]
+    fn test_set_field_value_string_rejects_empty() {
+        let mut config = Config::default();
+        assert!(set_field_value(&mut config, 1, 2, "").is_err());
+    }
+
+    #[test]
+    fn test_set_field_value_url_validation() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 2, 0, "http://custom:8080").unwrap();
+        assert_eq!(config.ollama.host, "http://custom:8080");
+
+        assert!(set_field_value(&mut config, 2, 0, "ftp://bad").is_err());
+    }
+
+    #[test]
+    fn test_set_field_value_f32_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 2, 7, "3.5").unwrap();
+        assert!((config.ollama.retry_backoff - 3.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_set_field_value_f64_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 5, 2, "0.90").unwrap();
+        assert!((config.context_pressure.threshold - 0.90).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_set_field_value_i64_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 5, 1, "150000").unwrap();
+        assert_eq!(config.context_pressure.context_window_size, 150_000);
+    }
+
+    #[test]
+    fn test_set_field_value_usize_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 2, 3, "768").unwrap();
+        assert_eq!(config.ollama.embedding_dim, 768);
+    }
+
+    #[test]
+    fn test_set_field_value_non_editable_returns_error() {
+        let mut config = Config::default();
+        // Toggle field (0,0) is not handled by set_field_value
+        assert!(set_field_value(&mut config, 0, 0, "true").is_err());
+        // ReadOnlyList
+        assert!(set_field_value(&mut config, 7, 2, "test").is_err());
+        // Unknown field
+        assert!(set_field_value(&mut config, 99, 0, "x").is_err());
+    }
+
+    #[test]
+    fn test_set_field_value_all_number_fields() {
+        // Verify every number field can be set with its default value (round-trip)
+        let defaults = Config::default();
+        let number_fields: &[(usize, usize)] = &[
+            (0, 2), // layer1_timeout_ms
+            (2, 3), // embedding_dim
+            (2, 4), // timeout_ms
+            (2, 5), // max_retries
+            (2, 6), // retry_delay_ms
+            (2, 7), // retry_backoff
+            (3, 1), // auto_whitelist_threshold
+            (3, 2), // auto_blacklist_threshold
+            (4, 2), // max_size_mb
+            (4, 3), // max_files
+            (5, 1), // context_window_size
+            (5, 2), // threshold
+            (6, 1), // stale_hours
+        ];
+
+        for &(s, f) in number_fields {
+            let mut config = Config::default();
+            let default_val = get_field_value(&defaults, s, f);
+            let result = set_field_value(&mut config, s, f, &default_val);
+            assert!(
+                result.is_ok(),
+                "set_field_value({s}, {f}, \"{default_val}\") failed: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    // --- Phase 3: reset_field_to_default tests ---
+
+    #[test]
+    fn test_reset_field_to_default_number() {
+        let mut config = Config::default();
+        config.validator.layer1_timeout_ms = 999;
+        reset_field_to_default(&mut config, 0, 2);
+        assert_eq!(config.validator.layer1_timeout_ms, 30000);
+    }
+
+    #[test]
+    fn test_reset_field_to_default_string() {
+        let mut config = Config::default();
+        config.ollama.host = "http://custom:9999".to_owned();
+        reset_field_to_default(&mut config, 2, 0);
+        assert_eq!(config.ollama.host, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn test_reset_field_to_default_bool() {
+        let mut config = Config::default();
+        config.validator.enabled = false;
+        reset_field_to_default(&mut config, 0, 0);
+        assert!(config.validator.enabled);
+    }
+
+    #[test]
+    fn test_reset_field_to_default_unknown_returns_false() {
+        let mut config = Config::default();
+        assert!(!reset_field_to_default(&mut config, 99, 0));
+        assert!(!reset_field_to_default(&mut config, 7, 2)); // ReadOnlyList
+    }
+
+    #[test]
+    fn test_reset_all_fields_to_default() {
+        let mut config = Config::default();
+        // Modify several fields
+        config.validator.layer1_timeout_ms = 1;
+        config.ollama.host = "changed".to_owned();
+        config.context_pressure.threshold = 0.5;
+
+        // Reset them
+        reset_field_to_default(&mut config, 0, 2);
+        reset_field_to_default(&mut config, 2, 0);
+        reset_field_to_default(&mut config, 5, 2);
+
+        let defaults = Config::default();
+        assert_eq!(
+            config.validator.layer1_timeout_ms,
+            defaults.validator.layer1_timeout_ms
+        );
+        assert_eq!(config.ollama.host, defaults.ollama.host);
+        assert!(
+            (config.context_pressure.threshold - defaults.context_pressure.threshold).abs()
+                < f64::EPSILON
+        );
     }
 }
