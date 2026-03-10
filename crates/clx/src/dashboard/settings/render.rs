@@ -6,7 +6,7 @@ use ratatui::widgets::{
 };
 
 use super::config_bridge::{get_default_value, get_field_value};
-use super::fields::{fields_for_section, FieldWidget};
+use super::fields::{FieldWidget, fields_for_section};
 use super::sections::SECTIONS;
 use crate::dashboard::app::{App, InputMode};
 
@@ -32,8 +32,10 @@ pub fn render_settings_tab(frame: &mut Frame, app: &mut App, area: Rect) {
         let panels = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(area);
         render_section_list(frame, app, panels[0]);
 
-        let config_path_display = Config::config_file_path()
-            .map_or_else(|_| "~/.clx/config.yaml".to_owned(), |p| p.display().to_string());
+        let config_path_display = Config::config_file_path().map_or_else(
+            |_| "~/.clx/config.yaml".to_owned(),
+            |p| p.display().to_string(),
+        );
         let block = Block::bordered().title(format!(" Settings - {config_path_display} "));
         let inner = block.inner(panels[1]);
         frame.render_widget(block, panels[1]);
@@ -44,10 +46,7 @@ pub fn render_settings_tab(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Red).bold(),
             )),
             Line::from(""),
-            Line::from(Span::styled(
-                err.as_str(),
-                Style::default().fg(Color::Red),
-            )),
+            Line::from(Span::styled(err.as_str(), Style::default().fg(Color::Red))),
             Line::from(""),
             Line::from(Span::styled(
                 "Editing is disabled. Fix the config file manually or press [r] to retry.",
@@ -105,8 +104,8 @@ fn render_section_list(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Fill(1)])
-        .block(Block::bordered().title(" Sections "));
+    let table =
+        Table::new(rows, [Constraint::Fill(1)]).block(Block::bordered().title(" Sections "));
 
     frame.render_widget(table, area);
 }
@@ -126,8 +125,10 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .map_or("Fields", |s| s.title);
 
     // Config file path in panel title
-    let config_path_display = Config::config_file_path()
-        .map_or_else(|_| "~/.clx/config.yaml".to_owned(), |p| p.display().to_string());
+    let config_path_display = Config::config_file_path().map_or_else(
+        |_| "~/.clx/config.yaml".to_owned(),
+        |p| p.display().to_string(),
+    );
 
     let header = Row::new(vec![
         Cell::from("Field").style(Style::default().bold()),

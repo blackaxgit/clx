@@ -302,8 +302,7 @@ fn handle_settings_edit_field(app: &mut App) {
         | FieldWidget::NumberUsize { .. } => {
             // Copy current value into edit buffer
             let config = app.settings_editing_config.as_ref().unwrap();
-            app.settings_edit_buffer =
-                config_bridge::get_field_value(config, section, field);
+            app.settings_edit_buffer = config_bridge::get_field_value(config, section, field);
             app.settings_edit_error = None;
             app.settings_edit_error_time = None;
             app.input_mode = InputMode::SettingsEdit;

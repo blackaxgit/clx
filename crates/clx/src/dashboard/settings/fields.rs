@@ -113,10 +113,7 @@ pub const OLLAMA_FIELDS: &[FieldDef] = &[
     FieldDef {
         label: "embedding_dim",
         description: "Embedding vector dimension",
-        widget: FieldWidget::NumberUsize {
-            min: 1,
-            max: 65536,
-        },
+        widget: FieldWidget::NumberUsize { min: 1, max: 65536 },
     },
     FieldDef {
         label: "timeout_ms",
@@ -278,10 +275,7 @@ pub const ALL_SECTION_FIELDS: &[&[FieldDef]] = &[
 /// Get the field definitions for a given section index.
 #[must_use]
 pub fn fields_for_section(section: usize) -> &'static [FieldDef] {
-    ALL_SECTION_FIELDS
-        .get(section)
-        .copied()
-        .unwrap_or_default()
+    ALL_SECTION_FIELDS.get(section).copied().unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -19,7 +19,8 @@ pub enum ExitTarget {
 }
 
 impl DashboardTab {
-    pub const ALL: [DashboardTab; 4] = [Self::Sessions, Self::AuditLog, Self::Rules, Self::Settings];
+    pub const ALL: [DashboardTab; 4] =
+        [Self::Sessions, Self::AuditLog, Self::Rules, Self::Settings];
 
     pub fn title(self) -> &'static str {
         match self {

@@ -113,8 +113,7 @@ pub fn set_field_value(
         // Section 1: Context
         (1, 2) => {
             validate_nonempty_string(raw)?;
-            raw.trim()
-                .clone_into(&mut config.context.embedding_model);
+            raw.trim().clone_into(&mut config.context.embedding_model);
         }
 
         // Section 2: Ollama
@@ -128,8 +127,7 @@ pub fn set_field_value(
         }
         (2, 2) => {
             validate_nonempty_string(raw)?;
-            raw.trim()
-                .clone_into(&mut config.ollama.embedding_model);
+            raw.trim().clone_into(&mut config.ollama.embedding_model);
         }
         (2, 3) => {
             config.ollama.embedding_dim = validate_usize(raw, 1, 65536)?;
@@ -435,7 +433,8 @@ mod tests {
                 assert!(
                     !value.is_empty(),
                     "Empty value for section '{}' field {}",
-                    section.key, f
+                    section.key,
+                    f
                 );
             }
         }
@@ -457,7 +456,8 @@ mod tests {
                     get_field_value(&config, s, f),
                     get_default_value(s, f),
                     "Default mismatch for section '{}' field {}",
-                    section.key, f
+                    section.key,
+                    f
                 );
             }
         }
@@ -512,10 +512,7 @@ mod tests {
             let before = get_field_value(&config, s, f);
             toggle_field(&mut config, s, f);
             let after = get_field_value(&config, s, f);
-            assert_ne!(
-                before, after,
-                "toggle_field({s}, {f}) did not change value"
-            );
+            assert_ne!(before, after, "toggle_field({s}, {f}) did not change value");
 
             // Toggle back should restore original
             toggle_field(&mut config, s, f);
