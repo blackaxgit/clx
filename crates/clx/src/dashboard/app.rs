@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use clx_core::config::Config;
 use ratatui::widgets::TableState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,16 +8,18 @@ pub enum DashboardTab {
     Sessions,
     AuditLog,
     Rules,
+    Settings,
 }
 
 impl DashboardTab {
-    pub const ALL: [DashboardTab; 3] = [Self::Sessions, Self::AuditLog, Self::Rules];
+    pub const ALL: [DashboardTab; 4] = [Self::Sessions, Self::AuditLog, Self::Rules, Self::Settings];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Sessions => "Sessions",
             Self::AuditLog => "Audit Log",
             Self::Rules => "Rules",
+            Self::Settings => "Settings",
         }
     }
 
@@ -29,6 +32,8 @@ impl DashboardTab {
 pub enum InputMode {
     Normal,
     Filter,
+    SettingsNav,
+    SettingsEdit,
 }
 
 pub struct App {
@@ -47,6 +52,21 @@ pub struct App {
     pub last_refresh: Instant,
     pub refresh_interval: Duration,
     pub days_filter: u32,
+
+    // Settings tab state
+    pub settings_section_idx: usize,
+    pub settings_field_idx: usize,
+    pub settings_field_table_state: TableState,
+    pub settings_original_config: Option<Config>,
+    pub settings_editing_config: Option<Config>,
+    // Settings editing state
+    pub settings_is_dirty: bool,
+    #[allow(dead_code)]
+    pub settings_edit_buffer: String,
+    pub settings_edit_error: Option<String>,
+    pub settings_save_result: Option<String>,
+    #[allow(dead_code)]
+    pub settings_confirm_reset: bool,
 }
 
 impl App {
@@ -67,6 +87,16 @@ impl App {
             last_refresh: Instant::now(),
             refresh_interval: Duration::from_secs(refresh_secs),
             days_filter: days,
+            settings_section_idx: 0,
+            settings_field_idx: 0,
+            settings_field_table_state: TableState::default(),
+            settings_original_config: None,
+            settings_editing_config: None,
+            settings_is_dirty: false,
+            settings_edit_buffer: String::new(),
+            settings_edit_error: None,
+            settings_save_result: None,
+            settings_confirm_reset: false,
         }
     }
 
@@ -107,6 +137,9 @@ impl App {
             DashboardTab::Rules => {
                 self.rules_scroll_offset = self.rules_scroll_offset.saturating_add(1);
             }
+            DashboardTab::Settings => {
+                self.settings_scroll_field_down();
+            }
         }
     }
 
@@ -122,6 +155,9 @@ impl App {
             }
             DashboardTab::Rules => {
                 self.rules_scroll_offset = self.rules_scroll_offset.saturating_sub(1);
+            }
+            DashboardTab::Settings => {
+                self.settings_scroll_field_up();
             }
         }
     }
@@ -151,6 +187,11 @@ impl App {
                     .rules_scroll_offset
                     .saturating_add(Self::PAGE_SIZE as u16);
             }
+            DashboardTab::Settings => {
+                for _ in 0..Self::PAGE_SIZE {
+                    self.settings_scroll_field_down();
+                }
+            }
         }
     }
 
@@ -175,6 +216,11 @@ impl App {
                     .rules_scroll_offset
                     .saturating_sub(Self::PAGE_SIZE as u16);
             }
+            DashboardTab::Settings => {
+                for _ in 0..Self::PAGE_SIZE {
+                    self.settings_scroll_field_up();
+                }
+            }
         }
     }
 
@@ -188,6 +234,10 @@ impl App {
             }
             DashboardTab::Rules => {
                 self.rules_scroll_offset = 0;
+            }
+            DashboardTab::Settings => {
+                self.settings_field_idx = 0;
+                self.settings_field_table_state.select(Some(0));
             }
         }
     }
@@ -209,6 +259,11 @@ impl App {
             DashboardTab::Rules => {
                 self.rules_scroll_offset = u16::MAX / 2;
             }
+            DashboardTab::Settings => {
+                let max = self.settings_current_field_count().saturating_sub(1);
+                self.settings_field_idx = max;
+                self.settings_field_table_state.select(Some(max));
+            }
         }
     }
 
@@ -227,7 +282,7 @@ impl App {
                 self.audit_sort_column = (self.audit_sort_column + 1) % 6;
                 self.audit_sort_ascending = true;
             }
-            DashboardTab::Rules => {}
+            DashboardTab::Rules | DashboardTab::Settings => {}
         }
     }
 
@@ -239,8 +294,71 @@ impl App {
             DashboardTab::AuditLog => {
                 self.audit_sort_ascending = !self.audit_sort_ascending;
             }
-            DashboardTab::Rules => {}
+            DashboardTab::Rules | DashboardTab::Settings => {}
         }
+    }
+
+    // --- Settings helpers ---
+
+    /// Number of fields in the currently selected section.
+    fn settings_current_field_count(&self) -> usize {
+        super::settings::fields::fields_for_section(self.settings_section_idx).len()
+    }
+
+    /// Move the field selection down by one row.
+    fn settings_scroll_field_down(&mut self) {
+        let max = self.settings_current_field_count().saturating_sub(1);
+        if max > 0 || self.settings_field_idx == 0 {
+            self.settings_field_idx = self.settings_field_idx.saturating_add(1).min(max);
+            self.settings_field_table_state
+                .select(Some(self.settings_field_idx));
+        }
+    }
+
+    /// Move the field selection up by one row.
+    fn settings_scroll_field_up(&mut self) {
+        self.settings_field_idx = self.settings_field_idx.saturating_sub(1);
+        self.settings_field_table_state
+            .select(Some(self.settings_field_idx));
+    }
+
+    /// Switch to the next section (wrapping).
+    pub fn settings_next_section(&mut self) {
+        let count = super::settings::sections::SECTIONS.len();
+        self.settings_section_idx = (self.settings_section_idx + 1) % count;
+        self.settings_field_idx = 0;
+        self.settings_field_table_state.select(Some(0));
+    }
+
+    /// Switch to the previous section (wrapping).
+    pub fn settings_prev_section(&mut self) {
+        let count = super::settings::sections::SECTIONS.len();
+        self.settings_section_idx = if self.settings_section_idx == 0 {
+            count - 1
+        } else {
+            self.settings_section_idx - 1
+        };
+        self.settings_field_idx = 0;
+        self.settings_field_table_state.select(Some(0));
+    }
+
+    /// Called when entering the Settings tab. Loads config from disk.
+    pub fn on_enter_settings_tab(&mut self) {
+        // Only load if not already loaded (avoids overwriting edits on re-entry)
+        if self.settings_original_config.is_none() {
+            let config: Config = match Config::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    self.settings_save_result = Some(format!("Load error: {e}"));
+                    Config::default()
+                }
+            };
+            self.settings_editing_config = Some(config.clone());
+            self.settings_original_config = Some(config);
+        }
+        self.settings_field_table_state
+            .select(Some(self.settings_field_idx));
+        self.input_mode = InputMode::SettingsNav;
     }
 }
 
@@ -292,7 +410,7 @@ mod tests {
     #[test]
     fn test_next_tab_wraparound() {
         let mut app = make_app();
-        app.current_tab = DashboardTab::Rules;
+        app.current_tab = DashboardTab::Settings;
         app.next_tab();
         assert_eq!(app.current_tab, DashboardTab::Sessions);
     }
@@ -302,7 +420,7 @@ mod tests {
         let mut app = make_app();
         app.current_tab = DashboardTab::Sessions;
         app.prev_tab();
-        assert_eq!(app.current_tab, DashboardTab::Rules);
+        assert_eq!(app.current_tab, DashboardTab::Settings);
     }
 
     #[test]
