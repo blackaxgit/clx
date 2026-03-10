@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/blackaxgit/clx/actions/workflows/ci.yml/badge.svg)](https://github.com/blackaxgit/clx/actions/workflows/ci.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
+[![Claude Code Ready](https://img.shields.io/badge/Claude_Code-Auto_Install_Ready-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDE2IDE2Ij48dGV4dCB4PSIwIiB5PSIxMyIgZm9udC1zaXplPSIxNCI+8J+UpTwvdGV4dD48L3N2Zz4=)](#install-with-claude-code)
 
 > **Note:** Currently supports macOS (ARM64/Apple Silicon) only.
 
@@ -38,20 +39,26 @@ Intelligent command validation and context persistence for Claude Code.
 ollama serve
 ```
 
-**2.** Paste this prompt into Claude Code:
+**2.** Paste this into Claude Code:
 
 ```
-Install CLX for me:
-1. Clone https://github.com/blackaxgit/clx and build with cargo build --release
-2. Run ./target/release/clx install
+Install CLX from https://github.com/blackaxgit/clx:
+1. Clone the repo and build: git clone https://github.com/blackaxgit/clx.git /tmp/clx && cd /tmp/clx && cargo build --release
+2. Run the installer: ./target/release/clx install
 3. Pull Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b
-4. Add ~/.clx/bin to my PATH by appending 'export PATH="$HOME/.clx/bin:$PATH"' to ~/.zshrc
+4. Add to PATH: echo 'export PATH="$HOME/.clx/bin:$PATH"' >> ~/.zshrc
 5. Tell me to restart Claude Code when done
 ```
 
 **3.** Restart Claude Code.
 
 **Done.** Hooks are validating commands, context is being persisted, and MCP tools are available.
+
+### One-line install (alternative)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blackaxgit/clx/main/install.sh | bash
+```
 
 ---
 
