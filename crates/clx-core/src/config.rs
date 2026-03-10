@@ -574,6 +574,20 @@ impl Config {
         Ok(config)
     }
 
+    /// Load configuration from file only (no environment variable overrides).
+    ///
+    /// Used by the dashboard Settings tab to show raw YAML values for editing,
+    /// without env var overrides that would confuse the user.
+    pub fn load_from_file_only() -> crate::Result<Self> {
+        let config_path = Self::config_dir()?.join("config.yaml");
+        if config_path.exists() {
+            let content = fs::read_to_string(&config_path)?;
+            Ok(serde_yml::from_str(&content)?)
+        } else {
+            Ok(Config::default())
+        }
+    }
+
     /// Get the CLX configuration directory path
     pub fn config_dir() -> crate::Result<PathBuf> {
         Ok(crate::paths::clx_dir())

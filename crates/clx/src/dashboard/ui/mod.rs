@@ -2,6 +2,7 @@ mod audit;
 pub(super) mod overview;
 mod rules;
 mod sessions;
+mod settings;
 
 use chrono::Utc;
 use ratatui::prelude::*;
@@ -24,6 +25,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         DashboardTab::Sessions => sessions::render(frame, app, chunks[1]),
         DashboardTab::AuditLog => audit::render(frame, app, chunks[1]),
         DashboardTab::Rules => rules::render(frame, app, chunks[1]),
+        DashboardTab::Settings => settings::render(frame, app, chunks[1]),
     }
 
     render_status_bar(frame, app, chunks[2]);
@@ -34,10 +36,15 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            if i == app.current_tab.index() && !app.filter_text.is_empty() {
-                format!("{} [filter: {}]", t.title(), app.filter_text)
+            let base = if *t == DashboardTab::Settings && app.settings_is_dirty {
+                format!("{} *", t.title())
             } else {
                 t.title().to_string()
+            };
+            if i == app.current_tab.index() && !app.filter_text.is_empty() {
+                format!("{base} [filter: {}]", app.filter_text)
+            } else {
+                base
             }
         })
         .collect();
@@ -62,6 +69,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             format!(" | Filter: {}", app.filter_text)
         }
         InputMode::Normal => String::new(),
+        InputMode::SettingsNav | InputMode::SettingsEdit => String::new(),
     };
 
     let error_info = match &app.data.load_error {
@@ -69,18 +77,60 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         None => String::new(),
     };
 
+    let key_hints = match app.input_mode {
+        InputMode::SettingsEdit => {
+            "Type to edit | [Enter] Confirm | [Esc] Cancel | [Ctrl+U] Clear".to_owned()
+        }
+        InputMode::SettingsNav if app.settings_exit_pending.is_some() => {
+            "[s] Save  [x] Discard  [Esc] Stay".to_owned()
+        }
+        InputMode::SettingsNav if app.settings_reload_confirm => {
+            "Reload from disk? [y] Yes  [n/Esc] No".to_owned()
+        }
+        InputMode::SettingsNav if app.settings_confirm_reset => {
+            "Reset all changes? [y] Yes  [n/Esc] No".to_owned()
+        }
+        InputMode::SettingsNav => {
+            let save_hint = if app.settings_is_dirty {
+                " [s]Save [R]Reset"
+            } else {
+                ""
+            };
+            format!(
+                "h/l:section j/k:field Space/Enter:edit [d]Default [r]Reload{save_hint} q:quit Tab:switch"
+            )
+        }
+        _ => "q:quit Tab:switch /:filter s:sort S:reverse PgUp/Dn g/G:top/bottom r:refresh"
+            .to_owned(),
+    };
+
+    let settings_error = match &app.settings_edit_error {
+        Some(e) => format!(" | {e}"),
+        None => String::new(),
+    };
+
+    let save_result = match &app.settings_save_result {
+        Some(msg) => format!(" | {msg}"),
+        None => String::new(),
+    };
+
     let status = format!(
-        " {} | Refresh {}s | Sessions: {} | Commands: {}{}{} | q:quit Tab:switch /:filter s:sort S:reverse PgUp/Dn g/G:top/bottom r:refresh",
+        " {} | Refresh {}s | Sessions: {} | Commands: {}{}{}{}{} | {}",
         now,
         refresh_secs,
         app.data.total_sessions,
         app.data.total_commands,
         filter_info,
         error_info,
+        settings_error,
+        save_result,
+        key_hints,
     );
 
-    let style = if app.data.load_error.is_some() {
+    let style = if app.data.load_error.is_some() || app.settings_edit_error.is_some() {
         Style::default().bg(Color::Red).fg(Color::White)
+    } else if app.settings_is_dirty && app.current_tab == DashboardTab::Settings {
+        Style::default().bg(Color::Yellow).fg(Color::Black)
     } else {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     };
