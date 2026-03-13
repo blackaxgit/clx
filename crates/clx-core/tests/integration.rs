@@ -410,3 +410,65 @@ fn test_storage_backend_trait_polymorphism() {
     let ended = backend.get_session(sid.as_str()).unwrap().unwrap();
     assert_eq!(ended.status, SessionStatus::Ended);
 }
+
+// =========================================================================
+// 9. Concurrent access with busy_timeout
+// =========================================================================
+
+#[test]
+fn test_concurrent_storage_access() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let db_path = dir.path().join("concurrent.db");
+
+    // Initialize the database with one connection first
+    {
+        let storage = Storage::open(&db_path).expect("Failed to open storage");
+        let sid = SessionId::new("setup-session");
+        storage
+            .create_session(&Session::new(sid, "/project".to_string()))
+            .unwrap();
+    }
+
+    let path = Arc::new(db_path);
+    let barrier = Arc::new(Barrier::new(2));
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let storage = Storage::open(path.as_ref()).expect("Failed to open storage");
+                // Synchronize threads to maximize contention
+                barrier.wait();
+                for j in 0..20 {
+                    let sid = SessionId::new(format!("thread-{i}-session-{j}"));
+                    let session = Session::new(sid.clone(), format!("/project/{i}/{j}"));
+                    storage.create_session(&session).unwrap();
+
+                    let mut event = Event::new(sid, EventType::ToolUse);
+                    event.tool_name = Some(format!("tool-{i}-{j}"));
+                    storage.append_event(&event).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("Thread panicked");
+    }
+
+    // Verify all writes persisted
+    let storage = Storage::open(path.as_ref()).expect("Failed to reopen storage");
+    for i in 0..2 {
+        for j in 0..20 {
+            let sid = format!("thread-{i}-session-{j}");
+            let session = storage.get_session(&sid).unwrap();
+            assert!(session.is_some(), "Missing session {sid}");
+        }
+    }
+    // Also verify the setup session
+    assert!(storage.get_session("setup-session").unwrap().is_some());
+}

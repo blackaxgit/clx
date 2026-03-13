@@ -13,6 +13,7 @@ pub mod error;
 pub mod ollama;
 pub mod paths;
 pub mod policy;
+pub mod recall;
 pub mod redaction;
 pub mod storage;
 pub mod text;

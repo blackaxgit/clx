@@ -34,9 +34,6 @@ pub(crate) const MAX_SEMANTIC_RESULTS: usize = 10;
 /// Results with distance above this are considered less relevant
 pub(crate) const SEMANTIC_DISTANCE_THRESHOLD: f32 = 1.5;
 
-/// Result type for search operations: (result entry, optional `snapshot_id`)
-pub(crate) type SearchResult = (std::collections::HashMap<String, Value>, Option<i64>);
-
 /// MCP server state
 pub struct McpServer {
     pub(crate) storage: Storage,
