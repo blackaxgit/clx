@@ -81,20 +81,28 @@ impl<'a> RecallEngine<'a> {
         }
     }
 
-    /// Run hybrid search: semantic + FTS5, merged and deduplicated.
+    /// Run hybrid search: FTS5 first (fast), then semantic if available.
+    ///
+    /// FTS5 runs first because it completes in <10ms, guaranteeing baseline
+    /// results even if the Ollama embedding call consumes most of the timeout.
     pub async fn query(&self, query: &str, config: &RecallQueryConfig) -> Vec<RecallHit> {
-        let mut semantic_hits = Vec::new();
         let mut fts_hits = Vec::new();
+        let mut semantic_hits = Vec::new();
 
-        // Try semantic search
+        // FTS5 first — always fast (<10ms), provides baseline results
+        if config.fallback_to_fts {
+            fts_hits = self.try_fts(query, config);
+        }
+
+        // Then try semantic search (may be slow due to Ollama embedding)
         if let (Some(ollama), Some(emb_store)) = (self.ollama, self.embedding_store)
             && emb_store.is_vector_search_enabled()
         {
             semantic_hits = self.try_semantic(query, ollama, emb_store, config).await;
         }
 
-        // Try FTS5 search (always, or as fallback)
-        if config.fallback_to_fts || semantic_hits.is_empty() {
+        // If FTS5 was skipped and semantic found nothing, try FTS5 as last resort
+        if !config.fallback_to_fts && semantic_hits.is_empty() {
             fts_hits = self.try_fts(query, config);
         }
 
