@@ -52,6 +52,10 @@ pub(crate) struct HookInput {
 
     /// Trigger type (for `PreCompact`)
     pub trigger: Option<String>,
+
+    /// User prompt text (for `UserPromptSubmit`)
+    /// Used by auto-recall in the `UserPromptSubmit` hook handler.
+    pub prompt: Option<String>,
 }
 
 /// Hook output for `PreToolUse`

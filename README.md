@@ -19,6 +19,12 @@ Intelligent command validation and context persistence for Claude Code.
   - Vector embeddings for semantic recall
   - Session history and analytics
 
+- **Auto-Recall** - Automatic context injection on every prompt:
+  - Hybrid search: semantic (sqlite-vec) + FTS5 full-text
+  - Relevant past sessions injected as `additionalContext`
+  - Configurable thresholds, timeouts, and result limits
+  - Graceful degradation: Ollama down → FTS5 fallback → orchestrator-only
+
 - **User Learning** - Adapts to your workflow:
   - Tracks approved/denied commands
   - Auto-generates rules based on usage patterns
@@ -172,6 +178,16 @@ user_learning:
 logging:
   level: "info"
   file: "~/.clx/logs/clx.log"
+
+auto_recall:
+  enabled: true
+  max_results: 3              # Top-K results to inject
+  similarity_threshold: 0.35  # Min relevance score (0.0-1.0)
+  max_context_chars: 1000     # Max chars for recall context
+  timeout_ms: 500             # Recall timeout per prompt
+  fallback_to_fts: true       # Use FTS5 if semantic fails
+  include_key_facts: true     # Include key facts in context
+  min_prompt_len: 10          # Skip recall for short prompts
 ```
 
 ### Custom Rules
@@ -248,6 +264,7 @@ clx/
 │   │       ├── config.rs      # Configuration management
 │   │       ├── storage/       # SQLite storage (sessions, snapshots, rules)
 │   │       ├── policy/        # Command validation (L0 rules + L1 LLM)
+│   │       ├── recall.rs      # Hybrid search engine (semantic + FTS5)
 │   │       ├── ollama.rs      # Ollama client
 │   │       └── embeddings.rs  # Vector search
 │   ├── clx-hook/       # Hook handler binary

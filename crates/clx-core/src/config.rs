@@ -32,6 +32,14 @@
 //! - `CLX_SESSION_RECOVERY_STALE_HOURS`
 //! - `CLX_MCP_TOOLS_ENABLED`
 //! - `CLX_MCP_TOOLS_DEFAULT_DECISION`
+//! - `CLX_AUTO_RECALL_ENABLED`
+//! - `CLX_AUTO_RECALL_MAX_RESULTS` (1-10)
+//! - `CLX_AUTO_RECALL_SIMILARITY_THRESHOLD` (0.0-1.0)
+//! - `CLX_AUTO_RECALL_MAX_CONTEXT_CHARS` (100-5000)
+//! - `CLX_AUTO_RECALL_TIMEOUT_MS` (100-10000)
+//! - `CLX_AUTO_RECALL_FALLBACK_TO_FTS`
+//! - `CLX_AUTO_RECALL_INCLUDE_KEY_FACTS`
+//! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -171,6 +179,67 @@ pub struct Config {
     /// MCP tool command validation configuration
     #[serde(default)]
     pub mcp_tools: McpToolsConfig,
+
+    /// Auto-recall configuration
+    #[serde(default)]
+    pub auto_recall: AutoRecallConfig,
+}
+
+/// Auto-recall configuration for automatic context injection.
+///
+/// Controls the behaviour of the `UserPromptSubmit` hook that performs
+/// hybrid semantic + FTS5 search and injects relevant past context via
+/// `additionalContext`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoRecallConfig {
+    /// Enable auto-recall on every user prompt
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Maximum number of recall results to inject (1-10)
+    #[serde(default = "default_auto_recall_max_results")]
+    pub max_results: usize,
+
+    /// Minimum similarity score threshold (0.0-1.0)
+    ///
+    /// NOTE: f32 matches `EmbeddingStore::find_similar()` return type (f32 distances).
+    #[serde(default = "default_auto_recall_similarity_threshold")]
+    pub similarity_threshold: f32,
+
+    /// Maximum total characters for injected context (100-5000)
+    #[serde(default = "default_auto_recall_max_context_chars")]
+    pub max_context_chars: usize,
+
+    /// Timeout in milliseconds for the recall operation (100-10000)
+    #[serde(default = "default_auto_recall_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// Fall back to FTS5 search when semantic search is unavailable
+    #[serde(default = "default_true")]
+    pub fallback_to_fts: bool,
+
+    /// Include key facts in the injected context
+    #[serde(default = "default_true")]
+    pub include_key_facts: bool,
+
+    /// Minimum prompt length to trigger auto-recall
+    #[serde(default = "default_auto_recall_min_prompt_len")]
+    pub min_prompt_len: usize,
+}
+
+impl Default for AutoRecallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            max_results: default_auto_recall_max_results(),
+            similarity_threshold: default_auto_recall_similarity_threshold(),
+            max_context_chars: default_auto_recall_max_context_chars(),
+            timeout_ms: default_auto_recall_timeout_ms(),
+            fallback_to_fts: default_true(),
+            include_key_facts: default_true(),
+            min_prompt_len: default_auto_recall_min_prompt_len(),
+        }
+    }
 }
 
 /// Validator configuration
@@ -453,6 +522,26 @@ fn default_mcp_command_tools() -> Vec<McpCommandTool> {
             command_field: "code".to_string(),
         },
     ]
+}
+
+fn default_auto_recall_max_results() -> usize {
+    3
+}
+
+fn default_auto_recall_similarity_threshold() -> f32 {
+    0.35
+}
+
+fn default_auto_recall_max_context_chars() -> usize {
+    1000
+}
+
+fn default_auto_recall_timeout_ms() -> u64 {
+    500
+}
+
+fn default_auto_recall_min_prompt_len() -> usize {
+    10
 }
 
 impl Default for ValidatorConfig {
@@ -826,6 +915,74 @@ impl Config {
                 &mut self.session_recovery.stale_hours,
             );
         }
+
+        // Auto Recall overrides
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_ENABLED") {
+            apply_bool_override(
+                &val,
+                "CLX_AUTO_RECALL_ENABLED",
+                &mut self.auto_recall.enabled,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_MAX_RESULTS") {
+            apply_usize_override(
+                &val,
+                "CLX_AUTO_RECALL_MAX_RESULTS",
+                1,
+                10,
+                &mut self.auto_recall.max_results,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_SIMILARITY_THRESHOLD") {
+            apply_f32_override(
+                &val,
+                "CLX_AUTO_RECALL_SIMILARITY_THRESHOLD",
+                0.0,
+                1.0,
+                &mut self.auto_recall.similarity_threshold,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_MAX_CONTEXT_CHARS") {
+            apply_usize_override(
+                &val,
+                "CLX_AUTO_RECALL_MAX_CONTEXT_CHARS",
+                100,
+                5000,
+                &mut self.auto_recall.max_context_chars,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_TIMEOUT_MS") {
+            apply_u64_override(
+                &val,
+                "CLX_AUTO_RECALL_TIMEOUT_MS",
+                100,
+                10000,
+                &mut self.auto_recall.timeout_ms,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_FALLBACK_TO_FTS") {
+            apply_bool_override(
+                &val,
+                "CLX_AUTO_RECALL_FALLBACK_TO_FTS",
+                &mut self.auto_recall.fallback_to_fts,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_INCLUDE_KEY_FACTS") {
+            apply_bool_override(
+                &val,
+                "CLX_AUTO_RECALL_INCLUDE_KEY_FACTS",
+                &mut self.auto_recall.include_key_facts,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_MIN_PROMPT_LEN") {
+            apply_usize_override(
+                &val,
+                "CLX_AUTO_RECALL_MIN_PROMPT_LEN",
+                1,
+                500,
+                &mut self.auto_recall.min_prompt_len,
+            );
+        }
     }
 }
 
@@ -983,6 +1140,32 @@ fn apply_f64_override(val: &str, var_name: &str, min: f64, max: f64, target: &mu
     }
 }
 
+/// Apply an f32 env var override with range validation and warning
+fn apply_f32_override(val: &str, var_name: &str, min: f32, max: f32, target: &mut f32) {
+    match val.parse::<f32>() {
+        Ok(v) if v >= min && v <= max => *target = v,
+        Ok(v) => {
+            tracing::warn!(
+                "{}={} out of range ({}-{}), using default {}",
+                var_name,
+                v,
+                min,
+                max,
+                target
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Invalid {} value '{}': {}, using default {}",
+                var_name,
+                val,
+                e,
+                target
+            );
+        }
+    }
+}
+
 /// Apply an enum env var override, parsing from string with validation
 fn apply_enum_override<T: FromStr<Err = String> + fmt::Display>(
     val: &str,
@@ -1081,6 +1264,16 @@ mod tests {
         assert_eq!(config.logging.file, "~/.clx/logs/clx.log");
         assert_eq!(config.logging.max_size_mb, 10);
         assert_eq!(config.logging.max_files, 5);
+
+        // Auto recall defaults
+        assert!(config.auto_recall.enabled);
+        assert_eq!(config.auto_recall.max_results, 3);
+        assert!((config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON,);
+        assert_eq!(config.auto_recall.max_context_chars, 1000);
+        assert_eq!(config.auto_recall.timeout_ms, 500);
+        assert!(config.auto_recall.fallback_to_fts);
+        assert!(config.auto_recall.include_key_facts);
+        assert_eq!(config.auto_recall.min_prompt_len, 10);
     }
 
     #[test]
@@ -1801,5 +1994,129 @@ mcp_tools:
         fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
         assert_clone_send_sync::<McpToolsConfig>();
         assert_clone_send_sync::<McpCommandTool>();
+    }
+
+    // --- Auto-recall config tests ---
+
+    #[test]
+    fn test_auto_recall_yaml_parsing() {
+        let yaml = r"
+auto_recall:
+  enabled: false
+  max_results: 5
+  similarity_threshold: 0.5
+  max_context_chars: 2000
+  timeout_ms: 1000
+  fallback_to_fts: false
+  include_key_facts: false
+  min_prompt_len: 20
+";
+
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert!(!config.auto_recall.enabled);
+        assert_eq!(config.auto_recall.max_results, 5);
+        assert!((config.auto_recall.similarity_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(config.auto_recall.max_context_chars, 2000);
+        assert_eq!(config.auto_recall.timeout_ms, 1000);
+        assert!(!config.auto_recall.fallback_to_fts);
+        assert!(!config.auto_recall.include_key_facts);
+        assert_eq!(config.auto_recall.min_prompt_len, 20);
+    }
+
+    #[test]
+    fn test_auto_recall_missing_section_gets_defaults() {
+        let yaml = "validator:\n  enabled: true\n";
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert!(config.auto_recall.enabled);
+        assert_eq!(config.auto_recall.max_results, 3);
+        assert!((config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON);
+        assert_eq!(config.auto_recall.max_context_chars, 1000);
+        assert_eq!(config.auto_recall.timeout_ms, 500);
+        assert!(config.auto_recall.fallback_to_fts);
+        assert!(config.auto_recall.include_key_facts);
+        assert_eq!(config.auto_recall.min_prompt_len, 10);
+    }
+
+    #[test]
+    fn test_auto_recall_partial_yaml_uses_field_defaults() {
+        let yaml = r"
+auto_recall:
+  enabled: false
+";
+
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert!(!config.auto_recall.enabled);
+        // All other fields should be defaults
+        assert_eq!(config.auto_recall.max_results, 3);
+        assert!(config.auto_recall.fallback_to_fts);
+        assert!(config.auto_recall.include_key_facts);
+    }
+
+    #[test]
+    fn test_auto_recall_serialization_roundtrip() {
+        let config = Config::default();
+        let yaml = serde_yml::to_string(&config).unwrap();
+        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(config.auto_recall, parsed.auto_recall);
+    }
+
+    #[test]
+    fn test_auto_recall_is_clone_send_sync() {
+        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+        assert_clone_send_sync::<AutoRecallConfig>();
+    }
+
+    // --- apply_f32_override tests ---
+
+    #[test]
+    fn test_apply_f32_override_valid() {
+        let mut val = 0.35_f32;
+        apply_f32_override("0.50", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!((val - 0.50).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_f32_override_boundary_values() {
+        let mut val = 0.5_f32;
+
+        // Exact min should be accepted
+        apply_f32_override("0.0", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(val.abs() < f32::EPSILON);
+
+        // Exact max should be accepted
+        apply_f32_override("1.0", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!((val - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_f32_override_out_of_range_keeps_default() {
+        let mut val = 0.35_f32;
+        apply_f32_override("1.5", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "above max should keep default"
+        );
+
+        apply_f32_override("-0.1", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "below min should keep default"
+        );
+    }
+
+    #[test]
+    fn test_apply_f32_override_invalid_keeps_default() {
+        let mut val = 0.35_f32;
+        apply_f32_override("not_a_number", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "non-numeric input should keep default"
+        );
+
+        apply_f32_override("", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "empty string should keep default"
+        );
     }
 }
