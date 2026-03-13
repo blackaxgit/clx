@@ -13,8 +13,7 @@ impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
     pub(super) fn configure_pragmas(&self) -> crate::Result<()> {
         // Allow up to 5s for write lock contention in multi-session scenarios.
-        self.conn
-            .busy_timeout(std::time::Duration::from_secs(5))?;
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         self.conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;

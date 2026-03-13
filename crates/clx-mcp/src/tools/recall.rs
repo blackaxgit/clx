@@ -43,9 +43,12 @@ impl McpServer {
 
         let hits = self.runtime.block_on(engine.query(&query, &config));
 
-        let has_semantic = hits
-            .iter()
-            .any(|h| matches!(h.search_type, RecallSearchType::Semantic | RecallSearchType::Hybrid));
+        let has_semantic = hits.iter().any(|h| {
+            matches!(
+                h.search_type,
+                RecallSearchType::Semantic | RecallSearchType::Hybrid
+            )
+        });
 
         // Convert RecallHits to the existing verbose JSON format
         let results: Vec<HashMap<String, Value>> = hits

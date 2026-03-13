@@ -365,9 +365,7 @@ pub fn format_recall_context(
             }
         }
 
-        if include_key_facts
-            && let Some(facts) = &hit.key_facts
-        {
+        if include_key_facts && let Some(facts) = &hit.key_facts {
             let max_facts = 80;
             line.push_str(" [Facts: ");
             if facts.len() > max_facts {
@@ -643,8 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recall_engine_query_no_results() {
-        let (storage, _) =
-            setup_test_storage("Database migration completed", "postgres, schema");
+        let (storage, _) = setup_test_storage("Database migration completed", "postgres, schema");
 
         let engine = RecallEngine::new(&storage, None, None);
         let config = RecallQueryConfig {

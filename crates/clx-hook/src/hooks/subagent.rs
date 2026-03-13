@@ -104,14 +104,16 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
         }
     };
 
-    let embedding_store =
-        match clx_core::embeddings::EmbeddingStore::open_with_dimension(&db_path, config.ollama.embedding_dim) {
-            Ok(store) => Some(store),
-            Err(e) => {
-                warn!("Auto-recall: failed to open EmbeddingStore: {e}");
-                None
-            }
-        };
+    let embedding_store = match clx_core::embeddings::EmbeddingStore::open_with_dimension(
+        &db_path,
+        config.ollama.embedding_dim,
+    ) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            warn!("Auto-recall: failed to open EmbeddingStore: {e}");
+            None
+        }
+    };
 
     let recall_config = clx_core::recall::RecallQueryConfig {
         max_results: config.auto_recall.max_results,
@@ -120,11 +122,8 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
         include_key_facts: config.auto_recall.include_key_facts,
     };
 
-    let engine = clx_core::recall::RecallEngine::new(
-        &storage,
-        ollama.as_ref(),
-        embedding_store.as_ref(),
-    );
+    let engine =
+        clx_core::recall::RecallEngine::new(&storage, ollama.as_ref(), embedding_store.as_ref());
     let hits = engine.query(prompt, &recall_config).await;
 
     if hits.is_empty() {

@@ -285,12 +285,18 @@ pub const AUTO_RECALL_FIELDS: &[FieldDef] = &[
     FieldDef {
         label: "max_context_chars",
         description: "Max chars for recall context",
-        widget: FieldWidget::NumberUsize { min: 100, max: 5000 },
+        widget: FieldWidget::NumberUsize {
+            min: 100,
+            max: 5000,
+        },
     },
     FieldDef {
         label: "timeout_ms",
         description: "Recall timeout in milliseconds",
-        widget: FieldWidget::NumberU64 { min: 100, max: 10000 },
+        widget: FieldWidget::NumberU64 {
+            min: 100,
+            max: 10000,
+        },
     },
     FieldDef {
         label: "fallback_to_fts",

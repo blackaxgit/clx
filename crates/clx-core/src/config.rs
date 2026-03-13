@@ -918,7 +918,11 @@ impl Config {
 
         // Auto Recall overrides
         if let Ok(val) = env::var("CLX_AUTO_RECALL_ENABLED") {
-            apply_bool_override(&val, "CLX_AUTO_RECALL_ENABLED", &mut self.auto_recall.enabled);
+            apply_bool_override(
+                &val,
+                "CLX_AUTO_RECALL_ENABLED",
+                &mut self.auto_recall.enabled,
+            );
         }
         if let Ok(val) = env::var("CLX_AUTO_RECALL_MAX_RESULTS") {
             apply_usize_override(
@@ -1264,9 +1268,7 @@ mod tests {
         // Auto recall defaults
         assert!(config.auto_recall.enabled);
         assert_eq!(config.auto_recall.max_results, 3);
-        assert!(
-            (config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON,
-        );
+        assert!((config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON,);
         assert_eq!(config.auto_recall.max_context_chars, 1000);
         assert_eq!(config.auto_recall.timeout_ms, 500);
         assert!(config.auto_recall.fallback_to_fts);
