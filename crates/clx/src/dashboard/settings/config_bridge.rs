@@ -192,7 +192,7 @@ pub fn set_field_value(
             config.auto_recall.timeout_ms = validate_u64(raw, 100, 10000)?;
         }
         (8, 7) => {
-            config.auto_recall.min_prompt_len = validate_usize(raw, 1, 100)?;
+            config.auto_recall.min_prompt_len = validate_usize(raw, 1, 500)?;
         }
 
         _ => return Err("Field is not editable".to_owned()),

@@ -91,6 +91,7 @@ impl McpServer {
             );
             header + &serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string())
         };
+        let response_text = clx_core::redaction::redact_secrets(&response_text);
 
         Ok(json!({
             "content": [{

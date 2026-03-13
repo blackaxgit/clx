@@ -30,6 +30,7 @@ pub(crate) async fn handle_user_prompt_submit(input: HookInput) -> Result<()> {
     );
 
     let recall_ctx = build_recall_context(&input).await;
+    let recall_ctx = recall_ctx.map(|ctx| clx_core::redaction::redact_secrets(&ctx));
 
     let additional_context = match recall_ctx {
         Some(recall) => format!("{ORCHESTRATOR_CONTEXT}\n\n{recall}"),
@@ -54,10 +55,10 @@ fn check_recall_preconditions<'a>(
     }
 
     let prompt = input.prompt.as_deref()?;
-    if prompt.len() < config.min_prompt_len {
+    if prompt.chars().count() < config.min_prompt_len {
         debug!(
             "Prompt too short for recall ({} < {})",
-            prompt.len(),
+            prompt.chars().count(),
             config.min_prompt_len
         );
         return None;

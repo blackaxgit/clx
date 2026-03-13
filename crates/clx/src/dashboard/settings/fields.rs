@@ -305,7 +305,7 @@ pub const AUTO_RECALL_FIELDS: &[FieldDef] = &[
     FieldDef {
         label: "min_prompt_len",
         description: "Min prompt length for recall",
-        widget: FieldWidget::NumberUsize { min: 1, max: 100 },
+        widget: FieldWidget::NumberUsize { min: 1, max: 500 },
     },
 ];
 
