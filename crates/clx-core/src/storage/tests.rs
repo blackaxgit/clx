@@ -43,6 +43,16 @@ fn test_pragmas_enabled() {
     assert_eq!(foreign_keys, 1);
 }
 
+#[test]
+fn test_busy_timeout_is_set() {
+    let storage = create_test_storage();
+    let timeout: i64 = storage
+        .conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(timeout, 5000);
+}
+
 // =========================================================================
 // Session Tests
 // =========================================================================

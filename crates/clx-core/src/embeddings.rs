@@ -28,6 +28,8 @@ impl EmbeddingStore {
     /// the store will operate in degraded mode where vector operations
     /// are disabled.
     pub fn new(conn: Connection) -> crate::Result<Self> {
+        // Allow up to 5s for write lock contention in multi-session scenarios.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut store = Self {
             conn,
             extension_loaded: false,
@@ -48,6 +50,8 @@ impl EmbeddingStore {
 
     /// Create a new embedding store with a custom dimension
     pub fn with_dimension(conn: Connection, embedding_dim: usize) -> crate::Result<Self> {
+        // Allow up to 5s for write lock contention in multi-session scenarios.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut store = Self {
             conn,
             extension_loaded: false,
