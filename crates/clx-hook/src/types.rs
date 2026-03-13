@@ -54,6 +54,8 @@ pub(crate) struct HookInput {
     pub trigger: Option<String>,
 
     /// User prompt text (for `UserPromptSubmit`)
+    /// Used by auto-recall in the `UserPromptSubmit` hook handler.
+    #[allow(dead_code)]
     pub prompt: Option<String>,
 }
 
