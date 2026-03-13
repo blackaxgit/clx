@@ -85,7 +85,8 @@ async fn build_recall_context(input: &HookInput) -> Option<String> {
 ///
 /// All errors are swallowed (returns `None`) so the hook always succeeds.
 async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<String> {
-    let storage = clx_core::storage::Storage::open_default().ok()?;
+    let db_path = clx_core::paths::database_path();
+    let storage = clx_core::storage::Storage::open(&db_path).ok()?;
 
     // Build OllamaClient with a tighter timeout (leave 50ms for formatting).
     // Hook process is short-lived (one prompt), so no need for static caching.
@@ -102,7 +103,6 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
         }
     };
 
-    let db_path = clx_core::paths::database_path();
     let embedding_store =
         match clx_core::embeddings::EmbeddingStore::open_with_dimension(&db_path, config.ollama.embedding_dim) {
             Ok(store) => Some(store),

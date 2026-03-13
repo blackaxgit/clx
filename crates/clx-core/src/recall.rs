@@ -291,18 +291,19 @@ fn hybrid_merge(
 ) -> Vec<RecallHit> {
     let mut by_id: HashMap<i64, RecallHit> = HashMap::new();
 
-    // Insert semantic hits
-    for hit in semantic_hits {
+    // Insert semantic hits (weighted at 0.6)
+    for mut hit in semantic_hits {
+        hit.score *= 0.6;
         by_id.insert(hit.snapshot_id, hit);
     }
 
-    // Merge FTS5 hits
-    for fts_hit in fts_hits {
+    // Merge FTS5 hits (weighted at 0.4, clamped to [0.0, 1.0] before weighting)
+    for mut fts_hit in fts_hits {
+        fts_hit.score = fts_hit.score.clamp(0.0, 1.0) * 0.4;
         by_id
             .entry(fts_hit.snapshot_id)
             .and_modify(|existing| {
-                // Combine: semantic * 0.6 + fts * 0.4
-                existing.score = existing.score * 0.6 + fts_hit.score * 0.4;
+                existing.score += fts_hit.score;
                 existing.search_type = RecallSearchType::Hybrid;
             })
             .or_insert(fts_hit);
@@ -343,7 +344,8 @@ pub fn format_recall_context(
                 .saturating_sub(line.len())
                 .saturating_sub(facts_reserve);
             if summary.len() > max_summary {
-                line.push_str(&summary[..max_summary.min(summary.len())]);
+                let boundary = summary.floor_char_boundary(max_summary);
+                line.push_str(&summary[..boundary]);
                 line.push_str("...");
             } else {
                 line.push_str(summary);
@@ -356,7 +358,8 @@ pub fn format_recall_context(
             let max_facts = 80;
             line.push_str(" [Facts: ");
             if facts.len() > max_facts {
-                line.push_str(&facts[..max_facts.min(facts.len())]);
+                let boundary = facts.floor_char_boundary(max_facts);
+                line.push_str(&facts[..boundary]);
                 line.push_str("...]");
             } else {
                 line.push_str(facts);
@@ -366,7 +369,13 @@ pub fn format_recall_context(
 
         line.push('\n');
 
-        if output.len() + line.len() > max_chars {
+        let remaining = max_chars.saturating_sub(output.len());
+        if line.len() > remaining {
+            if remaining > 4 {
+                let boundary = line.floor_char_boundary(remaining.saturating_sub(4));
+                output.push_str(&line[..boundary]);
+                output.push_str("...\n");
+            }
             break;
         }
         output.push_str(&line);
@@ -414,6 +423,13 @@ mod tests {
         let merged = hybrid_merge(sem, fts, 10);
         assert_eq!(merged.len(), 1, "duplicate snapshot_id should be merged");
         assert_eq!(merged[0].search_type, RecallSearchType::Hybrid);
+        // 0.9 * 0.6 + 0.8 * 0.4 = 0.54 + 0.32 = 0.86
+        let expected = 0.9 * 0.6 + 0.8 * 0.4;
+        assert!(
+            (merged[0].score - expected).abs() < 1e-10,
+            "deduped hybrid score should be sem*0.6 + fts*0.4, got {}",
+            merged[0].score
+        );
     }
 
     #[test]
@@ -432,6 +448,39 @@ mod tests {
     }
 
     #[test]
+    fn test_hybrid_merge_single_source_weighting() {
+        // Semantic-only hits should be weighted at 0.6
+        let sem = vec![make_hit(1, 0.9, RecallSearchType::Semantic)];
+        let merged_sem = hybrid_merge(sem, Vec::new(), 10);
+        let expected_sem = 0.9 * 0.6;
+        assert!(
+            (merged_sem[0].score - expected_sem).abs() < 1e-10,
+            "semantic-only score should be 0.9*0.6={expected_sem}, got {}",
+            merged_sem[0].score
+        );
+
+        // FTS-only hits should be weighted at 0.4
+        let fts = vec![make_hit(2, 0.8, RecallSearchType::Fts5)];
+        let merged_fts = hybrid_merge(Vec::new(), fts, 10);
+        let expected_fts = 0.8 * 0.4;
+        assert!(
+            (merged_fts[0].score - expected_fts).abs() < 1e-10,
+            "fts-only score should be 0.8*0.4={expected_fts}, got {}",
+            merged_fts[0].score
+        );
+
+        // FTS scores > 1.0 should be clamped before weighting
+        let fts_high = vec![make_hit(3, 1.5, RecallSearchType::Fts5)];
+        let merged_clamped = hybrid_merge(Vec::new(), fts_high, 10);
+        let expected_clamped = 1.0 * 0.4; // clamped to 1.0 then * 0.4
+        assert!(
+            (merged_clamped[0].score - expected_clamped).abs() < 1e-10,
+            "clamped fts score should be 1.0*0.4={expected_clamped}, got {}",
+            merged_clamped[0].score
+        );
+    }
+
+    #[test]
     fn test_hybrid_merge_sorts_descending() {
         let sem = vec![
             make_hit(1, 0.5, RecallSearchType::Semantic),
@@ -441,6 +490,7 @@ mod tests {
         let fts = Vec::new();
 
         let merged = hybrid_merge(sem, fts, 10);
+        // After 0.6 weighting: id2=0.54, id3=0.42, id1=0.30
         assert_eq!(merged[0].snapshot_id, 2);
         assert_eq!(merged[1].snapshot_id, 3);
         assert_eq!(merged[2].snapshot_id, 1);
@@ -483,6 +533,28 @@ mod tests {
     fn test_format_context_empty_returns_none() {
         let result = format_recall_context(&[], 1000, true);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_format_context_multibyte_no_panic() {
+        let mut hit = make_hit(1, 0.9, RecallSearchType::Semantic);
+        hit.summary = Some("日本語テスト文字列の概要".to_string());
+        hit.key_facts = Some("重要な事実：データベースの設計".to_string());
+        let result = format_recall_context(&[hit], 100, true);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_format_context_respects_budget_with_long_summary() {
+        let mut hit = make_hit(1, 0.9, RecallSearchType::Semantic);
+        hit.summary = Some("A".repeat(2000));
+        let result = format_recall_context(&[hit], 200, false);
+        let text = result.unwrap();
+        assert!(
+            text.len() <= 200,
+            "output {} exceeded budget 200",
+            text.len()
+        );
     }
 
     /// Helper to construct a test `RecallHit`.

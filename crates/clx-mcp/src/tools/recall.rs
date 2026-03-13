@@ -32,6 +32,8 @@ impl McpServer {
             self.embedding_store.as_ref(),
         );
 
+        // MCP recall uses a more permissive threshold (0.25) than auto-recall (0.35)
+        // because it is user-invoked and benefits from broader results.
         let config = RecallQueryConfig {
             max_results: MAX_SEMANTIC_RESULTS,
             similarity_threshold: 1.0 - (SEMANTIC_DISTANCE_THRESHOLD / 2.0),

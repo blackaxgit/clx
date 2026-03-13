@@ -39,6 +39,7 @@
 //! - `CLX_AUTO_RECALL_TIMEOUT_MS` (100-10000)
 //! - `CLX_AUTO_RECALL_FALLBACK_TO_FTS`
 //! - `CLX_AUTO_RECALL_INCLUDE_KEY_FACTS`
+//! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -967,6 +968,15 @@ impl Config {
                 &val,
                 "CLX_AUTO_RECALL_INCLUDE_KEY_FACTS",
                 &mut self.auto_recall.include_key_facts,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_MIN_PROMPT_LEN") {
+            apply_usize_override(
+                &val,
+                "CLX_AUTO_RECALL_MIN_PROMPT_LEN",
+                1,
+                500,
+                &mut self.auto_recall.min_prompt_len,
             );
         }
     }
