@@ -260,6 +260,55 @@ pub const MCP_TOOLS_FIELDS: &[FieldDef] = &[
     },
 ];
 
+// --- Auto Recall fields (section 8) ---
+
+pub const AUTO_RECALL_FIELDS: &[FieldDef] = &[
+    FieldDef {
+        label: "enabled",
+        description: "Enable auto-recall on prompts",
+        widget: FieldWidget::Toggle,
+    },
+    FieldDef {
+        label: "max_results",
+        description: "Max results to inject (1-10)",
+        widget: FieldWidget::NumberUsize { min: 1, max: 10 },
+    },
+    FieldDef {
+        label: "similarity_threshold",
+        description: "Min relevance score (0.0-1.0)",
+        widget: FieldWidget::NumberF32 {
+            min: 0.0,
+            max: 1.0,
+            decimals: 2,
+        },
+    },
+    FieldDef {
+        label: "max_context_chars",
+        description: "Max chars for recall context",
+        widget: FieldWidget::NumberUsize { min: 100, max: 5000 },
+    },
+    FieldDef {
+        label: "timeout_ms",
+        description: "Recall timeout in milliseconds",
+        widget: FieldWidget::NumberU64 { min: 100, max: 10000 },
+    },
+    FieldDef {
+        label: "fallback_to_fts",
+        description: "Use FTS5 if semantic fails",
+        widget: FieldWidget::Toggle,
+    },
+    FieldDef {
+        label: "include_key_facts",
+        description: "Include key facts in context",
+        widget: FieldWidget::Toggle,
+    },
+    FieldDef {
+        label: "min_prompt_len",
+        description: "Min prompt length for recall",
+        widget: FieldWidget::NumberUsize { min: 1, max: 100 },
+    },
+];
+
 /// All field definition arrays indexed by section index.
 pub const ALL_SECTION_FIELDS: &[&[FieldDef]] = &[
     VALIDATOR_FIELDS,
@@ -270,6 +319,7 @@ pub const ALL_SECTION_FIELDS: &[&[FieldDef]] = &[
     CONTEXT_PRESSURE_FIELDS,
     SESSION_RECOVERY_FIELDS,
     MCP_TOOLS_FIELDS,
+    AUTO_RECALL_FIELDS,
 ];
 
 /// Get the field definitions for a given section index.

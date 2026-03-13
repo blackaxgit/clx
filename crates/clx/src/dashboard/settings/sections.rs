@@ -52,6 +52,11 @@ pub const SECTIONS: &[SectionDef] = &[
         title: "MCP Tools",
         field_count: 3,
     },
+    SectionDef {
+        key: "auto_recall",
+        title: "Auto Recall",
+        field_count: 8,
+    },
 ];
 
 #[cfg(test)]
@@ -60,13 +65,13 @@ mod tests {
 
     #[test]
     fn test_sections_count() {
-        assert_eq!(SECTIONS.len(), 8);
+        assert_eq!(SECTIONS.len(), 9);
     }
 
     #[test]
     fn test_total_field_count() {
         let total: usize = SECTIONS.iter().map(|s| s.field_count).sum();
-        // 6+3+8+3+4+3+2+3 = 32 scalar fields (+ display-only items)
-        assert_eq!(total, 32);
+        // 6+3+8+3+4+3+2+3+8 = 40 scalar fields (+ display-only items)
+        assert_eq!(total, 40);
     }
 }

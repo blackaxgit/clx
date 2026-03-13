@@ -178,6 +178,23 @@ pub fn set_field_value(
             config.session_recovery.stale_hours = validate_u32(raw, 1, 168)?;
         }
 
+        // Section 8: Auto Recall
+        (8, 1) => {
+            config.auto_recall.max_results = validate_usize(raw, 1, 10)?;
+        }
+        (8, 2) => {
+            config.auto_recall.similarity_threshold = validate_f32(raw, 0.0, 1.0)?;
+        }
+        (8, 3) => {
+            config.auto_recall.max_context_chars = validate_usize(raw, 100, 5000)?;
+        }
+        (8, 4) => {
+            config.auto_recall.timeout_ms = validate_u64(raw, 100, 10000)?;
+        }
+        (8, 7) => {
+            config.auto_recall.min_prompt_len = validate_usize(raw, 1, 100)?;
+        }
+
         _ => return Err("Field is not editable".to_owned()),
     }
     Ok(())
@@ -249,6 +266,20 @@ pub fn reset_field_to_default(config: &mut Config, section: usize, field: usize)
         (7, 0) => config.mcp_tools.enabled = defaults.mcp_tools.enabled,
         (7, 1) => config.mcp_tools.default_decision = defaults.mcp_tools.default_decision,
 
+        // Section 8: Auto Recall
+        (8, 0) => config.auto_recall.enabled = defaults.auto_recall.enabled,
+        (8, 1) => config.auto_recall.max_results = defaults.auto_recall.max_results,
+        (8, 2) => {
+            config.auto_recall.similarity_threshold = defaults.auto_recall.similarity_threshold;
+        }
+        (8, 3) => {
+            config.auto_recall.max_context_chars = defaults.auto_recall.max_context_chars;
+        }
+        (8, 4) => config.auto_recall.timeout_ms = defaults.auto_recall.timeout_ms,
+        (8, 5) => config.auto_recall.fallback_to_fts = defaults.auto_recall.fallback_to_fts,
+        (8, 6) => config.auto_recall.include_key_facts = defaults.auto_recall.include_key_facts,
+        (8, 7) => config.auto_recall.min_prompt_len = defaults.auto_recall.min_prompt_len,
+
         _ => return false,
     }
     true
@@ -309,6 +340,16 @@ pub fn get_field_value(config: &Config, section: usize, field: usize) -> String 
         (7, 1) => config.mcp_tools.default_decision.to_string(),
         (7, 2) => format!("{} tools", config.mcp_tools.command_tools.len()),
 
+        // Section 8: Auto Recall
+        (8, 0) => config.auto_recall.enabled.to_string(),
+        (8, 1) => config.auto_recall.max_results.to_string(),
+        (8, 2) => format!("{:.2}", config.auto_recall.similarity_threshold),
+        (8, 3) => config.auto_recall.max_context_chars.to_string(),
+        (8, 4) => config.auto_recall.timeout_ms.to_string(),
+        (8, 5) => config.auto_recall.fallback_to_fts.to_string(),
+        (8, 6) => config.auto_recall.include_key_facts.to_string(),
+        (8, 7) => config.auto_recall.min_prompt_len.to_string(),
+
         _ => "???".to_string(),
     }
 }
@@ -344,6 +385,11 @@ pub fn toggle_field(config: &mut Config, section: usize, field: usize) {
 
         // Section 7: MCP Tools
         (7, 0) => config.mcp_tools.enabled = !config.mcp_tools.enabled,
+
+        // Section 8: Auto Recall
+        (8, 0) => config.auto_recall.enabled = !config.auto_recall.enabled,
+        (8, 5) => config.auto_recall.fallback_to_fts = !config.auto_recall.fallback_to_fts,
+        (8, 6) => config.auto_recall.include_key_facts = !config.auto_recall.include_key_facts,
 
         _ => {} // Not a toggle field
     }
@@ -482,6 +528,16 @@ mod tests {
 
         // MCP Tools
         assert_eq!(get_field_value(&config, 7, 2), "4 tools");
+
+        // Auto Recall
+        assert_eq!(get_field_value(&config, 8, 0), "true");
+        assert_eq!(get_field_value(&config, 8, 1), "3");
+        assert_eq!(get_field_value(&config, 8, 2), "0.35");
+        assert_eq!(get_field_value(&config, 8, 3), "1000");
+        assert_eq!(get_field_value(&config, 8, 4), "500");
+        assert_eq!(get_field_value(&config, 8, 5), "true");
+        assert_eq!(get_field_value(&config, 8, 6), "true");
+        assert_eq!(get_field_value(&config, 8, 7), "10");
     }
 
     #[test]
@@ -506,6 +562,9 @@ mod tests {
             (3, 0), // user_learning.enabled
             (6, 0), // session_recovery.enabled
             (7, 0), // mcp_tools.enabled
+            (8, 0), // auto_recall.enabled
+            (8, 5), // auto_recall.fallback_to_fts
+            (8, 6), // auto_recall.include_key_facts
         ];
 
         for &(s, f) in bool_fields {
@@ -857,6 +916,11 @@ mod tests {
             (5, 1), // context_window_size
             (5, 2), // threshold
             (6, 1), // stale_hours
+            (8, 1), // auto_recall.max_results
+            (8, 2), // auto_recall.similarity_threshold
+            (8, 3), // auto_recall.max_context_chars
+            (8, 4), // auto_recall.timeout_ms
+            (8, 7), // auto_recall.min_prompt_len
         ];
 
         for &(s, f) in number_fields {
