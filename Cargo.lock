@@ -534,6 +534,7 @@ dependencies = [
  "serde_json",
  "serde_yml",
  "serial_test",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

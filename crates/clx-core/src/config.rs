@@ -1260,6 +1260,18 @@ mod tests {
         assert_eq!(config.logging.file, "~/.clx/logs/clx.log");
         assert_eq!(config.logging.max_size_mb, 10);
         assert_eq!(config.logging.max_files, 5);
+
+        // Auto recall defaults
+        assert!(config.auto_recall.enabled);
+        assert_eq!(config.auto_recall.max_results, 3);
+        assert!(
+            (config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON,
+        );
+        assert_eq!(config.auto_recall.max_context_chars, 1000);
+        assert_eq!(config.auto_recall.timeout_ms, 500);
+        assert!(config.auto_recall.fallback_to_fts);
+        assert!(config.auto_recall.include_key_facts);
+        assert_eq!(config.auto_recall.min_prompt_len, 10);
     }
 
     #[test]
@@ -1980,5 +1992,129 @@ mcp_tools:
         fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
         assert_clone_send_sync::<McpToolsConfig>();
         assert_clone_send_sync::<McpCommandTool>();
+    }
+
+    // --- Auto-recall config tests ---
+
+    #[test]
+    fn test_auto_recall_yaml_parsing() {
+        let yaml = r"
+auto_recall:
+  enabled: false
+  max_results: 5
+  similarity_threshold: 0.5
+  max_context_chars: 2000
+  timeout_ms: 1000
+  fallback_to_fts: false
+  include_key_facts: false
+  min_prompt_len: 20
+";
+
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert!(!config.auto_recall.enabled);
+        assert_eq!(config.auto_recall.max_results, 5);
+        assert!((config.auto_recall.similarity_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(config.auto_recall.max_context_chars, 2000);
+        assert_eq!(config.auto_recall.timeout_ms, 1000);
+        assert!(!config.auto_recall.fallback_to_fts);
+        assert!(!config.auto_recall.include_key_facts);
+        assert_eq!(config.auto_recall.min_prompt_len, 20);
+    }
+
+    #[test]
+    fn test_auto_recall_missing_section_gets_defaults() {
+        let yaml = "validator:\n  enabled: true\n";
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert!(config.auto_recall.enabled);
+        assert_eq!(config.auto_recall.max_results, 3);
+        assert!((config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON);
+        assert_eq!(config.auto_recall.max_context_chars, 1000);
+        assert_eq!(config.auto_recall.timeout_ms, 500);
+        assert!(config.auto_recall.fallback_to_fts);
+        assert!(config.auto_recall.include_key_facts);
+        assert_eq!(config.auto_recall.min_prompt_len, 10);
+    }
+
+    #[test]
+    fn test_auto_recall_partial_yaml_uses_field_defaults() {
+        let yaml = r"
+auto_recall:
+  enabled: false
+";
+
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert!(!config.auto_recall.enabled);
+        // All other fields should be defaults
+        assert_eq!(config.auto_recall.max_results, 3);
+        assert!(config.auto_recall.fallback_to_fts);
+        assert!(config.auto_recall.include_key_facts);
+    }
+
+    #[test]
+    fn test_auto_recall_serialization_roundtrip() {
+        let config = Config::default();
+        let yaml = serde_yml::to_string(&config).unwrap();
+        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(config.auto_recall, parsed.auto_recall);
+    }
+
+    #[test]
+    fn test_auto_recall_is_clone_send_sync() {
+        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+        assert_clone_send_sync::<AutoRecallConfig>();
+    }
+
+    // --- apply_f32_override tests ---
+
+    #[test]
+    fn test_apply_f32_override_valid() {
+        let mut val = 0.35_f32;
+        apply_f32_override("0.50", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!((val - 0.50).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_f32_override_boundary_values() {
+        let mut val = 0.5_f32;
+
+        // Exact min should be accepted
+        apply_f32_override("0.0", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(val.abs() < f32::EPSILON);
+
+        // Exact max should be accepted
+        apply_f32_override("1.0", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!((val - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_f32_override_out_of_range_keeps_default() {
+        let mut val = 0.35_f32;
+        apply_f32_override("1.5", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "above max should keep default"
+        );
+
+        apply_f32_override("-0.1", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "below min should keep default"
+        );
+    }
+
+    #[test]
+    fn test_apply_f32_override_invalid_keeps_default() {
+        let mut val = 0.35_f32;
+        apply_f32_override("not_a_number", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "non-numeric input should keep default"
+        );
+
+        apply_f32_override("", "TEST_VAR", 0.0, 1.0, &mut val);
+        assert!(
+            (val - 0.35).abs() < f32::EPSILON,
+            "empty string should keep default"
+        );
     }
 }
