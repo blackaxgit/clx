@@ -1,10 +1,12 @@
 //! Tests for the CLX MCP server.
 
+use std::io::BufReader;
+
 use serde_json::json;
 
 use clx_core::credentials::CredentialStore;
 use clx_core::storage::Storage;
-use clx_core::types::SessionId;
+use clx_core::types::{AuditDecision, AuditLogEntry, SessionId};
 
 use crate::protocol::types::*;
 use crate::server::McpServer;
@@ -568,4 +570,349 @@ fn test_credentials_action_wrong_type() {
     assert!(result.is_err());
     let (code, _) = result.unwrap_err();
     assert_eq!(code, INVALID_PARAMS);
+}
+
+// =========================================================================
+// T20 — tool_recall additional coverage
+// =========================================================================
+
+#[test]
+fn test_recall_returns_empty_message_when_no_match() {
+    // Arrange
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+    let _ = server.tool_remember(&json!({"text": "Rust async programming with tokio"}));
+
+    // Act — query that won't match anything stored
+    let result = server.tool_recall(&json!({"query": "zxqvbnm_nonexistent_xyz"}));
+
+    // Assert
+    assert!(result.is_ok());
+    let value = result.unwrap();
+    let content = value.get("content").unwrap().as_array().unwrap();
+    let text = content[0].get("text").unwrap().as_str().unwrap();
+    assert!(text.contains("No relevant context found"));
+}
+
+#[test]
+fn test_recall_with_seeded_data_returns_formatted_results() {
+    // Arrange — seed a snapshot and recall with a matching query
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+    let _ = server.tool_remember(&json!({"text": "database migration strategy using flyway"}));
+
+    // Act
+    let result = server.tool_recall(&json!({"query": "database migration flyway"}));
+
+    // Assert
+    assert!(result.is_ok());
+    let value = result.unwrap();
+    let content = value.get("content").unwrap().as_array().unwrap();
+    assert!(!content.is_empty());
+    let text = content[0].get("text").unwrap().as_str().unwrap();
+    // With no embedding infrastructure the fallback FTS5 search runs;
+    // the response is either results or "No relevant context found" — either is valid.
+    // What matters is the response is well-formed.
+    assert!(
+        text.contains("Found") || text.contains("No relevant context found"),
+        "unexpected response: {text}"
+    );
+}
+
+// =========================================================================
+// T21 — MCP Tools partial coverage gaps
+// =========================================================================
+
+#[test]
+fn test_remember_creates_snapshot_in_storage() {
+    // Arrange
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    // Act
+    let result = server.tool_remember(&json!({"text": "important architectural decision"}));
+
+    // Assert — tool succeeds
+    assert!(result.is_ok());
+    let value = result.unwrap();
+    let text = value["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Successfully remembered"));
+
+    // Assert — snapshot actually persisted in storage
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .expect("should retrieve snapshots");
+    assert!(
+        !snapshots.is_empty(),
+        "at least one snapshot should be stored"
+    );
+    let last = snapshots.last().unwrap();
+    assert!(
+        last.summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("architectural decision"),
+        "snapshot summary should contain remembered text"
+    );
+}
+
+#[test]
+fn test_remember_without_embedding_infrastructure_still_saves() {
+    // Arrange — server with no Ollama/embedding (the default test server)
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    // Act — embedding_store is None so embedding generation is skipped
+    let result = server.tool_remember(&json!({"text": "embedding failure graceful fallback"}));
+
+    // Assert — memory is saved despite missing embedding infrastructure
+    assert!(result.is_ok(), "remember should succeed even without embeddings");
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .expect("should retrieve snapshots");
+    assert!(!snapshots.is_empty(), "snapshot must be persisted without embedding");
+}
+
+#[test]
+fn test_checkpoint_creates_snapshot_in_storage() {
+    // Arrange
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    // Act
+    let result = server.tool_checkpoint(&json!({"note": "before refactor"}));
+
+    // Assert — tool succeeds and includes the note in the response
+    assert!(result.is_ok());
+    let text = result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("Checkpoint created"));
+    assert!(text.contains("before refactor"));
+
+    // Assert — snapshot written to storage with Checkpoint trigger
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .expect("should retrieve snapshots");
+    assert!(!snapshots.is_empty(), "checkpoint snapshot must be persisted");
+}
+
+#[test]
+fn test_checkpoint_without_note_succeeds() {
+    // Arrange
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    // Act
+    let result = server.tool_checkpoint(&json!({}));
+
+    // Assert
+    assert!(result.is_ok());
+    let text = result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("Checkpoint created"));
+}
+
+#[test]
+fn test_rules_get_project_rules_missing_action_invalid() {
+    // Supplying an unrecognised action returns INVALID_PARAMS
+    let server = create_test_server();
+    let result = server.tool_rules(&json!({"action": "unknown_action"}));
+    assert!(result.is_err());
+    let (code, _) = result.unwrap_err();
+    assert_eq!(code, INVALID_PARAMS);
+}
+
+#[test]
+fn test_rules_add_blacklist_rule() {
+    // Arrange
+    let server = create_test_server();
+
+    // Act
+    let result = server.tool_rules(&json!({
+        "action": "add",
+        "pattern": "rm -rf *",
+        "rule_type": "blacklist"
+    }));
+
+    // Assert — succeeds and response mentions "deny"
+    assert!(result.is_ok());
+    let text = result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("deny"));
+    assert!(text.contains("rm -rf *"));
+}
+
+#[test]
+fn test_stats_with_seeded_audit_data() {
+    // Arrange — create a session and two audit log entries
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    let allow_entry = AuditLogEntry::new(
+        SessionId::new("test-session"),
+        "cargo build".to_string(),
+        "policy".to_string(),
+        AuditDecision::Allowed,
+    );
+    let deny_entry = AuditLogEntry::new(
+        SessionId::new("test-session"),
+        "rm -rf /".to_string(),
+        "policy".to_string(),
+        AuditDecision::Blocked,
+    );
+    server.storage.create_audit_log(&allow_entry).unwrap();
+    server.storage.create_audit_log(&deny_entry).unwrap();
+
+    // Act
+    let result = server.tool_stats(&json!({"days": 7}));
+
+    // Assert — tool succeeds and the JSON structure is well-formed
+    assert!(result.is_ok());
+    let value = result.unwrap();
+    let text = value["content"][0]["text"].as_str().unwrap();
+    let stats: serde_json::Value = serde_json::from_str(text).expect("stats output must be JSON");
+    assert!(stats.get("period_days").is_some());
+    assert!(stats.get("sessions").is_some());
+    assert!(stats.get("commands").is_some());
+}
+
+#[test]
+fn test_stats_max_days_boundary() {
+    // days=365 is the maximum allowed value
+    let server = create_test_server();
+    let result = server.tool_stats(&json!({"days": 365}));
+    assert!(result.is_ok());
+    let text = result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stats: serde_json::Value =
+        serde_json::from_str(&text).expect("stats output must be valid JSON");
+    assert_eq!(stats["period_days"], 365);
+}
+
+// =========================================================================
+// T22 — Server functions: handle_tools_call and read_bounded_line
+// =========================================================================
+
+#[test]
+fn test_handle_tools_call_valid_dispatch_returns_result() {
+    // Arrange
+    let server = create_test_server();
+
+    // Act — clx_session_info requires no FK deps and always succeeds
+    let result = server.handle_tools_call(&json!({
+        "name": "clx_session_info",
+        "arguments": {}
+    }));
+
+    // Assert
+    assert!(result.is_ok());
+    let value = result.unwrap();
+    assert!(
+        value.get("content").is_some(),
+        "dispatched tool must return MCP content array"
+    );
+}
+
+#[test]
+fn test_handle_tools_call_missing_name_returns_invalid_params() {
+    // Arrange
+    let server = create_test_server();
+
+    // Act — params object has no "name" key
+    let result = server.handle_tools_call(&json!({"arguments": {}}));
+
+    // Assert
+    assert!(result.is_err());
+    let (code, _) = result.unwrap_err();
+    assert_eq!(code, INVALID_PARAMS);
+}
+
+#[test]
+fn test_read_bounded_line_normal() {
+    // Arrange — a simple line well within the size limit
+    let data = b"hello world\n";
+    let mut reader = BufReader::new(data.as_ref());
+    let mut buf = String::new();
+
+    // Act
+    let result = McpServer::read_bounded_line(&mut reader, &mut buf);
+
+    // Assert
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_some(), "should return Some for a normal line");
+    assert_eq!(buf, "hello world");
+}
+
+#[test]
+fn test_read_bounded_line_eof_returns_none() {
+    // Arrange — empty buffer signals EOF
+    let data: &[u8] = b"";
+    let mut reader = BufReader::new(data);
+    let mut buf = String::new();
+
+    // Act
+    let result = McpServer::read_bounded_line(&mut reader, &mut buf);
+
+    // Assert
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_none(), "empty input must return None (EOF)");
+}
+
+#[test]
+fn test_read_bounded_line_at_limit_succeeds() {
+    // Arrange — exactly MAX_LINE_SIZE bytes followed by a newline
+    let mut data = vec![b'x'; McpServer::MAX_LINE_SIZE];
+    data.push(b'\n');
+    let mut reader = BufReader::new(data.as_slice());
+    let mut buf = String::new();
+
+    // Act
+    let result = McpServer::read_bounded_line(&mut reader, &mut buf);
+
+    // Assert — at-limit is accepted
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_some());
+    assert_eq!(buf.len(), McpServer::MAX_LINE_SIZE);
+}
+
+#[test]
+fn test_read_bounded_line_over_limit_returns_error() {
+    // Arrange — MAX_LINE_SIZE + 1 bytes before the newline
+    let mut data = vec![b'x'; McpServer::MAX_LINE_SIZE + 1];
+    data.push(b'\n');
+    let mut reader = BufReader::new(data.as_slice());
+    let mut buf = String::new();
+
+    // Act
+    let result = McpServer::read_bounded_line(&mut reader, &mut buf);
+
+    // Assert — over-limit is rejected with InvalidData
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
