@@ -233,6 +233,7 @@ pub(crate) fn parse_summary_response(response: &str) -> Result<SummaryResponse, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TranscriptMessage;
 
     #[test]
     fn test_count_transcript_tokens_missing_file() {
@@ -313,5 +314,204 @@ mod tests {
         assert_eq!(msg_count, 110);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // =========================================================================
+    // T16 — process_transcript tests
+    // =========================================================================
+
+    /// Write a JSONL transcript file to `path` from the given lines.
+    fn write_transcript(path: &std::path::Path, lines: &[&str]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).expect("create transcript file");
+        for line in lines {
+            writeln!(f, "{line}").expect("write line");
+        }
+    }
+
+    /// T16-1: `process_transcript` with a mock Ollama server returns a non-empty summary.
+    ///
+    /// Wiremock binds to 127.0.0.1 (loopback), which `OllamaClient` accepts.
+    /// `CLX_OLLAMA_HOST` is overridden per-test via a scoped env var guard so that
+    /// `Config::load()` picks up the mock server URL.
+    #[tokio::test]
+    async fn test_process_transcript_success_with_mock_ollama() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Arrange — start mock server
+        let server = MockServer::start().await;
+
+        // Mock GET /api/tags (is_available check)
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"models":[{"name":"llama3.2:3b"}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        // Mock POST /api/generate (generate call)
+        let summary_json =
+            r#"{"summary":"Discussed Rust testing","key_facts":["used wiremock"],"todos":[]}"#;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"response":{json},"done":true}}"#,
+                json = serde_json::to_string(summary_json).unwrap()
+            )))
+            .mount(&server)
+            .await;
+
+        // Write a small transcript file
+        let temp_dir = std::env::temp_dir().join(format!("clx-t16-success-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let transcript_path = temp_dir.join("transcript.jsonl");
+        write_transcript(
+            &transcript_path,
+            &[
+                r#"{"type":"user","message":"Hello"}"#,
+                r#"{"type":"assistant","message":"Hi there"}"#,
+            ],
+        );
+
+        // Point Config::load() at the mock server via env var.
+        // SAFETY: test isolation — env var is restored in the same async task.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CLX_OLLAMA_HOST", server.uri());
+        }
+
+        // Act
+        let result = process_transcript(transcript_path.to_str().unwrap()).await;
+
+        // Restore env var
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CLX_OLLAMA_HOST");
+        }
+
+        // Assert
+        let summary = result.summary.expect("summary should be Some");
+        assert!(!summary.is_empty(), "summary must be non-empty");
+        assert_eq!(result.message_count, Some(2));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// T16-2: `process_transcript` falls back gracefully when Ollama is unavailable.
+    ///
+    /// Port 19999 is chosen as an unused local port that will refuse connections
+    /// immediately. `OllamaClient::new()` validates the host is localhost, which
+    /// 127.0.0.1 satisfies, so it constructs but `is_available()` returns false.
+    #[tokio::test]
+    async fn test_process_transcript_fallback_when_ollama_unavailable() {
+        // Arrange — write a small transcript
+        let temp_dir =
+            std::env::temp_dir().join(format!("clx-t16-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let transcript_path = temp_dir.join("transcript.jsonl");
+        write_transcript(
+            &transcript_path,
+            &[
+                r#"{"type":"user","message":"Hello"}"#,
+                r#"{"type":"assistant","message":"Hi"}"#,
+            ],
+        );
+
+        // Point Ollama at a port that is not listening so is_available() returns false.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CLX_OLLAMA_HOST", "http://127.0.0.1:19998");
+        }
+
+        // Act
+        let result = process_transcript(transcript_path.to_str().unwrap()).await;
+
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CLX_OLLAMA_HOST");
+        }
+
+        // Assert — function completes without panic and provides a fallback summary
+        let summary = result
+            .summary
+            .expect("summary should be Some even when Ollama unavailable");
+        assert!(!summary.is_empty(), "fallback summary must be non-empty");
+        assert_eq!(
+            result.message_count,
+            Some(2),
+            "message_count must reflect the transcript lines"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// T16-3: `count_transcript_tokens` with a known structure returns correct token counts.
+    ///
+    /// `estimate_tokens` formula: (len + 3) / 4
+    ///   "user msg"      = 8  chars → (8+3)/4  = 2 tokens  (integer division)
+    ///   "assistant msg" = 13 chars → (13+3)/4 = 4 tokens
+    #[test]
+    fn test_count_transcript_tokens_known_structure() {
+        use std::io::Write;
+
+        let temp_dir = std::env::temp_dir().join(format!("clx-t16-tokens-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let transcript_path = temp_dir.join("transcript.jsonl");
+
+        let mut f = std::fs::File::create(&transcript_path).unwrap();
+        // "user msg" = 8 chars → (8+3)/4 = 2 tokens
+        writeln!(f, r#"{{"type":"user","message":"user msg"}}"#).unwrap();
+        // "assistant msg" = 13 chars → (13+3)/4 = 4 tokens
+        writeln!(f, r#"{{"type":"assistant","message":"assistant msg"}}"#).unwrap();
+        // blank line — skipped
+        writeln!(f).unwrap();
+        // non-JSON — skipped
+        writeln!(f, "not-json").unwrap();
+
+        let (input_tok, output_tok, msg_count) =
+            count_transcript_tokens(transcript_path.to_str().unwrap());
+
+        assert_eq!(input_tok, 2, "user 'user msg' → 2 tokens");
+        assert_eq!(output_tok, 4, "assistant 'assistant msg' → 4 tokens");
+        assert_eq!(msg_count, 2, "only 2 valid JSONL entries");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// T16-4: `build_transcript_text` does not panic on multi-byte UTF-8 content.
+    ///
+    /// Exercises the `truncate_to_char_boundary` path inside `build_transcript_text`
+    /// when a message exceeds 500 chars and contains multi-byte characters.
+    #[test]
+    fn test_process_transcript_utf8_safety_no_panic() {
+        // "こんにちは" is 5 chars × 3 bytes each = 15 bytes per repetition.
+        // Repeat 40 times → 200 chars, 600 bytes (well above the 500-byte truncation threshold).
+        let long_japanese = "こんにちは".repeat(40);
+        let entries = vec![
+            TranscriptEntry {
+                entry_type: Some("user".to_string()),
+                message: Some(TranscriptMessage::String(long_japanese.clone())),
+                tool: None,
+            },
+            TranscriptEntry {
+                entry_type: Some("assistant".to_string()),
+                message: Some(TranscriptMessage::String(long_japanese)),
+                tool: None,
+            },
+        ];
+
+        // Must not panic even though slicing at byte 500 would split a 3-byte character.
+        let text = build_transcript_text(&entries);
+        assert!(text.contains("[user]:"), "should contain user label");
+        assert!(
+            text.contains("[assistant]:"),
+            "should contain assistant label"
+        );
+        assert!(text.contains("..."), "truncation marker should be present");
+        // Result must be valid UTF-8 (no panics from bad slicing)
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
     }
 }

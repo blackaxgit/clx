@@ -610,6 +610,60 @@ mod tests {
 
     #[test]
     #[ignore = "Requires keychain access"]
+    fn test_get_with_fallback_returns_global_when_no_project_credential() {
+        let store = test_store();
+        let key = "test_fallback_global_key";
+        let project = "/tmp/test-project";
+
+        // Ensure clean state
+        let _ = store.delete_scoped(key, Some(project));
+        let _ = store.delete(key);
+
+        // Store only global credential
+        store.store(key, "global_value").expect("store global");
+
+        // get_with_fallback should return the global value
+        let result = store
+            .get_with_fallback(key, project)
+            .expect("get_with_fallback");
+        assert_eq!(result, Some("global_value".to_string()));
+
+        // Clean up
+        store.delete(key).expect("cleanup");
+    }
+
+    #[test]
+    #[ignore = "Requires keychain access"]
+    fn test_get_with_fallback_prefers_project_over_global() {
+        let store = test_store();
+        let key = "test_fallback_project_key";
+        let project = "/tmp/test-project";
+
+        // Ensure clean state
+        let _ = store.delete_scoped(key, Some(project));
+        let _ = store.delete(key);
+
+        // Store both project-scoped and global credentials
+        store
+            .store_scoped(key, "project_value", Some(project))
+            .expect("store project-scoped");
+        store.store(key, "global_value").expect("store global");
+
+        // get_with_fallback should return the project-scoped value
+        let result = store
+            .get_with_fallback(key, project)
+            .expect("get_with_fallback");
+        assert_eq!(result, Some("project_value".to_string()));
+
+        // Clean up
+        store
+            .delete_scoped(key, Some(project))
+            .expect("cleanup project");
+        store.delete(key).expect("cleanup global");
+    }
+
+    #[test]
+    #[ignore = "Requires keychain access"]
     fn test_overwrite() {
         let store = test_store();
         let key = "test_overwrite_key";

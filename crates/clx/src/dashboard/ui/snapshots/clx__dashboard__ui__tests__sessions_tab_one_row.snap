@@ -1,0 +1,29 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+assertion_line: 276
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+Sessions: 1 (0 active)  │  Tokens: 0 in/0 out  │  Cost: $0.00  │  Cmds: 0
+░░░░░░░░░░ 0% allow  ░░░░░░░░░░ 0% deny  ░░░░░░░░░░ 0% prompt  │  Risk L:0 M:0
+┌ Sessions (1) ────────────────────────────────────────────────────────────────↑
+│Status     ID         Started ▼      Duration     Msgs    Cmds    Tokens     P█
+│                                                                              █
+│ended      abcd1234   03-13 09:00    5m           10      3       1.2K       /█
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+└──────────────────────────────────────────────────────────────────────────────↓
+ <TIME> | Refresh <N>s | Sessions: 1 | Commands: 0 | q:quit Tab:switch /:filter

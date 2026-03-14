@@ -525,6 +525,313 @@ impl OllamaClient {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // T08 + T09 — Wiremock-based async HTTP tests
+    // -----------------------------------------------------------------------
+    mod async_tests {
+        use super::*;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Start a wiremock server and build an `OllamaClient` pointed at it.
+        ///
+        /// `max_retries` is set to 0 so tests observe exactly one attempt and
+        /// never sleep between retries. `timeout_ms` is kept at the default
+        /// 60 s so only the dedicated timeout test overrides it.
+        async fn mock_ollama() -> (MockServer, OllamaClient) {
+            let server = MockServer::start().await;
+            let config = OllamaConfig {
+                host: server.uri(),
+                max_retries: 0,
+                ..OllamaConfig::default()
+            };
+            let client = OllamaClient::new(config).expect("failed to build OllamaClient in test");
+            (server, client)
+        }
+
+        // ------------------------------------------------------------------
+        // embed() tests
+        // ------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn embed_success_returns_embedding_vec() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("POST"))
+                .and(path("/api/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"embedding":[0.1,0.2,0.3]}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.embed("hello", None).await;
+
+            // Assert
+            let embedding = result.expect("embed should succeed");
+            assert_eq!(embedding.len(), 3);
+        }
+
+        #[tokio::test]
+        async fn embed_http_500_returns_err() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("POST"))
+                .and(path("/api/embeddings"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.embed("hello", None).await;
+
+            // Assert
+            assert!(result.is_err(), "expected Err on HTTP 500");
+        }
+
+        #[tokio::test]
+        async fn embed_timeout_returns_err() {
+            // Arrange — use a very short timeout so the test completes quickly.
+            let server = MockServer::start().await;
+            let config = OllamaConfig {
+                host: server.uri(),
+                max_retries: 0,
+                timeout_ms: 100, // 100 ms client timeout
+                ..OllamaConfig::default()
+            };
+            let client = OllamaClient::new(config).expect("failed to build OllamaClient in test");
+
+            Mock::given(method("POST"))
+                .and(path("/api/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_delay(Duration::from_secs(30)), // far exceeds the 100 ms timeout
+                )
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.embed("hello", None).await;
+
+            // Assert
+            assert!(result.is_err(), "expected Err on timeout");
+        }
+
+        #[tokio::test]
+        async fn embed_explicit_model_param_succeeds() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("POST"))
+                .and(path("/api/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"embedding":[0.5,0.6,0.7,0.8]}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            // Act — pass an explicit model name instead of relying on the default
+            let result = client.embed("hello", Some("nomic-embed-text")).await;
+
+            // Assert
+            let embedding = result.expect("embed with explicit model should succeed");
+            assert_eq!(embedding.len(), 4);
+        }
+
+        // ------------------------------------------------------------------
+        // generate() tests
+        // ------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn generate_success_returns_response_text() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("POST"))
+                .and(path("/api/generate"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"response":"text","done":true}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.generate("Hello", None).await;
+
+            // Assert
+            let text = result.expect("generate should succeed");
+            assert!(
+                text.contains("text"),
+                "response should contain 'text', got: {text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn generate_empty_response_returns_empty_string() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("POST"))
+                .and(path("/api/generate"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"response":"","done":true}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.generate("Hello", None).await;
+
+            // Assert
+            let text = result.expect("generate with empty response should succeed");
+            assert_eq!(text, "");
+        }
+
+        #[tokio::test]
+        async fn generate_http_503_returns_err() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("POST"))
+                .and(path("/api/generate"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.generate("Hello", None).await;
+
+            // Assert
+            assert!(result.is_err(), "expected Err on HTTP 503");
+        }
+
+        // ------------------------------------------------------------------
+        // is_available() tests
+        // ------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn is_available_returns_true_when_server_up() {
+            // Arrange — mount a 200 response on GET /api/tags (the health-check endpoint)
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("GET"))
+                .and(path("/api/tags"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(r#"{"models":[]}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            // Act
+            let available = client.is_available().await;
+
+            // Assert
+            assert!(available, "client should report server as available");
+        }
+
+        #[tokio::test]
+        async fn is_available_returns_false_when_no_successful_response() {
+            // Arrange — wiremock returns 404 for unmatched requests; no mock
+            // is mounted, so every request gets a 404, which is not a 2xx
+            // success and therefore is_available() should return false.
+            let (server, client) = mock_ollama().await;
+            // Drop the server binding to suppress the "unused variable" lint
+            // while keeping the server alive long enough for the request.
+            let _ = &server;
+
+            // Act
+            let available = client.is_available().await;
+
+            // Assert
+            assert!(!available, "client should report server as unavailable");
+        }
+
+        #[tokio::test]
+        async fn is_available_returns_false_on_http_error() {
+            // Arrange — mount a mock that returns HTTP 500 on GET /api/tags
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("GET"))
+                .and(path("/api/tags"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            // Act
+            let available = client.is_available().await;
+
+            // Assert — a 500 response is not a success; the client must report unavailable
+            assert!(
+                !available,
+                "HTTP 500 must cause is_available() to return false"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // list_models() tests
+        // ------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn list_models_success_returns_model_names() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("GET"))
+                .and(path("/api/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    r#"{"models":[{"name":"llama3.2:3b"},{"name":"mistral:7b"}]}"#,
+                    "application/json",
+                ))
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.list_models().await;
+
+            // Assert
+            let models = result.expect("list_models should succeed");
+            assert!(
+                models.contains(&"llama3.2:3b".to_string()),
+                "should contain llama3.2:3b, got: {models:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn list_models_empty_returns_empty_vec() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("GET"))
+                .and(path("/api/tags"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(r#"{"models":[]}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.list_models().await;
+
+            // Assert
+            let models = result.expect("list_models with empty list should succeed");
+            assert!(models.is_empty(), "expected empty vec, got: {models:?}");
+        }
+
+        #[tokio::test]
+        async fn list_models_http_404_returns_err() {
+            // Arrange
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("GET"))
+                .and(path("/api/tags"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            // Act
+            let result = client.list_models().await;
+
+            // Assert
+            assert!(result.is_err(), "expected Err on HTTP 404");
+        }
+    }
+
     /// RAII guard that saves env var values on creation and restores them on drop.
     /// Guarantees cleanup even if the test panics.
     #[allow(unsafe_code)]

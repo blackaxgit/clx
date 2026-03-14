@@ -1,0 +1,11 @@
+---
+source: crates/clx-hook/src/tests.rs
+expression: value
+---
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Dangerous command detected"
+  }
+}
