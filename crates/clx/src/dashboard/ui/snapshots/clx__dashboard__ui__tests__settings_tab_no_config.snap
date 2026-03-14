@@ -1,0 +1,29 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+assertion_line: 329
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
+│> Validator         ││                                                        │
+│  Context           ││                                                        │
+│  Ollama            ││                                                        │
+│  User Learning     ││                                                        │
+│  Logging           ││                                                        │
+│  Ctx Pressure      ││                                                        │
+│  Sess Recovery     ││                                                        │
+│  MCP Tools         ││                                                        │
+│  Auto Recall       ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | q:quit Tab:switch /:filter
