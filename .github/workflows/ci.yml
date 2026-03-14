@@ -1,10 +1,12 @@
 # CI pipeline for CLX — Rust workspace with 4 crates.
 #
 # Jobs:
-#   check  — Format + lint validation (fast gate, runs on ubuntu only)
-#   test   — Run full test suite (matrix: ubuntu + macos)
-#   build  — Compile release binaries (matrix: ubuntu + macos)
-#   audit  — Check dependencies for known vulnerabilities (ubuntu only)
+#   check    — Format + lint validation (fast gate, runs on ubuntu only)
+#   test     — Run full test suite (matrix: ubuntu + macos)
+#   build    — Compile release binaries (matrix: ubuntu + macos)
+#   coverage — Measure line coverage with cargo-llvm-cov; fails if < 80%
+#              Also verifies no unreviewed insta snapshots are present.
+#   audit    — Check dependencies for known vulnerabilities (ubuntu only)
 #
 # Caching: Swatinem/rust-cache caches ~/.cargo/registry, ~/.cargo/git,
 # and the target directory keyed on Cargo.lock + OS + toolchain.
@@ -106,6 +108,67 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release --workspace
+
+  # ---------------------------------------------------------------------------
+  # coverage: measure line coverage with cargo-llvm-cov on macOS to match
+  # the primary dev environment. Fails the build if line coverage drops
+  # below 80%. Also verifies that no unreviewed insta snapshots exist.
+  #
+  # Two cargo-llvm-cov invocations are used intentionally:
+  #   1. Generate the LCOV report for artifact upload.
+  #   2. Re-run with --fail-under-lines to enforce the threshold as a hard
+  #      gate. A single invocation with both flags is not supported by all
+  #      versions of cargo-llvm-cov, so two passes keep this explicit.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Coverage (macOS)
+    runs-on: macos-latest
+    needs: check
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # taiki-e/install-action provides a fast, pre-built install of
+      # cargo-llvm-cov without a full `cargo install` compile step.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Install cargo-insta to run the snapshot check step below.
+      - name: Install cargo-insta
+        uses: taiki-e/install-action@cargo-insta
+
+      # Verify that every insta snapshot has been reviewed (i.e. committed).
+      # --check causes `cargo insta test` to fail if any snapshot is pending
+      # review, preventing unreviewed snapshots from landing in main.
+      - name: Check insta snapshots are reviewed
+        run: cargo insta test --workspace --check
+
+      # Generate the LCOV report. --all-features ensures every code path
+      # gated behind a feature flag is included in the measurement.
+      - name: Generate LCOV coverage report
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      # Hard gate: fail the job if line coverage is below 80%.
+      # This re-runs the instrumented tests; the Swatinem cache keeps it fast.
+      - name: Enforce 80% line coverage threshold
+        run: cargo llvm-cov --all-features --workspace --fail-under-lines 80
+
+      # Upload lcov.info so it can be inspected in the Actions UI or fed
+      # to a coverage viewer without re-running the full build.
+      - name: Upload LCOV report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-report
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # audit: check dependencies for known vulnerabilities
