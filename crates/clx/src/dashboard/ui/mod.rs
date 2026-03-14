@@ -199,9 +199,7 @@ mod tests {
                     let vis_len: usize = replaced.chars().count();
                     if vis_len >= 80 {
                         lines.push(replaced.chars().take(80).collect());
-                    } else if replaced.contains('─')
-                        && replaced.trim_end().ends_with('┐')
-                    {
+                    } else if replaced.contains('─') && replaced.trim_end().ends_with('┐') {
                         // Insert ─ before the trailing ┐ to fill to 80 cols.
                         let trimmed = replaced.trim_end_matches('┐');
                         let mut padded = trimmed.to_string();
