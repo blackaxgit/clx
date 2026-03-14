@@ -1,0 +1,29 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+assertion_line: 306
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Rules ───────────────────────────────────────────────────────────────────────┐
+│Builtin Whitelist (0)                                                         │
+│                                                                              │
+│  None                                                                        │
+│                                                                              │
+│Builtin Blacklist (0)                                                         │
+│                                                                              │
+│  None                                                                        │
+│                                                                              │
+│Config Whitelist (0)                                                          │
+│                                                                              │
+│  None                                                                        │
+│                                                                              │
+│Config Blacklist (0)                                                          │
+│                                                                              │
+│  None                                                                        │
+│                                                                              │
+│Learned Rules (0)                                                             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | q:quit Tab:switch /:filter

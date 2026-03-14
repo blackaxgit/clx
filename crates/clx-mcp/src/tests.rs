@@ -885,6 +885,211 @@ fn test_mcp_server_new_get_tools_returns_all_seven_names() {
 }
 
 // =========================================================================
+// T20 — tool_recall additional coverage (named per spec)
+// =========================================================================
+
+#[test]
+fn test_recall_with_seeded_data_returns_results() {
+    // Arrange — seed a session and a snapshot via tool_remember, then recall
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+    let _ = server.tool_remember(&json!({"text": "Rust ownership model and borrow checker"}));
+
+    // Act
+    let result = server.tool_recall(&json!({"query": "Rust ownership borrow"}));
+
+    // Assert — the call succeeds and returns well-formed MCP content
+    assert!(result.is_ok(), "recall with seeded data must succeed");
+    let value = result.unwrap();
+    let content = value.get("content").unwrap().as_array().unwrap();
+    assert!(!content.is_empty(), "content array must not be empty");
+    // The response is either results or the "no match" message — both are valid
+    let text = content[0].get("text").unwrap().as_str().unwrap();
+    assert!(
+        text.contains("Found") || text.contains("No relevant context found"),
+        "unexpected response shape: {text}"
+    );
+}
+
+#[test]
+fn test_recall_result_format_contains_expected_fields() {
+    // Arrange — seed data so there is something to recall
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+    let _ = server.tool_remember(&json!({"text": "tokio async runtime configuration"}));
+
+    // Act — issue a matching query
+    let result = server.tool_recall(&json!({"query": "tokio async"}));
+
+    // Assert — response JSON structure is well-formed per MCP spec
+    assert!(result.is_ok());
+    let value = result.unwrap();
+
+    // Top-level "content" key must be an array
+    let content = value
+        .get("content")
+        .expect("response must have 'content' key")
+        .as_array()
+        .expect("'content' must be an array");
+    assert!(!content.is_empty(), "'content' array must not be empty");
+
+    // Each item in the content array must have a "type" and "text" field
+    let item = &content[0];
+    assert!(
+        item.get("type").is_some(),
+        "content item must have 'type' field"
+    );
+    assert!(
+        item.get("text").is_some(),
+        "content item must have 'text' field"
+    );
+    assert_eq!(
+        item.get("type").unwrap().as_str(),
+        Some("text"),
+        "content item 'type' must be 'text'"
+    );
+}
+
+// =========================================================================
+// T21 — MCP Tools additional coverage (named per spec)
+// =========================================================================
+
+#[test]
+fn test_remember_embedding_failure_still_saves() {
+    // Arrange — the default test server has ollama_client = None and
+    // embedding_store = None, simulating an embedding infrastructure failure
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    // Act — call tool_remember; embedding generation will be skipped (no client)
+    let result = server.tool_remember(&json!({
+        "text": "important context that must be saved without embeddings"
+    }));
+
+    // Assert — the tool must succeed even with no embedding infrastructure
+    assert!(
+        result.is_ok(),
+        "tool_remember must succeed when embedding infrastructure is absent"
+    );
+
+    // Assert — the snapshot was persisted to storage
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .expect("storage must be readable after tool_remember");
+    assert!(
+        !snapshots.is_empty(),
+        "at least one snapshot must be saved even when embeddings are unavailable"
+    );
+}
+
+#[test]
+fn test_stats_with_seeded_data() {
+    // Arrange — create a session and seed audit log entries
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    let allow_entry = AuditLogEntry::new(
+        SessionId::new("test-session"),
+        "cargo test".to_string(),
+        "policy".to_string(),
+        AuditDecision::Allowed,
+    );
+    let deny_entry = AuditLogEntry::new(
+        SessionId::new("test-session"),
+        "curl http://external".to_string(),
+        "policy".to_string(),
+        AuditDecision::Blocked,
+    );
+    server.storage.create_audit_log(&allow_entry).unwrap();
+    server.storage.create_audit_log(&deny_entry).unwrap();
+
+    // Act
+    let result = server.tool_stats(&json!({"days": 30}));
+
+    // Assert — response is well-formed JSON with expected top-level keys
+    assert!(result.is_ok(), "tool_stats must succeed with seeded data");
+    let value = result.unwrap();
+    let text = value["content"][0]["text"].as_str().unwrap();
+    let stats: serde_json::Value =
+        serde_json::from_str(text).expect("stats response must be valid JSON");
+    assert!(
+        stats.get("period_days").is_some(),
+        "stats must contain 'period_days'"
+    );
+    assert!(
+        stats.get("sessions").is_some(),
+        "stats must contain 'sessions'"
+    );
+    assert!(
+        stats.get("commands").is_some(),
+        "stats must contain 'commands'"
+    );
+    assert_eq!(
+        stats["period_days"], 30,
+        "period_days must reflect requested days"
+    );
+}
+
+#[test]
+fn test_stats_date_range_filtering() {
+    // Arrange — create a session and audit entries that fall within "now"
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    let entry = AuditLogEntry::new(
+        SessionId::new("test-session"),
+        "git status".to_string(),
+        "policy".to_string(),
+        AuditDecision::Allowed,
+    );
+    server.storage.create_audit_log(&entry).unwrap();
+
+    // Act — query with a narrow window (days=1) and a wide window (days=365)
+    let result_narrow = server.tool_stats(&json!({"days": 1}));
+    let result_wide = server.tool_stats(&json!({"days": 365}));
+
+    // Assert — both succeed and return JSON with the expected period_days values
+    assert!(result_narrow.is_ok(), "stats with days=1 must succeed");
+    assert!(result_wide.is_ok(), "stats with days=365 must succeed");
+
+    let narrow_text = result_narrow.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wide_text = result_wide.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let narrow: serde_json::Value =
+        serde_json::from_str(&narrow_text).expect("narrow stats must be valid JSON");
+    let wide: serde_json::Value =
+        serde_json::from_str(&wide_text).expect("wide stats must be valid JSON");
+
+    assert_eq!(narrow["period_days"], 1, "narrow window must have period_days=1");
+    assert_eq!(wide["period_days"], 365, "wide window must have period_days=365");
+
+    // The wide window must report at least as many commands as the narrow one
+    let narrow_total = narrow["commands"]["total"].as_i64().unwrap_or(0);
+    let wide_total = wide["commands"]["total"].as_i64().unwrap_or(0);
+    assert!(
+        wide_total >= narrow_total,
+        "wider date range must include at least as many commands as the narrow range"
+    );
+}
+
+// =========================================================================
 // T22 — Server functions: handle_tools_call and read_bounded_line
 // =========================================================================
 

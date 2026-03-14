@@ -749,6 +749,23 @@ mod tests {
             assert!(!available, "client should report server as unavailable");
         }
 
+        #[tokio::test]
+        async fn is_available_returns_false_on_http_error() {
+            // Arrange — mount a mock that returns HTTP 500 on GET /api/tags
+            let (server, client) = mock_ollama().await;
+            Mock::given(method("GET"))
+                .and(path("/api/tags"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            // Act
+            let available = client.is_available().await;
+
+            // Assert — a 500 response is not a success; the client must report unavailable
+            assert!(!available, "HTTP 500 must cause is_available() to return false");
+        }
+
         // ------------------------------------------------------------------
         // list_models() tests
         // ------------------------------------------------------------------

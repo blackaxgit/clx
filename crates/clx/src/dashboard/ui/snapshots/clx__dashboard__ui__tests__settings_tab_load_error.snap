@@ -1,0 +1,29 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+assertion_line: 317
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Settings - /Users/blackax/.clx/config.yaml ────────────┐
+│> Validator         ││Failed to load configuration                            │
+│  Context           ││                                                        │
+│  Ollama            ││Cannot open config file                                 │
+│  User Learning     ││                                                        │
+│  Logging           ││Editing is disabled. Fix the config file manually or    │
+│  Ctx Pressure      ││press [r] to retry.                                     │
+│  Sess Recovery     ││                                                        │
+│  MCP Tools         ││                                                        │
+│  Auto Recall       ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | q:quit Tab:switch /:filter

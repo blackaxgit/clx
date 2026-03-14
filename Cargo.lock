@@ -561,6 +561,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "indicatif",
+ "insta",
  "predicates",
  "proptest",
  "ratatui",

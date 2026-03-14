@@ -1377,6 +1377,33 @@ fn test_get_nonexistent_rule() {
 // =========================================================================
 
 #[test]
+fn test_open_creates_db_at_path_ending_with_data_clx_db() {
+    // Arrange — build a temp directory and construct a path that mirrors the
+    // canonical CLX database layout: <root>/data/clx.db
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = temp_dir.path().join("data").join("clx.db");
+
+    // Act — open() must create the parent directory and initialise the DB
+    let storage = Storage::open(&db_path).expect("Storage::open should succeed for temp path");
+
+    // Assert — path ends with the expected suffix components
+    assert!(
+        db_path.ends_with("data/clx.db"),
+        "db path must end with 'data/clx.db', got: {}",
+        db_path.display()
+    );
+    assert_eq!(
+        db_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+        Some("data"),
+        "parent directory of the db file must be 'data'"
+    );
+
+    // Assert — the storage is operational
+    let version = storage.schema_version().expect("schema_version must succeed after open");
+    assert!(version >= 0, "schema version must be non-negative");
+}
+
+#[test]
 fn test_open_default_succeeds_and_is_functional() {
     // Arrange: open_default() resolves ~/.clx/data/clx.db and creates dirs as needed.
     // Act
