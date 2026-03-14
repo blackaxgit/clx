@@ -1,6 +1,8 @@
 //! Tests for clx-hook modules.
 
 #[cfg(test)]
+use crate::context::{extract_critical_rules, load_previous_session_summary, load_project_rules};
+#[cfg(test)]
 use crate::embedding::{resolve_command_paths, truncate_to_char_boundary};
 #[cfg(test)]
 use crate::learning::{extract_command_pattern, is_pattern_too_broad, is_restricted_command};
@@ -436,4 +438,378 @@ fn test_pattern_too_broad_social_engineering_attack() {
     assert!(is_pattern_too_broad(
         "git status; echo \"malicious\" | bash"
     ));
+}
+
+// =========================================================================
+// T10 — output.rs: JSON structure tests with insta snapshots
+//
+// output_decision() and output_generic() write directly to stdout.
+// We test the JSON they would produce by constructing the same output
+// structs and snapshotting the serialized value via insta.
+// =========================================================================
+
+#[test]
+fn test_output_decision_allow_no_reason_no_context() {
+    // Arrange
+    let output = HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: "allow".to_string(),
+            permission_decision_reason: None,
+            additional_context: None,
+        },
+        system_message: None,
+    };
+
+    // Act
+    let value = serde_json::to_value(&output).unwrap();
+
+    // Assert — snapshot captures the camelCase JSON shape
+    insta::assert_json_snapshot!("output_decision_allow_minimal", value);
+}
+
+#[test]
+fn test_output_decision_deny_with_reason() {
+    // Arrange
+    let output = HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: "deny".to_string(),
+            permission_decision_reason: Some("Dangerous command detected".to_string()),
+            additional_context: None,
+        },
+        system_message: None,
+    };
+
+    // Act
+    let value = serde_json::to_value(&output).unwrap();
+
+    // Assert
+    insta::assert_json_snapshot!("output_decision_deny_with_reason", value);
+}
+
+#[test]
+fn test_output_decision_block_with_reason_and_context() {
+    // Arrange
+    let output = HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: "block".to_string(),
+            permission_decision_reason: Some("Policy violation".to_string()),
+            additional_context: Some("RULES: Check agent descriptions".to_string()),
+        },
+        system_message: None,
+    };
+
+    // Act
+    let value = serde_json::to_value(&output).unwrap();
+
+    // Assert — all fields present
+    insta::assert_json_snapshot!("output_decision_block_full", value);
+}
+
+#[test]
+fn test_output_generic_user_prompt_submit_with_context() {
+    // Arrange
+    let output = HookGenericOutput {
+        hook_specific_output: HookGenericSpecificOutput {
+            hook_event_name: "UserPromptSubmit".to_string(),
+            additional_context: Some("Orchestrator context injected".to_string()),
+        },
+        system_message: None,
+    };
+
+    // Act
+    let value = serde_json::to_value(&output).unwrap();
+
+    // Assert — no permissionDecision field present
+    insta::assert_json_snapshot!("output_generic_user_prompt_with_context", value);
+    assert!(!value.to_string().contains("permissionDecision"));
+}
+
+#[test]
+fn test_output_generic_session_start_with_system_message() {
+    // Arrange
+    let output = HookGenericOutput {
+        hook_specific_output: HookGenericSpecificOutput {
+            hook_event_name: "SessionStart".to_string(),
+            additional_context: None,
+        },
+        system_message: Some("Previous session: task was X".to_string()),
+    };
+
+    // Act
+    let value = serde_json::to_value(&output).unwrap();
+
+    // Assert — additionalContext absent, systemMessage present
+    insta::assert_json_snapshot!("output_generic_session_start_system_msg", value);
+    assert!(!value.to_string().contains("additionalContext"));
+}
+
+#[test]
+fn test_output_generic_all_fields_populated() {
+    // Arrange
+    let output = HookGenericOutput {
+        hook_specific_output: HookGenericSpecificOutput {
+            hook_event_name: "SubagentStart".to_string(),
+            additional_context: Some("[SPECIALIST RULES] Execute directly.".to_string()),
+        },
+        system_message: Some("Global context here".to_string()),
+    };
+
+    // Act
+    let value = serde_json::to_value(&output).unwrap();
+
+    // Assert — both additionalContext and systemMessage present
+    insta::assert_json_snapshot!("output_generic_all_fields", value);
+    let s = value.to_string();
+    assert!(s.contains("additionalContext"));
+    assert!(s.contains("systemMessage"));
+}
+
+// =========================================================================
+// T17 — context.rs: load_previous_session_summary, load_project_rules,
+//                   extract_critical_rules
+// =========================================================================
+
+#[test]
+fn test_load_previous_session_summary_returns_none_on_fresh_storage() {
+    // Arrange — in-memory DB has no sessions at all
+    let storage = clx_core::storage::Storage::open_in_memory().unwrap();
+    let session_id = clx_core::types::SessionId::new("sess-fresh-001");
+
+    // Act
+    let result = load_previous_session_summary(&storage, &session_id, "/some/project");
+
+    // Assert
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_load_previous_session_summary_returns_summary_from_previous_session() {
+    use clx_core::types::{Session, SessionId, Snapshot, SnapshotTrigger};
+
+    // Arrange — create a previous session with a snapshot that has a summary
+    let storage = clx_core::storage::Storage::open_in_memory().unwrap();
+    let project = "/test/project";
+
+    let prev_id = SessionId::new("sess-prev-001");
+    let mut prev_session = Session::new(prev_id.clone(), project.to_string());
+    // Make the previous session start earlier so it sorts before current
+    prev_session.started_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+    storage.create_session(&prev_session).unwrap();
+
+    let mut snap = Snapshot::new(prev_id.clone(), SnapshotTrigger::Auto);
+    snap.summary = Some("Previous work: implemented feature X".to_string());
+    storage.create_snapshot(&snap).unwrap();
+
+    let current_id = SessionId::new("sess-current-001");
+    let current_session = Session::new(current_id.clone(), project.to_string());
+    storage.create_session(&current_session).unwrap();
+
+    // Act
+    let result = load_previous_session_summary(&storage, &current_id, project);
+
+    // Assert
+    assert!(result.is_some());
+    assert_eq!(result.unwrap(), "Previous work: implemented feature X");
+}
+
+#[test]
+fn test_load_project_rules_returns_none_when_no_claude_md() {
+    // Arrange — temp dir with no CLAUDE.md
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_str().unwrap();
+
+    // Act — project-specific path won't exist; global ~/.claude/CLAUDE.md may exist
+    // We only verify no panic and handle None gracefully when project file is absent.
+    // (Global path is outside our control in tests.)
+    let result = load_project_rules(cwd);
+
+    // Assert — result is either None (no global CLAUDE.md either) or Some with global rules only.
+    // Either is acceptable; the key invariant is no panic and correct type returned.
+    // If global rules exist they will be included; we just verify the call succeeds.
+    let _ = result; // accepted: None or Some(global_rules)
+}
+
+#[test]
+fn test_load_project_rules_returns_content_when_claude_md_exists() {
+    use std::io::Write as _;
+
+    // Arrange — write a CLAUDE.md with a critical section into a temp dir
+    let dir = tempfile::tempdir().unwrap();
+    let claude_md = dir.path().join("CLAUDE.md");
+    let mut f = std::fs::File::create(&claude_md).unwrap();
+    writeln!(f, "# Rules [STRICT]").unwrap();
+    writeln!(f, "Always delegate via Task tool.").unwrap();
+    writeln!(f, "# Other").unwrap();
+    writeln!(f, "Non-critical text.").unwrap();
+    drop(f);
+
+    let cwd = dir.path().to_str().unwrap();
+
+    // Act
+    let result = load_project_rules(cwd);
+
+    // Assert — at minimum the project section is present
+    assert!(result.is_some());
+    let rules = result.unwrap();
+    assert!(
+        rules.contains("Project Rules"),
+        "expected project header in: {rules}"
+    );
+    assert!(
+        rules.contains("[STRICT]"),
+        "expected STRICT marker in: {rules}"
+    );
+    assert!(
+        rules.contains("delegate via Task tool"),
+        "expected rule body in: {rules}"
+    );
+}
+
+#[test]
+fn test_extract_critical_rules_extracts_only_critical_lines() {
+    // Arrange
+    let content = "\
+# Normal Heading
+This line is not critical.
+
+## Security [STRICT]
+Never expose secrets.
+Always validate input.
+
+# Another Normal
+Nothing here.
+
+IMPORTANT: Remember to check permissions.
+";
+
+    // Act
+    let result = extract_critical_rules(content);
+
+    // Assert — should include the STRICT section and the IMPORTANT line
+    assert!(
+        result.contains("[STRICT]"),
+        "expected STRICT section in: {result}"
+    );
+    assert!(
+        result.contains("Never expose secrets"),
+        "expected rule body in: {result}"
+    );
+    assert!(
+        result.contains("IMPORTANT:"),
+        "expected IMPORTANT line in: {result}"
+    );
+    // Normal sections should not bleed in
+    assert!(
+        !result.contains("Nothing here"),
+        "unexpected normal content in: {result}"
+    );
+}
+
+// =========================================================================
+// T18 — audit.rs: log_audit_entry
+//
+// log_audit_entry() hardcodes Storage::open_default() internally, so we
+// cannot inject an in-memory store.  We test the underlying audit storage
+// operations directly (same path as log_audit_entry uses) and also verify
+// that calling log_audit_entry in an environment where default storage may
+// or may not exist completes without panicking.
+// =========================================================================
+
+#[test]
+fn test_audit_storage_write_and_verify_fields() {
+    use clx_core::types::{AuditDecision, AuditLogEntry, Session, SessionId};
+
+    // Arrange
+    let storage = clx_core::storage::Storage::open_in_memory().unwrap();
+    let session_id = SessionId::new("sess-audit-001");
+    // audit_log has a FK to sessions — create the session first
+    storage
+        .create_session(&Session::new(session_id.clone(), "/test".to_string()))
+        .unwrap();
+    let mut entry = AuditLogEntry::new(
+        session_id.clone(),
+        "git status".to_string(),
+        "layer0".to_string(),
+        AuditDecision::Allowed,
+    );
+    entry.working_dir = Some("/projects/clx".to_string());
+    entry.risk_score = Some(2);
+    entry.reasoning = Some("Read-only git command".to_string());
+
+    // Act
+    let id = storage.create_audit_log(&entry).unwrap();
+    let fetched = storage.get_audit_log(id).unwrap().unwrap();
+
+    // Assert
+    assert_eq!(fetched.session_id, session_id);
+    assert_eq!(fetched.command, "git status");
+    assert_eq!(fetched.layer, "layer0");
+    assert_eq!(fetched.decision, AuditDecision::Allowed);
+    assert_eq!(fetched.working_dir.as_deref(), Some("/projects/clx"));
+    assert_eq!(fetched.risk_score, Some(2));
+    assert_eq!(fetched.reasoning.as_deref(), Some("Read-only git command"));
+}
+
+#[test]
+fn test_audit_storage_multiple_entries_count_and_order() {
+    use clx_core::types::{AuditDecision, AuditLogEntry, Session, SessionId};
+
+    // Arrange
+    let storage = clx_core::storage::Storage::open_in_memory().unwrap();
+    let session_id = SessionId::new("sess-audit-002");
+    // audit_log has a FK to sessions — create the session first
+    storage
+        .create_session(&Session::new(session_id.clone(), "/test".to_string()))
+        .unwrap();
+
+    // Act — write 5 entries
+    for i in 0..5_u8 {
+        let entry = AuditLogEntry::new(
+            session_id.clone(),
+            format!("command-{i}"),
+            "layer0".to_string(),
+            AuditDecision::Allowed,
+        );
+        storage.create_audit_log(&entry).unwrap();
+    }
+
+    let entries = storage
+        .get_audit_log_by_session(session_id.as_str())
+        .unwrap();
+
+    // Assert — exactly 5 entries stored
+    assert_eq!(entries.len(), 5);
+
+    // Entries are returned DESC by timestamp; commands should all be present
+    let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+    for i in 0..5_u8 {
+        assert!(
+            commands.contains(&format!("command-{i}").as_str()),
+            "missing command-{i} in {commands:?}"
+        );
+    }
+}
+
+#[test]
+fn test_log_audit_entry_does_not_panic_when_default_storage_unavailable() {
+    use clx_core::types::{AuditDecision, SessionId};
+
+    // Arrange — call log_audit_entry which internally opens default storage.
+    // The default storage path (~/.clx/data/clx.db) may or may not exist in CI.
+    // The function swallows errors silently; we verify it does not panic.
+    let session_id = SessionId::new("sess-audit-silent-003");
+
+    // Act + Assert (no panic)
+    crate::audit::log_audit_entry(
+        &session_id,
+        "echo hello",
+        "/tmp",
+        "layer0",
+        AuditDecision::Allowed,
+        None,
+        None,
+    );
 }

@@ -1,0 +1,11 @@
+---
+source: crates/clx-hook/src/tests.rs
+expression: value
+---
+{
+  "hookSpecificOutput": {
+    "additionalContext": "[SPECIALIST RULES] Execute directly.",
+    "hookEventName": "SubagentStart"
+  },
+  "systemMessage": "Global context here"
+}

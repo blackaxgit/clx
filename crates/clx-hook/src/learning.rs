@@ -262,3 +262,158 @@ pub(crate) fn extract_command_pattern(command: &str) -> String {
         _ => format!("Bash({cmd}:*)"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clx_core::storage::Storage;
+    use clx_core::types::RuleType;
+
+    // Default thresholds from Config::default(): whitelist=3, blacklist=2.
+    // track_user_decision uses Config::load() which falls back to defaults when
+    // no config file exists, so tests do not need to write a config file.
+
+    /// T15-1: N-1 approvals (below whitelist threshold) must not produce an Allow rule.
+    #[test]
+    fn test_below_whitelist_threshold_no_rule_upgrade() {
+        // Arrange
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "cargo build";
+        let project = "/tmp/project";
+
+        // Act — call (threshold-1) = 2 times with approved=true
+        track_user_decision(&storage, command, project, true);
+        track_user_decision(&storage, command, project, true);
+
+        // Assert — pattern exists but is still tracking (RuleType::Allow is the initial
+        // value assigned on first decision; what must NOT happen is confirmation_count
+        // reaching the threshold that would have triggered a debug log and kept Allow).
+        // The real invariant is: confirmation_count == 2, below threshold of 3.
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule should exist after decisions");
+        assert_eq!(rule.confirmation_count, 2, "should have 2 confirmations");
+        // rule_type stays Allow (initial), but confirmation_count < threshold means
+        // the auto-whitelist branch was NOT triggered (no log, no mutation to deny)
+        assert_eq!(rule.rule_type, RuleType::Allow);
+    }
+
+    /// T15-2: Exactly `auto_whitelist_threshold` approvals → rule stays Allow (auto-whitelist).
+    #[test]
+    fn test_auto_whitelist_at_threshold() {
+        // Arrange
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        // Use a safe command that is not in NEVER_AUTO_WHITELIST and not too broad
+        let command = "cargo test";
+        let project = "/tmp/project";
+
+        // Act — call threshold (3) times
+        for _ in 0..3 {
+            track_user_decision(&storage, command, project, true);
+        }
+
+        // Assert
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule should exist");
+        assert_eq!(rule.confirmation_count, 3);
+        assert_eq!(
+            rule.rule_type,
+            RuleType::Allow,
+            "should be Allow after reaching whitelist threshold"
+        );
+    }
+
+    /// T15-3: Exactly `auto_blacklist_threshold` denials → rule becomes Deny (auto-blacklist).
+    #[test]
+    fn test_auto_blacklist_at_threshold() {
+        // Arrange
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        // Use a command that is NOT in NEVER_AUTO_BLACKLIST
+        let command = "curl http://example.com";
+        let project = "/tmp/project";
+
+        // Act — call threshold (2) times with approved=false
+        for _ in 0..2 {
+            track_user_decision(&storage, command, project, false);
+        }
+
+        // Assert
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule should exist");
+        assert_eq!(rule.denial_count, 2);
+        assert_eq!(
+            rule.rule_type,
+            RuleType::Deny,
+            "should be Deny after reaching blacklist threshold"
+        );
+    }
+
+    /// T15-4: Mixed allow/deny decisions, each count below its threshold → no promotion.
+    #[test]
+    fn test_mixed_decisions_below_threshold_no_promotion() {
+        // Arrange
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "curl http://example.com";
+        let project = "/tmp/project";
+
+        // Act — 1 allow then 1 deny (both counts < their respective thresholds)
+        track_user_decision(&storage, command, project, true);
+        track_user_decision(&storage, command, project, false);
+
+        // Assert
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule should exist");
+        // confirmation_count=1 < 3, denial_count=1 < 2 → no promotion to a promoted state
+        assert_eq!(rule.confirmation_count, 1);
+        assert_eq!(rule.denial_count, 1);
+        // Rule type reflects the most recently stored value; importantly it was
+        // NOT force-upgraded to Deny (denial_count=1, threshold=2) nor stayed Allow
+        // from whitelist promotion (confirmation_count=1, threshold=3).
+        // The type cycles with each call; the key assertion is neither threshold was crossed.
+        assert!(
+            rule.confirmation_count < 3,
+            "confirmation_count must be below whitelist threshold"
+        );
+        assert!(
+            rule.denial_count < 2,
+            "denial_count must be below blacklist threshold"
+        );
+    }
+
+    /// T15-5: A second set of decisions for an already-existing rule must not create a duplicate.
+    #[test]
+    fn test_idempotency_no_duplicate_rule() {
+        // Arrange
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "cargo test";
+        let project = "/tmp/project";
+
+        // Act — record the same pattern multiple times
+        for _ in 0..3 {
+            track_user_decision(&storage, command, project, true);
+        }
+        // Record once more beyond threshold
+        track_user_decision(&storage, command, project, true);
+
+        // Assert — only one rule exists for this pattern (ON CONFLICT DO UPDATE)
+        let pattern = extract_command_pattern(command);
+        let all_rules = storage.get_rules().expect("get_rules");
+        let matching: Vec<_> = all_rules.iter().filter(|r| r.pattern == pattern).collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "should have exactly one rule for the pattern, not a duplicate"
+        );
+    }
+}

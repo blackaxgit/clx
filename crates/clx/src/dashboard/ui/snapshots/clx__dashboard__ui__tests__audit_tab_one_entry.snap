@@ -1,0 +1,29 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+assertion_line: 297
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Audit Log (1) ───────────────────────────────────────────────────────────────↑
+│Time ▼      Decision     Risk     Layer      Command              Session     █
+│                                                                              █
+│<TIME>    allowed      10       builtin    ls -la /tmp          abcd1234    █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+└──────────────────────────────────────────────────────────────────────────────↓
+┌ Detail ──────────────────────────────────────────────────────────────────────┐
+│Select a row to view details                                                  │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 1 | q:quit Tab:switch /:filter

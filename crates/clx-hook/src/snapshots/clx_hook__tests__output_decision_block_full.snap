@@ -1,0 +1,12 @@
+---
+source: crates/clx-hook/src/tests.rs
+expression: value
+---
+{
+  "hookSpecificOutput": {
+    "additionalContext": "RULES: Check agent descriptions",
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "block",
+    "permissionDecisionReason": "Policy violation"
+  }
+}
