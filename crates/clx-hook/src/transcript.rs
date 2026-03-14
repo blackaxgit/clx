@@ -329,11 +329,11 @@ mod tests {
         }
     }
 
-    /// T16-1: process_transcript with a mock Ollama server returns a non-empty summary.
+    /// T16-1: `process_transcript` with a mock Ollama server returns a non-empty summary.
     ///
-    /// Wiremock binds to 127.0.0.1 (loopback), which OllamaClient accepts.
-    /// CLX_OLLAMA_HOST is overridden per-test via a scoped env var guard so that
-    /// Config::load() picks up the mock server URL.
+    /// Wiremock binds to 127.0.0.1 (loopback), which `OllamaClient` accepts.
+    /// `CLX_OLLAMA_HOST` is overridden per-test via a scoped env var guard so that
+    /// `Config::load()` picks up the mock server URL.
     #[tokio::test]
     async fn test_process_transcript_success_with_mock_ollama() {
         use wiremock::matchers::{method, path};
@@ -400,11 +400,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    /// T16-2: process_transcript falls back gracefully when Ollama is unavailable.
+    /// T16-2: `process_transcript` falls back gracefully when Ollama is unavailable.
     ///
     /// Port 19999 is chosen as an unused local port that will refuse connections
-    /// immediately. OllamaClient::new() validates the host is localhost, which
-    /// 127.0.0.1 satisfies, so it constructs but is_available() returns false.
+    /// immediately. `OllamaClient::new()` validates the host is localhost, which
+    /// 127.0.0.1 satisfies, so it constructs but `is_available()` returns false.
     #[tokio::test]
     async fn test_process_transcript_fallback_when_ollama_unavailable() {
         // Arrange — write a small transcript
@@ -448,9 +448,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    /// T16-3: count_transcript_tokens with a known structure returns correct token counts.
+    /// T16-3: `count_transcript_tokens` with a known structure returns correct token counts.
     ///
-    /// estimate_tokens formula: (len + 3) / 4
+    /// `estimate_tokens` formula: (len + 3) / 4
     ///   "user msg"      = 8  chars → (8+3)/4  = 2 tokens  (integer division)
     ///   "assistant msg" = 13 chars → (13+3)/4 = 4 tokens
     #[test]
@@ -481,9 +481,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    /// T16-4: build_transcript_text does not panic on multi-byte UTF-8 content.
+    /// T16-4: `build_transcript_text` does not panic on multi-byte UTF-8 content.
     ///
-    /// Exercises the truncate_to_char_boundary path inside build_transcript_text
+    /// Exercises the `truncate_to_char_boundary` path inside `build_transcript_text`
     /// when a message exceeds 500 chars and contains multi-byte characters.
     #[test]
     fn test_process_transcript_utf8_safety_no_panic() {

@@ -317,7 +317,7 @@ mod tests {
         insta::assert_snapshot!("settings_tab_load_error", rendered);
     }
 
-    /// Settings tab with no config loaded and no error (settings_editing_config
+    /// Settings tab with no config loaded and no error (`settings_editing_config`
     /// is None by default) — renders the empty field placeholder.
     #[test]
     fn test_snapshot_settings_tab_no_config() {

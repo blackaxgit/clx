@@ -129,7 +129,7 @@ mod tests {
     ///
     /// The function stores the embedding to the default DB path (under HOME).
     /// We redirect HOME to a temp directory so the real ~/.clx is untouched.
-    /// Wiremock binds to 127.0.0.1, which OllamaClient accepts as localhost.
+    /// Wiremock binds to 127.0.0.1, which `OllamaClient` accepts as localhost.
     #[tokio::test]
     async fn test_generate_and_store_embedding_success() {
         use wiremock::matchers::{method, path};
@@ -187,11 +187,11 @@ mod tests {
     }
 
     /// T19-2: Timeout path — mock server delays longer than the 5-second internal
-    /// timeout in generate_and_store_embedding; function must return Ok(()) without
+    /// timeout in `generate_and_store_embedding`; function must return `Ok(())` without
     /// panicking (timeout is caught and logged as a warning).
     ///
-    /// We use a 6-second response delay on /api/embeddings so the 5-second
-    /// tokio::time::timeout inside the production code fires first.
+    /// We use a 6-second response delay on `/api/embeddings` so the 5-second
+    /// `tokio::time::timeout` inside the production code fires first.
     #[tokio::test]
     async fn test_generate_and_store_embedding_timeout_no_panic() {
         use std::time::Duration;
@@ -249,11 +249,11 @@ mod tests {
     }
 
     /// T19-3: Long text path — a very long input string is passed; the function
-    /// must not panic (OllamaClient itself has a MAX_RESPONSE_SIZE guard and the
-    /// request succeeds or gracefully degrades). We verify truncate_to_char_boundary
-    /// handles extreme lengths and that the overall call returns Ok(()).
+    /// must not panic (`OllamaClient` itself has a `MAX_RESPONSE_SIZE` guard and the
+    /// request succeeds or gracefully degrades). We verify `truncate_to_char_boundary`
+    /// handles extreme lengths and that the overall call returns `Ok(())`.
     ///
-    /// Because generate_and_store_embedding delegates to OllamaClient which sends
+    /// Because `generate_and_store_embedding` delegates to `OllamaClient` which sends
     /// the text as-is, the "truncation before sending" contract lives at the caller
     /// level. This test verifies the function is panic-free for very long inputs.
     #[tokio::test]

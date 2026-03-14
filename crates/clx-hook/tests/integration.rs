@@ -343,7 +343,7 @@ fn test_hook_malformed_input_does_not_crash() {
 // =========================================================================
 
 /// T11-1: Normal tool use event is logged without producing stdout output
-/// (PostToolUse only emits stdout when context pressure triggers).
+/// (`PostToolUse` only emits stdout when context pressure triggers).
 #[test]
 fn test_post_tool_use_normal_event_logged_successfully() {
     let input = serde_json::json!({
@@ -374,7 +374,7 @@ fn test_post_tool_use_normal_event_logged_successfully() {
     }
 }
 
-/// T11-2: Bash command is extracted from tool_input and tracked for learning.
+/// T11-2: Bash command is extracted from `tool_input` and tracked for learning.
 /// The handler must not crash and must exit cleanly.
 #[test]
 fn test_post_tool_use_bash_command_extraction() {
@@ -430,8 +430,7 @@ fn test_post_tool_use_context_pressure_warning_emitted() {
         for _ in 0..3 {
             writeln!(
                 f,
-                "{{\"type\":\"assistant\",\"message\":\"{}\"}}",
-                big_content
+                "{{\"type\":\"assistant\",\"message\":\"{big_content}\"}}"
             )
             .unwrap();
         }
@@ -486,7 +485,7 @@ fn test_post_tool_use_context_pressure_warning_emitted() {
     );
 }
 
-/// T11-4: Auto-learning trigger — Bash command executed (tool_response present)
+/// T11-4: Auto-learning trigger — Bash command executed (`tool_response` present)
 /// is tracked; no-response commands are not. Handler must complete cleanly either way.
 #[test]
 fn test_post_tool_use_auto_learning_executed_vs_not_executed() {
@@ -574,7 +573,7 @@ fn test_pre_compact_snapshot_created_without_transcript() {
     }
 }
 
-/// T12-2: Trigger field controls SnapshotTrigger variant — both "auto" and
+/// T12-2: Trigger field controls `SnapshotTrigger` variant — both "auto" and
 /// "manual" triggers must complete without error.
 #[test]
 fn test_pre_compact_auto_and_manual_trigger() {
@@ -777,7 +776,7 @@ fn test_session_start_new_session_creates_and_emits_system_message() {
     );
 }
 
-/// T13-2: Resume detection — when the same session_id is sent twice, the
+/// T13-2: Resume detection — when the same `session_id` is sent twice, the
 /// second call detects an existing session and logs a resume.
 #[test]
 fn test_session_start_resumed_session_detection() {
@@ -1262,10 +1261,10 @@ fn test_session_end_token_count_reported_on_stderr() {
 // T31 — UserPromptSubmit handler (4 tests)
 // =========================================================================
 
-/// T31-1: Recall success path — seed storage with a prior session (via SessionStart +
-/// PreCompact), then send a UserPromptSubmit with a matching prompt. The handler
-/// must always produce valid JSON with hookEventName = "UserPromptSubmit" and
-/// additionalContext containing at least the orchestrator reminder.
+/// T31-1: Recall success path — seed storage with a prior session (via `SessionStart` +
+/// `PreCompact`), then send a `UserPromptSubmit` with a matching prompt. The handler
+/// must always produce valid JSON with `hookEventName` = "`UserPromptSubmit`" and
+/// `additionalContext` containing at least the orchestrator reminder.
 ///
 /// NOTE: The recall engine requires Ollama for embedding generation. In CI/test
 /// environments Ollama is not available, so the handler falls back gracefully to
@@ -1454,7 +1453,7 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
     );
 }
 
-/// T31-3: Recall error swallowing — no Ollama available and auto_recall enabled.
+/// T31-3: Recall error swallowing — no Ollama available and `auto_recall` enabled.
 /// The handler must swallow all errors internally and still produce valid JSON with
 /// the orchestrator reminder injected into additionalContext. No panic allowed.
 #[test]
@@ -1535,7 +1534,7 @@ fn test_user_prompt_submit_recall_error_swallowed_no_panic() {
     );
 }
 
-/// T31-4: Empty storage — call UserPromptSubmit against empty storage (no prior
+/// T31-4: Empty storage — call `UserPromptSubmit` against empty storage (no prior
 /// sessions). Recall finds no results; handler must still produce valid JSON with
 /// the orchestrator reminder and no recall context appended.
 #[test]
