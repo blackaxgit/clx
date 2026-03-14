@@ -722,8 +722,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/embeddings"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(mock_embedding_json, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(mock_embedding_json, "application/json"),
             )
             .mount(&server)
             .await;
@@ -785,8 +784,7 @@ mod tests {
         );
         assert!(
             hits.iter().any(|h| {
-                h.search_type == RecallSearchType::Fts5
-                    || h.search_type == RecallSearchType::Text
+                h.search_type == RecallSearchType::Fts5 || h.search_type == RecallSearchType::Text
             }),
             "hits should come from FTS5 or text search, got: {:?}",
             hits.iter().map(|h| h.search_type).collect::<Vec<_>>()

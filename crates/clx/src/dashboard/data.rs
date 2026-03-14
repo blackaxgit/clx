@@ -295,7 +295,12 @@ mod tests {
         Storage::open_in_memory().expect("in-memory storage must open")
     }
 
-    fn make_session(id: &str, input_tokens: i64, output_tokens: i64, started: DateTime<Utc>) -> Session {
+    fn make_session(
+        id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        started: DateTime<Utc>,
+    ) -> Session {
         Session {
             id: SessionId::new(id),
             project_path: "/test/project".to_string(),

@@ -367,7 +367,10 @@ fn test_post_tool_use_normal_event_logged_successfully() {
         let hook_event = parsed["hookSpecificOutput"]["hookEventName"]
             .as_str()
             .unwrap_or("");
-        assert_eq!(hook_event, "PostToolUse", "hookEventName must be PostToolUse");
+        assert_eq!(
+            hook_event, "PostToolUse",
+            "hookEventName must be PostToolUse"
+        );
     }
 }
 
@@ -402,8 +405,7 @@ fn test_post_tool_use_context_pressure_warning_emitted() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-post-pressure-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-post-pressure-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // Write config enabling context pressure in "notify" mode with a low window
@@ -515,12 +517,14 @@ fn test_post_tool_use_auto_learning_executed_vs_not_executed() {
     let (stdout_no_exec, _) = run_hook(&input_not_executed.to_string());
 
     // Both must exit cleanly; any stdout must parse as JSON
-    for (label, stdout) in [("executed", &stdout_exec), ("not_executed", &stdout_no_exec)] {
+    for (label, stdout) in [
+        ("executed", &stdout_exec),
+        ("not_executed", &stdout_no_exec),
+    ] {
         if !stdout.trim().is_empty() {
-            let _: serde_json::Value =
-                serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-                    panic!("PostToolUse ({label}) must emit valid JSON: {e}\nOutput: {stdout}")
-                });
+            let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+                panic!("PostToolUse ({label}) must emit valid JSON: {e}\nOutput: {stdout}")
+            });
         }
     }
 }
@@ -585,12 +589,9 @@ fn test_pre_compact_auto_and_manual_trigger() {
         let (stdout, _stderr) = run_hook(&input.to_string());
 
         if !stdout.trim().is_empty() {
-            let _: serde_json::Value =
-                serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-                    panic!(
-                        "PreCompact (trigger={trigger}) must emit valid JSON: {e}\nOutput: {stdout}"
-                    )
-                });
+            let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+                panic!("PreCompact (trigger={trigger}) must emit valid JSON: {e}\nOutput: {stdout}")
+            });
         }
     }
 }
@@ -756,15 +757,17 @@ fn test_session_start_new_session_creates_and_emits_system_message() {
         "SessionStart must always emit JSON output"
     );
 
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("SessionStart must emit valid JSON: {e}\nOutput: {stdout}")
-    });
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("SessionStart must emit valid JSON: {e}\nOutput: {stdout}"));
 
     // Must reference the correct hook event
     let hook_event = parsed["hookSpecificOutput"]["hookEventName"]
         .as_str()
         .unwrap_or("");
-    assert_eq!(hook_event, "SessionStart", "hookEventName must be SessionStart");
+    assert_eq!(
+        hook_event, "SessionStart",
+        "hookEventName must be SessionStart"
+    );
 
     // systemMessage must contain CLX tools reminder
     let system_msg = parsed["systemMessage"].as_str().unwrap_or("");
@@ -780,8 +783,7 @@ fn test_session_start_new_session_creates_and_emits_system_message() {
 fn test_session_start_resumed_session_detection() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-start-resume-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-start-resume-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     let input = serde_json::json!({
@@ -817,7 +819,10 @@ fn test_session_start_resumed_session_detection() {
 
     // First call — creates the session
     let (stdout1, _) = run(binary, &temp_home, &input_str);
-    assert!(!stdout1.trim().is_empty(), "First SessionStart must emit JSON");
+    assert!(
+        !stdout1.trim().is_empty(),
+        "First SessionStart must emit JSON"
+    );
 
     // Second call — should detect existing session (resume path)
     let (stdout2, _stderr2) = run(binary, &temp_home, &input_str);
@@ -845,8 +850,7 @@ fn test_session_start_previous_summary_injected() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-start-summary-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-start-summary-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // Seed the storage with a previous session + snapshot using clx-core directly
@@ -872,7 +876,11 @@ fn test_session_start_previous_summary_injected() {
     let transcript_path = data_dir.join("prior_session_transcript.jsonl");
     {
         let mut f = std::fs::File::create(&transcript_path).unwrap();
-        writeln!(f, "{{\"type\":\"user\",\"message\":\"implement feature X\"}}").unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"user\",\"message\":\"implement feature X\"}}"
+        )
+        .unwrap();
         writeln!(
             f,
             "{{\"type\":\"assistant\",\"message\":\"Done, feature X implemented.\"}}"
@@ -880,25 +888,24 @@ fn test_session_start_previous_summary_injected() {
         .unwrap();
     }
 
-    let run_hook_isolated =
-        |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
-            let mut child = std::process::Command::new(binary)
-                .env("HOME", temp_home)
-                .env("CLX_LOG", "error")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(body.to_string().as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
+    let run_hook_isolated = |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
+        let mut child = std::process::Command::new(binary)
+            .env("HOME", temp_home)
+            .env("CLX_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
 
     let project_str = project_cwd.to_str().unwrap();
 
@@ -958,9 +965,7 @@ fn test_session_start_previous_summary_injected() {
     );
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "New SessionStart (with prior summary) must emit valid JSON: {e}\nOutput: {stdout}"
-        )
+        panic!("New SessionStart (with prior summary) must emit valid JSON: {e}\nOutput: {stdout}")
     });
 
     // The systemMessage should contain either a previous session block or CLX tools
@@ -980,8 +985,7 @@ fn test_session_start_project_rules_injected() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-start-rules-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-start-rules-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // Create a project directory with a CLAUDE.md that has a CRITICAL section
@@ -1107,8 +1111,7 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-end-snapshot-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-end-snapshot-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // Disable Ollama to avoid timeout delay in CI
@@ -1187,9 +1190,7 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
 
     if !stdout.trim().is_empty() {
         let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!(
-                "SessionEnd (with transcript) must emit valid JSON: {e}\nOutput: {stdout}"
-            )
+            panic!("SessionEnd (with transcript) must emit valid JSON: {e}\nOutput: {stdout}")
         });
     }
 }
@@ -1220,8 +1221,7 @@ fn test_session_end_no_session_found_graceful() {
 #[test]
 fn test_session_end_token_count_reported_on_stderr() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-end-tokens-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-end-tokens-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     let input = serde_json::json!({
@@ -1274,8 +1274,7 @@ fn test_session_end_token_count_reported_on_stderr() {
 #[test]
 fn test_user_prompt_submit_recall_success_produces_valid_json() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-ups-recall-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-ups-recall-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // Disable Ollama to force the graceful-degradation path (no embedding service
@@ -1289,25 +1288,24 @@ fn test_user_prompt_submit_recall_success_produces_valid_json() {
     .unwrap();
 
     // Seed storage: start a prior session so storage is non-empty.
-    let run_hook_isolated =
-        |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
-            let mut child = std::process::Command::new(binary)
-                .env("HOME", temp_home)
-                .env("CLX_LOG", "error")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(body.to_string().as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
+    let run_hook_isolated = |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
+        let mut child = std::process::Command::new(binary)
+            .env("HOME", temp_home)
+            .env("CLX_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
 
     // Create a prior session to ensure the database file exists.
     run_hook_isolated(
@@ -1356,9 +1354,8 @@ fn test_user_prompt_submit_recall_success_produces_valid_json() {
         "UserPromptSubmit must always emit JSON output"
     );
 
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("UserPromptSubmit must emit valid JSON: {e}\nOutput: {stdout}")
-    });
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("UserPromptSubmit must emit valid JSON: {e}\nOutput: {stdout}"));
 
     // hookEventName must identify the hook.
     assert_eq!(
@@ -1387,8 +1384,7 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
     use std::time::Instant;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-ups-timeout-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-ups-timeout-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // Point Ollama at an unreachable port with the minimum allowed timeout (100 ms).
@@ -1446,9 +1442,7 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
     );
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "UserPromptSubmit (timeout path) must emit valid JSON: {e}\nOutput: {stdout}"
-        )
+        panic!("UserPromptSubmit (timeout path) must emit valid JSON: {e}\nOutput: {stdout}")
     });
 
     assert_eq!(
@@ -1466,8 +1460,7 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
 #[test]
 fn test_user_prompt_submit_recall_error_swallowed_no_panic() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-ups-error-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-ups-error-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     // No Ollama available; auto_recall enabled. All recall errors must be swallowed.
@@ -1520,9 +1513,7 @@ fn test_user_prompt_submit_recall_error_swallowed_no_panic() {
     );
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "UserPromptSubmit (error swallow path) must emit valid JSON: {e}\nOutput: {stdout}"
-        )
+        panic!("UserPromptSubmit (error swallow path) must emit valid JSON: {e}\nOutput: {stdout}")
     });
 
     // hookEventName must be correct.
@@ -1566,9 +1557,7 @@ fn test_user_prompt_submit_empty_storage_valid_output() {
     );
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "UserPromptSubmit (empty storage) must emit valid JSON: {e}\nOutput: {stdout}"
-        )
+        panic!("UserPromptSubmit (empty storage) must emit valid JSON: {e}\nOutput: {stdout}")
     });
 
     // hookEventName must identify the correct hook event.

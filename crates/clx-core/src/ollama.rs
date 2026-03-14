@@ -607,8 +607,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/api/embeddings"))
                 .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_delay(Duration::from_secs(30)), // far exceeds the 100 ms timeout
+                    ResponseTemplate::new(200).set_delay(Duration::from_secs(30)), // far exceeds the 100 ms timeout
                 )
                 .mount(&server)
                 .await;
@@ -627,10 +626,8 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/api/embeddings"))
                 .respond_with(
-                    ResponseTemplate::new(200).set_body_raw(
-                        r#"{"embedding":[0.5,0.6,0.7,0.8]}"#,
-                        "application/json",
-                    ),
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"embedding":[0.5,0.6,0.7,0.8]}"#, "application/json"),
                 )
                 .mount(&server)
                 .await;
@@ -654,10 +651,8 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/api/generate"))
                 .respond_with(
-                    ResponseTemplate::new(200).set_body_raw(
-                        r#"{"response":"text","done":true}"#,
-                        "application/json",
-                    ),
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"response":"text","done":true}"#, "application/json"),
                 )
                 .mount(&server)
                 .await;
@@ -667,7 +662,10 @@ mod tests {
 
             // Assert
             let text = result.expect("generate should succeed");
-            assert!(text.contains("text"), "response should contain 'text', got: {text}");
+            assert!(
+                text.contains("text"),
+                "response should contain 'text', got: {text}"
+            );
         }
 
         #[tokio::test]
@@ -719,8 +717,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/api/tags"))
                 .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_raw(r#"{"models":[]}"#, "application/json"),
+                    ResponseTemplate::new(200).set_body_raw(r#"{"models":[]}"#, "application/json"),
                 )
                 .mount(&server)
                 .await;
@@ -763,7 +760,10 @@ mod tests {
             let available = client.is_available().await;
 
             // Assert — a 500 response is not a success; the client must report unavailable
-            assert!(!available, "HTTP 500 must cause is_available() to return false");
+            assert!(
+                !available,
+                "HTTP 500 must cause is_available() to return false"
+            );
         }
 
         // ------------------------------------------------------------------
@@ -776,12 +776,10 @@ mod tests {
             let (server, client) = mock_ollama().await;
             Mock::given(method("GET"))
                 .and(path("/api/tags"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_raw(
-                        r#"{"models":[{"name":"llama3.2:3b"},{"name":"mistral:7b"}]}"#,
-                        "application/json",
-                    ),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    r#"{"models":[{"name":"llama3.2:3b"},{"name":"mistral:7b"}]}"#,
+                    "application/json",
+                ))
                 .mount(&server)
                 .await;
 
@@ -803,8 +801,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/api/tags"))
                 .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_raw(r#"{"models":[]}"#, "application/json"),
+                    ResponseTemplate::new(200).set_body_raw(r#"{"models":[]}"#, "application/json"),
                 )
                 .mount(&server)
                 .await;

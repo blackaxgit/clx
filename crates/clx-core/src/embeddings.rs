@@ -785,10 +785,20 @@ mod tests {
             return;
         }
 
-        store.store_embedding(1, vec![0.1f32; DEFAULT_EMBEDDING_DIM]).unwrap();
-        store.store_embedding(2, vec![0.5f32; DEFAULT_EMBEDDING_DIM]).unwrap();
-        store.store_embedding(3, vec![0.9f32; DEFAULT_EMBEDDING_DIM]).unwrap();
-        assert_eq!(store.count_embeddings().unwrap(), 3, "should have 3 embeddings before rebuild");
+        store
+            .store_embedding(1, vec![0.1f32; DEFAULT_EMBEDDING_DIM])
+            .unwrap();
+        store
+            .store_embedding(2, vec![0.5f32; DEFAULT_EMBEDDING_DIM])
+            .unwrap();
+        store
+            .store_embedding(3, vec![0.9f32; DEFAULT_EMBEDDING_DIM])
+            .unwrap();
+        assert_eq!(
+            store.count_embeddings().unwrap(),
+            3,
+            "should have 3 embeddings before rebuild"
+        );
 
         // Act: rebuild with a different dimension
         let new_dim = 512usize;

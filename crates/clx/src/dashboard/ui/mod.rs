@@ -141,8 +141,8 @@ pub(super) fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     use super::super::app::{App, DashboardTab};
     use super::super::data::{AuditRow, SessionRow};

@@ -409,10 +409,7 @@ mod tests {
         // Assert — only one rule exists for this pattern (ON CONFLICT DO UPDATE)
         let pattern = extract_command_pattern(command);
         let all_rules = storage.get_rules().expect("get_rules");
-        let matching: Vec<_> = all_rules
-            .iter()
-            .filter(|r| r.pattern == pattern)
-            .collect();
+        let matching: Vec<_> = all_rules.iter().filter(|r| r.pattern == pattern).collect();
         assert_eq!(
             matching.len(),
             1,

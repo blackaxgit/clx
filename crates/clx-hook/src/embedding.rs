@@ -136,8 +136,8 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         // Arrange — isolated HOME so DB writes go to a temp directory
-        let temp_home = std::env::temp_dir()
-            .join(format!("clx-t19-success-{}", std::process::id()));
+        let temp_home =
+            std::env::temp_dir().join(format!("clx-t19-success-{}", std::process::id()));
         std::fs::create_dir_all(&temp_home).unwrap();
 
         let server = MockServer::start().await;
@@ -221,8 +221,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let temp_home = std::env::temp_dir()
-            .join(format!("clx-t19-timeout-{}", std::process::id()));
+        let temp_home =
+            std::env::temp_dir().join(format!("clx-t19-timeout-{}", std::process::id()));
         std::fs::create_dir_all(&temp_home).unwrap();
 
         #[allow(unsafe_code)]
@@ -278,14 +278,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/embeddings"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(r#"{"embedding":[0.9,0.8,0.7]}"#),
+                ResponseTemplate::new(200).set_body_string(r#"{"embedding":[0.9,0.8,0.7]}"#),
             )
             .mount(&server)
             .await;
 
-        let temp_home = std::env::temp_dir()
-            .join(format!("clx-t19-longtext-{}", std::process::id()));
+        let temp_home =
+            std::env::temp_dir().join(format!("clx-t19-longtext-{}", std::process::id()));
         std::fs::create_dir_all(&temp_home).unwrap();
 
         #[allow(unsafe_code)]

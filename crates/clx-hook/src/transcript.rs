@@ -357,18 +357,15 @@ mod tests {
             r#"{"summary":"Discussed Rust testing","key_facts":["used wiremock"],"todos":[]}"#;
         Mock::given(method("POST"))
             .and(path("/api/generate"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(format!(
-                    r#"{{"response":{json},"done":true}}"#,
-                    json = serde_json::to_string(summary_json).unwrap()
-                )),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"response":{json},"done":true}}"#,
+                json = serde_json::to_string(summary_json).unwrap()
+            )))
             .mount(&server)
             .await;
 
         // Write a small transcript file
-        let temp_dir = std::env::temp_dir()
-            .join(format!("clx-t16-success-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("clx-t16-success-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let transcript_path = temp_dir.join("transcript.jsonl");
         write_transcript(
@@ -411,8 +408,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_transcript_fallback_when_ollama_unavailable() {
         // Arrange — write a small transcript
-        let temp_dir = std::env::temp_dir()
-            .join(format!("clx-t16-fallback-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("clx-t16-fallback-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let transcript_path = temp_dir.join("transcript.jsonl");
         write_transcript(
@@ -438,11 +435,10 @@ mod tests {
         }
 
         // Assert — function completes without panic and provides a fallback summary
-        let summary = result.summary.expect("summary should be Some even when Ollama unavailable");
-        assert!(
-            !summary.is_empty(),
-            "fallback summary must be non-empty"
-        );
+        let summary = result
+            .summary
+            .expect("summary should be Some even when Ollama unavailable");
+        assert!(!summary.is_empty(), "fallback summary must be non-empty");
         assert_eq!(
             result.message_count,
             Some(2),
@@ -461,8 +457,7 @@ mod tests {
     fn test_count_transcript_tokens_known_structure() {
         use std::io::Write;
 
-        let temp_dir = std::env::temp_dir()
-            .join(format!("clx-t16-tokens-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("clx-t16-tokens-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let transcript_path = temp_dir.join("transcript.jsonl");
 
@@ -511,7 +506,10 @@ mod tests {
         // Must not panic even though slicing at byte 500 would split a 3-byte character.
         let text = build_transcript_text(&entries);
         assert!(text.contains("[user]:"), "should contain user label");
-        assert!(text.contains("[assistant]:"), "should contain assistant label");
+        assert!(
+            text.contains("[assistant]:"),
+            "should contain assistant label"
+        );
         assert!(text.contains("..."), "truncation marker should be present");
         // Result must be valid UTF-8 (no panics from bad slicing)
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());

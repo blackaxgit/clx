@@ -612,10 +612,7 @@ fn test_load_previous_session_summary_returns_summary_from_previous_session() {
 
     // Assert
     assert!(result.is_some());
-    assert_eq!(
-        result.unwrap(),
-        "Previous work: implemented feature X"
-    );
+    assert_eq!(result.unwrap(), "Previous work: implemented feature X");
 }
 
 #[test]
@@ -657,9 +654,18 @@ fn test_load_project_rules_returns_content_when_claude_md_exists() {
     // Assert — at minimum the project section is present
     assert!(result.is_some());
     let rules = result.unwrap();
-    assert!(rules.contains("Project Rules"), "expected project header in: {rules}");
-    assert!(rules.contains("[STRICT]"), "expected STRICT marker in: {rules}");
-    assert!(rules.contains("delegate via Task tool"), "expected rule body in: {rules}");
+    assert!(
+        rules.contains("Project Rules"),
+        "expected project header in: {rules}"
+    );
+    assert!(
+        rules.contains("[STRICT]"),
+        "expected STRICT marker in: {rules}"
+    );
+    assert!(
+        rules.contains("delegate via Task tool"),
+        "expected rule body in: {rules}"
+    );
 }
 
 #[test]
@@ -683,11 +689,23 @@ IMPORTANT: Remember to check permissions.
     let result = extract_critical_rules(content);
 
     // Assert — should include the STRICT section and the IMPORTANT line
-    assert!(result.contains("[STRICT]"), "expected STRICT section in: {result}");
-    assert!(result.contains("Never expose secrets"), "expected rule body in: {result}");
-    assert!(result.contains("IMPORTANT:"), "expected IMPORTANT line in: {result}");
+    assert!(
+        result.contains("[STRICT]"),
+        "expected STRICT section in: {result}"
+    );
+    assert!(
+        result.contains("Never expose secrets"),
+        "expected rule body in: {result}"
+    );
+    assert!(
+        result.contains("IMPORTANT:"),
+        "expected IMPORTANT line in: {result}"
+    );
     // Normal sections should not bleed in
-    assert!(!result.contains("Nothing here"), "unexpected normal content in: {result}");
+    assert!(
+        !result.contains("Nothing here"),
+        "unexpected normal content in: {result}"
+    );
 }
 
 // =========================================================================
@@ -732,10 +750,7 @@ fn test_audit_storage_write_and_verify_fields() {
     assert_eq!(fetched.decision, AuditDecision::Allowed);
     assert_eq!(fetched.working_dir.as_deref(), Some("/projects/clx"));
     assert_eq!(fetched.risk_score, Some(2));
-    assert_eq!(
-        fetched.reasoning.as_deref(),
-        Some("Read-only git command")
-    );
+    assert_eq!(fetched.reasoning.as_deref(), Some("Read-only git command"));
 }
 
 #[test]

@@ -1393,13 +1393,18 @@ fn test_open_creates_db_at_path_ending_with_data_clx_db() {
         db_path.display()
     );
     assert_eq!(
-        db_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+        db_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
         Some("data"),
         "parent directory of the db file must be 'data'"
     );
 
     // Assert — the storage is operational
-    let version = storage.schema_version().expect("schema_version must succeed after open");
+    let version = storage
+        .schema_version()
+        .expect("schema_version must succeed after open");
     assert!(version >= 0, "schema version must be non-negative");
 }
 
@@ -1410,7 +1415,9 @@ fn test_open_default_succeeds_and_is_functional() {
     let storage = Storage::open_default().expect("open_default should succeed");
 
     // Assert: the resulting storage responds to schema queries without error.
-    let version = storage.schema_version().expect("schema_version should work on default db");
+    let version = storage
+        .schema_version()
+        .expect("schema_version should work on default db");
     assert!(version >= 0, "schema version must be non-negative");
 }
 
@@ -1428,7 +1435,10 @@ fn test_open_default_path_resolves_to_expected_components() {
 
     // Parent directory component must be "data".
     assert_eq!(
-        db_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+        db_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
         Some("data"),
         "parent of database file must be 'data'"
     );

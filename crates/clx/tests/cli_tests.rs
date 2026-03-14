@@ -121,10 +121,7 @@ fn config_reset_json_exits_zero() {
 #[test]
 fn config_unknown_subcommand_exits_nonzero() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["config", "bogus"])
-        .assert()
-        .failure();
+    clx(&tmp).args(["config", "bogus"]).assert().failure();
 }
 
 // ---------------------------------------------------------------------------
@@ -134,10 +131,7 @@ fn config_unknown_subcommand_exits_nonzero() {
 #[test]
 fn rules_list_exits_zero() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["rules", "list"])
-        .assert()
-        .success();
+    clx(&tmp).args(["rules", "list"]).assert().success();
 }
 
 #[test]
@@ -154,10 +148,7 @@ fn rules_allow_then_list_contains_pattern() {
     let tmp = tmp();
 
     // First install to initialise the database.
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
     clx(&tmp)
         .args(["--json", "rules", "allow", "--global", "cargo build"])
@@ -197,10 +188,7 @@ fn rules_reset_json_exits_zero() {
 #[test]
 fn recall_with_empty_db_exits_zero() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["recall", "some query"])
-        .assert()
-        .success();
+    clx(&tmp).args(["recall", "some query"]).assert().success();
 }
 
 #[test]
@@ -244,24 +232,15 @@ fn recall_fresh_temp_dir_does_not_panic() {
 fn embeddings_status_exits_zero() {
     let tmp = tmp();
     // First install to initialise the database so the embedding store exists.
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
-    clx(&tmp)
-        .args(["embeddings", "status"])
-        .assert()
-        .success();
+    clx(&tmp).args(["embeddings", "status"]).assert().success();
 }
 
 #[test]
 fn embeddings_rebuild_dry_run_exits_zero() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
     clx(&tmp)
         .args(["--json", "embeddings", "rebuild", "--dry-run"])
@@ -272,10 +251,7 @@ fn embeddings_rebuild_dry_run_exits_zero() {
 #[test]
 fn embed_backfill_dry_run_exits_zero_on_fresh_db() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
     // With vector search disabled (no sqlite-vec), the command exits 0 with
     // a graceful message rather than panicking.
@@ -288,10 +264,7 @@ fn embed_backfill_dry_run_exits_zero_on_fresh_db() {
 #[test]
 fn embed_backfill_without_ollama_does_not_panic() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
     // Without Ollama running the command either exits 0 with a graceful
     // "not available" message or exits non-zero; it must never panic.
@@ -342,11 +315,7 @@ fn credentials_delete_missing_key_does_not_panic() {
     let tmp = tmp();
     // Deleting a non-existent key may succeed or fail gracefully; no panic.
     let status = clx(&tmp)
-        .args([
-            "credentials",
-            "delete",
-            "CLX_TEST_KEY_DOES_NOT_EXIST_XYZ",
-        ])
+        .args(["credentials", "delete", "CLX_TEST_KEY_DOES_NOT_EXIST_XYZ"])
         .output()
         .expect("process must spawn");
     assert!(
@@ -397,39 +366,24 @@ fn install_with_isolated_home_exits_zero() {
 #[test]
 fn install_is_idempotent() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
     // Second invocation must also succeed (no error on already-existing dirs).
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 }
 
 #[test]
 fn uninstall_after_install_exits_zero() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
-    clx(&tmp)
-        .args(["--json", "uninstall"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "uninstall"]).assert().success();
 }
 
 #[test]
 fn uninstall_purge_removes_clx_directory() {
     let tmp = tmp();
-    clx(&tmp)
-        .args(["--json", "install"])
-        .assert()
-        .success();
+    clx(&tmp).args(["--json", "install"]).assert().success();
 
     // Confirm ~/.clx was created.
     let clx_dir = tmp.path().join(".clx");
@@ -451,8 +405,5 @@ fn uninstall_purge_removes_clx_directory() {
 fn uninstall_on_fresh_home_exits_zero() {
     // Uninstalling when CLX was never installed must exit 0 gracefully.
     let fresh = tmp();
-    clx(&fresh)
-        .args(["--json", "uninstall"])
-        .assert()
-        .success();
+    clx(&fresh).args(["--json", "uninstall"]).assert().success();
 }

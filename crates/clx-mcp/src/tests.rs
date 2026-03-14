@@ -675,12 +675,18 @@ fn test_remember_without_embedding_infrastructure_still_saves() {
     let result = server.tool_remember(&json!({"text": "embedding failure graceful fallback"}));
 
     // Assert — memory is saved despite missing embedding infrastructure
-    assert!(result.is_ok(), "remember should succeed even without embeddings");
+    assert!(
+        result.is_ok(),
+        "remember should succeed even without embeddings"
+    );
     let snapshots = server
         .storage
         .get_snapshots_by_session("test-session")
         .expect("should retrieve snapshots");
-    assert!(!snapshots.is_empty(), "snapshot must be persisted without embedding");
+    assert!(
+        !snapshots.is_empty(),
+        "snapshot must be persisted without embedding"
+    );
 }
 
 #[test]
@@ -708,7 +714,10 @@ fn test_checkpoint_creates_snapshot_in_storage() {
         .storage
         .get_snapshots_by_session("test-session")
         .expect("should retrieve snapshots");
-    assert!(!snapshots.is_empty(), "checkpoint snapshot must be persisted");
+    assert!(
+        !snapshots.is_empty(),
+        "checkpoint snapshot must be persisted"
+    );
 }
 
 #[test]
@@ -1077,8 +1086,14 @@ fn test_stats_date_range_filtering() {
     let wide: serde_json::Value =
         serde_json::from_str(&wide_text).expect("wide stats must be valid JSON");
 
-    assert_eq!(narrow["period_days"], 1, "narrow window must have period_days=1");
-    assert_eq!(wide["period_days"], 365, "wide window must have period_days=365");
+    assert_eq!(
+        narrow["period_days"], 1,
+        "narrow window must have period_days=1"
+    );
+    assert_eq!(
+        wide["period_days"], 365,
+        "wide window must have period_days=365"
+    );
 
     // The wide window must report at least as many commands as the narrow one
     let narrow_total = narrow["commands"]["total"].as_i64().unwrap_or(0);
@@ -1139,7 +1154,10 @@ fn test_read_bounded_line_normal() {
 
     // Assert
     assert!(result.is_ok());
-    assert!(result.unwrap().is_some(), "should return Some for a normal line");
+    assert!(
+        result.unwrap().is_some(),
+        "should return Some for a normal line"
+    );
     assert_eq!(buf, "hello world");
 }
 
@@ -1155,7 +1173,10 @@ fn test_read_bounded_line_eof_returns_none() {
 
     // Assert
     assert!(result.is_ok());
-    assert!(result.unwrap().is_none(), "empty input must return None (EOF)");
+    assert!(
+        result.unwrap().is_none(),
+        "empty input must return None (EOF)"
+    );
 }
 
 #[test]
