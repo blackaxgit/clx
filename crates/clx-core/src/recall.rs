@@ -685,6 +685,164 @@ mod tests {
         );
     }
 
+    // --- T38: RecallEngine path tests ---
+
+    #[tokio::test]
+    async fn test_t38_semantic_path_with_mock_ollama() {
+        // Arrange: seed storage with a snapshot, then mock Ollama to return an
+        // embedding so that the semantic path in try_semantic() executes.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (storage, snapshot_id) = setup_test_storage(
+            "Rust async runtime tokio integration",
+            "tokio, async, runtime",
+        );
+
+        // Build an embedding that matches DEFAULT_EMBEDDING_DIM (1024).
+        // The EmbeddingStore is in-memory so vector search may not be enabled;
+        // if it isn't we skip gracefully — the semantic path requires it.
+        let emb_store = crate::embeddings::EmbeddingStore::open_in_memory().unwrap();
+        if !emb_store.is_vector_search_enabled() {
+            return; // Skip: sqlite-vec not available
+        }
+
+        // Store the embedding for the seeded snapshot so find_similar can
+        // return it when queried.
+        let stored_emb = vec![1.0f32; crate::embeddings::DEFAULT_EMBEDDING_DIM];
+        emb_store.store_embedding(snapshot_id, stored_emb).unwrap();
+
+        // Mock Ollama: return the same embedding vector for any /api/embeddings
+        // request so the query embedding matches the stored one exactly.
+        let mock_embedding_json = {
+            let values = vec!["1.0"; crate::embeddings::DEFAULT_EMBEDDING_DIM];
+            format!("{{\"embedding\":[{}]}}", values.join(","))
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(mock_embedding_json, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let ollama_config = crate::config::OllamaConfig {
+            host: server.uri(),
+            max_retries: 0,
+            ..crate::config::OllamaConfig::default()
+        };
+        let ollama = crate::ollama::OllamaClient::new(ollama_config)
+            .expect("failed to create OllamaClient for test");
+
+        let engine = RecallEngine::new(&storage, Some(&ollama), Some(&emb_store));
+        let config = RecallQueryConfig {
+            max_results: 5,
+            similarity_threshold: 0.0, // accept all distances
+            fallback_to_fts: false,
+            include_key_facts: true,
+        };
+
+        // Act
+        let hits = engine.query("tokio async", &config).await;
+
+        // Assert: at least one semantic hit should be returned
+        assert!(
+            !hits.is_empty(),
+            "semantic path should return results when Ollama mock returns a matching embedding"
+        );
+        assert!(
+            hits.iter().any(|h| h.snapshot_id == snapshot_id),
+            "results should include the seeded snapshot_id={snapshot_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t38_substring_fallback_when_no_ollama() {
+        // Arrange: seed storage with a recognisable summary; provide no Ollama
+        // client so the semantic path is skipped and the substring fallback runs.
+        let (storage, _) = setup_test_storage(
+            "continuous integration pipeline configuration",
+            "CI, pipeline, yaml",
+        );
+
+        let engine = RecallEngine::new(&storage, None, None);
+        let config = RecallQueryConfig {
+            max_results: 5,
+            similarity_threshold: 0.35,
+            fallback_to_fts: true,
+            include_key_facts: false,
+        };
+
+        // Act — "pipeline" appears in the seeded summary
+        let hits = engine.query("pipeline", &config).await;
+
+        // Assert: substring/FTS fallback must find the seeded snapshot
+        assert!(
+            !hits.is_empty(),
+            "substring/FTS fallback should return results when query matches stored summary"
+        );
+        assert!(
+            hits.iter().any(|h| {
+                h.search_type == RecallSearchType::Fts5
+                    || h.search_type == RecallSearchType::Text
+            }),
+            "hits should come from FTS5 or text search, got: {:?}",
+            hits.iter().map(|h| h.search_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t38_empty_storage_returns_empty() {
+        // Arrange: completely empty in-memory storage (no sessions, no snapshots)
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+
+        let engine = RecallEngine::new(&storage, None, None);
+        let config = RecallQueryConfig {
+            max_results: 10,
+            similarity_threshold: 0.35,
+            fallback_to_fts: true,
+            include_key_facts: false,
+        };
+
+        // Act
+        let hits = engine.query("anything", &config).await;
+
+        // Assert
+        assert!(
+            hits.is_empty(),
+            "query against empty storage must return an empty result set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t38_no_match_returns_empty() {
+        // Arrange: seed storage with content that will NOT match the query term
+        let (storage, _) = setup_test_storage(
+            "GraphQL schema design and resolver patterns",
+            "graphql, schema, resolver",
+        );
+
+        let engine = RecallEngine::new(&storage, None, None);
+        let config = RecallQueryConfig {
+            max_results: 10,
+            similarity_threshold: 0.35,
+            fallback_to_fts: true,
+            include_key_facts: false,
+        };
+
+        // Act — this term does not appear anywhere in the seeded data
+        let hits = engine.query("xyzzy_no_match_qqqqqq", &config).await;
+
+        // Assert
+        assert!(
+            hits.is_empty(),
+            "query with a non-matching term must return an empty result set, got {} hits",
+            hits.len()
+        );
+    }
+
     /// Helper to construct a test `RecallHit`.
     fn make_hit(snapshot_id: i64, score: f64, search_type: RecallSearchType) -> RecallHit {
         RecallHit {

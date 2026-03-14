@@ -75,6 +75,8 @@ pub fn learned_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -90,5 +92,45 @@ mod tests {
 
         let ld = lib_dir();
         assert!(ld.ends_with(".clx/lib"));
+    }
+
+    #[test]
+    fn clx_dir_ends_with_dot_clx() {
+        let dir = clx_dir();
+        assert!(
+            dir.ends_with(".clx"),
+            "clx_dir() should end with '.clx', got: {}",
+            dir.display()
+        );
+    }
+
+    #[rstest]
+    #[case(prompts_dir(), "prompts")]
+    #[case(rules_dir(), "rules")]
+    #[case(bin_dir(), "bin")]
+    #[case(logs_dir(), "logs")]
+    #[case(learned_dir(), "learned")]
+    fn each_dir_ends_with_correct_suffix(#[case] path: PathBuf, #[case] suffix: &str) {
+        assert!(
+            path.ends_with(suffix),
+            "{suffix} dir should end with '{suffix}', got: {}",
+            path.display()
+        );
+    }
+
+    #[rstest]
+    #[case(prompts_dir())]
+    #[case(rules_dir())]
+    #[case(bin_dir())]
+    #[case(logs_dir())]
+    #[case(learned_dir())]
+    fn each_dir_is_child_of_clx_dir(#[case] path: PathBuf) {
+        let base = clx_dir();
+        assert!(
+            path.starts_with(&base),
+            "{} should be a child of {}",
+            path.display(),
+            base.display()
+        );
     }
 }

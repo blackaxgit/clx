@@ -1,0 +1,10 @@
+---
+source: crates/clx-hook/src/tests.rs
+expression: value
+---
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart"
+  },
+  "systemMessage": "Previous session: task was X"
+}

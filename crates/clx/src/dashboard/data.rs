@@ -285,6 +285,105 @@ impl DashboardData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
+    use clx_core::storage::Storage;
+    use clx_core::types::{Session, SessionId, SessionStatus};
+
+    // ---- T33 helpers ----
+
+    fn make_storage() -> Storage {
+        Storage::open_in_memory().expect("in-memory storage must open")
+    }
+
+    fn make_session(id: &str, input_tokens: i64, output_tokens: i64, started: DateTime<Utc>) -> Session {
+        Session {
+            id: SessionId::new(id),
+            project_path: "/test/project".to_string(),
+            transcript_path: None,
+            started_at: started,
+            ended_at: Some(started + ChronoDuration::minutes(5)),
+            source: clx_core::types::SessionSource::Startup,
+            message_count: 2,
+            command_count: 1,
+            input_tokens,
+            output_tokens,
+            status: SessionStatus::Ended,
+        }
+    }
+
+    // ---- T33: fetch_from_storage tests ----
+
+    #[test]
+    fn test_fetch_from_empty_storage_returns_zeros() {
+        // Arrange
+        let storage = make_storage();
+        // Act
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        // Assert: all numeric aggregates must be zero/empty with no errors
+        assert_eq!(data.total_sessions, 0);
+        assert_eq!(data.active_sessions, 0);
+        assert_eq!(data.total_input_tokens, 0);
+        assert_eq!(data.total_output_tokens, 0);
+        assert_eq!(data.total_commands, 0);
+        assert!(data.sessions.is_empty());
+        assert!(data.audit_entries.is_empty());
+        assert!(data.load_error.is_none());
+    }
+
+    #[test]
+    fn test_fetch_from_seeded_storage_populates_sessions() {
+        // Arrange
+        let storage = make_storage();
+        let now = Utc::now();
+        let s1 = make_session("abcdef0001", 100, 50, now);
+        let s2 = make_session("abcdef0002", 200, 80, now - ChronoDuration::hours(1));
+        storage.create_session(&s1).expect("create s1");
+        storage.create_session(&s2).expect("create s2");
+        // Act
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        // Assert
+        assert_eq!(data.total_sessions, 2);
+        assert_eq!(data.sessions.len(), 2);
+        assert!(data.load_error.is_none());
+    }
+
+    #[test]
+    fn test_fetch_date_filter_excludes_old_sessions() {
+        // Arrange: one recent session, one 30-day-old session
+        let storage = make_storage();
+        let now = Utc::now();
+        let recent = make_session("recent0001", 10, 5, now - ChronoDuration::hours(1));
+        let old = make_session("old0000001", 10, 5, now - ChronoDuration::days(30));
+        storage.create_session(&recent).expect("create recent");
+        storage.create_session(&old).expect("create old");
+        // Apply a 7-day filter
+        let since = Some(now - ChronoDuration::days(7));
+        // Act
+        let data = DashboardData::fetch_from_storage(&storage, since);
+        // Assert: only the recent session should appear
+        assert_eq!(data.total_sessions, 1);
+    }
+
+    #[test]
+    fn test_fetch_token_aggregation() {
+        // Arrange: seed 3 sessions with known token counts
+        let storage = make_storage();
+        let now = Utc::now();
+        for i in 0_u8..3 {
+            let session = make_session(
+                &format!("toktest{i:05}"),
+                1000_i64,
+                500_i64,
+                now - ChronoDuration::minutes(i64::from(i) * 10),
+            );
+            storage.create_session(&session).expect("create session");
+        }
+        // Act
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        // Assert: total tokens = 3 * (1000 input + 500 output) = 4500 across all sessions
+        assert_eq!(data.total_input_tokens, 3000);
+        assert_eq!(data.total_output_tokens, 1500);
+    }
 
     // ---- last_n_chars ----
 

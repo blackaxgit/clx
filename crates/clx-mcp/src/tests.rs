@@ -815,6 +815,76 @@ fn test_stats_max_days_boundary() {
 }
 
 // =========================================================================
+// T36 — McpServer::new Integration Tests
+// =========================================================================
+
+#[test]
+fn test_mcp_server_new_creates_db_at_default_path() {
+    // McpServer::new() falls back to clx_core::paths::database_path() when
+    // CLX_DB_PATH is not set. We exercise the real code-path by calling
+    // McpServer::new() directly (CLX_DB_PATH not set in CI / clean env).
+    // The test asserts the call succeeds and the db_path field is non-empty —
+    // verifying that Storage::open ran without error is the key assertion.
+    //
+    // Note: env::set_var is forbidden by workspace `unsafe_code = "deny"`, so
+    // we test the no-env-var code path here and rely on the other T36 tests
+    // (which use create_test_server) for post-init state verification.
+    let result = McpServer::new();
+    assert!(
+        result.is_ok(),
+        "McpServer::new() must succeed with default path: {:?}",
+        result.err()
+    );
+    let server = result.unwrap();
+    assert!(
+        !server.db_path.is_empty(),
+        "db_path should be populated after successful init"
+    );
+}
+
+#[test]
+fn test_mcp_server_new_ollama_is_optional_at_init() {
+    // Verify that McpServer::new() succeeds even when there is no reachable
+    // Ollama server.  The ollama_client field may be None after init — that
+    // is acceptable and tested here.
+    let result = McpServer::new();
+    assert!(
+        result.is_ok(),
+        "McpServer::new() must succeed even when Ollama is unavailable"
+    );
+    // ollama_client is None OR Some — both are valid; what matters is no panic/error.
+    let _ = result.unwrap();
+}
+
+#[test]
+fn test_mcp_server_new_get_tools_returns_all_seven_names() {
+    // Arrange — use create_test_server (in-memory) to exercise get_tools() on
+    // a fully initialised McpServer, verifying all 7 required tool names.
+    let server = create_test_server();
+
+    // Act
+    let tools = server.get_tools();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+    // Assert — all seven expected tools are present
+    assert_eq!(tools.len(), 7, "get_tools() must return exactly 7 tools");
+    for expected in &[
+        "clx_recall",
+        "clx_remember",
+        "clx_checkpoint",
+        "clx_rules",
+        "clx_session_info",
+        "clx_credentials",
+        "clx_stats",
+    ] {
+        assert!(
+            names.contains(expected),
+            "get_tools() is missing '{expected}'"
+        );
+    }
+}
+
+// =========================================================================
 // T22 — Server functions: handle_tools_call and read_bounded_line
 // =========================================================================
 

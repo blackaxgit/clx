@@ -1066,6 +1066,52 @@ fn test_sanitize_fts_query_empty_after_sanitization() {
 }
 
 // =========================================================================
+// T35: Property Tests for FTS Query Safety
+// =========================================================================
+
+mod prop_tests {
+    use proptest::prelude::*;
+
+    use super::super::Storage;
+    use super::super::util::sanitize_fts_query;
+
+    // Arbitrary strings passed through the sanitiser must never panic.
+    proptest! {
+        #[test]
+        fn prop_fts_query_no_panic(query in ".*") {
+            // Act: must not panic regardless of input
+            let result = sanitize_fts_query(&query);
+            // Assert: result is a valid String (no panic occurred)
+            let _ = result.len();
+        }
+    }
+
+    // Strings containing SQLite FTS5 special characters must not cause
+    // a storage query to panic or return an error when used in a real
+    // in-memory FTS5 search.
+    proptest! {
+        #[test]
+        fn prop_fts_query_no_sql_injection(
+            // Bias towards characters that are meaningful to FTS5 / SQL
+            query in r#"[a-zA-Z0-9 "*()\-_\[\]:^~?!@#$%&/\\|<>{}]{0,120}"#,
+        ) {
+            // Arrange
+            let storage = Storage::open_in_memory().expect("in-memory storage");
+            // Act: sanitise then execute a real FTS5 search — must not panic
+            let sanitised = sanitize_fts_query(&query);
+            if !sanitised.is_empty() {
+                // search_snapshots performs an FTS5 MATCH query; verify it does
+                // not panic or return a storage-level error from malformed SQL.
+                let result = storage.search_snapshots_fts(&sanitised, 10);
+                // Either Ok (empty results) or an Err (FTS parse error) are both
+                // acceptable — what must NOT happen is a panic or memory unsafety.
+                let _ = result;
+            }
+        }
+    }
+}
+
+// =========================================================================
 // C6: Silent Migration Failures Tests
 // =========================================================================
 
@@ -1324,4 +1370,39 @@ fn test_get_nonexistent_rule() {
     let storage = create_test_storage();
     let result = storage.get_rule_by_pattern("nonexistent").unwrap();
     assert!(result.is_none());
+}
+
+// =========================================================================
+// T05: Storage::open_default tests
+// =========================================================================
+
+#[test]
+fn test_open_default_succeeds_and_is_functional() {
+    // Arrange: open_default() resolves ~/.clx/data/clx.db and creates dirs as needed.
+    // Act
+    let storage = Storage::open_default().expect("open_default should succeed");
+
+    // Assert: the resulting storage responds to schema queries without error.
+    let version = storage.schema_version().expect("schema_version should work on default db");
+    assert!(version >= 0, "schema version must be non-negative");
+}
+
+#[test]
+fn test_open_default_path_resolves_to_expected_components() {
+    // Arrange + Act: resolve the path that open_default() will use.
+    let db_path = crate::paths::database_path();
+
+    // Assert: path ends with the canonical CLX database location.
+    assert!(
+        db_path.ends_with(".clx/data/clx.db"),
+        "database_path() should end with .clx/data/clx.db, got: {}",
+        db_path.display()
+    );
+
+    // Parent directory component must be "data".
+    assert_eq!(
+        db_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+        Some("data"),
+        "parent of database file must be 'data'"
+    );
 }

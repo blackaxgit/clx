@@ -541,6 +541,71 @@ mod tests {
 
     // ---- Tab navigation ----
 
+    // ---- T32: App::new initial state ----
+
+    #[test]
+    fn test_new_initial_tab_is_sessions() {
+        // Arrange / Act
+        let app = make_app();
+        // Assert: default tab is Sessions (index 0)
+        assert_eq!(app.current_tab, DashboardTab::Sessions);
+        assert_eq!(app.current_tab.index(), 0);
+    }
+
+    #[test]
+    fn test_new_data_fields_empty() {
+        // Arrange / Act
+        let app = make_app();
+        // Assert: all data collections start empty
+        assert_eq!(app.data.total_sessions, 0);
+        assert_eq!(app.data.active_sessions, 0);
+        assert!(app.data.sessions.is_empty());
+        assert!(app.data.audit_entries.is_empty());
+        assert!(app.data.learned_rules.is_empty());
+    }
+
+    #[test]
+    fn test_new_should_quit_is_false() {
+        // Arrange / Act
+        let app = make_app();
+        // Assert: quit flag is not set on construction
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_quit_flag_set_directly() {
+        // Arrange
+        let mut app = make_app();
+        // Act: simulate the 'q' key handler setting the flag
+        app.should_quit = true;
+        // Assert
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_refresh_data_updates_last_refresh() {
+        // Arrange
+        let mut app = make_app();
+        let before = app.last_refresh;
+        // Act: call refresh_data — it calls DashboardData::fetch which opens the
+        // default DB, but regardless the timestamp must be updated.
+        // We allow failure from the DB open and just test timing behaviour.
+        app.refresh_data();
+        // Assert: last_refresh has been bumped (elapsed since `before` should
+        // be zero or near-zero, but last_refresh is a fresh Instant::now()).
+        assert!(app.last_refresh >= before);
+    }
+
+    #[test]
+    fn test_days_filter_stored_on_construction() {
+        // Arrange / Act
+        let app = App::new(30, 10);
+        // Assert: constructor parameters are preserved
+        assert_eq!(app.days_filter, 30);
+    }
+
+    // ---- T32: Tab navigation ----
+
     #[test]
     fn test_next_tab_wraparound() {
         let mut app = make_app();

@@ -1,0 +1,10 @@
+---
+source: crates/clx-hook/src/tests.rs
+expression: value
+---
+{
+  "hookSpecificOutput": {
+    "additionalContext": "Orchestrator context injected",
+    "hookEventName": "UserPromptSubmit"
+  }
+}

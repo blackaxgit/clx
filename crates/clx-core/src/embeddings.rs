@@ -671,4 +671,171 @@ mod tests {
             assert_eq!(store.count_embeddings().unwrap(), 1);
         }
     }
+
+    // --- T04: delete_embedding, has_embedding edge cases, needs_dimension_migration edge cases ---
+
+    #[test]
+    fn test_delete_embedding_without_extension() {
+        // Arrange
+        let store = create_test_store();
+
+        if !store.is_vector_search_enabled() {
+            // Act: delete on a store with no extension should succeed (no-op)
+            let result = store.delete_embedding(42);
+
+            // Assert
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_delete_embedding_removes_row_with_extension() {
+        // Arrange
+        let store = create_test_store();
+
+        if store.is_vector_search_enabled() {
+            let emb = vec![0.1f32; DEFAULT_EMBEDDING_DIM];
+            store.store_embedding(99, emb).unwrap();
+            assert!(store.has_embedding(99).unwrap());
+
+            // Act
+            store.delete_embedding(99).unwrap();
+
+            // Assert
+            assert!(!store.has_embedding(99).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_has_embedding_false_for_different_key() {
+        // Arrange: store an embedding for id=1, then check id=2
+        let store = create_test_store();
+
+        if store.is_vector_search_enabled() {
+            let emb = vec![0.5f32; DEFAULT_EMBEDDING_DIM];
+            store.store_embedding(1, emb).unwrap();
+
+            // Act: check a key that was never stored
+            let result = store.has_embedding(2).unwrap();
+
+            // Assert
+            assert!(!result);
+        }
+    }
+
+    #[test]
+    fn test_needs_dimension_migration_no_table_yet() {
+        // Arrange: open a fresh in-memory store then drop the table to simulate
+        // "no table" state. Without extension, get_table_dimension returns None
+        // and needs_dimension_migration returns false regardless of expected_dim.
+        let store = create_test_store();
+
+        if !store.is_vector_search_enabled() {
+            // Act + Assert: no table, no extension -> false
+            assert!(!store.needs_dimension_migration(DEFAULT_EMBEDDING_DIM));
+            assert!(!store.needs_dimension_migration(512));
+        }
+    }
+
+    #[test]
+    fn test_needs_dimension_migration_returns_false_on_match_with_extension() {
+        // Arrange: store created with DEFAULT_EMBEDDING_DIM
+        let store = create_test_store();
+
+        if store.is_vector_search_enabled() {
+            // Act: check against the same dimension the table was created with
+            let result = store.needs_dimension_migration(DEFAULT_EMBEDDING_DIM);
+
+            // Assert: same dimension -> no migration needed
+            assert!(!result);
+        }
+    }
+
+    // --- T37: EmbeddingStore integration — store_embedding, rebuild_table, find_similar ---
+
+    #[test]
+    fn test_t37_store_embedding_has_embedding_returns_true() {
+        // Arrange
+        let store = create_test_store();
+
+        if !store.is_vector_search_enabled() {
+            // Skip: sqlite-vec extension not available in this environment
+            return;
+        }
+
+        let embedding = vec![0.42f32; DEFAULT_EMBEDDING_DIM];
+
+        // Act
+        store.store_embedding(10, embedding).unwrap();
+
+        // Assert
+        assert!(
+            store.has_embedding(10).unwrap(),
+            "has_embedding should return true after a successful store_embedding call"
+        );
+    }
+
+    #[test]
+    fn test_t37_rebuild_table_clears_all_three_embeddings() {
+        // Arrange: store 3 embeddings with the default dimension
+        let mut store = create_test_store();
+
+        if !store.is_vector_search_enabled() {
+            // Skip: sqlite-vec extension not available in this environment
+            return;
+        }
+
+        store.store_embedding(1, vec![0.1f32; DEFAULT_EMBEDDING_DIM]).unwrap();
+        store.store_embedding(2, vec![0.5f32; DEFAULT_EMBEDDING_DIM]).unwrap();
+        store.store_embedding(3, vec![0.9f32; DEFAULT_EMBEDDING_DIM]).unwrap();
+        assert_eq!(store.count_embeddings().unwrap(), 3, "should have 3 embeddings before rebuild");
+
+        // Act: rebuild with a different dimension
+        let new_dim = 512usize;
+        store.rebuild_table(new_dim).unwrap();
+
+        // Assert: old embeddings cleared, new dimension set
+        assert_eq!(
+            store.count_embeddings().unwrap(),
+            0,
+            "all embeddings must be removed after rebuild_table"
+        );
+        assert_eq!(
+            store.embedding_dim(),
+            new_dim,
+            "embedding_dim should reflect the new dimension after rebuild"
+        );
+
+        // Verify the new table accepts embeddings of the new dimension
+        store.store_embedding(99, vec![0.7f32; new_dim]).unwrap();
+        assert_eq!(store.count_embeddings().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_t37_find_similar_returns_stored_key() {
+        // Arrange: store one embedding and search with an identical query
+        let store = create_test_store();
+
+        if !store.is_vector_search_enabled() {
+            // Skip: sqlite-vec extension not available in this environment
+            return;
+        }
+
+        let embedding = vec![0.8f32; DEFAULT_EMBEDDING_DIM];
+        store.store_embedding(42, embedding.clone()).unwrap();
+
+        // Act
+        let results = store.find_similar(&embedding, 5).unwrap();
+
+        // Assert: the stored key must appear in results
+        assert!(
+            !results.is_empty(),
+            "find_similar should return at least one result after storing an embedding"
+        );
+        let returned_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
+        assert!(
+            returned_ids.contains(&42),
+            "find_similar should include the stored snapshot_id 42 in results, got: {returned_ids:?}"
+        );
+    }
 }
