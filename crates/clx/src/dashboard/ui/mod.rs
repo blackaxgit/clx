@@ -178,6 +178,52 @@ mod tests {
     /// - `HH:MM:SS` clock in the status bar → `<TIME>`
     /// - `Refresh Ns` countdown → `Refresh <N>s`
     fn redact_volatile(s: &str) -> String {
+        // Replace the home directory path so snapshots are portable across
+        // machines (e.g. /Users/blackax vs /home/runner). Because the path
+        // length affects ratatui box-drawing padding, we also normalize each
+        // line to exactly 80 visible characters so border widths are stable.
+        let home = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let s = if home.is_empty() {
+            s.to_string()
+        } else {
+            // After replacing the path, re-pad lines that changed so the
+            // total visible width stays at 80 columns.  The ratatui
+            // TestBackend always renders exactly 80 columns, but the
+            // <HOME> token may be shorter/longer than the real path.
+            let mut lines: Vec<String> = Vec::new();
+            for line in s.lines() {
+                if line.contains(&home) {
+                    let replaced = line.replace(&home, "<HOME>");
+                    let vis_len: usize = replaced.chars().count();
+                    if vis_len >= 80 {
+                        lines.push(replaced.chars().take(80).collect());
+                    } else if replaced.contains('─')
+                        && replaced.trim_end().ends_with('┐')
+                    {
+                        // Insert ─ before the trailing ┐ to fill to 80 cols.
+                        let trimmed = replaced.trim_end_matches('┐');
+                        let mut padded = trimmed.to_string();
+                        for _ in 0..(80 - vis_len) {
+                            padded.push('─');
+                        }
+                        padded.push('┐');
+                        lines.push(padded);
+                    } else {
+                        let mut padded = replaced;
+                        for _ in 0..(80 - vis_len) {
+                            padded.push(' ');
+                        }
+                        lines.push(padded);
+                    }
+                } else {
+                    lines.push(line.to_string());
+                }
+            }
+            lines.join("\n")
+        };
+        let s = &s;
         // Walk through the string replacing HH:MM:SS patterns (all digits with
         // two colons in the right positions) and "Refresh <digits>s" spans.
         let bytes = s.as_bytes();
