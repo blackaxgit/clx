@@ -313,7 +313,154 @@ fn test_hook_trust_mode_expired_token_falls_through() {
 }
 
 // =========================================================================
-// 6. Invalid/malformed input handling
+// 6. Default decision "allow" when Ollama is unavailable
+// =========================================================================
+
+#[test]
+fn test_hook_default_decision_allow_on_ollama_unavailable() {
+    // When L1 is enabled but Ollama is unreachable, the hook should fall back
+    // to the configured default_decision. Here we set it to "allow".
+    let binary = env!("CARGO_BIN_EXE_clx-hook");
+
+    let temp_home =
+        std::env::temp_dir().join(format!("clx-default-allow-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_home).unwrap();
+
+    let clx_dir = temp_home.join(".clx");
+    std::fs::create_dir_all(&clx_dir).unwrap();
+    std::fs::write(
+        clx_dir.join("config.yaml"),
+        "\
+validator:
+  enabled: true
+  layer1_enabled: true
+  default_decision: allow
+  auto_allow_reads: false
+  cache_enabled: false
+ollama:
+  host: \"http://127.0.0.1:19999\"
+  timeout_ms: 1000
+",
+    )
+    .unwrap();
+
+    // Use a non-whitelisted command so L0 does not auto-allow
+    let input = serde_json::json!({
+        "session_id": "test-default-allow-001",
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "tu-default-allow-001",
+        "tool_input": {
+            "command": "python3 -c \"print('hello')\""
+        }
+    });
+
+    let mut child = Command::new(binary)
+        .env("HOME", &temp_home)
+        .env("CLX_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn clx-hook binary");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for clx-hook");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("Failed to parse output: {e}\nOutput: {stdout}"));
+
+    let hook_output = &parsed["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "allow",
+        "default_decision=allow should result in 'allow' when Ollama is unreachable"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+// =========================================================================
+// 7. Default decision "deny" when Ollama is unavailable
+// =========================================================================
+
+#[test]
+fn test_hook_default_decision_deny_on_ollama_unavailable() {
+    // When L1 is enabled but Ollama is unreachable, the hook should fall back
+    // to the configured default_decision. Here we set it to "deny".
+    let binary = env!("CARGO_BIN_EXE_clx-hook");
+
+    let temp_home = std::env::temp_dir().join(format!("clx-default-deny-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_home).unwrap();
+
+    let clx_dir = temp_home.join(".clx");
+    std::fs::create_dir_all(&clx_dir).unwrap();
+    std::fs::write(
+        clx_dir.join("config.yaml"),
+        "\
+validator:
+  enabled: true
+  layer1_enabled: true
+  default_decision: deny
+  auto_allow_reads: false
+  cache_enabled: false
+ollama:
+  host: \"http://127.0.0.1:19999\"
+  timeout_ms: 1000
+",
+    )
+    .unwrap();
+
+    // Use a non-whitelisted command so L0 does not auto-allow
+    let input = serde_json::json!({
+        "session_id": "test-default-deny-001",
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "tu-default-deny-001",
+        "tool_input": {
+            "command": "python3 -c \"print('hello')\""
+        }
+    });
+
+    let mut child = Command::new(binary)
+        .env("HOME", &temp_home)
+        .env("CLX_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn clx-hook binary");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for clx-hook");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("Failed to parse output: {e}\nOutput: {stdout}"));
+
+    let hook_output = &parsed["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "default_decision=deny should result in 'deny' when Ollama is unreachable"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+// =========================================================================
+// 8. Invalid/malformed input handling
 // =========================================================================
 
 #[test]
