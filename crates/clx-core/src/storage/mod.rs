@@ -22,8 +22,10 @@ mod session;
 mod snapshot;
 mod traits;
 mod util;
+mod validation_cache;
 
 pub use traits::StorageBackend;
+pub use validation_cache::CachedDecision;
 
 use rusqlite::Connection;
 use std::fs;

@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 3;
+pub(super) const SCHEMA_VERSION: i32 = 4;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -62,6 +62,10 @@ impl Storage {
                 self.migrate_to_v3()?;
             }
 
+            if current_version < 4 {
+                self.migrate_to_v4()?;
+            }
+
             self.conn.execute(
                 "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
                 [SCHEMA_VERSION],
@@ -84,6 +88,7 @@ impl Storage {
             "learned_rules",
             "analytics",
             "snapshots_fts",
+            "validation_cache",
         ];
         if !VALID_TABLES.contains(&table) {
             return false;
@@ -275,6 +280,30 @@ impl Storage {
         info!("Completed migration to schema version 3 (FTS5 full-text search)");
         Ok(())
     }
+
+    /// Migrate to schema version 4 - add validation decision cache
+    ///
+    /// Wrapped in a transaction so partial failures roll back cleanly.
+    pub(super) fn migrate_to_v4(&self) -> crate::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS validation_cache (
+                cache_key TEXT PRIMARY KEY,
+                decision TEXT NOT NULL,
+                reason TEXT,
+                risk_score INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_validation_cache_expires
+                ON validation_cache(expires_at);",
+        )?;
+
+        tx.commit()?;
+        info!("Completed migration to schema version 4 (validation cache)");
+        Ok(())
+    }
 }
 
 /// Valid table names for `ALTER TABLE` migrations.
@@ -290,6 +319,7 @@ const VALID_MIGRATION_TABLES: &[&str] = &[
     "analytics",
     "embeddings",
     "context_snapshots",
+    "validation_cache",
 ];
 
 /// Add a column to a table, validating table name against a whitelist.
