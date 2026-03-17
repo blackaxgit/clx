@@ -460,7 +460,80 @@ ollama:
 }
 
 // =========================================================================
-// 8. Invalid/malformed input handling
+// 8. Default decision "ask" when Ollama is unavailable
+// =========================================================================
+
+#[test]
+fn test_hook_default_decision_ask_on_ollama_unavailable() {
+    // When L1 is enabled but Ollama is unreachable, the hook should fall back
+    // to the configured default_decision. Here we set it to "ask".
+    let binary = env!("CARGO_BIN_EXE_clx-hook");
+
+    let temp_home = std::env::temp_dir().join(format!("clx-default-ask-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_home).unwrap();
+
+    let clx_dir = temp_home.join(".clx");
+    std::fs::create_dir_all(&clx_dir).unwrap();
+    std::fs::write(
+        clx_dir.join("config.yaml"),
+        "\
+validator:
+  enabled: true
+  layer1_enabled: true
+  default_decision: ask
+  auto_allow_reads: false
+  cache_enabled: false
+ollama:
+  host: \"http://127.0.0.1:19999\"
+  timeout_ms: 1000
+",
+    )
+    .unwrap();
+
+    // Use a non-whitelisted command so L0 does not auto-allow
+    let input = serde_json::json!({
+        "session_id": "test-default-ask-001",
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "tu-default-ask-001",
+        "tool_input": {
+            "command": "python3 -c \"print('hello')\""
+        }
+    });
+
+    let mut child = Command::new(binary)
+        .env("HOME", &temp_home)
+        .env("CLX_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn clx-hook binary");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for clx-hook");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("Failed to parse output: {e}\nOutput: {stdout}"));
+
+    let hook_output = &parsed["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "ask",
+        "default_decision=ask should result in 'ask' when Ollama is unreachable"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+// =========================================================================
+// 9. Invalid/malformed input handling
 // =========================================================================
 
 #[test]

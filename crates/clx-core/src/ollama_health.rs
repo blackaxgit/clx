@@ -122,4 +122,25 @@ mod tests {
         let cloned = status;
         assert_eq!(format!("{cloned:?}"), "Available");
     }
+
+    #[test]
+    fn stale_file_returns_unknown() {
+        let path = temp_health_path();
+        write_health_to(&path, true);
+
+        // Backdate mtime to 60 seconds ago (well past 30s TTL)
+        use std::time::{Duration, SystemTime};
+        let past = SystemTime::now() - Duration::from_secs(60);
+        let times = std::fs::FileTimes::new()
+            .set_modified(past)
+            .set_accessed(past);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_times(times).unwrap();
+
+        assert_eq!(read_health_from(&path), HealthStatus::Unknown);
+        let _ = std::fs::remove_file(&path);
+    }
 }
