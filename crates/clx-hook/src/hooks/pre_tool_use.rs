@@ -340,6 +340,35 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         .evaluate_with_llm("Bash", command, &input.cwd, &ollama, None)
         .await;
 
+    // Handle LLM generation failure: evaluate_with_llm returns Ask("LLM unavailable")
+    // when the generation call fails (distinct from the is_available() check above).
+    // Apply the same default_decision fallback and update health cache.
+    if let PolicyDecision::Ask { ref reason } = l1_decision
+        && reason == "LLM unavailable"
+    {
+        clx_core::ollama_health::write_health(false);
+        let fallback = config.validator.default_decision.as_str();
+        let fallback_reason = format!("LLM unavailable — fallback: {fallback}");
+        log_audit_entry(
+            &input.session_id,
+            command,
+            &input.cwd,
+            "L1",
+            match config.validator.default_decision {
+                DefaultDecision::Allow => AuditDecision::Allowed,
+                DefaultDecision::Deny => AuditDecision::Blocked,
+                DefaultDecision::Ask => AuditDecision::Prompted,
+            },
+            None,
+            Some(&format!(
+                "LLM generation failed — default_decision: {}",
+                config.validator.default_decision
+            )),
+        );
+        output_decision(fallback, Some(fallback_reason), Some(RULES_REMINDER), None);
+        return Ok(());
+    }
+
     // Update health cache after successful LLM interaction
     clx_core::ollama_health::write_health(true);
 
