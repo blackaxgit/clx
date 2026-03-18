@@ -42,6 +42,12 @@ const MAX_RESPONSE_SIZE: usize = 100_000;
 /// Maximum number of concurrent Ollama HTTP requests.
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 
+/// Timeout for health check requests (2 seconds).
+const HEALTH_CHECK_TIMEOUT_MS: u64 = 2_000;
+
+/// Maximum retries for health checks (1 retry = 2 attempts total).
+const HEALTH_CHECK_MAX_RETRIES: u32 = 1;
+
 /// Errors that can occur when interacting with Ollama
 #[derive(Error, Debug)]
 pub enum OllamaError {
@@ -279,18 +285,19 @@ impl OllamaClient {
     /// transient failures (e.g., Ollama briefly busy loading a model).
     pub async fn is_available(&self) -> bool {
         let url = format!("{}/api/tags", self.host);
+        let health_timeout = Duration::from_millis(HEALTH_CHECK_TIMEOUT_MS);
         let mut attempt = 0u32;
         loop {
-            match self.client.get(&url).send().await {
+            match self.client.get(&url).timeout(health_timeout).send().await {
                 Ok(response) if response.status().is_success() => return true,
-                Ok(_) | Err(_) if attempt < self.max_retries => {
+                Ok(_) | Err(_) if attempt < HEALTH_CHECK_MAX_RETRIES => {
                     let delay = (self.retry_delay_ms as f32
                         * self.retry_backoff.powi(attempt as i32))
                         as u64;
                     tracing::debug!(
                         "Ollama availability check failed (attempt {}/{}), retrying in {delay}ms",
                         attempt + 1,
-                        self.max_retries + 1,
+                        HEALTH_CHECK_MAX_RETRIES + 1,
                     );
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     attempt += 1;

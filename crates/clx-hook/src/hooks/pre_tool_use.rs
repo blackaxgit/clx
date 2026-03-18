@@ -2,9 +2,11 @@
 
 use anyhow::Result;
 use clx_core::config::Config;
+use clx_core::config::DefaultDecision;
 use clx_core::ollama::OllamaClient;
 use clx_core::policy::{
-    McpExtraction, PolicyDecision, PolicyEngine, extract_mcp_command, is_read_only_command,
+    McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
+    is_read_only_command,
 };
 use clx_core::storage::Storage;
 use clx_core::types::AuditDecision;
@@ -204,6 +206,37 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         }
     }
 
+    // Check SQLite decision cache before calling Ollama
+    if config.validator.cache_enabled {
+        let cache_key = compute_cache_key(command, &input.cwd);
+        if let Ok(storage) = Storage::open_default() {
+            // Best-effort cleanup of expired entries (1 in 20 chance)
+            if rand_cleanup() {
+                let _ = storage.cleanup_expired_cache();
+            }
+
+            if let Ok(Some(cached)) = storage.get_cached_decision(&cache_key) {
+                debug!("L1-CACHE hit for command: {}", command);
+                let audit_decision = match cached.decision.as_str() {
+                    "allow" => AuditDecision::Allowed,
+                    "deny" => AuditDecision::Blocked,
+                    _ => AuditDecision::Prompted,
+                };
+                log_audit_entry(
+                    &input.session_id,
+                    command,
+                    &input.cwd,
+                    "L1-CACHE",
+                    audit_decision,
+                    cached.risk_score.map(|s| s as i32),
+                    cached.reason.as_deref(),
+                );
+                output_decision(&cached.decision, cached.reason, Some(RULES_REMINDER), None);
+                return Ok(());
+            }
+        }
+    }
+
     // Layer 1: LLM-based validation (if enabled)
     if !config.validator.layer1_enabled {
         debug!("L1 disabled, defaulting to ask");
@@ -229,52 +262,115 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     let ollama = match OllamaClient::new(config.ollama.clone()) {
         Ok(client) => client,
         Err(e) => {
-            debug!("Failed to create Ollama client: {}, defaulting to ask", e);
+            debug!(
+                "Failed to create Ollama client: {}, defaulting to {}",
+                e, config.validator.default_decision
+            );
+            let fallback = config.validator.default_decision.as_str();
+            let reason = format!("LLM unavailable — fallback: {fallback}");
             log_audit_entry(
                 &input.session_id,
                 command,
                 &input.cwd,
                 "L1",
-                AuditDecision::Prompted,
+                match config.validator.default_decision {
+                    DefaultDecision::Allow => AuditDecision::Allowed,
+                    DefaultDecision::Deny => AuditDecision::Blocked,
+                    DefaultDecision::Ask => AuditDecision::Prompted,
+                },
                 None,
-                Some(&format!("Ollama client error: {e}")),
+                Some(&format!(
+                    "Ollama client error: {e} — default_decision: {}",
+                    config.validator.default_decision
+                )),
             );
-            output_decision(
-                "ask",
-                Some("LLM validation unavailable".to_string()),
-                Some(RULES_REMINDER),
-                None,
-            );
+            output_decision(fallback, Some(reason), Some(RULES_REMINDER), None);
             return Ok(());
         }
     };
 
-    // Check if Ollama is available
-    if !ollama.is_available().await {
-        debug!("Ollama not available, defaulting to ask");
+    // Check file-based health cache before network call
+    let health = clx_core::ollama_health::read_cached_health();
+    let ollama_available = match health {
+        clx_core::ollama_health::HealthStatus::Available => {
+            debug!("Health cache: Ollama recently available, skipping check");
+            true
+        }
+        clx_core::ollama_health::HealthStatus::Unavailable => {
+            debug!("Health cache: Ollama recently unavailable, skipping check");
+            false
+        }
+        clx_core::ollama_health::HealthStatus::Unknown => {
+            let available = ollama.is_available().await;
+            clx_core::ollama_health::write_health(available);
+            available
+        }
+    };
+
+    if !ollama_available {
+        debug!(
+            "Ollama not available, defaulting to {}",
+            config.validator.default_decision
+        );
+        let fallback = config.validator.default_decision.as_str();
+        let reason = format!("LLM unavailable — fallback: {fallback}");
         log_audit_entry(
             &input.session_id,
             command,
             &input.cwd,
             "L1",
-            AuditDecision::Prompted,
+            match config.validator.default_decision {
+                DefaultDecision::Allow => AuditDecision::Allowed,
+                DefaultDecision::Deny => AuditDecision::Blocked,
+                DefaultDecision::Ask => AuditDecision::Prompted,
+            },
             None,
-            Some("Ollama unavailable"),
+            Some(&format!(
+                "Ollama unavailable — default_decision: {}",
+                config.validator.default_decision
+            )),
         );
-        output_decision(
-            "ask",
-            Some("LLM validation unavailable".to_string()),
-            Some(RULES_REMINDER),
-            None,
-        );
+        output_decision(fallback, Some(reason), Some(RULES_REMINDER), None);
         return Ok(());
     }
 
-    // Cache is not useful in a short-lived hook process.
-    // Each invocation is a separate process, so the cache is always empty.
+    // In-memory cache is not useful in a short-lived hook process;
+    // SQLite cache (above) handles cross-process caching instead.
     let l1_decision = policy_engine
         .evaluate_with_llm("Bash", command, &input.cwd, &ollama, None)
         .await;
+
+    // Handle LLM generation failure: evaluate_with_llm returns Ask("LLM unavailable")
+    // when the generation call fails (distinct from the is_available() check above).
+    // Apply the same default_decision fallback and update health cache.
+    if let PolicyDecision::Ask { ref reason } = l1_decision
+        && reason == "LLM unavailable"
+    {
+        clx_core::ollama_health::write_health(false);
+        let fallback = config.validator.default_decision.as_str();
+        let fallback_reason = format!("LLM unavailable — fallback: {fallback}");
+        log_audit_entry(
+            &input.session_id,
+            command,
+            &input.cwd,
+            "L1",
+            match config.validator.default_decision {
+                DefaultDecision::Allow => AuditDecision::Allowed,
+                DefaultDecision::Deny => AuditDecision::Blocked,
+                DefaultDecision::Ask => AuditDecision::Prompted,
+            },
+            None,
+            Some(&format!(
+                "LLM generation failed — default_decision: {}",
+                config.validator.default_decision
+            )),
+        );
+        output_decision(fallback, Some(fallback_reason), Some(RULES_REMINDER), None);
+        return Ok(());
+    }
+
+    // Update health cache after successful LLM interaction
+    clx_core::ollama_health::write_health(true);
 
     match l1_decision {
         PolicyDecision::Allow => {
@@ -289,6 +385,19 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
                 None,
             );
             output_decision("allow", None, Some(RULES_REMINDER), None);
+            // Cache allow decision
+            if config.validator.cache_enabled {
+                let cache_key = compute_cache_key(command, &input.cwd);
+                if let Ok(storage) = Storage::open_default() {
+                    let _ = storage.cache_decision(
+                        &cache_key,
+                        "allow",
+                        None,
+                        Some(1),
+                        config.validator.cache_allow_ttl_secs as i64,
+                    );
+                }
+            }
         }
         PolicyDecision::Deny { reason } => {
             debug!("L1: Denied command '{}': {}", command, reason);
@@ -321,6 +430,19 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
                     Some(&format!("Read-only auto-allowed: {reason}")),
                 );
                 output_decision("allow", None, Some(RULES_REMINDER), None);
+                // Cache the read-only auto-allow as an allow decision
+                if config.validator.cache_enabled {
+                    let cache_key = compute_cache_key(command, &input.cwd);
+                    if let Ok(storage) = Storage::open_default() {
+                        let _ = storage.cache_decision(
+                            &cache_key,
+                            "allow",
+                            None,
+                            Some(1),
+                            config.validator.cache_allow_ttl_secs as i64,
+                        );
+                    }
+                }
             } else {
                 debug!("L1: Ask for command '{}': {}", command, reason);
                 log_audit_entry(
@@ -332,10 +454,30 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
                     Some(5),
                     Some(&reason),
                 );
+                // Cache ask decision (before output_decision consumes reason)
+                if config.validator.cache_enabled {
+                    let cache_key = compute_cache_key(command, &input.cwd);
+                    if let Ok(storage) = Storage::open_default() {
+                        let _ = storage.cache_decision(
+                            &cache_key,
+                            "ask",
+                            Some(&reason),
+                            Some(5),
+                            config.validator.cache_ask_ttl_secs as i64,
+                        );
+                    }
+                }
                 output_decision("ask", Some(reason), Some(RULES_REMINDER), None);
             }
         }
     }
 
     Ok(())
+}
+
+/// Probabilistic cleanup trigger (~5% of invocations).
+fn rand_cleanup() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok_and(|d| d.subsec_nanos() % 20 == 0)
 }

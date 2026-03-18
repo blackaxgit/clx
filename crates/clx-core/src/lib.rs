@@ -11,6 +11,7 @@ pub mod credentials;
 pub mod embeddings;
 pub mod error;
 pub mod ollama;
+pub mod ollama_health;
 pub mod paths;
 pub mod policy;
 pub mod recall;

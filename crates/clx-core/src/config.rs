@@ -10,6 +10,9 @@
 //! - `CLX_VALIDATOR_LAYER1_TIMEOUT_MS`
 //! - `CLX_VALIDATOR_DEFAULT_DECISION`
 //! - `CLX_VALIDATOR_AUTO_ALLOW_READS` (auto-allow read-only commands)
+//! - `CLX_VALIDATOR_CACHE_ENABLED` (enable `SQLite` decision cache)
+//! - `CLX_VALIDATOR_CACHE_ALLOW_TTL` (TTL for cached allow decisions, seconds)
+//! - `CLX_VALIDATOR_CACHE_ASK_TTL` (TTL for cached ask decisions, seconds)
 //! - `CLX_CONTEXT_ENABLED`
 //! - `CLX_CONTEXT_AUTO_SNAPSHOT`
 //! - `CLX_CONTEXT_EMBEDDING_MODEL`
@@ -271,6 +274,18 @@ pub struct ValidatorConfig {
     /// Commands like cat, ls, head, tail, grep, find, etc. are allowed immediately
     #[serde(default = "default_true")]
     pub auto_allow_reads: bool,
+
+    /// Enable L1 decision caching in `SQLite` (cross-process)
+    #[serde(default = "default_true")]
+    pub cache_enabled: bool,
+
+    /// TTL for cached "allow" decisions in seconds (default: 1 hour)
+    #[serde(default = "default_cache_allow_ttl")]
+    pub cache_allow_ttl_secs: u64,
+
+    /// TTL for cached "ask" decisions in seconds (default: 15 minutes)
+    #[serde(default = "default_cache_ask_ttl")]
+    pub cache_ask_ttl_secs: u64,
 }
 
 /// Context configuration
@@ -429,6 +444,14 @@ fn default_layer1_timeout() -> u64 {
     30000 // 30 seconds - model may need to load into memory
 }
 
+fn default_cache_allow_ttl() -> u64 {
+    3600
+}
+
+fn default_cache_ask_ttl() -> u64 {
+    900
+}
+
 #[must_use]
 pub fn default_embedding_model() -> String {
     "qwen3-embedding:0.6b".to_string()
@@ -553,6 +576,9 @@ impl Default for ValidatorConfig {
             default_decision: DefaultDecision::Ask,
             trust_mode: false,
             auto_allow_reads: default_true(),
+            cache_enabled: default_true(),
+            cache_allow_ttl_secs: default_cache_allow_ttl(),
+            cache_ask_ttl_secs: default_cache_ask_ttl(),
         }
     }
 }
@@ -749,6 +775,31 @@ impl Config {
                 &val,
                 "CLX_VALIDATOR_AUTO_ALLOW_READS",
                 &mut self.validator.auto_allow_reads,
+            );
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_CACHE_ENABLED") {
+            apply_bool_override(
+                &val,
+                "CLX_VALIDATOR_CACHE_ENABLED",
+                &mut self.validator.cache_enabled,
+            );
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_CACHE_ALLOW_TTL") {
+            apply_u64_override(
+                &val,
+                "CLX_VALIDATOR_CACHE_ALLOW_TTL",
+                60,
+                86400,
+                &mut self.validator.cache_allow_ttl_secs,
+            );
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_CACHE_ASK_TTL") {
+            apply_u64_override(
+                &val,
+                "CLX_VALIDATOR_CACHE_ASK_TTL",
+                60,
+                86400,
+                &mut self.validator.cache_ask_ttl_secs,
             );
         }
 
