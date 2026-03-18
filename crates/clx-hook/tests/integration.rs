@@ -322,8 +322,7 @@ fn test_hook_default_decision_allow_on_ollama_unavailable() {
     // to the configured default_decision. Here we set it to "allow".
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-default-allow-{}", std::process::id()));
+    let temp_home = std::env::temp_dir().join(format!("clx-default-allow-{}", std::process::id()));
     std::fs::create_dir_all(&temp_home).unwrap();
 
     let clx_dir = temp_home.join(".clx");

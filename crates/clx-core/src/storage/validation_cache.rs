@@ -199,10 +199,7 @@ mod tests {
         assert!(storage.get_cached_decision("old_key").unwrap().is_none());
 
         // Valid entry should remain
-        assert!(storage
-            .get_cached_decision("fresh_key")
-            .unwrap()
-            .is_some());
+        assert!(storage.get_cached_decision("fresh_key").unwrap().is_some());
     }
 
     #[test]

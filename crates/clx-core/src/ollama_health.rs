@@ -134,10 +134,7 @@ mod tests {
         let times = std::fs::FileTimes::new()
             .set_modified(past)
             .set_accessed(past);
-        let file = std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();
 
         assert_eq!(read_health_from(&path), HealthStatus::Unknown);
