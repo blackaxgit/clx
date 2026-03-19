@@ -188,3 +188,105 @@ jobs:
             release-assets/*.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # update-homebrew: update the Homebrew tap formula after a successful release.
+  # Downloads SHA256 checksums from the release, generates the formula, and
+  # pushes it to the blackaxgit/homebrew-clx tap repository.
+  # ---------------------------------------------------------------------------
+  update-homebrew:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: release
+    # Skip pre-releases — only update the tap for stable releases.
+    if: ${{ !contains(github.ref_name, '-') }}
+
+    steps:
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: blackaxgit/homebrew-clx
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download checksums and generate formula
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+
+          # Download SHA256 checksum files from the GitHub Release.
+          for arch in aarch64 x86_64; do
+            curl -fsSL \
+              "https://github.com/blackaxgit/clx/releases/download/${TAG}/clx-${arch}-apple-darwin.tar.gz.sha256" \
+              -o "clx-${arch}.sha256"
+          done
+
+          ARM_SHA=$(awk '{print $1}' clx-aarch64.sha256)
+          X86_SHA=$(awk '{print $1}' clx-x86_64.sha256)
+
+          echo "Version: ${VERSION}"
+          echo "ARM SHA256: ${ARM_SHA}"
+          echo "x86 SHA256: ${X86_SHA}"
+
+          # Generate the formula with correct 2-space Ruby indentation.
+          # The heredoc is indented to satisfy YAML block scalar rules;
+          # sed strips the 10-space padding to produce clean Ruby.
+          mkdir -p Formula
+          sed 's/^          //' > Formula/clx.rb << '____FORMULA'
+          # typed: false
+          # frozen_string_literal: true
+
+          class Clx < Formula
+            desc "Intelligent command validation and context persistence for Claude Code"
+            homepage "https://github.com/blackaxgit/clx"
+            version "____VERSION____"
+            license "MPL-2.0"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/blackaxgit/clx/releases/download/____TAG____/clx-aarch64-apple-darwin.tar.gz"
+                sha256 "____ARM_SHA____"
+              end
+              on_intel do
+                url "https://github.com/blackaxgit/clx/releases/download/____TAG____/clx-x86_64-apple-darwin.tar.gz"
+                sha256 "____X86_SHA____"
+              end
+            end
+
+            def install
+              bin.install "bin/clx"
+              bin.install "bin/clx-hook"
+              bin.install "bin/clx-mcp"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/clx --version")
+            end
+          end
+          ____FORMULA
+
+          # Substitute placeholders with actual values.
+          sed -i "s|____VERSION____|${VERSION}|g" Formula/clx.rb
+          sed -i "s|____TAG____|${TAG}|g" Formula/clx.rb
+          sed -i "s|____ARM_SHA____|${ARM_SHA}|g" Formula/clx.rb
+          sed -i "s|____X86_SHA____|${X86_SHA}|g" Formula/clx.rb
+
+      - name: Commit and push formula
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/clx.rb
+
+          # No-op if the formula is unchanged (idempotent).
+          if git diff --cached --quiet; then
+            echo "No changes to formula — skipping commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update clx to ${VERSION}"
+          git push
