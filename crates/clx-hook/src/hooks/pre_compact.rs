@@ -29,7 +29,7 @@ pub(crate) async fn handle_pre_compact(input: HookInput) -> Result<()> {
 
     // Read and process transcript if available
     let result = if let Some(transcript_path) = &input.transcript_path {
-        process_transcript(transcript_path).await
+        process_transcript(transcript_path, true).await
     } else {
         TranscriptResult {
             summary: None,
