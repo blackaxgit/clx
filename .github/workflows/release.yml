@@ -35,7 +35,8 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    # Both legs run on the free ARM64 runner; x86_64 is cross-compiled.
+    runs-on: macos-latest
 
     strategy:
       fail-fast: false
@@ -44,16 +45,11 @@ jobs:
           # Apple Silicon — native build on ARM64 runner.
           - arch: aarch64
             target: aarch64-apple-darwin
-            cross: false
 
           # Intel x86_64 — cross-compiled from ARM64 runner (free tier).
           # macos-13 was retired Dec 2025; paid large runners not needed.
           - arch: x86_64
             target: x86_64-apple-darwin
-            cross: true
-
-    # Both legs run on the free ARM64 runner.
-    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
