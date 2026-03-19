@@ -45,8 +45,9 @@ jobs:
           - runner: macos-latest
             arch: aarch64
 
-          # Intel x86_64 — macos-13 is the last Intel macOS runner in GHA.
-          - runner: macos-13
+          # Intel x86_64 — macos-13 was retired Dec 2025; macos-15-large is
+          # the current Intel runner. Intel support ends Fall 2027.
+          - runner: macos-15-large
             arch: x86_64
 
     steps:
