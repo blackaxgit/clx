@@ -1,0 +1,88 @@
+# Automated versioning with release-plz.
+#
+# On every push to main, this workflow:
+#   1. Creates/updates a Release PR with version bumps + changelog
+#   2. If the push is a merged Release PR, creates a git tag (v0.x.y)
+#
+# The git tag then triggers release.yml → build → GitHub Release → Homebrew.
+#
+# Requires RELEASE_PLZ_TOKEN secret (Fine-Grained PAT with Contents + PRs
+# read/write on this repo). GITHUB_TOKEN cannot be used because tags created
+# by GITHUB_TOKEN do not trigger other workflows (GitHub platform limitation).
+
+name: Release-plz
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # -------------------------------------------------------------------
+  # Job 1: Create or update the Release PR
+  # Runs on every push to main. If no releasable changes exist,
+  # release-plz is a no-op.
+  # -------------------------------------------------------------------
+  release-plz-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Prevent concurrent release-pr runs from racing on PR updates.
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history needed to analyze commits since last tag.
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  # -------------------------------------------------------------------
+  # Job 2: Create git tag if the Release PR was just merged
+  # Only acts when release_always = false and the latest commit comes
+  # from a release-plz-* branch merge.
+  # -------------------------------------------------------------------
+  release-plz-release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz release
+        id: release
+        uses: release-plz/action@v0
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      # Log the release output for debugging.
+      - name: Log release output
+        if: steps.release.outputs.releases_created == 'true'
+        run: |
+          echo "Releases created!"
+          echo "Output: ${{ steps.release.outputs.releases }}"
