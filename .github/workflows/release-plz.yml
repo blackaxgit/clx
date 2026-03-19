@@ -1,69 +1,30 @@
-# Automated versioning with release-plz.
+# Automated tagging for CLX releases.
 #
-# On every push to main, this workflow:
-#   1. Creates/updates a Release PR with version bumps + changelog
-#   2. If the push is a merged Release PR, creates a git tag (v0.x.y)
+# On every push to main, compares the workspace version in Cargo.toml
+# against existing git tags. If the version doesn't have a corresponding
+# tag, creates one — which triggers release.yml → build → GitHub Release → Homebrew.
 #
-# The git tag then triggers release.yml → build → GitHub Release → Homebrew.
+# To release: bump the version in Cargo.toml (workspace.package.version),
+# merge to main, and this workflow handles the rest.
 #
-# Requires RELEASE_PLZ_TOKEN secret (Fine-Grained PAT with Contents + PRs
-# read/write on this repo). GITHUB_TOKEN cannot be used because tags created
-# by GITHUB_TOKEN do not trigger other workflows (GitHub platform limitation).
+# Requires RELEASE_PLZ_TOKEN secret (Fine-Grained PAT with Contents write).
+# GITHUB_TOKEN cannot create tags that trigger other workflows.
 
-name: Release-plz
+name: Auto-Tag Release
 
 on:
   push:
     branches:
       - main
+    paths:
+      - "Cargo.toml"
 
 jobs:
-  # -------------------------------------------------------------------
-  # Job 1: Create or update the Release PR
-  # Runs on every push to main. If no releasable changes exist,
-  # release-plz is a no-op.
-  # -------------------------------------------------------------------
-  release-plz-pr:
-    name: Release PR
+  auto-tag:
+    name: Create release tag
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
-    # Prevent concurrent release-pr runs from racing on PR updates.
-    concurrency:
-      group: release-plz-pr
-      cancel-in-progress: false
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          # Full history needed to analyze commits since last tag.
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: stable
-
-      - name: Run release-plz release-pr
-        uses: release-plz/action@49c995b2442b0f60dd4aab07a164cc00643471fc # v0.5.128
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-
-  # -------------------------------------------------------------------
-  # Job 2: Create git tag if the Release PR was just merged
-  # Only acts when release_always = false and the latest commit comes
-  # from a release-plz-* branch merge.
-  # -------------------------------------------------------------------
-  release-plz-release:
-    name: Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -71,22 +32,26 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: stable
-
-      - name: Run release-plz release
-        id: release
-        uses: release-plz/action@49c995b2442b0f60dd4aab07a164cc00643471fc # v0.5.128
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-
-      # Log the release output for debugging.
-      - name: Log release output
-        if: steps.release.outputs.releases_created == 'true'
+      - name: Check version and create tag
         run: |
-          echo "Releases created!"
-          echo "Output: ${{ steps.release.outputs.releases }}"
+          set -euo pipefail
+
+          # Extract version from workspace Cargo.toml
+          VERSION=$(grep -m1 'version = ' Cargo.toml | head -1 | sed 's/.*version = "\(.*\)"/\1/')
+          TAG="v${VERSION}"
+
+          echo "Workspace version: ${VERSION}"
+          echo "Expected tag: ${TAG}"
+
+          # Check if tag already exists
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists — nothing to do."
+            exit 0
+          fi
+
+          echo "Tag ${TAG} does not exist — creating it."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed tag ${TAG}"

@@ -59,7 +59,7 @@ colored = "2"
 keyring = "2"
 
 # Internal crates
-clx-core = { path = "crates/clx-core", version = "0.1.0" }
+clx-core = { path = "crates/clx-core" }
 
 # Testing — dev-only
 wiremock = "0.6"
