@@ -4,7 +4,7 @@
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
 [![Claude Code Ready](https://img.shields.io/badge/Claude_Code-Auto_Install_Ready-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDE2IDE2Ij48dGV4dCB4PSIwIiB5PSIxMyIgZm9udC1zaXplPSIxNCI+8J+UpTwvdGV4dD48L3N2Zz4=)](#install-with-claude-code)
 
-> **Note:** Currently supports macOS (ARM64/Apple Silicon) only.
+> **Note:** Currently supports macOS (ARM64 and Intel) only.
 
 Intelligent command validation and context persistence for Claude Code.
 
@@ -34,6 +34,21 @@ Intelligent command validation and context persistence for Claude Code.
   - `clx_remember` - Explicitly save information
   - `clx_checkpoint` - Create manual snapshots
   - `clx_rules` - Manage validation rules
+
+## Quick Install
+
+### macOS (Homebrew)
+
+```bash
+brew tap blackaxgit/clx
+brew install clx
+```
+
+This installs `clx`, `clx-hook`, and `clx-mcp`. To update:
+
+```bash
+brew update && brew upgrade clx
+```
 
 ## Install with Claude Code
 
