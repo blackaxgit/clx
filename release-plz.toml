@@ -9,6 +9,10 @@
 # Do not publish to crates.io — CLX is distributed as binaries only.
 publish = false
 
+# Skip cargo package verification — CLX uses path-only workspace
+# dependencies without version specifiers, which cargo package rejects.
+publish_no_verify = true
+
 # Derive versions from git tags, not the cargo registry.
 # Required when publish = false (no registry to query).
 git_only = true
