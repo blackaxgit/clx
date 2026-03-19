@@ -42,10 +42,10 @@ jobs:
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
 
       - name: Run release-plz release-pr
-        uses: release-plz/action@v0
+        uses: release-plz/action@49c995b2442b0f60dd4aab07a164cc00643471fc # v0.5.128
         with:
           command: release-pr
         env:
@@ -70,11 +70,11 @@ jobs:
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
 
       - name: Run release-plz release
         id: release
-        uses: release-plz/action@v0
+        uses: release-plz/action@49c995b2442b0f60dd4aab07a164cc00643471fc # v0.5.128
         with:
           command: release
         env:
