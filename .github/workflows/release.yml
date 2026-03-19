@@ -41,14 +41,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Apple Silicon — macos-latest resolves to an M-series ARM64 runner.
-          - runner: macos-latest
-            arch: aarch64
+          # Apple Silicon — native build on ARM64 runner.
+          - arch: aarch64
+            target: aarch64-apple-darwin
+            cross: false
 
-          # Intel x86_64 — macos-13 was retired Dec 2025; macos-15-large is
-          # the current Intel runner. Intel support ends Fall 2027.
-          - runner: macos-15-large
-            arch: x86_64
+          # Intel x86_64 — cross-compiled from ARM64 runner (free tier).
+          # macos-13 was retired Dec 2025; paid large runners not needed.
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            cross: true
+
+    # Both legs run on the free ARM64 runner.
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
@@ -56,31 +61,30 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       # Cache ~/.cargo/registry, ~/.cargo/git, and the target directory.
       # The cache key includes Cargo.lock so a lockfile change busts the cache.
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       # Build all three binary crates in a single workspace compile.
-      # The resulting binaries land in target/release/{clx,clx-hook,clx-mcp}.
+      # Cross-compiled binaries land in target/<target>/release/.
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --target ${{ matrix.target }}
 
-      # Verify the actual CPU architecture matches the matrix expectation.
-      # This guards against silent runner reclassification by GitHub.
-      - name: Verify architecture
+      # Verify the produced binaries have the expected architecture.
+      - name: Verify binary architecture
         run: |
-          ACTUAL_ARCH=$(uname -m)
-          echo "Runner reports architecture: $ACTUAL_ARCH"
-          if [[ "$ACTUAL_ARCH" != "${{ matrix.arch }}" ]]; then
-            # arm64 is macOS's name for aarch64; treat them as equivalent.
-            if [[ "$ACTUAL_ARCH" == "arm64" && "${{ matrix.arch }}" == "aarch64" ]]; then
-              echo "arm64 == aarch64, continuing"
-            else
-              echo "ERROR: expected ${{ matrix.arch }}, got $ACTUAL_ARCH" >&2
-              exit 1
-            fi
+          BINARY="target/${{ matrix.target }}/release/clx"
+          file "$BINARY"
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            file "$BINARY" | grep -q "x86_64" || { echo "ERROR: binary is not x86_64" >&2; exit 1; }
+          else
+            file "$BINARY" | grep -q "arm64" || { echo "ERROR: binary is not arm64" >&2; exit 1; }
           fi
 
       # Bundle all three binaries and the pre-built install script into one tarball.
@@ -96,13 +100,14 @@ jobs:
         run: |
           TARBALL_STEM="clx-${{ matrix.arch }}-apple-darwin"
           STAGE_DIR="${TARBALL_STEM}"
+          BIN_DIR="target/${{ matrix.target }}/release"
 
           mkdir -p "${STAGE_DIR}/bin"
 
           # Copy the three binary crates.
-          cp target/release/clx          "${STAGE_DIR}/bin/"
-          cp target/release/clx-hook     "${STAGE_DIR}/bin/"
-          cp target/release/clx-mcp      "${STAGE_DIR}/bin/"
+          cp "${BIN_DIR}/clx"          "${STAGE_DIR}/bin/"
+          cp "${BIN_DIR}/clx-hook"     "${STAGE_DIR}/bin/"
+          cp "${BIN_DIR}/clx-mcp"      "${STAGE_DIR}/bin/"
 
           # Copy the installer script from the repository root.
           cp install.sh "${STAGE_DIR}/install.sh"
