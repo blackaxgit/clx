@@ -46,8 +46,15 @@ pub(crate) fn count_transcript_tokens(transcript_path: &str) -> (i64, i64, i32) 
     (input_tokens, output_tokens, message_count)
 }
 
-/// Read and process a transcript file
-pub(crate) async fn process_transcript(transcript_path: &str) -> TranscriptResult {
+/// Read and process a transcript file.
+///
+/// When `ollama_available` is `false` the function skips the LLM
+/// summarization call entirely (no health check, no generate request).
+/// This avoids the 2-4 s timeout that causes `SessionEnd` to be cancelled.
+pub(crate) async fn process_transcript(
+    transcript_path: &str,
+    ollama_available: bool,
+) -> TranscriptResult {
     // Read transcript file
     let file = match File::open(transcript_path) {
         Ok(f) => f,
@@ -113,6 +120,18 @@ pub(crate) async fn process_transcript(transcript_path: &str) -> TranscriptResul
 
     // Build transcript text for summarization
     let transcript_text = build_transcript_text(&entries);
+
+    // Fast path: skip all LLM work when the caller knows Ollama is down.
+    if !ollama_available {
+        return TranscriptResult {
+            summary: Some(format!("Session with {message_count} messages")),
+            key_facts: None,
+            todos: None,
+            message_count: Some(message_count),
+            input_tokens,
+            output_tokens,
+        };
+    }
 
     // Generate summary using Ollama
     let config = Config::load().unwrap_or_default();
@@ -384,7 +403,7 @@ mod tests {
         }
 
         // Act
-        let result = process_transcript(transcript_path.to_str().unwrap()).await;
+        let result = process_transcript(transcript_path.to_str().unwrap(), true).await;
 
         // Restore env var
         #[allow(unsafe_code)]
@@ -426,8 +445,8 @@ mod tests {
             std::env::set_var("CLX_OLLAMA_HOST", "http://127.0.0.1:19998");
         }
 
-        // Act
-        let result = process_transcript(transcript_path.to_str().unwrap()).await;
+        // Act — pass ollama_available=false to skip the slow health check
+        let result = process_transcript(transcript_path.to_str().unwrap(), false).await;
 
         #[allow(unsafe_code)]
         unsafe {
