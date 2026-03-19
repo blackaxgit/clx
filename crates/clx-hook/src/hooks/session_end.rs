@@ -206,8 +206,7 @@ mod tests {
         assert!(result.is_ok(), "handle_session_end must return Ok(())");
         assert!(
             elapsed < Duration::from_millis(1500),
-            "SessionEnd must complete within 1.5s, took {:?}",
-            elapsed
+            "SessionEnd must complete within 1.5s, took {elapsed:?}",
         );
 
         let _ = std::fs::remove_dir_all(&temp_home);
