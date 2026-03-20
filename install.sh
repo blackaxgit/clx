@@ -29,6 +29,16 @@ if [[ "$ARCH" != "arm64" ]]; then
     warn "CLX is optimized for Apple Silicon (arm64). Detected: $ARCH"
 fi
 
+# Model defaults — read from config if available, otherwise use defaults.
+# This ensures install.sh and clx-services.sh stay in sync with config.yaml.
+CLX_CONFIG="$HOME/.clx/config.yaml"
+if [[ -f "$CLX_CONFIG" ]]; then
+    VALIDATION_MODEL=$(grep '^\s*model:' "$CLX_CONFIG" | head -1 | sed 's/.*model:\s*//' | tr -d '[:space:]')
+    EMBEDDING_MODEL=$(grep '^\s*embedding_model:' "$CLX_CONFIG" | head -1 | sed 's/.*embedding_model:\s*//' | tr -d '[:space:]')
+fi
+VALIDATION_MODEL="${VALIDATION_MODEL:-qwen3:1.7b}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
+
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║         CLX Installer v0.1.0           ║${NC}"
@@ -50,16 +60,82 @@ if [[ -d "$CLX_DIR" ]]; then
     fi
 fi
 
-# Step 1: Check dependencies
-info "Checking dependencies..."
+# Step 1: Prerequisite validation
+info "Checking prerequisites..."
+
+MISSING=()
+
+# Check Git
+if ! command -v git &> /dev/null; then
+    MISSING+=("git")
+fi
+
+# Check curl
+if ! command -v curl &> /dev/null; then
+    MISSING+=("curl")
+fi
 
 # Check Rust/Cargo
+RUST_MISSING=false
 if ! command -v cargo &> /dev/null; then
-    warn "Rust not found. Installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
+    RUST_MISSING=true
+    MISSING+=("cargo (Rust toolchain)")
 fi
-success "Rust installed"
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    warn "Missing prerequisites:"
+    for dep in "${MISSING[@]}"; do
+        echo "  - $dep"
+    done
+    echo ""
+
+    # Provide install instructions for non-Rust dependencies
+    if ! command -v git &> /dev/null; then
+        echo "  Install git:"
+        echo "    macOS: xcode-select --install"
+        echo "    Linux: sudo apt-get install git  (or equivalent)"
+        echo ""
+    fi
+    if ! command -v curl &> /dev/null; then
+        echo "  Install curl:"
+        echo "    macOS: curl should be pre-installed"
+        echo "    Linux: sudo apt-get install curl  (or equivalent)"
+        echo ""
+    fi
+
+    # Offer to install Rust automatically if it's the only (or one of the) missing deps
+    if [[ "$RUST_MISSING" == "true" ]]; then
+        # If git or curl are missing, we can't proceed (need curl for rustup, git for clone)
+        if ! command -v curl &> /dev/null; then
+            error "curl is required to install Rust and to run this installer. Please install it first."
+        fi
+        if ! command -v git &> /dev/null; then
+            error "git is required to clone the CLX repository. Please install it first."
+        fi
+
+        read -p "Install Rust automatically via rustup? [Y/n] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            info "Installing Rust via rustup..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            success "Rust installed"
+        else
+            error "Rust is required to build CLX. Please install it from https://rustup.rs and re-run."
+        fi
+    else
+        # Non-Rust deps are missing
+        error "Please install missing prerequisites and re-run the installer."
+    fi
+else
+    # All prerequisites present, but Rust might still need the success message
+    success "All prerequisites met (git, curl, cargo)"
+fi
+
+# Final cargo check (in case rustup was just installed)
+if ! command -v cargo &> /dev/null; then
+    error "Rust/Cargo not found. Please install from https://rustup.rs and re-run."
+fi
 
 # Check Ollama (Docker or native)
 OLLAMA_INSTALLED=false
@@ -202,18 +278,8 @@ if [[ -f "scripts/clx-services.sh" ]]; then
     success "Service management script installed"
 fi
 
-# Install sqlite-vec library for semantic search
-mkdir -p "$CLX_DIR/lib"
-if [[ -f "libs/vec0.dylib" ]]; then
-    cp "libs/vec0.dylib" "$CLX_DIR/lib/"
-    success "sqlite-vec library installed"
-elif [[ -f "$CLX_DIR/lib/vec0.dylib" ]]; then
-    success "sqlite-vec library already installed"
-else
-    warn "sqlite-vec library not found"
-    echo "  Semantic search requires vec0.dylib"
-    echo "  Download from: https://github.com/asg017/sqlite-vec/releases"
-fi
+# sqlite-vec is statically linked into the binary — no dylib download required.
+success "sqlite-vec (vector search) built-in"
 
 # Step 5: Add to PATH
 SHELL_RC=""
@@ -244,6 +310,10 @@ if [[ "$OLLAMA_VIA_DOCKER" == "true" ]]; then
     echo ""
     info "Setting up Docker-based Ollama..."
 
+    # Pull latest Ollama image to avoid stale cached versions
+    info "Pulling latest Ollama Docker image..."
+    docker pull ollama/ollama:latest
+
     # Start Ollama container
     info "Starting Ollama container..."
     docker compose -f "$CLX_DIR/docker/docker-compose.yml" up -d
@@ -264,16 +334,16 @@ if [[ "$OLLAMA_VIA_DOCKER" == "true" ]]; then
         warn "Ollama did not start in time. You can start it manually with: clx-services start"
     else
         # Pull models inside Docker container
-        read -p "Pull required models now? (qwen3:1.7b ~1.4GB, qwen3-embedding:0.6b ~639MB) [Y/n] " -n 1 -r
+        read -p "Pull required models now? ($VALIDATION_MODEL ~1.4GB, $EMBEDDING_MODEL ~639MB) [Y/n] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            info "Pulling qwen3:1.7b..."
-            docker exec clx-ollama ollama pull qwen3:1.7b
-            success "qwen3:1.7b pulled"
+            info "Pulling $VALIDATION_MODEL..."
+            docker exec clx-ollama ollama pull "$VALIDATION_MODEL"
+            success "$VALIDATION_MODEL pulled"
 
-            info "Pulling qwen3-embedding:0.6b..."
-            docker exec clx-ollama ollama pull qwen3-embedding:0.6b
-            success "qwen3-embedding:0.6b pulled"
+            info "Pulling $EMBEDDING_MODEL..."
+            docker exec clx-ollama ollama pull "$EMBEDDING_MODEL"
+            success "$EMBEDDING_MODEL pulled"
         else
             info "You can pull models later with: clx-services pull-models"
         fi
@@ -288,26 +358,26 @@ elif [[ "$OLLAMA_INSTALLED" == "true" ]]; then
     # Check if models exist (native Ollama)
     MODELS=$(ollama list 2>/dev/null || echo "")
 
-    if ! echo "$MODELS" | grep -q "qwen3:1.7b"; then
-        read -p "Pull qwen3:1.7b model (~1.4GB)? [Y/n] " -n 1 -r
+    if ! echo "$MODELS" | grep -q "$VALIDATION_MODEL"; then
+        read -p "Pull $VALIDATION_MODEL model (~1.4GB)? [Y/n] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            info "Pulling qwen3:1.7b..."
-            ollama pull qwen3:1.7b
+            info "Pulling $VALIDATION_MODEL..."
+            ollama pull "$VALIDATION_MODEL"
         fi
     else
-        success "qwen3:1.7b available"
+        success "$VALIDATION_MODEL available"
     fi
 
-    if ! echo "$MODELS" | grep -q "qwen3-embedding:0.6b"; then
-        read -p "Pull qwen3-embedding:0.6b model (~639MB)? [Y/n] " -n 1 -r
+    if ! echo "$MODELS" | grep -q "$EMBEDDING_MODEL"; then
+        read -p "Pull $EMBEDDING_MODEL model (~639MB)? [Y/n] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            info "Pulling qwen3-embedding:0.6b..."
-            ollama pull qwen3-embedding:0.6b
+            info "Pulling $EMBEDDING_MODEL..."
+            ollama pull "$EMBEDDING_MODEL"
         fi
     else
-        success "qwen3-embedding:0.6b available"
+        success "$EMBEDDING_MODEL available"
     fi
 fi
 

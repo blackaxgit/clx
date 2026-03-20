@@ -7,6 +7,15 @@
 
 set -e
 
+# Model defaults — read from config if available.
+CLX_CONFIG="$HOME/.clx/config.yaml"
+if [[ -f "$CLX_CONFIG" ]]; then
+    VALIDATION_MODEL=$(grep '^\s*model:' "$CLX_CONFIG" | head -1 | sed 's/.*model:\s*//' | tr -d '[:space:]')
+    EMBEDDING_MODEL=$(grep '^\s*embedding_model:' "$CLX_CONFIG" | head -1 | sed 's/.*embedding_model:\s*//' | tr -d '[:space:]')
+fi
+VALIDATION_MODEL="${VALIDATION_MODEL:-qwen3:1.7b}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
+
 # Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -34,6 +43,8 @@ fi
 
 case "$1" in
     start)
+        info "Pulling latest Ollama image..."
+        docker compose -f "$COMPOSE_FILE" pull
         info "Starting CLX services..."
         docker compose -f "$COMPOSE_FILE" up -d
         success "Services started"
@@ -81,14 +92,14 @@ case "$1" in
         info "Pulling required Ollama models..."
         echo ""
 
-        info "Pulling qwen3:1.7b (~1.4GB)..."
-        docker exec clx-ollama ollama pull qwen3:1.7b
-        success "qwen3:1.7b pulled"
+        info "Pulling $VALIDATION_MODEL..."
+        docker exec clx-ollama ollama pull "$VALIDATION_MODEL"
+        success "$VALIDATION_MODEL pulled"
 
         echo ""
-        info "Pulling qwen3-embedding:0.6b (~639MB)..."
-        docker exec clx-ollama ollama pull qwen3-embedding:0.6b
-        success "qwen3-embedding:0.6b pulled"
+        info "Pulling $EMBEDDING_MODEL..."
+        docker exec clx-ollama ollama pull "$EMBEDDING_MODEL"
+        success "$EMBEDDING_MODEL pulled"
 
         echo ""
         success "All models pulled successfully"

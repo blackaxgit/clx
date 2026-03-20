@@ -31,28 +31,6 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         return Ok(());
     };
 
-    // Check if vector search is enabled (sqlite-vec loaded)
-    if !emb_store.is_vector_search_enabled() {
-        if cli.json {
-            let output = RecallOutput {
-                query: query.to_string(),
-                results: vec![],
-            };
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!("{}", "Context Recall".cyan().bold());
-            println!("{}", "=".repeat(50));
-            println!();
-            println!("{}  {}", "Query:".bold(), query);
-            println!();
-            println!("{}", "Vector search not available.".yellow());
-            println!("Install sqlite-vec extension for semantic search:");
-            println!("  Download from https://github.com/asg017/sqlite-vec/releases");
-            println!("  Place vec0.dylib in ~/.clx/lib/");
-        }
-        return Ok(());
-    }
-
     // Load config and create Ollama client
     let config = Config::load().context("Failed to load configuration")?;
     let ollama = clx_core::ollama::OllamaClient::new(config.ollama.clone())

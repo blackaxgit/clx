@@ -25,7 +25,7 @@ mod tests;
 
 use anyhow::Result;
 use clx_core::redaction::redact_secrets;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use tracing::{debug, error, warn};
 
 use hooks::{
@@ -35,8 +35,37 @@ use hooks::{
 use output::output_decision;
 use types::{HookInput, MAX_INPUT_SIZE};
 
+fn print_usage() {
+    eprintln!("clx-hook - Claude Code hook handler for CLX");
+    eprintln!();
+    eprintln!("This binary is invoked automatically by Claude Code via hooks.");
+    eprintln!("It reads JSON input from stdin and is not intended for manual use.");
+    eprintln!();
+    eprintln!("Supported hook events: PreToolUse, PostToolUse, PreCompact,");
+    eprintln!("  SessionStart, SessionEnd, SubagentStart, UserPromptSubmit");
+    eprintln!();
+    eprintln!("Configuration: ~/.clx/config.yaml");
+    eprintln!("Documentation: https://github.com/blackaxgit/clx");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Handle --help or -h
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return Ok(());
+    }
+
+    // If stdin is a terminal (no piped input), show usage
+    if io::stdin().is_terminal() {
+        print_usage();
+        return Ok(());
+    }
+
+    clx_core::init_sqlite_vec();
+
     // Initialize tracing - only ERROR level to avoid confusing Claude Code
     // Claude Code interprets any stderr output as hook errors
     tracing_subscriber::fmt()

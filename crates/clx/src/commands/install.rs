@@ -13,6 +13,9 @@ use clx_core::storage::Storage;
 
 use crate::Cli;
 
+/// Default docker-compose.yml embedded from scripts/docker-compose.yml
+const DOCKER_COMPOSE_YML: &str = include_str!("../../../../scripts/docker-compose.yml");
+
 /// CLX section to inject into CLAUDE.md
 const CLX_CLAUDE_MD_SECTION: &str = r#"
 # CLX Integration [STRICT]
@@ -396,6 +399,7 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
     }
 
     // Step 1: Create directory structure
+    let docker_dir = clx_dir.join("docker");
     let dirs_to_create = [
         clx_dir.clone(),
         clx_core::paths::bin_dir(),
@@ -404,6 +408,7 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
         clx_core::paths::rules_dir(),
         clx_core::paths::prompts_dir(),
         clx_core::paths::learned_dir(),
+        docker_dir.clone(),
     ];
 
     for dir in &dirs_to_create {
@@ -416,6 +421,18 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
         } else if !cli.json {
             println!("  {} Exists  {}", "*".dimmed(), dir.display());
         }
+    }
+
+    // Write default docker-compose.yml if not present
+    let compose_path = docker_dir.join("docker-compose.yml");
+    if !compose_path.exists() {
+        fs::write(&compose_path, DOCKER_COMPOSE_YML)?;
+        if !cli.json {
+            println!("  {} Created {}", "+".green(), compose_path.display());
+        }
+        installed_items.push("docker-compose.yml".to_string());
+    } else if !cli.json {
+        println!("  {} Exists  {}", "*".dimmed(), compose_path.display());
     }
 
     // Set restrictive permissions on ~/.clx/ root directory (owner-only access)

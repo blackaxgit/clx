@@ -84,18 +84,11 @@ impl McpServer {
             }
         };
 
-        // Initialize embedding store (may fail if sqlite-vec not available)
+        // Initialize embedding store
         let embedding_store = match Storage::create_embedding_store(&db_path) {
             Ok(store) => {
-                if store.is_vector_search_enabled() {
-                    info!("Embedding store initialized with vector search support");
-                    Some(store)
-                } else {
-                    warn!(
-                        "Embedding store created but vector search is disabled (sqlite-vec not loaded)"
-                    );
-                    Some(store)
-                }
+                info!("Embedding store initialized with vector search support");
+                Some(store)
             }
             Err(e) => {
                 warn!(
