@@ -332,6 +332,7 @@ mod tests {
 
     #[test]
     fn test_custom_dimension() {
+        crate::init_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
         let store = EmbeddingStore::with_dimension(conn, 384).unwrap();
         assert_eq!(store.embedding_dim(), 384);
