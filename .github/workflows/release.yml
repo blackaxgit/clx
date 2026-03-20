@@ -109,8 +109,12 @@ jobs:
           cp install.sh "${STAGE_DIR}/install.sh"
           chmod +x "${STAGE_DIR}/install.sh"
 
-          # Produce the tarball.
-          tar -czf "${TARBALL_STEM}.tar.gz" "${STAGE_DIR}"
+          # Reset timestamps to avoid "Can't restore time: Operation not permitted"
+          # errors when Homebrew extracts on macOS with SIP enabled.
+          find "${STAGE_DIR}" -exec touch -t 202601010000 {} +
+
+          # Produce the tarball without extended attributes.
+          tar --no-xattrs -czf "${TARBALL_STEM}.tar.gz" "${STAGE_DIR}"
 
           # SHA256 checksum — one file, no path prefix (matches standard tooling expectations).
           shasum -a 256 "${TARBALL_STEM}.tar.gz" > "${TARBALL_STEM}.tar.gz.sha256"
