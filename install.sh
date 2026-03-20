@@ -29,6 +29,16 @@ if [[ "$ARCH" != "arm64" ]]; then
     warn "CLX is optimized for Apple Silicon (arm64). Detected: $ARCH"
 fi
 
+# Model defaults — read from config if available, otherwise use defaults.
+# This ensures install.sh and clx-services.sh stay in sync with config.yaml.
+CLX_CONFIG="$HOME/.clx/config.yaml"
+if [[ -f "$CLX_CONFIG" ]]; then
+    VALIDATION_MODEL=$(grep '^\s*model:' "$CLX_CONFIG" | head -1 | sed 's/.*model:\s*//' | tr -d '[:space:]')
+    EMBEDDING_MODEL=$(grep '^\s*embedding_model:' "$CLX_CONFIG" | head -1 | sed 's/.*embedding_model:\s*//' | tr -d '[:space:]')
+fi
+VALIDATION_MODEL="${VALIDATION_MODEL:-qwen3:1.7b}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
+
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║         CLX Installer v0.1.0           ║${NC}"
@@ -334,16 +344,16 @@ if [[ "$OLLAMA_VIA_DOCKER" == "true" ]]; then
         warn "Ollama did not start in time. You can start it manually with: clx-services start"
     else
         # Pull models inside Docker container
-        read -p "Pull required models now? (qwen3:1.7b ~1.4GB, qwen3-embedding:0.6b ~639MB) [Y/n] " -n 1 -r
+        read -p "Pull required models now? ($VALIDATION_MODEL ~1.4GB, $EMBEDDING_MODEL ~639MB) [Y/n] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            info "Pulling qwen3:1.7b..."
-            docker exec clx-ollama ollama pull qwen3:1.7b
-            success "qwen3:1.7b pulled"
+            info "Pulling $VALIDATION_MODEL..."
+            docker exec clx-ollama ollama pull $VALIDATION_MODEL
+            success "$VALIDATION_MODEL pulled"
 
-            info "Pulling qwen3-embedding:0.6b..."
-            docker exec clx-ollama ollama pull qwen3-embedding:0.6b
-            success "qwen3-embedding:0.6b pulled"
+            info "Pulling $EMBEDDING_MODEL..."
+            docker exec clx-ollama ollama pull $EMBEDDING_MODEL
+            success "$EMBEDDING_MODEL pulled"
         else
             info "You can pull models later with: clx-services pull-models"
         fi
@@ -358,26 +368,26 @@ elif [[ "$OLLAMA_INSTALLED" == "true" ]]; then
     # Check if models exist (native Ollama)
     MODELS=$(ollama list 2>/dev/null || echo "")
 
-    if ! echo "$MODELS" | grep -q "qwen3:1.7b"; then
-        read -p "Pull qwen3:1.7b model (~1.4GB)? [Y/n] " -n 1 -r
+    if ! echo "$MODELS" | grep -q "$VALIDATION_MODEL"; then
+        read -p "Pull $VALIDATION_MODEL model (~1.4GB)? [Y/n] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            info "Pulling qwen3:1.7b..."
-            ollama pull qwen3:1.7b
+            info "Pulling $VALIDATION_MODEL..."
+            ollama pull $VALIDATION_MODEL
         fi
     else
-        success "qwen3:1.7b available"
+        success "$VALIDATION_MODEL available"
     fi
 
-    if ! echo "$MODELS" | grep -q "qwen3-embedding:0.6b"; then
-        read -p "Pull qwen3-embedding:0.6b model (~639MB)? [Y/n] " -n 1 -r
+    if ! echo "$MODELS" | grep -q "$EMBEDDING_MODEL"; then
+        read -p "Pull $EMBEDDING_MODEL model (~639MB)? [Y/n] " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            info "Pulling qwen3-embedding:0.6b..."
-            ollama pull qwen3-embedding:0.6b
+            info "Pulling $EMBEDDING_MODEL..."
+            ollama pull $EMBEDDING_MODEL
         fi
     else
-        success "qwen3-embedding:0.6b available"
+        success "$EMBEDDING_MODEL available"
     fi
 fi
 
