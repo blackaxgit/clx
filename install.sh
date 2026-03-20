@@ -278,18 +278,8 @@ if [[ -f "scripts/clx-services.sh" ]]; then
     success "Service management script installed"
 fi
 
-# Install sqlite-vec library for semantic search
-mkdir -p "$CLX_DIR/lib"
-if [[ -f "libs/vec0.dylib" ]]; then
-    cp "libs/vec0.dylib" "$CLX_DIR/lib/"
-    success "sqlite-vec library installed"
-elif [[ -f "$CLX_DIR/lib/vec0.dylib" ]]; then
-    success "sqlite-vec library already installed"
-else
-    warn "sqlite-vec library not found"
-    echo "  Semantic search requires vec0.dylib"
-    echo "  Download from: https://github.com/asg017/sqlite-vec/releases"
-fi
+# sqlite-vec is statically linked into the binary — no dylib download required.
+success "sqlite-vec (vector search) built-in"
 
 # Step 5: Add to PATH
 SHELL_RC=""
@@ -348,11 +338,11 @@ if [[ "$OLLAMA_VIA_DOCKER" == "true" ]]; then
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             info "Pulling $VALIDATION_MODEL..."
-            docker exec clx-ollama ollama pull $VALIDATION_MODEL
+            docker exec clx-ollama ollama pull "$VALIDATION_MODEL"
             success "$VALIDATION_MODEL pulled"
 
             info "Pulling $EMBEDDING_MODEL..."
-            docker exec clx-ollama ollama pull $EMBEDDING_MODEL
+            docker exec clx-ollama ollama pull "$EMBEDDING_MODEL"
             success "$EMBEDDING_MODEL pulled"
         else
             info "You can pull models later with: clx-services pull-models"
@@ -373,7 +363,7 @@ elif [[ "$OLLAMA_INSTALLED" == "true" ]]; then
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             info "Pulling $VALIDATION_MODEL..."
-            ollama pull $VALIDATION_MODEL
+            ollama pull "$VALIDATION_MODEL"
         fi
     else
         success "$VALIDATION_MODEL available"
@@ -384,7 +374,7 @@ elif [[ "$OLLAMA_INSTALLED" == "true" ]]; then
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             info "Pulling $EMBEDDING_MODEL..."
-            ollama pull $EMBEDDING_MODEL
+            ollama pull "$EMBEDDING_MODEL"
         fi
     else
         success "$EMBEDDING_MODEL available"
