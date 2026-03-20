@@ -37,6 +37,8 @@ use types::{HookInput, MAX_INPUT_SIZE};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    clx_core::init_sqlite_vec();
+
     // Initialize tracing - only ERROR level to avoid confusing Claude Code
     // Claude Code interprets any stderr output as hook errors
     tracing_subscriber::fmt()
