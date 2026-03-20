@@ -27,6 +27,8 @@ use tracing::info;
 use server::McpServer;
 
 fn main() -> Result<()> {
+    clx_core::init_sqlite_vec();
+
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(

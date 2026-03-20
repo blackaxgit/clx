@@ -60,11 +60,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 println!("  Dimension:          {dim}");
                 println!(
                     "  Vector search:      {}",
-                    if vec_enabled {
-                        "enabled".green().to_string()
-                    } else {
-                        "disabled (sqlite-vec not found)".yellow().to_string()
-                    }
+                    "enabled (statically linked)".green()
                 );
                 println!("  Stored embeddings:  {count}");
                 if needs_migration {
@@ -86,24 +82,6 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 config.ollama.embedding_dim,
             )
             .context("Failed to open embedding store. Run 'clx install' first.")?;
-
-            if !emb_store.is_vector_search_enabled() {
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "error": "Vector search not available",
-                            "hint": "Install sqlite-vec extension"
-                        })
-                    );
-                } else {
-                    println!("{}", "Vector search not available.".yellow());
-                    println!("Install sqlite-vec extension for semantic search:");
-                    println!("  Download from https://github.com/asg017/sqlite-vec/releases");
-                    println!("  Place vec0.dylib in ~/.clx/lib/");
-                }
-                return Ok(());
-            }
 
             // Get all snapshots to regenerate
             let storage = Storage::open_default().context("Failed to open database")?;
@@ -297,24 +275,6 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
     // Open embedding store
     let emb_store = Storage::create_embedding_store(&db_path)
         .context("Failed to open embedding store. Run 'clx install' first.")?;
-
-    if !emb_store.is_vector_search_enabled() {
-        if cli.json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "error": "Vector search not available",
-                    "hint": "Install sqlite-vec extension"
-                })
-            );
-        } else {
-            println!("{}", "Vector search not available.".yellow());
-            println!("Install sqlite-vec extension for semantic search:");
-            println!("  Download from https://github.com/asg017/sqlite-vec/releases");
-            println!("  Place vec0.dylib in ~/.clx/lib/");
-        }
-        return Ok(());
-    }
 
     // Load config and create Ollama client
     let config = Config::load().context("Failed to load configuration")?;

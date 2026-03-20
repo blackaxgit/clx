@@ -241,6 +241,8 @@ fn test_storage_snapshot_fts_search_ranking() {
 
 #[test]
 fn test_embedding_store_creation_from_storage() {
+    clx_core::init_sqlite_vec();
+
     // Verify in-memory embedding store can be created via Storage helper
     let store = Storage::create_embedding_store_in_memory().unwrap();
 
@@ -250,13 +252,9 @@ fn test_embedding_store_creation_from_storage() {
         clx_core::embeddings::DEFAULT_EMBEDDING_DIM
     );
 
-    // Graceful degradation when sqlite-vec not loaded
-    if !store.is_vector_search_enabled() {
-        let query = vec![0.0f32; store.embedding_dim()];
-        let results = store.find_similar(&query, 10).unwrap();
-        assert!(results.is_empty());
-        assert_eq!(store.count_embeddings().unwrap(), 0);
-    }
+    // sqlite-vec is now statically linked, so vector search is always enabled
+    assert!(store.is_vector_search_enabled());
+    assert_eq!(store.count_embeddings().unwrap(), 0);
 }
 
 // =========================================================================

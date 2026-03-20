@@ -699,13 +699,10 @@ mod tests {
             "tokio, async, runtime",
         );
 
-        // Build an embedding that matches DEFAULT_EMBEDDING_DIM (1024).
-        // The EmbeddingStore is in-memory so vector search may not be enabled;
-        // if it isn't we skip gracefully — the semantic path requires it.
+        // Ensure sqlite-vec is registered for this test process.
+        crate::init_sqlite_vec();
+
         let emb_store = crate::embeddings::EmbeddingStore::open_in_memory().unwrap();
-        if !emb_store.is_vector_search_enabled() {
-            return; // Skip: sqlite-vec not available
-        }
 
         // Store the embedding for the seeded snapshot so find_similar can
         // return it when queried.

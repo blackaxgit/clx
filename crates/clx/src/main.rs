@@ -125,6 +125,8 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    clx_core::init_sqlite_vec();
+
     let cli = Cli::parse();
 
     // Initialize tracing (only if not JSON mode)
