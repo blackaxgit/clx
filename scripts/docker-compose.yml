@@ -6,6 +6,14 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+      # Corporate SSL inspection / custom CA certificates:
+      # 1. Set CLX_CA_CERT_PATH to your corporate CA certificate file path
+      #    Example: export CLX_CA_CERT_PATH=/path/to/corporate-ca.crt
+      # 2. Uncomment the volume mount and environment lines below
+      # 3. Run: docker compose up -d  (to recreate the container with certs)
+      # - ${CLX_CA_CERT_PATH:-/dev/null}:/usr/local/share/ca-certificates/corporate-ca.crt:ro
+    # environment:
+    #   - SSL_CERT_FILE=/usr/local/share/ca-certificates/corporate-ca.crt
     restart: unless-stopped
 
     # GPU support for Linux (NVIDIA)

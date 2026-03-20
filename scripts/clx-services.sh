@@ -34,6 +34,8 @@ fi
 
 case "$1" in
     start)
+        info "Pulling latest Ollama image..."
+        docker compose -f "$COMPOSE_FILE" pull
         info "Starting CLX services..."
         docker compose -f "$COMPOSE_FILE" up -d
         success "Services started"

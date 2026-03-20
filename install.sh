@@ -50,16 +50,82 @@ if [[ -d "$CLX_DIR" ]]; then
     fi
 fi
 
-# Step 1: Check dependencies
-info "Checking dependencies..."
+# Step 1: Prerequisite validation
+info "Checking prerequisites..."
+
+MISSING=()
+
+# Check Git
+if ! command -v git &> /dev/null; then
+    MISSING+=("git")
+fi
+
+# Check curl
+if ! command -v curl &> /dev/null; then
+    MISSING+=("curl")
+fi
 
 # Check Rust/Cargo
+RUST_MISSING=false
 if ! command -v cargo &> /dev/null; then
-    warn "Rust not found. Installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
+    RUST_MISSING=true
+    MISSING+=("cargo (Rust toolchain)")
 fi
-success "Rust installed"
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    warn "Missing prerequisites:"
+    for dep in "${MISSING[@]}"; do
+        echo "  - $dep"
+    done
+    echo ""
+
+    # Provide install instructions for non-Rust dependencies
+    if ! command -v git &> /dev/null; then
+        echo "  Install git:"
+        echo "    macOS: xcode-select --install"
+        echo "    Linux: sudo apt-get install git  (or equivalent)"
+        echo ""
+    fi
+    if ! command -v curl &> /dev/null; then
+        echo "  Install curl:"
+        echo "    macOS: curl should be pre-installed"
+        echo "    Linux: sudo apt-get install curl  (or equivalent)"
+        echo ""
+    fi
+
+    # Offer to install Rust automatically if it's the only (or one of the) missing deps
+    if [[ "$RUST_MISSING" == "true" ]]; then
+        # If git or curl are missing, we can't proceed (need curl for rustup, git for clone)
+        if ! command -v curl &> /dev/null; then
+            error "curl is required to install Rust and to run this installer. Please install it first."
+        fi
+        if ! command -v git &> /dev/null; then
+            error "git is required to clone the CLX repository. Please install it first."
+        fi
+
+        read -p "Install Rust automatically via rustup? [Y/n] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            info "Installing Rust via rustup..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            success "Rust installed"
+        else
+            error "Rust is required to build CLX. Please install it from https://rustup.rs and re-run."
+        fi
+    else
+        # Non-Rust deps are missing
+        error "Please install missing prerequisites and re-run the installer."
+    fi
+else
+    # All prerequisites present, but Rust might still need the success message
+    success "All prerequisites met (git, curl, cargo)"
+fi
+
+# Final cargo check (in case rustup was just installed)
+if ! command -v cargo &> /dev/null; then
+    error "Rust/Cargo not found. Please install from https://rustup.rs and re-run."
+fi
 
 # Check Ollama (Docker or native)
 OLLAMA_INSTALLED=false
@@ -243,6 +309,10 @@ info "Configuring Claude Code integration..."
 if [[ "$OLLAMA_VIA_DOCKER" == "true" ]]; then
     echo ""
     info "Setting up Docker-based Ollama..."
+
+    # Pull latest Ollama image to avoid stale cached versions
+    info "Pulling latest Ollama Docker image..."
+    docker pull ollama/ollama:latest
 
     # Start Ollama container
     info "Starting Ollama container..."
