@@ -13,6 +13,7 @@
 //! - `CLX_VALIDATOR_CACHE_ENABLED` (enable `SQLite` decision cache)
 //! - `CLX_VALIDATOR_CACHE_ALLOW_TTL` (TTL for cached allow decisions, seconds)
 //! - `CLX_VALIDATOR_CACHE_ASK_TTL` (TTL for cached ask decisions, seconds)
+//! - `CLX_VALIDATOR_PROMPT_SENSITIVITY` (high/standard/low/custom)
 //! - `CLX_CONTEXT_ENABLED`
 //! - `CLX_CONTEXT_AUTO_SNAPSHOT`
 //! - `CLX_CONTEXT_EMBEDDING_MODEL`
@@ -95,6 +96,52 @@ impl PartialEq<&str> for ContextPressureMode {
             (self, *other),
             (Self::Auto, "auto") | (Self::Notify, "notify") | (Self::Disabled, "disabled")
         )
+    }
+}
+
+/// Validator prompt sensitivity level.
+///
+/// Controls which built-in prompt template is used when no custom prompt
+/// file is found. The sensitivity changes the **prompt content** (how
+/// suspicious the LLM is told to be), not the score thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptSensitivity {
+    /// Strict: treats ambiguous commands as suspicious, flags network access
+    High,
+    /// Balanced: current default behaviour
+    #[default]
+    Standard,
+    /// Relaxed: trusts common dev tools, fewer interruptions
+    Low,
+    /// User-edited prompt in ~/.clx/prompts/validator.txt
+    Custom,
+}
+
+impl fmt::Display for PromptSensitivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::High => write!(f, "high"),
+            Self::Standard => write!(f, "standard"),
+            Self::Low => write!(f, "low"),
+            Self::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+impl FromStr for PromptSensitivity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "high" => Ok(Self::High),
+            "standard" => Ok(Self::Standard),
+            "low" => Ok(Self::Low),
+            "custom" => Ok(Self::Custom),
+            _ => Err(format!(
+                "Invalid prompt sensitivity: '{s}'. Expected: high, standard, low, custom"
+            )),
+        }
     }
 }
 
@@ -286,6 +333,10 @@ pub struct ValidatorConfig {
     /// TTL for cached "ask" decisions in seconds (default: 15 minutes)
     #[serde(default = "default_cache_ask_ttl")]
     pub cache_ask_ttl_secs: u64,
+
+    /// Prompt sensitivity level for LLM-based validation
+    #[serde(default)]
+    pub prompt_sensitivity: PromptSensitivity,
 }
 
 /// Context configuration
@@ -579,6 +630,7 @@ impl Default for ValidatorConfig {
             cache_enabled: default_true(),
             cache_allow_ttl_secs: default_cache_allow_ttl(),
             cache_ask_ttl_secs: default_cache_ask_ttl(),
+            prompt_sensitivity: PromptSensitivity::Standard,
         }
     }
 }
@@ -800,6 +852,13 @@ impl Config {
                 60,
                 86400,
                 &mut self.validator.cache_ask_ttl_secs,
+            );
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_PROMPT_SENSITIVITY") {
+            apply_enum_override::<PromptSensitivity>(
+                &val,
+                "CLX_VALIDATOR_PROMPT_SENSITIVITY",
+                &mut self.validator.prompt_sensitivity,
             );
         }
 
@@ -2207,6 +2266,124 @@ validator:
         assert!(!config.validator.enabled);
         // Other fields are defaults — the point is env vars play no role here.
         assert_eq!(config.ollama.host, "http://127.0.0.1:11434");
+    }
+
+    // --- PromptSensitivity tests ---
+
+    #[test]
+    fn test_prompt_sensitivity_default_is_standard() {
+        let config = Config::default();
+        assert_eq!(
+            config.validator.prompt_sensitivity,
+            PromptSensitivity::Standard
+        );
+    }
+
+    #[test]
+    fn test_prompt_sensitivity_yaml_parsing() {
+        for (yaml_val, expected) in [
+            ("high", PromptSensitivity::High),
+            ("standard", PromptSensitivity::Standard),
+            ("low", PromptSensitivity::Low),
+            ("custom", PromptSensitivity::Custom),
+        ] {
+            let yaml = format!("validator:\n  prompt_sensitivity: \"{yaml_val}\"\n");
+            let config: Config = serde_yml::from_str(&yaml).unwrap();
+            assert_eq!(
+                config.validator.prompt_sensitivity, expected,
+                "Failed for yaml value: {yaml_val}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prompt_sensitivity_missing_uses_default() {
+        let yaml = "validator:\n  enabled: true\n";
+        let config: Config = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.validator.prompt_sensitivity,
+            PromptSensitivity::Standard
+        );
+    }
+
+    #[test]
+    fn test_prompt_sensitivity_from_str() {
+        assert_eq!(
+            "high".parse::<PromptSensitivity>().unwrap(),
+            PromptSensitivity::High
+        );
+        assert_eq!(
+            "standard".parse::<PromptSensitivity>().unwrap(),
+            PromptSensitivity::Standard
+        );
+        assert_eq!(
+            "low".parse::<PromptSensitivity>().unwrap(),
+            PromptSensitivity::Low
+        );
+        assert_eq!(
+            "custom".parse::<PromptSensitivity>().unwrap(),
+            PromptSensitivity::Custom
+        );
+        assert_eq!(
+            "HIGH".parse::<PromptSensitivity>().unwrap(),
+            PromptSensitivity::High
+        );
+        assert!("invalid".parse::<PromptSensitivity>().is_err());
+    }
+
+    #[test]
+    fn test_prompt_sensitivity_display() {
+        assert_eq!(PromptSensitivity::High.to_string(), "high");
+        assert_eq!(PromptSensitivity::Standard.to_string(), "standard");
+        assert_eq!(PromptSensitivity::Low.to_string(), "low");
+        assert_eq!(PromptSensitivity::Custom.to_string(), "custom");
+    }
+
+    #[test]
+    fn test_prompt_sensitivity_serialization_roundtrip() {
+        let config = Config::default();
+        let yaml = serde_yml::to_string(&config).unwrap();
+        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.validator.prompt_sensitivity,
+            parsed.validator.prompt_sensitivity
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn test_prompt_sensitivity_env_override() {
+        let _guard = EnvGuard::new(&["CLX_VALIDATOR_PROMPT_SENSITIVITY"]);
+
+        // SAFETY: Serialized via #[serial_test::serial], no concurrent mutation.
+        unsafe {
+            env::set_var("CLX_VALIDATOR_PROMPT_SENSITIVITY", "high");
+        }
+
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert_eq!(config.validator.prompt_sensitivity, PromptSensitivity::High);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn test_prompt_sensitivity_env_invalid_keeps_default() {
+        let _guard = EnvGuard::new(&["CLX_VALIDATOR_PROMPT_SENSITIVITY"]);
+
+        // SAFETY: Serialized via #[serial_test::serial], no concurrent mutation.
+        unsafe {
+            env::set_var("CLX_VALIDATOR_PROMPT_SENSITIVITY", "extreme");
+        }
+
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert_eq!(
+            config.validator.prompt_sensitivity,
+            PromptSensitivity::Standard,
+            "Invalid env value should keep default"
+        );
     }
 
     // ---- T35: Property tests for config safety ----

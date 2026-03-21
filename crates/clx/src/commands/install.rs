@@ -468,13 +468,29 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
         }
     }
 
-    // Step 4: Write default prompts/validator.txt
+    // Step 4: Write prompt templates + active validator.txt
+    let prompts_dir = clx_core::paths::prompts_dir();
+    let prompt_templates: &[(&str, &str)] = &[
+        ("validator-standard.txt", clx_core::policy::PROMPT_STANDARD),
+        ("validator-high.txt", clx_core::policy::PROMPT_HIGH),
+        ("validator-low.txt", clx_core::policy::PROMPT_LOW),
+    ];
+    for &(filename, content) in prompt_templates {
+        let path = prompts_dir.join(filename);
+        if !path.exists() {
+            fs::write(&path, content)?;
+            if !cli.json {
+                println!("  {} Created {}", "+".green(), path.display());
+            }
+            installed_items.push(format!("prompts/{filename}"));
+        } else if !cli.json {
+            println!("  {} Exists  {}", "*".dimmed(), path.display());
+        }
+    }
+    // Write active validator.txt (standard by default) if not present
     let validator_prompt_path = clx_core::paths::validator_prompt_path();
     if !validator_prompt_path.exists() {
-        fs::write(
-            &validator_prompt_path,
-            clx_core::policy::DEFAULT_VALIDATOR_PROMPT,
-        )?;
+        fs::write(&validator_prompt_path, clx_core::policy::PROMPT_STANDARD)?;
         if !cli.json {
             println!(
                 "  {} Created {}",
