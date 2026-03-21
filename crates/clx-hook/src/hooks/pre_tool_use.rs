@@ -337,7 +337,14 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     // In-memory cache is not useful in a short-lived hook process;
     // SQLite cache (above) handles cross-process caching instead.
     let l1_decision = policy_engine
-        .evaluate_with_llm("Bash", command, &input.cwd, &ollama, None)
+        .evaluate_with_llm(
+            "Bash",
+            command,
+            &input.cwd,
+            &ollama,
+            None,
+            &config.validator.prompt_sensitivity,
+        )
         .await;
 
     // Handle LLM generation failure: evaluate_with_llm returns Ask("LLM unavailable")

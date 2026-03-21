@@ -22,6 +22,7 @@ mod file_util;
 mod llm;
 pub mod matching;
 pub mod mcp;
+pub mod prompts;
 mod rate_limiter;
 pub mod read_only;
 mod rules;
@@ -35,6 +36,7 @@ pub use file_util::ensure_default_rules_file;
 pub use llm::DEFAULT_VALIDATOR_PROMPT;
 pub use matching::glob_match;
 pub use mcp::{McpExtraction, extract_mcp_command};
+pub use prompts::{PROMPT_HIGH, PROMPT_LOW, PROMPT_STANDARD};
 pub use read_only::is_read_only_command;
 pub use types::*;
 
