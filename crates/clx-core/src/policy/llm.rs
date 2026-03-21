@@ -4,12 +4,15 @@
 //! (deterministic rules) returns Ask.
 
 use std::fs;
+use std::path::Path;
 use tracing::{debug, warn};
 
+use crate::config::PromptSensitivity;
 use crate::ollama::OllamaClient;
 
 use super::PolicyEngine;
 use super::cache::{ValidationCache, compute_cache_key};
+use super::prompts::{PROMPT_HIGH, PROMPT_LOW, PROMPT_STANDARD};
 use super::types::{LlmValidationResponse, PolicyDecision};
 
 /// Default prompt template for LLM-based command validation
@@ -74,6 +77,7 @@ impl PolicyEngine {
         working_dir: &str,
         ollama: &OllamaClient,
         cache: Option<&ValidationCache>,
+        sensitivity: &PromptSensitivity,
     ) -> PolicyDecision {
         // Check rate limit first
         if !self.rate_limiter.check() {
@@ -92,8 +96,8 @@ impl PolicyEngine {
             return cached_decision;
         }
 
-        // Load prompt template
-        let prompt_template = load_validator_prompt();
+        // Load prompt template (3-tier: per-project > global > built-in)
+        let prompt_template = load_validator_prompt(working_dir, sensitivity);
 
         // JSON-encode both command and working_dir to prevent prompt injection
         let escaped_command = serde_json::to_string(command).unwrap_or_else(|_| {
@@ -377,32 +381,88 @@ pub(crate) fn validate_prompt_template(content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the validator prompt template from ~/.clx/prompts/validator.txt or use default
-pub(crate) fn load_validator_prompt() -> String {
-    let prompt_path = crate::paths::validator_prompt_path();
-    if prompt_path.exists() {
-        if !is_file_safe(&prompt_path) {
-            warn!(
-                "Validator prompt file {} has unsafe permissions (world-writable), using default prompt",
-                prompt_path.display()
-            );
-            return DEFAULT_VALIDATOR_PROMPT.to_string();
-        }
-        if let Ok(content) = fs::read_to_string(&prompt_path) {
+/// Load the validator prompt template using a 3-tier lookup:
+///
+/// 1. **Per-project**: `<cwd>/.clx/prompts/validator.txt`
+/// 2. **Global**: `~/.clx/prompts/validator.txt`
+/// 3. **Built-in preset**: based on the configured `PromptSensitivity`
+///
+/// Each file-based prompt must pass `validate_prompt_template()` and
+/// `is_file_safe()` checks. If a file fails validation, we fall through
+/// to the next tier.
+pub(crate) fn load_validator_prompt(cwd: &str, sensitivity: &PromptSensitivity) -> String {
+    // 1. Try per-project prompt
+    let project_prompt = Path::new(cwd).join(".clx/prompts/validator.txt");
+    if let Some(content) = try_load_prompt_file(&project_prompt) {
+        debug!(
+            "Loaded per-project validator prompt from {}",
+            project_prompt.display()
+        );
+        return content;
+    }
+
+    // 2. Try global prompt
+    let global_prompt = crate::paths::validator_prompt_path();
+    if let Some(content) = try_load_prompt_file(&global_prompt) {
+        debug!(
+            "Loaded global validator prompt from {}",
+            global_prompt.display()
+        );
+        return content;
+    }
+
+    // 3. Built-in fallback based on sensitivity
+    let preset = sensitivity_to_prompt(sensitivity);
+    debug!(
+        "Using built-in {} sensitivity validator prompt",
+        sensitivity
+    );
+    preset.to_string()
+}
+
+/// Attempt to load and validate a prompt file. Returns `None` if the file
+/// does not exist, has unsafe permissions, cannot be read, or fails validation.
+fn try_load_prompt_file(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    if !is_file_safe(path) {
+        warn!(
+            "Validator prompt file {} has unsafe permissions (world-writable), skipping",
+            path.display()
+        );
+        return None;
+    }
+    match fs::read_to_string(path) {
+        Ok(content) => {
             if let Err(reason) = validate_prompt_template(&content) {
                 warn!(
-                    "Validator prompt file {} failed validation: {}, using default prompt",
-                    prompt_path.display(),
+                    "Validator prompt file {} failed validation: {}, skipping",
+                    path.display(),
                     reason
                 );
-                return DEFAULT_VALIDATOR_PROMPT.to_string();
+                return None;
             }
-            debug!("Loaded validator prompt from {}", prompt_path.display());
-            return content;
+            Some(content)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to read validator prompt file {}: {}, skipping",
+                path.display(),
+                e
+            );
+            None
         }
     }
-    debug!("Using default validator prompt");
-    DEFAULT_VALIDATOR_PROMPT.to_string()
+}
+
+/// Map a `PromptSensitivity` variant to its corresponding built-in prompt.
+fn sensitivity_to_prompt(sensitivity: &PromptSensitivity) -> &'static str {
+    match sensitivity {
+        PromptSensitivity::High => PROMPT_HIGH,
+        PromptSensitivity::Standard | PromptSensitivity::Custom => PROMPT_STANDARD,
+        PromptSensitivity::Low => PROMPT_LOW,
+    }
 }
 
 /// Check if a file has safe permissions (not world-writable).
@@ -498,5 +558,130 @@ pub(crate) fn risk_score_to_decision(
         _ => PolicyDecision::Ask {
             reason: format!("[{category}] {reasoning}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sensitivity_to_prompt_high() {
+        let prompt = sensitivity_to_prompt(&PromptSensitivity::High);
+        assert!(prompt.contains("HIGH SENSITIVITY"));
+        assert!(prompt.contains("STRICT"));
+    }
+
+    #[test]
+    fn test_sensitivity_to_prompt_standard() {
+        let prompt = sensitivity_to_prompt(&PromptSensitivity::Standard);
+        assert!(!prompt.contains("HIGH SENSITIVITY"));
+        assert!(!prompt.contains("LOW SENSITIVITY"));
+    }
+
+    #[test]
+    fn test_sensitivity_to_prompt_low() {
+        let prompt = sensitivity_to_prompt(&PromptSensitivity::Low);
+        assert!(prompt.contains("LOW SENSITIVITY"));
+        assert!(prompt.contains("Trust standard dev tools"));
+    }
+
+    #[test]
+    fn test_sensitivity_to_prompt_custom_falls_back_to_standard() {
+        let standard = sensitivity_to_prompt(&PromptSensitivity::Standard);
+        let custom = sensitivity_to_prompt(&PromptSensitivity::Custom);
+        assert_eq!(standard, custom);
+    }
+
+    #[test]
+    fn test_load_validator_prompt_nonexistent_cwd_skips_per_project() {
+        // When cwd doesn't exist, per-project file won't exist.
+        // Result is either global prompt or built-in preset.
+        let prompt = load_validator_prompt("/nonexistent/path", &PromptSensitivity::High);
+        // Must be a valid prompt regardless of which tier it came from
+        assert!(validate_prompt_template(&prompt).is_ok());
+        assert!(prompt.contains("{{command}}"));
+        assert!(prompt.contains("{{working_dir}}"));
+    }
+
+    #[test]
+    fn test_load_validator_prompt_per_project_takes_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        let prompt_dir = project_dir.join(".clx/prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+
+        // Write a valid custom prompt
+        let custom_prompt = "You are a validator.\n\nCommand: {{command}}\nDir: {{working_dir}}\n\nRespond in JSON only.\n";
+        std::fs::write(prompt_dir.join("validator.txt"), custom_prompt).unwrap();
+
+        let loaded =
+            load_validator_prompt(project_dir.to_str().unwrap(), &PromptSensitivity::Standard);
+        assert_eq!(loaded, custom_prompt);
+    }
+
+    #[test]
+    fn test_load_validator_prompt_invalid_per_project_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        let prompt_dir = project_dir.join(".clx/prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+
+        // Write an invalid prompt (missing placeholders)
+        std::fs::write(prompt_dir.join("validator.txt"), "bad prompt").unwrap();
+
+        // Should fall through past the invalid per-project prompt.
+        // The result will be either the global prompt (if ~/.clx/prompts/validator.txt
+        // exists on this machine) or the built-in preset. Either way, it must NOT
+        // be the invalid "bad prompt" content.
+        let loaded = load_validator_prompt(project_dir.to_str().unwrap(), &PromptSensitivity::Low);
+        assert_ne!(
+            loaded, "bad prompt",
+            "Invalid per-project prompt must be skipped"
+        );
+        // Must still be a valid prompt
+        assert!(validate_prompt_template(&loaded).is_ok());
+    }
+
+    #[test]
+    fn test_load_validator_prompt_each_sensitivity_loads_distinct_prompt() {
+        // Use nonexistent cwd so per-project file is skipped. If the global
+        // prompt exists on this machine it will be used for all sensitivities
+        // (same file), so skip this test in that case.
+        let global_prompt = crate::paths::validator_prompt_path();
+        if global_prompt.exists() {
+            // Can't distinguish sensitivities when a global file overrides all
+            return;
+        }
+
+        let high = load_validator_prompt("/nonexistent", &PromptSensitivity::High);
+        let standard = load_validator_prompt("/nonexistent", &PromptSensitivity::Standard);
+        let low = load_validator_prompt("/nonexistent", &PromptSensitivity::Low);
+
+        assert_ne!(high, standard);
+        assert_ne!(standard, low);
+        assert_ne!(high, low);
+    }
+
+    #[test]
+    fn test_try_load_prompt_file_nonexistent() {
+        assert!(try_load_prompt_file(Path::new("/nonexistent/prompt.txt")).is_none());
+    }
+
+    #[test]
+    fn test_try_load_prompt_file_invalid_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad.txt");
+        std::fs::write(&path, "no placeholders here").unwrap();
+        assert!(try_load_prompt_file(&path).is_none());
+    }
+
+    #[test]
+    fn test_try_load_prompt_file_valid_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("good.txt");
+        let content = "Validate {{command}} in {{working_dir}}. Respond in JSON.\n";
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(try_load_prompt_file(&path).unwrap(), content);
     }
 }
