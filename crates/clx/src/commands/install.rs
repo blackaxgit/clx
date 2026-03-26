@@ -370,7 +370,11 @@ async fn pull_ollama_model(model: &str) -> Result<()> {
         .context(format!("Failed to connect to Ollama to pull {model}"))?;
 
     if !resp.status().is_success() {
-        anyhow::bail!("Ollama returned status {} for model {}", resp.status(), model);
+        anyhow::bail!(
+            "Ollama returned status {} for model {}",
+            resp.status(),
+            model
+        );
     }
 
     // Wait for the pull to complete (non-streaming mode returns when done)
