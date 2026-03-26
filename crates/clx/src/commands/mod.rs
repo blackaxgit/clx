@@ -3,6 +3,7 @@
 pub mod config;
 pub mod credentials;
 pub mod embeddings;
+pub mod health;
 pub mod install;
 pub mod recall;
 pub mod rules;

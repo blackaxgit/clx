@@ -112,6 +112,13 @@ enum Commands {
         action: EmbeddingsAction,
     },
 
+    /// Check CLX system health
+    Health {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Interactive TUI dashboard
     Dashboard {
         /// Filter by last N days
@@ -172,6 +179,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Some(Commands::Embeddings { action }) => commands::cmd_embeddings(cli, action).await,
+        Some(Commands::Health { json }) => commands::health::cmd_health(*json || cli.json).await,
         Some(Commands::Dashboard { days, refresh }) => dashboard::run_dashboard(*days, *refresh)
             .map_err(|e| anyhow::anyhow!("Dashboard error: {e}")),
         None => commands::cmd_default(cli),
