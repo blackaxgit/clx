@@ -223,6 +223,52 @@ fn get_mcp_config() -> serde_json::Value {
     })
 }
 
+/// Check if Homebrew is available.
+fn has_homebrew() -> bool {
+    Command::new("which")
+        .arg("brew")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Install Ollama via Homebrew.
+fn install_ollama_brew() -> Result<()> {
+    let status = Command::new("brew")
+        .args(["install", "ollama"])
+        .status()
+        .context("Failed to run brew install ollama")?;
+    if !status.success() {
+        anyhow::bail!("brew install ollama exited with {status}");
+    }
+    Ok(())
+}
+
+/// Start Ollama server in the background and wait until it's reachable.
+async fn start_ollama_server() -> Result<()> {
+    // Launch `ollama serve` as a background process
+    Command::new("ollama")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to start ollama serve")?;
+
+    // Wait up to 10 seconds for the server to become reachable
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if client.get("http://127.0.0.1:11434/").send().await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("Ollama server did not start within 10 seconds")
+}
+
 /// Ollama prerequisite check status
 struct OllamaStatus {
     binary_installed: bool,
@@ -310,6 +356,36 @@ async fn check_ollama_prerequisites() -> OllamaStatus {
     }
 }
 
+/// Pull an Ollama model via the API.
+async fn pull_ollama_model(model: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()?;
+
+    let resp = client
+        .post("http://127.0.0.1:11434/api/pull")
+        .json(&serde_json::json!({ "name": model, "stream": false }))
+        .send()
+        .await
+        .context(format!("Failed to connect to Ollama to pull {model}"))?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Ollama returned status {} for model {}",
+            resp.status(),
+            model
+        );
+    }
+
+    // Wait for the pull to complete (non-streaming mode returns when done)
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if let Some(error) = body.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("Ollama error pulling {model}: {error}");
+    }
+
+    Ok(())
+}
+
 /// Install CLX integration
 pub async fn cmd_install(cli: &Cli) -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
@@ -372,18 +448,112 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
         }
 
         println!();
+    }
 
-        // Warn but continue
-        if !ollama_status.binary_installed {
+    // Auto-install Ollama if missing and Homebrew is available
+    let mut ollama_status = ollama_status;
+    if !ollama_status.binary_installed {
+        if has_homebrew() {
+            if !cli.json {
+                println!("{}", "Ollama Installation".cyan().bold());
+                println!("{}", "-".repeat(30));
+
+                let spinner = indicatif::ProgressBar::new_spinner();
+                spinner.set_message("Installing Ollama via Homebrew...");
+                spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+                match install_ollama_brew() {
+                    Ok(()) => {
+                        spinner.finish_and_clear();
+                        println!("  {} Ollama installed via Homebrew", "+".green());
+                        ollama_status.binary_installed = true;
+                        installed_items.push("ollama (brew)".to_string());
+                    }
+                    Err(e) => {
+                        spinner.finish_and_clear();
+                        println!("  {} Failed to install Ollama: {}", "!".red(), e);
+                    }
+                }
+            } else if install_ollama_brew().is_ok() {
+                ollama_status.binary_installed = true;
+                installed_items.push("ollama (brew)".to_string());
+            }
+        } else if !cli.json {
             println!(
                 "{}",
-                "⚠ Warning: Ollama is required for L1 validation and embeddings.".yellow()
+                "Ollama is required for L1 validation and embeddings.".yellow()
             );
             println!(
-                "{}",
-                "  CLX will work with L0 rules only until Ollama is installed.".dimmed()
+                "  Install from: {} or {}",
+                "brew install ollama".cyan(),
+                "https://ollama.com".cyan()
             );
             println!();
+        }
+    }
+
+    // Auto-start Ollama server if binary is installed but not running
+    if ollama_status.binary_installed && !ollama_status.server_running {
+        if !cli.json {
+            let spinner = indicatif::ProgressBar::new_spinner();
+            spinner.set_message("Starting Ollama server...");
+            spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+            match start_ollama_server().await {
+                Ok(()) => {
+                    spinner.finish_and_clear();
+                    println!("  {} Ollama server started", "+".green());
+                    ollama_status.server_running = true;
+
+                    // Re-check models now that server is running
+                    let fresh = check_ollama_prerequisites().await;
+                    ollama_status.missing_models = fresh.missing_models;
+                }
+                Err(e) => {
+                    spinner.finish_and_clear();
+                    println!("  {} Failed to start Ollama: {}", "!".yellow(), e);
+                }
+            }
+        } else if start_ollama_server().await.is_ok() {
+            ollama_status.server_running = true;
+            let fresh = check_ollama_prerequisites().await;
+            ollama_status.missing_models = fresh.missing_models;
+        }
+
+        if !cli.json {
+            println!();
+        }
+    }
+
+    // Auto-pull missing models if Ollama is running
+    let mut pulled_models: Vec<String> = Vec::new();
+    if ollama_status.server_running && !ollama_status.missing_models.is_empty() {
+        if !cli.json {
+            println!();
+            println!("{}", "Model Installation".cyan().bold());
+            println!("{}", "-".repeat(30));
+        }
+
+        for model in &ollama_status.missing_models {
+            if !cli.json {
+                let spinner = indicatif::ProgressBar::new_spinner();
+                spinner.set_message(format!("Pulling {model}..."));
+                spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+                match pull_ollama_model(model).await {
+                    Ok(()) => {
+                        spinner.finish_and_clear();
+                        println!("  {} Pulled {}", "+".green(), model);
+                        pulled_models.push(model.clone());
+                    }
+                    Err(e) => {
+                        spinner.finish_and_clear();
+                        println!("  {} Failed to pull {}: {}", "!".yellow(), model, e);
+                    }
+                }
+            } else if let Ok(()) = pull_ollama_model(model).await {
+                pulled_models.push(model.clone());
+            }
         }
     }
 
@@ -392,10 +562,13 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
     if !ollama_status.binary_installed {
         warnings.push("Ollama not installed - L1 validation disabled".to_string());
     } else if !ollama_status.server_running {
-        warnings.push("Ollama server not running".to_string());
+        warnings.push("Ollama server not running - could not pull models".to_string());
     }
+    // Only warn about models that weren't successfully pulled
     for model in &ollama_status.missing_models {
-        warnings.push(format!("Missing model: {model}"));
+        if !pulled_models.contains(model) {
+            warnings.push(format!("Missing model: {model}"));
+        }
     }
 
     // Step 1: Create directory structure
@@ -658,7 +831,8 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
             "ollama": {
                 "installed": ollama_status.binary_installed,
                 "running": ollama_status.server_running,
-                "missing_models": ollama_status.missing_models
+                "missing_models": ollama_status.missing_models,
+                "pulled_models": pulled_models
             },
             "paths": {
                 "clx_dir": clx_dir.display().to_string(),
