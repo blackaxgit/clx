@@ -350,7 +350,56 @@ fn credentials_list_json_produces_valid_json_or_error_json() {
 }
 
 // ---------------------------------------------------------------------------
-// T30 — Install and Uninstall
+// T30 — Health command
+// ---------------------------------------------------------------------------
+
+#[test]
+fn health_exits_zero_or_one_and_does_not_panic() {
+    let tmp = tmp();
+    // Health may report failures (e.g. no Ollama) but must never panic.
+    let status = clx(&tmp)
+        .arg("health")
+        .output()
+        .expect("process must spawn");
+    assert!(
+        status.status.code() == Some(0) || status.status.code() == Some(1),
+        "unexpected exit code: {:?}",
+        status.status
+    );
+}
+
+#[test]
+fn health_json_produces_valid_json() {
+    let tmp = tmp();
+    let output = clx(&tmp)
+        .args(["health", "--json"])
+        .output()
+        .expect("process must spawn");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("health --json output must be valid JSON");
+    assert!(parsed["checks"].is_array());
+    assert_eq!(parsed["checks"].as_array().unwrap().len(), 9);
+    assert_eq!(parsed["summary"]["total"].as_u64().unwrap(), 9);
+}
+
+#[test]
+fn health_global_json_flag_produces_valid_json() {
+    let tmp = tmp();
+    let output = clx(&tmp)
+        .args(["--json", "health"])
+        .output()
+        .expect("process must spawn");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json health output must be valid JSON");
+    assert!(parsed["checks"].is_array());
+}
+
+// ---------------------------------------------------------------------------
+// T31 — Install and Uninstall
 // ---------------------------------------------------------------------------
 
 #[test]

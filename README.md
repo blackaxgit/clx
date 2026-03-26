@@ -151,6 +151,10 @@ clx rules list
 clx rules allow "npm install *"
 clx rules deny "rm -rf /"
 
+# Check system health
+clx health              # Colored table output
+clx health --json       # Structured JSON output
+
 # Generate shell completions (v0.2+)
 clx completions bash > ~/.clx-completion.bash
 clx completions zsh > ~/.clx-completion.zsh
