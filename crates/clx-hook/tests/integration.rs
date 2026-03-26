@@ -12,9 +12,10 @@ use std::process::{Command, Stdio};
 fn run_hook(input: &str) -> (String, String) {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    // Use a temp directory as HOME to isolate from real ~/.clx
-    let temp_home = std::env::temp_dir().join(format!("clx-hook-test-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    // Use a unique temp directory per invocation to avoid parallel test interference.
+    // Keep `_temp_dir` alive until end of function so the directory isn't cleaned up early.
+    let _temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let temp_home = _temp_dir.path();
 
     let mut child = Command::new(binary)
         .env("HOME", &temp_home)
@@ -32,9 +33,6 @@ fn run_hook(input: &str) -> (String, String) {
     let output = child
         .wait_with_output()
         .expect("Failed to wait for clx-hook");
-
-    // Clean up temp directory (best-effort)
-    let _ = std::fs::remove_dir_all(&temp_home);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
