@@ -390,7 +390,7 @@ pub(crate) fn validate_prompt_template(content: &str) -> Result<(), String> {
 /// Each file-based prompt must pass `validate_prompt_template()` and
 /// `is_file_safe()` checks. If a file fails validation, we fall through
 /// to the next tier.
-pub(crate) fn load_validator_prompt(cwd: &str, sensitivity: &PromptSensitivity) -> String {
+pub fn load_validator_prompt(cwd: &str, sensitivity: &PromptSensitivity) -> String {
     // 1. Try per-project prompt
     let project_prompt = Path::new(cwd).join(".clx/prompts/validator.txt");
     if let Some(content) = try_load_prompt_file(&project_prompt) {
