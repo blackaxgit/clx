@@ -69,50 +69,64 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         return Ok(());
     }
 
-    // Trust mode: auto-allow ALL commands (but still log for audit)
-    // Trust mode expires after 1 hour via a token file for safety
+    // Trust mode: auto-allow ALL commands via JSON token (but still log for audit)
     if config.validator.trust_mode {
         let trust_token_path = clx_core::paths::clx_dir().join(".trust_mode_token");
 
-        // Atomic check-and-create to avoid TOCTOU race between exists() and write()
-        let trust_valid = if let Ok(metadata) = std::fs::metadata(&trust_token_path) {
-            // File exists — check if expired (1 hour)
-            metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|elapsed| elapsed.as_secs() < 3600)
-        } else {
-            // File does not exist — create atomically
-            let _ = std::fs::create_dir_all(
-                trust_token_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new(".")),
-            );
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true) // Atomic: fails if file already exists
-                .open(&trust_token_path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    let _ = file.write_all(b"trust_mode_active");
-                    true
-                }
-                Err(_) => {
-                    // Race: another process created it — recheck expiry
-                    std::fs::metadata(&trust_token_path)
+        let trust_valid = if let Ok(content) = std::fs::read_to_string(&trust_token_path) {
+            // Try JSON token first
+            if let Ok(token) = serde_json::from_str::<clx_core::types::TrustToken>(&content) {
+                let now = chrono::Utc::now();
+                let expires_valid = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
+                    .ok()
+                    .is_some_and(|exp| now < exp.with_timezone(&chrono::Utc));
+
+                let session_valid = token
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|tok_sid| input.session_id.as_str() == tok_sid);
+
+                if expires_valid && session_valid {
+                    let remaining = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
                         .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|elapsed| elapsed.as_secs() < 3600)
+                        .map(|exp| (exp.with_timezone(&chrono::Utc) - now).num_seconds().max(0));
+                    let reason = remaining.map_or_else(
+                        || "Trust mode enabled".to_string(),
+                        |r| format!("Trust mode ({r}s remaining)"),
+                    );
+                    debug!(
+                        "Trust mode: auto-allowing [{}] command '{}' ({})",
+                        tool_name, command_raw, reason
+                    );
+                    log_audit_entry(
+                        &input.session_id,
+                        &command_raw,
+                        &input.cwd,
+                        "TRUST",
+                        AuditDecision::Allowed,
+                        None,
+                        Some(&reason),
+                    );
+                    output_decision("allow", None, Some(RULES_REMINDER), None);
+                    return Ok(());
                 }
+                // Expired or session mismatch
+                false
+            } else {
+                // Backward compat: old plain-text token — check file mtime
+                std::fs::metadata(&trust_token_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed.as_secs() < 3600)
             }
+        } else {
+            false
         };
 
         if trust_valid {
             debug!(
-                "Trust mode: auto-allowing [{}] command '{}' (token valid)",
+                "Trust mode: auto-allowing [{}] command '{}' (legacy token)",
                 tool_name, command_raw
             );
             log_audit_entry(
@@ -122,13 +136,13 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
                 "TRUST",
                 AuditDecision::Allowed,
                 None,
-                Some("Trust mode enabled"),
+                Some("Trust mode enabled (legacy token)"),
             );
             output_decision("allow", None, Some(RULES_REMINDER), None);
             return Ok(());
         }
 
-        warn!("Trust mode token expired (>1 hour). Falling back to validation.");
+        warn!("Trust mode token expired or invalid. Falling back to validation.");
         let _ = std::fs::remove_file(&trust_token_path);
         // Fall through to normal validation
     }

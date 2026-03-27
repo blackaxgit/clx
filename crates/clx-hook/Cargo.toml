@@ -21,6 +21,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
+chrono.workspace = true
 
 [lints]
 workspace = true
@@ -30,4 +31,3 @@ tempfile = "3"
 wiremock = "0.6"
 insta = { version = "1", features = ["yaml", "json", "redactions"] }
 tokio = { version = "1", features = ["full"] }
-chrono.workspace = true

@@ -7,6 +7,7 @@ pub mod health;
 pub mod install;
 pub mod recall;
 pub mod rules;
+pub mod trust;
 pub mod version;
 
 // Re-export command handlers for convenient access
@@ -16,6 +17,7 @@ pub use embeddings::{cmd_embed_backfill, cmd_embeddings};
 pub use install::{cmd_install, cmd_uninstall};
 pub use recall::cmd_recall;
 pub use rules::cmd_rules;
+pub use trust::cmd_trust;
 pub use version::{cmd_default, cmd_version};
 
 // Re-export subcommand enums needed by the CLI dispatch
@@ -23,3 +25,4 @@ pub use config::ConfigAction;
 pub use credentials::CredentialsAction;
 pub use embeddings::EmbeddingsAction;
 pub use rules::RulesAction;
+pub use trust::TrustAction;
