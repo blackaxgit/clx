@@ -337,6 +337,14 @@ pub struct ValidatorConfig {
     /// Prompt sensitivity level for LLM-based validation
     #[serde(default)]
     pub prompt_sensitivity: PromptSensitivity,
+
+    /// Maximum allowed trust mode duration in seconds (default: 24h)
+    #[serde(default = "default_trust_mode_max_duration")]
+    pub trust_mode_max_duration: u64,
+
+    /// Default trust mode duration in seconds when no --duration given (default: 1h)
+    #[serde(default = "default_trust_mode_default_duration")]
+    pub trust_mode_default_duration: u64,
 }
 
 /// Context configuration
@@ -503,6 +511,14 @@ fn default_cache_ask_ttl() -> u64 {
     900
 }
 
+fn default_trust_mode_max_duration() -> u64 {
+    86400
+}
+
+fn default_trust_mode_default_duration() -> u64 {
+    3600
+}
+
 #[must_use]
 pub fn default_embedding_model() -> String {
     "qwen3-embedding:0.6b".to_string()
@@ -631,6 +647,8 @@ impl Default for ValidatorConfig {
             cache_allow_ttl_secs: default_cache_allow_ttl(),
             cache_ask_ttl_secs: default_cache_ask_ttl(),
             prompt_sensitivity: PromptSensitivity::Standard,
+            trust_mode_max_duration: default_trust_mode_max_duration(),
+            trust_mode_default_duration: default_trust_mode_default_duration(),
         }
     }
 }
@@ -859,6 +877,24 @@ impl Config {
                 &val,
                 "CLX_VALIDATOR_PROMPT_SENSITIVITY",
                 &mut self.validator.prompt_sensitivity,
+            );
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_TRUST_MODE_MAX_DURATION") {
+            apply_u64_override(
+                &val,
+                "CLX_VALIDATOR_TRUST_MODE_MAX_DURATION",
+                300,
+                604_800, // 7 days max
+                &mut self.validator.trust_mode_max_duration,
+            );
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_TRUST_MODE_DEFAULT_DURATION") {
+            apply_u64_override(
+                &val,
+                "CLX_VALIDATOR_TRUST_MODE_DEFAULT_DURATION",
+                300,
+                86400,
+                &mut self.validator.trust_mode_default_duration,
             );
         }
 
