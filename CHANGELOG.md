@@ -5,6 +5,16 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-03-27
+
+### Added
+- Dashboard session detail drill-down: press Enter on any session to see
+  full-screen detail with 4 sub-tabs (Info, Commands, Audit, Snapshots)
+- Info tab: session metadata, token/command/risk statistics
+- Commands tab: scrollable audit entries with decision reasoning detail pane
+- Audit tab: event timeline with tool use input/output details
+- Snapshots tab: snapshot list with expandable summary, key facts, and TODOs
+
 ## [0.4.0] - 2026-03-27
 
 ### Added
