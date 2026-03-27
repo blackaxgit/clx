@@ -11,6 +11,39 @@ pub enum DashboardTab {
     Settings,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenState {
+    /// Normal list view (Sessions, Audit, Rules, Settings tabs).
+    List,
+    /// Drill-down into a specific session.
+    SessionDetail(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailTab {
+    Info,
+    Commands,
+    Audit,
+    Snapshots,
+}
+
+impl DetailTab {
+    pub const ALL: [DetailTab; 4] = [Self::Info, Self::Commands, Self::Audit, Self::Snapshots];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Info => "Info",
+            Self::Commands => "Commands",
+            Self::Audit => "Audit",
+            Self::Snapshots => "Snapshots",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+}
+
 /// Where the user intended to go when leaving the Settings tab with unsaved changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitTarget {
@@ -61,6 +94,15 @@ pub struct App {
     pub refresh_interval: Duration,
     pub days_filter: u32,
 
+    // Session detail view state
+    pub screen_state: ScreenState,
+    pub detail_tab: DetailTab,
+    pub detail_commands_state: TableState,
+    pub detail_events_state: TableState,
+    pub detail_snapshots_state: TableState,
+    pub detail_scroll_offset: u16,
+    pub detail_data: Option<super::data::SessionDetailData>,
+
     // Settings tab state
     pub settings_section_idx: usize,
     pub settings_field_idx: usize,
@@ -98,6 +140,13 @@ impl App {
             last_refresh: Instant::now(),
             refresh_interval: Duration::from_secs(refresh_secs),
             days_filter: days,
+            screen_state: ScreenState::List,
+            detail_tab: DetailTab::Info,
+            detail_commands_state: TableState::default(),
+            detail_events_state: TableState::default(),
+            detail_snapshots_state: TableState::default(),
+            detail_scroll_offset: 0,
+            detail_data: None,
             settings_section_idx: 0,
             settings_field_idx: 0,
             settings_field_table_state: TableState::default(),
@@ -285,7 +334,153 @@ impl App {
 
     pub fn refresh_data(&mut self) {
         self.data = super::data::DashboardData::fetch(self.days_filter);
+        // Also refresh detail data if we are in detail view
+        if let ScreenState::SessionDetail(ref sid) = self.screen_state {
+            self.detail_data = super::data::SessionDetailData::fetch(sid);
+        }
         self.last_refresh = Instant::now();
+    }
+
+    /// Enter session detail view for the currently selected session row.
+    pub fn enter_session_detail(&mut self) {
+        let selected = self.sessions_table_state.selected().unwrap_or(0);
+        if let Some(row) = self.data.sessions.get(selected) {
+            let sid = row.session_id.clone();
+            self.detail_data = super::data::SessionDetailData::fetch(&sid);
+            self.screen_state = ScreenState::SessionDetail(sid);
+            self.detail_tab = DetailTab::Info;
+            self.detail_commands_state = TableState::default();
+            self.detail_events_state = TableState::default();
+            self.detail_snapshots_state = TableState::default();
+            self.detail_scroll_offset = 0;
+        }
+    }
+
+    /// Leave session detail view and return to the list.
+    pub fn leave_session_detail(&mut self) {
+        self.screen_state = ScreenState::List;
+        self.detail_data = None;
+    }
+
+    pub fn detail_next_tab(&mut self) {
+        let idx = self.detail_tab.index();
+        let next = (idx + 1) % DetailTab::ALL.len();
+        self.detail_tab = DetailTab::ALL[next];
+    }
+
+    pub fn detail_prev_tab(&mut self) {
+        let idx = self.detail_tab.index();
+        let prev = if idx == 0 {
+            DetailTab::ALL.len() - 1
+        } else {
+            idx - 1
+        };
+        self.detail_tab = DetailTab::ALL[prev];
+    }
+
+    pub fn detail_scroll_down(&mut self) {
+        match self.detail_tab {
+            DetailTab::Info => {
+                self.detail_scroll_offset = self.detail_scroll_offset.saturating_add(1);
+            }
+            DetailTab::Commands => {
+                if let Some(ref data) = self.detail_data
+                    && !data.audit_entries.is_empty()
+                {
+                    let i = self.detail_commands_state.selected().unwrap_or(0);
+                    let max = data.audit_entries.len() - 1;
+                    self.detail_commands_state
+                        .select(Some(i.saturating_add(1).min(max)));
+                }
+            }
+            DetailTab::Audit => {
+                if let Some(ref data) = self.detail_data
+                    && !data.events.is_empty()
+                {
+                    let i = self.detail_events_state.selected().unwrap_or(0);
+                    let max = data.events.len() - 1;
+                    self.detail_events_state
+                        .select(Some(i.saturating_add(1).min(max)));
+                }
+            }
+            DetailTab::Snapshots => {
+                if let Some(ref data) = self.detail_data
+                    && !data.snapshots.is_empty()
+                {
+                    let i = self.detail_snapshots_state.selected().unwrap_or(0);
+                    let max = data.snapshots.len() - 1;
+                    self.detail_snapshots_state
+                        .select(Some(i.saturating_add(1).min(max)));
+                }
+            }
+        }
+    }
+
+    pub fn detail_scroll_up(&mut self) {
+        match self.detail_tab {
+            DetailTab::Info => {
+                self.detail_scroll_offset = self.detail_scroll_offset.saturating_sub(1);
+            }
+            DetailTab::Commands => {
+                let i = self.detail_commands_state.selected().unwrap_or(0);
+                self.detail_commands_state.select(Some(i.saturating_sub(1)));
+            }
+            DetailTab::Audit => {
+                let i = self.detail_events_state.selected().unwrap_or(0);
+                self.detail_events_state.select(Some(i.saturating_sub(1)));
+            }
+            DetailTab::Snapshots => {
+                let i = self.detail_snapshots_state.selected().unwrap_or(0);
+                self.detail_snapshots_state
+                    .select(Some(i.saturating_sub(1)));
+            }
+        }
+    }
+
+    pub fn detail_scroll_to_top(&mut self) {
+        match self.detail_tab {
+            DetailTab::Info => self.detail_scroll_offset = 0,
+            DetailTab::Commands => self.detail_commands_state.select(Some(0)),
+            DetailTab::Audit => self.detail_events_state.select(Some(0)),
+            DetailTab::Snapshots => self.detail_snapshots_state.select(Some(0)),
+        }
+    }
+
+    pub fn detail_scroll_to_bottom(&mut self) {
+        if let Some(ref data) = self.detail_data {
+            match self.detail_tab {
+                DetailTab::Info => self.detail_scroll_offset = u16::MAX / 2,
+                DetailTab::Commands => {
+                    if !data.audit_entries.is_empty() {
+                        self.detail_commands_state
+                            .select(Some(data.audit_entries.len() - 1));
+                    }
+                }
+                DetailTab::Audit => {
+                    if !data.events.is_empty() {
+                        self.detail_events_state.select(Some(data.events.len() - 1));
+                    }
+                }
+                DetailTab::Snapshots => {
+                    if !data.snapshots.is_empty() {
+                        self.detail_snapshots_state
+                            .select(Some(data.snapshots.len() - 1));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn detail_page_down(&mut self) {
+        for _ in 0..Self::PAGE_SIZE {
+            self.detail_scroll_down();
+        }
+    }
+
+    pub fn detail_page_up(&mut self) {
+        for _ in 0..Self::PAGE_SIZE {
+            self.detail_scroll_up();
+        }
     }
 
     pub fn cycle_sort_column(&mut self) {
@@ -508,6 +703,7 @@ mod tests {
         let mut app = make_app();
         for _ in 0..n {
             app.data.sessions.push(super::super::data::SessionRow {
+                session_id: "full-session-id".into(),
                 short_id: "abc".into(),
                 project: "/tmp".into(),
                 started: "01-01 00:00".into(),

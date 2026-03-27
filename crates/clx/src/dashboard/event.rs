@@ -4,7 +4,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use super::app::{App, DashboardTab, ExitTarget, InputMode};
+use super::app::{App, DashboardTab, DetailTab, ExitTarget, InputMode, ScreenState};
 use super::settings::config_bridge;
 use super::settings::fields::{self, FieldWidget};
 use super::ui;
@@ -38,6 +38,12 @@ pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Resu
 }
 
 fn handle_key_event(app: &mut App, key: KeyEvent) {
+    // If we are in the session detail view, handle those keys first.
+    if matches!(app.screen_state, ScreenState::SessionDetail(_)) {
+        handle_detail_mode(app, key);
+        return;
+    }
+
     match app.input_mode {
         InputMode::Normal => handle_normal_mode(app, key),
         InputMode::Filter => handle_filter_mode(app, key),
@@ -50,6 +56,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => app.should_quit = true,
+        KeyCode::Enter => {
+            // Drill into session detail when on Sessions tab
+            if app.current_tab == DashboardTab::Sessions && !app.data.sessions.is_empty() {
+                app.enter_session_detail();
+            }
+        }
         KeyCode::Tab => {
             app.next_tab();
             on_tab_switch(app);
@@ -75,6 +87,26 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('2') => switch_to_tab(app, DashboardTab::AuditLog),
         KeyCode::Char('3') => switch_to_tab(app, DashboardTab::Rules),
         KeyCode::Char('4') => switch_to_tab(app, DashboardTab::Settings),
+        _ => {}
+    }
+}
+
+fn handle_detail_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.leave_session_detail(),
+        KeyCode::Tab => app.detail_next_tab(),
+        KeyCode::BackTab => app.detail_prev_tab(),
+        KeyCode::Char('1') => app.detail_tab = DetailTab::Info,
+        KeyCode::Char('2') => app.detail_tab = DetailTab::Commands,
+        KeyCode::Char('3') => app.detail_tab = DetailTab::Audit,
+        KeyCode::Char('4') => app.detail_tab = DetailTab::Snapshots,
+        KeyCode::Char('j') | KeyCode::Down => app.detail_scroll_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.detail_scroll_up(),
+        KeyCode::PageDown => app.detail_page_down(),
+        KeyCode::PageUp => app.detail_page_up(),
+        KeyCode::Char('g') | KeyCode::Home => app.detail_scroll_to_top(),
+        KeyCode::Char('G') | KeyCode::End => app.detail_scroll_to_bottom(),
+        KeyCode::Char('r') => app.refresh_data(),
         _ => {}
     }
 }
