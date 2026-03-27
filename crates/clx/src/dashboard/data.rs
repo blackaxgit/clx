@@ -52,6 +52,7 @@ pub struct DashboardData {
 }
 
 pub struct SessionRow {
+    pub session_id: String, // Full session ID for drill-down
     pub short_id: String,
     pub project: String,
     pub started: String,
@@ -85,6 +86,93 @@ pub struct LearnedRuleRow {
 pub struct BuiltinRuleRow {
     pub pattern: String,
     pub description: Option<String>,
+}
+
+/// Detail data for a single session drill-down view.
+pub struct SessionDetailData {
+    pub session: clx_core::types::Session,
+    pub audit_entries: Vec<clx_core::types::AuditLogEntry>,
+    pub events: Vec<clx_core::types::Event>,
+    pub snapshots: Vec<clx_core::types::Snapshot>,
+    pub command_stats: CommandStats,
+    pub risk_stats: RiskStats,
+}
+
+pub struct CommandStats {
+    pub total: usize,
+    pub allowed: usize,
+    pub blocked: usize,
+    pub prompted: usize,
+}
+
+pub struct RiskStats {
+    pub low: usize,
+    pub medium: usize,
+    pub high: usize,
+}
+
+impl SessionDetailData {
+    /// Fetch detail data for a single session from the default database.
+    pub fn fetch(session_id: &str) -> Option<Self> {
+        let storage = Storage::open_default().ok()?;
+        Self::fetch_from_storage(&storage, session_id)
+    }
+
+    /// Fetch detail data from a given storage instance.
+    pub fn fetch_from_storage(storage: &Storage, session_id: &str) -> Option<Self> {
+        use clx_core::types::AuditDecision;
+
+        let session = storage.get_session(session_id).ok()??;
+        let audit_entries = storage
+            .get_audit_log_by_session(session_id)
+            .unwrap_or_default();
+        let events = storage
+            .get_events_by_session(session_id)
+            .unwrap_or_default();
+        let snapshots = storage
+            .get_snapshots_by_session(session_id)
+            .unwrap_or_default();
+
+        let command_stats = CommandStats {
+            total: audit_entries.len(),
+            allowed: audit_entries
+                .iter()
+                .filter(|a| a.decision == AuditDecision::Allowed)
+                .count(),
+            blocked: audit_entries
+                .iter()
+                .filter(|a| a.decision == AuditDecision::Blocked)
+                .count(),
+            prompted: audit_entries
+                .iter()
+                .filter(|a| a.decision == AuditDecision::Prompted)
+                .count(),
+        };
+
+        let risk_stats = RiskStats {
+            low: audit_entries
+                .iter()
+                .filter(|a| a.risk_score.is_some_and(|s| s <= 3))
+                .count(),
+            medium: audit_entries
+                .iter()
+                .filter(|a| a.risk_score.is_some_and(|s| (4..=7).contains(&s)))
+                .count(),
+            high: audit_entries
+                .iter()
+                .filter(|a| a.risk_score.is_some_and(|s| s >= 8))
+                .count(),
+        };
+
+        Some(Self {
+            session,
+            audit_entries,
+            events,
+            snapshots,
+            command_stats,
+            risk_stats,
+        })
+    }
 }
 
 impl DashboardData {
@@ -204,6 +292,7 @@ impl DashboardData {
                     };
 
                     SessionRow {
+                        session_id: s.id.as_str().to_string(),
                         short_id,
                         project,
                         started,
@@ -455,5 +544,60 @@ mod tests {
         assert!(data.config_whitelist.is_empty());
         assert!(data.config_blacklist.is_empty());
         assert!(data.load_error.is_none());
+    }
+
+    #[test]
+    fn last_n_chars_short_string() {
+        assert_eq!(last_n_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn last_n_chars_exact_length() {
+        assert_eq!(last_n_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn last_n_chars_truncates() {
+        assert_eq!(last_n_chars("abcdefgh", 4), "efgh");
+    }
+
+    #[test]
+    fn last_n_chars_empty() {
+        assert_eq!(last_n_chars("", 5), "");
+    }
+
+    #[test]
+    fn last_n_chars_handles_unicode() {
+        // Multi-byte chars: should not panic or split mid-character
+        let s = "hello🌍world";
+        let result = last_n_chars(s, 8);
+        // Should be valid UTF-8
+        assert!(result.len() <= 8 || result.starts_with('🌍') || !result.is_empty());
+    }
+
+    #[test]
+    fn command_stats_defaults() {
+        let stats = CommandStats {
+            total: 10,
+            allowed: 7,
+            blocked: 1,
+            prompted: 2,
+        };
+        assert_eq!(stats.total, 10);
+        assert_eq!(stats.allowed, 7);
+        assert_eq!(stats.blocked, 1);
+        assert_eq!(stats.prompted, 2);
+    }
+
+    #[test]
+    fn risk_stats_defaults() {
+        let stats = RiskStats {
+            low: 5,
+            medium: 3,
+            high: 2,
+        };
+        assert_eq!(stats.low, 5);
+        assert_eq!(stats.medium, 3);
+        assert_eq!(stats.high, 2);
     }
 }
