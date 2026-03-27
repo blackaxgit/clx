@@ -399,6 +399,58 @@ fn health_global_json_flag_produces_valid_json() {
 }
 
 // ---------------------------------------------------------------------------
+// T32 — Trust command
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trust_status_exits_zero() {
+    let tmp = tmp();
+    clx(&tmp).args(["trust", "status"]).assert().success();
+}
+
+#[test]
+fn trust_on_then_status_shows_active() {
+    let tmp = tmp();
+    clx(&tmp).args(["trust", "on"]).assert().success();
+    let output = clx(&tmp)
+        .args(["--json", "trust", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["active"], true);
+}
+
+#[test]
+fn trust_off_then_status_shows_inactive() {
+    let tmp = tmp();
+    clx(&tmp).args(["trust", "on"]).assert().success();
+    clx(&tmp).args(["trust", "off"]).assert().success();
+    let output = clx(&tmp)
+        .args(["--json", "trust", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["active"], false);
+}
+
+#[test]
+fn trust_on_with_duration_exits_zero() {
+    let tmp = tmp();
+    clx(&tmp)
+        .args(["trust", "on", "--duration", "30m"])
+        .assert()
+        .success();
+}
+
+// ---------------------------------------------------------------------------
 // T31 — Install and Uninstall
 // ---------------------------------------------------------------------------
 

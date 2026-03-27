@@ -74,6 +74,21 @@ impl rusqlite::types::ToSql for SessionId {
     }
 }
 
+/// Trust mode token stored at `~/.clx/.trust_mode_token`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustToken {
+    /// When trust mode was enabled (UTC ISO 8601)
+    pub enabled_at: String,
+    /// When trust mode expires (UTC ISO 8601)
+    pub expires_at: String,
+    /// Duration in seconds
+    pub duration_secs: u64,
+    /// Optional session ID restriction
+    pub session_id: Option<String>,
+    /// How trust mode was enabled
+    pub enabled_by: String,
+}
+
 /// Command execution request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandRequest {

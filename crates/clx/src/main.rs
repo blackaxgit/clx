@@ -31,7 +31,7 @@ use std::io;
 use std::process;
 use tracing_subscriber::EnvFilter;
 
-use commands::{ConfigAction, CredentialsAction, EmbeddingsAction, RulesAction};
+use commands::{ConfigAction, CredentialsAction, EmbeddingsAction, RulesAction, TrustAction};
 
 /// CLX - Claude Code Extension
 #[derive(Parser)]
@@ -112,6 +112,12 @@ enum Commands {
         action: EmbeddingsAction,
     },
 
+    /// Manage trust mode (auto-allow all commands)
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+
     /// Check CLX system health
     Health {
         /// Output as JSON
@@ -179,6 +185,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Some(Commands::Embeddings { action }) => commands::cmd_embeddings(cli, action).await,
+        Some(Commands::Trust { action }) => commands::cmd_trust(cli, action.clone()).await,
         Some(Commands::Health { json }) => commands::health::cmd_health(*json || cli.json).await,
         Some(Commands::Dashboard { days, refresh }) => dashboard::run_dashboard(*days, *refresh)
             .map_err(|e| anyhow::anyhow!("Dashboard error: {e}")),
