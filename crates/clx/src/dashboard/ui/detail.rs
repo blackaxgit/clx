@@ -744,3 +744,57 @@ fn decision_style(decision: &str) -> Style {
         _ => Style::default().fg(Color::White),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_tokens_units() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0K");
+        assert_eq!(format_tokens(1_500), "1.5K");
+        assert_eq!(format_tokens(999_999), "1000.0K");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(5_300_000), "5.3M");
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn truncate_handles_unicode() {
+        // Multi-byte chars should not panic
+        let s = "hello 🌍 world";
+        let result = truncate(s, 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 13); // 10 + "..." worst case
+    }
+
+    #[test]
+    fn decision_style_colors() {
+        assert_eq!(decision_style("allowed").fg, Some(Color::Green));
+        assert_eq!(decision_style("blocked").fg, Some(Color::Red));
+        assert_eq!(decision_style("prompted").fg, Some(Color::Yellow));
+        assert_eq!(decision_style("unknown").fg, Some(Color::White));
+    }
+}
