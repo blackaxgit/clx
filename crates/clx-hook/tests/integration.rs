@@ -14,11 +14,11 @@ fn run_hook(input: &str) -> (String, String) {
 
     // Use a unique temp directory per invocation to avoid parallel test interference.
     // Keep `_temp_dir` alive until end of function so the directory isn't cleaned up early.
-    let _temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-    let temp_home = _temp_dir.path();
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let temp_home = temp_dir.path();
 
     let mut child = Command::new(binary)
-        .env("HOME", &temp_home)
+        .env("HOME", temp_home)
         .env("CLX_LOG", "error") // Suppress log noise
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
