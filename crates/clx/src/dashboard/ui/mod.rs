@@ -1,4 +1,5 @@
 mod audit;
+mod detail;
 pub(super) mod overview;
 mod rules;
 mod sessions;
@@ -9,9 +10,16 @@ use ratatui::prelude::*;
 use ratatui::symbols;
 use ratatui::widgets::{Block, Paragraph, Tabs};
 
-use super::app::{App, DashboardTab, InputMode};
+use super::app::{App, DashboardTab, InputMode, ScreenState};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    match app.screen_state {
+        ScreenState::List => render_list_view(frame, app),
+        ScreenState::SessionDetail(_) => detail::render(frame, app),
+    }
+}
+
+fn render_list_view(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(10),
@@ -273,6 +281,7 @@ mod tests {
 
     fn session_row(id: &str) -> SessionRow {
         SessionRow {
+            session_id: format!("full-{id}"),
             short_id: id.to_string(),
             project: "/home/user/project".to_string(),
             started: "03-13 09:00".to_string(),
