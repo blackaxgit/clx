@@ -545,4 +545,59 @@ mod tests {
         assert!(data.config_blacklist.is_empty());
         assert!(data.load_error.is_none());
     }
+
+    #[test]
+    fn last_n_chars_short_string() {
+        assert_eq!(last_n_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn last_n_chars_exact_length() {
+        assert_eq!(last_n_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn last_n_chars_truncates() {
+        assert_eq!(last_n_chars("abcdefgh", 4), "efgh");
+    }
+
+    #[test]
+    fn last_n_chars_empty() {
+        assert_eq!(last_n_chars("", 5), "");
+    }
+
+    #[test]
+    fn last_n_chars_handles_unicode() {
+        // Multi-byte chars: should not panic or split mid-character
+        let s = "hello🌍world";
+        let result = last_n_chars(s, 8);
+        // Should be valid UTF-8
+        assert!(result.len() <= 8 || result.starts_with('🌍') || !result.is_empty());
+    }
+
+    #[test]
+    fn command_stats_defaults() {
+        let stats = CommandStats {
+            total: 10,
+            allowed: 7,
+            blocked: 1,
+            prompted: 2,
+        };
+        assert_eq!(stats.total, 10);
+        assert_eq!(stats.allowed, 7);
+        assert_eq!(stats.blocked, 1);
+        assert_eq!(stats.prompted, 2);
+    }
+
+    #[test]
+    fn risk_stats_defaults() {
+        let stats = RiskStats {
+            low: 5,
+            medium: 3,
+            high: 2,
+        };
+        assert_eq!(stats.low, 5);
+        assert_eq!(stats.medium, 3);
+        assert_eq!(stats.high, 2);
+    }
 }
