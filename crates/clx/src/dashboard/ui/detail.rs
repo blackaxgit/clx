@@ -45,7 +45,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // Clone the pieces we need to avoid borrow conflicts with `app`
         // for stateful widget rendering.
         match app.detail_tab {
-            DetailTab::Info => render_info(frame, data, app.detail_scroll_offset, content_area),
+            DetailTab::Info => render_info(
+                frame,
+                data,
+                app.detail_scroll_offset,
+                &mut app.detail_commands_state,
+                content_area,
+            ),
             DetailTab::Commands => {
                 render_commands(frame, data, &mut app.detail_commands_state, content_area);
             }
@@ -107,7 +113,13 @@ fn render_detail_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 // ── Info Tab ─────────────────────────────────────────────────────────────────
 
 #[allow(clippy::vec_init_then_push)]
-fn render_info(frame: &mut Frame, data: &SessionDetailData, scroll_offset: u16, area: Rect) {
+fn render_info(
+    frame: &mut Frame,
+    data: &SessionDetailData,
+    scroll_offset: u16,
+    commands_state: &mut TableState,
+    area: Rect,
+) {
     let session = &data.session;
 
     let status_style = match session.status {
@@ -293,11 +305,95 @@ fn render_info(frame: &mut Frame, data: &SessionDetailData, scroll_offset: u16, 
         }
     }
 
+    // Split area: stats overview (top) + command list (bottom)
+    let [stats_area, commands_area] = Layout::vertical([
+        Constraint::Length(u16::try_from(lines.len()).unwrap_or(20) + 2), // +2 for border
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
     let paragraph = Paragraph::new(lines)
         .block(Block::bordered().title(" Info "))
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, stats_area);
+
+    // Embedded command table (same as Commands tab but inline)
+    render_info_commands(frame, data, commands_state, commands_area);
+}
+
+/// Render the embedded command table in the Info tab.
+fn render_info_commands(
+    frame: &mut Frame,
+    data: &SessionDetailData,
+    table_state: &mut TableState,
+    area: Rect,
+) {
+    let entries = &data.audit_entries;
+    let count = entries.len();
+
+    let header = Row::new(vec![
+        Cell::from("Time"),
+        Cell::from("Decision"),
+        Cell::from("Risk"),
+        Cell::from("Layer"),
+        Cell::from("Command"),
+    ])
+    .style(Style::default().bold())
+    .bottom_margin(1);
+
+    let rows: Vec<Row> = if entries.is_empty() {
+        vec![Row::new(vec![Cell::from(Span::styled(
+            "No commands recorded for this session",
+            Style::default().fg(Color::DarkGray).italic(),
+        ))])]
+    } else {
+        entries
+            .iter()
+            .map(|e| {
+                let ds = decision_style(e.decision.as_str());
+                let risk = e
+                    .risk_score
+                    .map_or_else(|| "-".to_string(), |r: i32| r.to_string());
+                Row::new(vec![
+                    Cell::from(e.timestamp.format("%H:%M:%S").to_string()),
+                    Cell::from(e.decision.as_str()).style(ds),
+                    Cell::from(risk),
+                    Cell::from(e.layer.as_str()),
+                    Cell::from(e.command.as_str()),
+                ])
+            })
+            .collect()
+    };
+
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Length(12),
+        Constraint::Fill(1),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title(format!(" Commands ({count}) ")))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{2192} ");
+    frame.render_stateful_widget(table, area, table_state);
+
+    // Scrollbar
+    if count > 0 {
+        let selected = table_state.selected().unwrap_or(0);
+        let mut scrollbar_state = ScrollbarState::new(count).position(selected);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{2191}"))
+            .end_symbol(Some("\u{2193}"));
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
 }
 
 // ── Commands Tab ─────────────────────────────────────────────────────────────

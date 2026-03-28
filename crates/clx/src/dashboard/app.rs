@@ -398,7 +398,15 @@ impl App {
     pub fn detail_scroll_down(&mut self) {
         match self.detail_tab {
             DetailTab::Info => {
-                self.detail_scroll_offset = self.detail_scroll_offset.saturating_add(1);
+                // Scroll the embedded command table in the Info tab
+                if let Some(ref data) = self.detail_data
+                    && !data.audit_entries.is_empty()
+                {
+                    let i = self.detail_commands_state.selected().unwrap_or(0);
+                    let max = data.audit_entries.len() - 1;
+                    self.detail_commands_state
+                        .select(Some(i.saturating_add(1).min(max)));
+                }
             }
             DetailTab::Commands => {
                 if let Some(ref data) = self.detail_data
@@ -436,7 +444,13 @@ impl App {
     pub fn detail_scroll_up(&mut self) {
         match self.detail_tab {
             DetailTab::Info => {
-                self.detail_scroll_offset = self.detail_scroll_offset.saturating_sub(1);
+                // Scroll the embedded command table in the Info tab
+                if let Some(ref data) = self.detail_data
+                    && !data.audit_entries.is_empty()
+                {
+                    let i = self.detail_commands_state.selected().unwrap_or(0);
+                    self.detail_commands_state.select(Some(i.saturating_sub(1)));
+                }
             }
             DetailTab::Commands => {
                 let i = self.detail_commands_state.selected().unwrap_or(0);
