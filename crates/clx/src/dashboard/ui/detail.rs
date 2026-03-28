@@ -305,12 +305,12 @@ fn render_info(
         }
     }
 
-    // Split area: stats overview (top) + command list (bottom)
-    let [stats_area, commands_area] = Layout::vertical([
-        Constraint::Length(u16::try_from(lines.len()).unwrap_or(20) + 2), // +2 for border
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+    // Split area: stats overview (top, max 40%) + command list (bottom, min 60%)
+    let stats_height = u16::try_from(lines.len()).unwrap_or(20) + 2; // +2 for border
+    let max_stats = area.height * 40 / 100;
+    let clamped = stats_height.min(max_stats).max(10);
+    let [stats_area, commands_area] =
+        Layout::vertical([Constraint::Length(clamped), Constraint::Fill(1)]).areas(area);
 
     let paragraph = Paragraph::new(lines)
         .block(Block::bordered().title(" Info "))
