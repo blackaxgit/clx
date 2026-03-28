@@ -349,10 +349,27 @@ impl App {
             self.detail_data = super::data::SessionDetailData::fetch(&sid);
             self.screen_state = ScreenState::SessionDetail(sid);
             self.detail_tab = DetailTab::Info;
-            self.detail_commands_state = TableState::default();
-            self.detail_events_state = TableState::default();
-            self.detail_snapshots_state = TableState::default();
             self.detail_scroll_offset = 0;
+
+            // Pre-select first row in each sub-tab table so detail pane
+            // shows content immediately (not "Select a ... to view details").
+            let mut cmd_state = TableState::default();
+            let mut evt_state = TableState::default();
+            let mut snap_state = TableState::default();
+            if let Some(ref data) = self.detail_data {
+                if !data.audit_entries.is_empty() {
+                    cmd_state.select(Some(0));
+                }
+                if !data.events.is_empty() {
+                    evt_state.select(Some(0));
+                }
+                if !data.snapshots.is_empty() {
+                    snap_state.select(Some(0));
+                }
+            }
+            self.detail_commands_state = cmd_state;
+            self.detail_events_state = evt_state;
+            self.detail_snapshots_state = snap_state;
         }
     }
 
