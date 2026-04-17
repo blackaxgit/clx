@@ -1,0 +1,6 @@
+{
+  "name": "clx",
+  "version": "0.5.3",
+  "description": "Teaches Claude how to use CLX's persistent memory system effectively — memory model, MCP tool triggers (clx_recall, clx_remember, clx_checkpoint, clx_rules), query craft, result interpretation, and layer comparison with native auto-memory.",
+  "skills": "./skills"
+}
