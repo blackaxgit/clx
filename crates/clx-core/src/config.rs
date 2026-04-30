@@ -1397,7 +1397,11 @@ pub enum LlmConfigError {
 ///
 /// Resolution order:
 /// 1. Env var named in `cfg.api_key_env` (if set and non-empty).
-/// 2. `CredentialStore` entry keyed `"<provider_name>:api-key"`.
+/// 2. `CredentialStore` entry keyed `"<provider_name>-api-key"`.
+///    (Hyphen — not colon — because `CredentialStore` rejects colons in user
+///    keys. Earlier 0.6.0 used a colon, which made the entry impossible to
+///    write via `clx credentials set`. See RUSTSEC-style note: contract
+///    mismatch fixed in 0.6.1.)
 /// 3. File at `cfg.api_key_file` (Unix: must be mode 0600).
 /// 4. Error.
 fn resolve_azure_credential(
@@ -1416,7 +1420,7 @@ fn resolve_azure_credential(
 
     // 2. CredentialStore (system keychain)
     let store = crate::credentials::CredentialStore::new();
-    let key = format!("{provider_name}:api-key");
+    let key = format!("{provider_name}-api-key");
     match store.get(&key) {
         Ok(Some(v)) => return Ok(SecretString::new(v.into())),
         Ok(None) => {} // fall through
@@ -1437,7 +1441,8 @@ fn resolve_azure_credential(
 
     Err(format!(
         "no credentials available for provider '{provider_name}' \
-         (checked env var, keychain key '{key}', and api_key_file)"
+         (checked env var, keychain key '{key}', and api_key_file). \
+         Run: clx credentials set {provider_name}-api-key '<your-key>'"
     ))
 }
 
@@ -2917,5 +2922,32 @@ ollama:
         cfg.translate_legacy_in_place();
         cfg.translate_legacy_in_place(); // second call must be a no-op
         assert_eq!(cfg.providers.len(), 1);
+    }
+
+    /// Regression for the 0.6.0 contract mismatch: the keychain key format
+    /// used by `resolve_azure_credential` MUST be writable through the
+    /// existing `CredentialStore` validator (which rejects colons). Earlier
+    /// 0.6.0 used `<provider>:api-key` (colon) and was unwriteable. 0.6.1
+    /// uses `<provider>-api-key` (hyphen).
+    #[test]
+    fn azure_keychain_key_passes_credential_store_validator() {
+        let store = crate::credentials::CredentialStore::with_service("clx-test-keyfmt");
+        // The resolver-format key (with hyphen) must round-trip cleanly.
+        // Use a unique provider name so this test never collides with real data.
+        let provider = "azure-regression-test-keyfmt";
+        let key = format!("{provider}-api-key");
+        // store/get/delete should all succeed without InvalidKey.
+        store.store(&key, "fake-value").expect("store must accept hyphen key");
+        let got = store.get(&key).expect("get ok").expect("value present");
+        assert_eq!(got, "fake-value");
+        store.delete(&key).expect("delete ok");
+
+        // Sanity check: the OLD colon format would have failed.
+        let bad = format!("{provider}:api-key");
+        let res = store.store(&bad, "fake-value");
+        assert!(
+            res.is_err(),
+            "colon-keyed format must NOT pass validator (regression guard)"
+        );
     }
 }
