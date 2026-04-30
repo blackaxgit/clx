@@ -11,15 +11,7 @@ pub mod credentials;
 pub mod llm;
 pub mod embeddings;
 pub mod error;
-// Deprecation shim during the refactor. Tasks 4 and 10 retire all callsites;
-// this re-export can be deleted in a follow-up.
-pub mod ollama {
-    pub use crate::llm::{OllamaBackend as OllamaClient, OllamaError};
-}
 pub mod llm_health;
-/// Deprecation shim. Old name during the multi-provider transition.
-#[deprecated(note = "use clx_core::llm_health instead")]
-pub use llm_health as ollama_health;
 pub mod paths;
 pub mod policy;
 pub mod recall;

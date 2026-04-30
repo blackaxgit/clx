@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::embeddings::EmbeddingStore;
-use crate::llm::LocalLlmBackend;
-use crate::ollama::OllamaClient;
+use crate::llm::LlmClient;
 use crate::storage::Storage;
 
 /// A single recall search result.
@@ -63,7 +62,7 @@ pub struct RecallQueryConfig {
 /// Engine that performs hybrid search across stored snapshots.
 pub struct RecallEngine<'a> {
     storage: &'a Storage,
-    ollama: Option<&'a OllamaClient>,
+    ollama: Option<&'a LlmClient>,
     embedding_store: Option<&'a EmbeddingStore>,
 }
 
@@ -72,7 +71,7 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn new(
         storage: &'a Storage,
-        ollama: Option<&'a OllamaClient>,
+        ollama: Option<&'a LlmClient>,
         embedding_store: Option<&'a EmbeddingStore>,
     ) -> Self {
         Self {
@@ -116,7 +115,7 @@ impl<'a> RecallEngine<'a> {
     async fn try_semantic(
         &self,
         query: &str,
-        ollama: &OllamaClient,
+        ollama: &LlmClient,
         emb_store: &EmbeddingStore,
         config: &RecallQueryConfig,
     ) -> Vec<RecallHit> {
@@ -730,8 +729,10 @@ mod tests {
             max_retries: 0,
             ..crate::config::OllamaConfig::default()
         };
-        let ollama = crate::ollama::OllamaClient::new(ollama_config)
-            .expect("failed to create OllamaClient for test");
+        let ollama = crate::llm::LlmClient::Ollama(
+            crate::llm::OllamaBackend::new(ollama_config)
+                .expect("failed to create OllamaBackend for test"),
+        );
 
         let engine = RecallEngine::new(&storage, Some(&ollama), Some(&emb_store));
         let config = RecallQueryConfig {

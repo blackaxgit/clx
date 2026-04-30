@@ -5,8 +5,7 @@ use clap::Subcommand;
 use colored::Colorize;
 use std::io::{self, Write};
 
-use clx_core::config::Config;
-use clx_core::llm::LocalLlmBackend;
+use clx_core::config::{Capability, Config, OllamaConfig};
 use clx_core::storage::Storage;
 
 use crate::Cli;
@@ -28,16 +27,19 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
     let config = Config::load().context("Failed to load configuration")?;
     let db_path = clx_core::paths::database_path();
 
+    let ollama_defaults = OllamaConfig::default();
+    let ollama_cfg = config.ollama.as_ref().unwrap_or(&ollama_defaults);
+
     match action {
         EmbeddingsAction::Status => {
             let emb_store = Storage::create_embedding_store_with_dimension(
                 &db_path,
-                config.ollama_or_default().embedding_dim,
+                ollama_cfg.embedding_dim,
             )
             .context("Failed to open embedding store. Run 'clx install' first.")?;
 
-            let model = &config.ollama_or_default().embedding_model;
-            let dim = config.ollama_or_default().embedding_dim;
+            let model = &ollama_cfg.embedding_model;
+            let dim = ollama_cfg.embedding_dim;
             let vec_enabled = emb_store.is_vector_search_enabled();
             let count = emb_store.count_embeddings().unwrap_or(0);
             let needs_migration = emb_store.needs_dimension_migration(dim);
@@ -80,7 +82,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
         EmbeddingsAction::Rebuild { dry_run } => {
             let mut emb_store = Storage::create_embedding_store_with_dimension(
                 &db_path,
-                config.ollama_or_default().embedding_dim,
+                ollama_cfg.embedding_dim,
             )
             .context("Failed to open embedding store. Run 'clx install' first.")?;
 
@@ -88,7 +90,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
             let storage = Storage::open_default().context("Failed to open database")?;
             let snapshots = storage.list_all_snapshots()?;
 
-            let dim = config.ollama_or_default().embedding_dim;
+            let dim = ollama_cfg.embedding_dim;
             let needs_migration = emb_store.needs_dimension_migration(dim);
             let existing_count = emb_store.count_embeddings().unwrap_or(0);
 
@@ -98,7 +100,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                         "{}",
                         serde_json::json!({
                             "dry_run": true,
-                            "model": config.ollama_or_default().embedding_model,
+                            "model": ollama_cfg.embedding_model,
                             "target_dimension": dim,
                             "needs_dimension_migration": needs_migration,
                             "existing_embeddings": existing_count,
@@ -112,7 +114,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                     println!();
                     println!(
                         "  Model:                {}",
-                        config.ollama_or_default().embedding_model.green()
+                        ollama_cfg.embedding_model.green()
                     );
                     println!("  Target dimension:     {dim}");
                     println!(
@@ -163,9 +165,14 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 }
             }
 
-            // Step 2: Create Ollama client and regenerate embeddings
-            let ollama = clx_core::ollama::OllamaClient::new(config.ollama_or_default().clone())
-                .context("Failed to create Ollama client")?;
+            // Step 2: Create LLM client and regenerate embeddings
+            let embed_model = config
+                .capability_route(Capability::Embeddings)
+                .map(|r| r.model.clone())
+                .unwrap_or_else(|_| ollama_cfg.embedding_model.clone());
+            let ollama = config
+                .create_llm_client(Capability::Embeddings)
+                .context("Failed to create LLM client")?;
 
             if !ollama.is_available().await {
                 if cli.json {
@@ -217,7 +224,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                     io::stdout().flush()?;
                 }
 
-                match ollama.embed(&text, None).await {
+                match ollama.embed(&text, Some(&embed_model)).await {
                     Ok(embedding) => {
                         if let Err(e) = emb_store.store_embedding(snapshot_id, embedding) {
                             if !cli.json {
@@ -246,7 +253,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                         "skipped": skipped,
                         "errors": errors,
                         "dimension": dim,
-                        "model": config.ollama_or_default().embedding_model,
+                        "model": ollama_cfg.embedding_model,
                     })
                 );
             } else {
@@ -260,7 +267,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                     println!("  Errors:           {errors}");
                 }
                 println!("  Dimension:        {dim}");
-                println!("  Model:            {}", config.ollama_or_default().embedding_model);
+                println!("  Model:            {}", ollama_cfg.embedding_model);
             }
         }
     }
@@ -277,21 +284,27 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
     let emb_store = Storage::create_embedding_store(&db_path)
         .context("Failed to open embedding store. Run 'clx install' first.")?;
 
-    // Load config and create Ollama client
+    // Load config and create LLM client for embeddings
     let config = Config::load().context("Failed to load configuration")?;
-    let ollama = match clx_core::ollama::OllamaClient::new(config.ollama_or_default().clone()) {
+    let backfill_defaults = OllamaConfig::default();
+    let backfill_cfg = config.ollama.as_ref().unwrap_or(&backfill_defaults);
+    let embed_model = config
+        .capability_route(Capability::Embeddings)
+        .map(|r| r.model.clone())
+        .unwrap_or_else(|_| backfill_cfg.embedding_model.clone());
+    let ollama = match config.create_llm_client(Capability::Embeddings) {
         Ok(client) => client,
         Err(e) => {
             if cli.json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "error": format!("Failed to create Ollama client: {}", e),
-                        "hint": "Check Ollama configuration"
+                        "error": format!("Failed to create LLM client: {}", e),
+                        "hint": "Check LLM configuration"
                     })
                 );
             } else {
-                println!("{}", format!("Failed to create Ollama client: {e}").red());
+                println!("{}", format!("Failed to create LLM client: {e}").red());
             }
             return Ok(());
         }
@@ -367,7 +380,7 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
             processed += 1;
         } else {
             // Generate embedding
-            match ollama.embed(&text, None).await {
+            match ollama.embed(&text, Some(&embed_model)).await {
                 Ok(embedding) => {
                     // Store embedding
                     if let Err(e) = emb_store.store_embedding(snapshot_id, embedding) {

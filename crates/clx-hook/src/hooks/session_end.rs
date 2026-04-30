@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use clx_core::ollama_health::{self, HealthStatus};
+use clx_core::llm_health::{self as ollama_health, HealthStatus};
 use clx_core::storage::Storage;
 use clx_core::types::{Snapshot, SnapshotTrigger};
 use tracing::{debug, info, warn};

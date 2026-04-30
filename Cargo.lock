@@ -601,6 +601,7 @@ dependencies = [
  "tokio",
  "tracing",
  "trait-variant",
+ "url",
  "wiremock",
 ]
 

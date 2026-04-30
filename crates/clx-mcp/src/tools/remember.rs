@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use clx_core::llm::LocalLlmBackend;
+
 use clx_core::types::{SessionId, Snapshot, SnapshotTrigger};
 
 use crate::protocol::types::INTERNAL_ERROR;
@@ -104,7 +104,7 @@ impl McpServer {
         let embedding_result = self.runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_millis(EMBEDDING_STORE_TIMEOUT_MS),
-                ollama.embed(text, None),
+                ollama.embed(text, Some(&self.embed_model)),
             )
             .await
         });

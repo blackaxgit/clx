@@ -6,10 +6,10 @@ use std::env;
 use std::io::{self, Write};
 use tracing::{debug, error, info, warn};
 
-use clx_core::config::OllamaConfig;
+use clx_core::config::{Capability, Config};
 use clx_core::credentials::CredentialStore;
 use clx_core::embeddings::EmbeddingStore;
-use clx_core::ollama::OllamaClient;
+use clx_core::llm::LlmClient;
 use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use clx_core::types::SessionId;
@@ -20,9 +20,6 @@ use crate::protocol::mcp_types::{
 use crate::protocol::types::{
     INVALID_PARAMS, INVALID_REQUEST, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR,
 };
-
-/// Timeout for embedding generation in milliseconds (for recall/search operations)
-pub(crate) const EMBEDDING_TIMEOUT_MS: u64 = 2000;
 
 /// Timeout for embedding storage in milliseconds (for remember/checkpoint operations)
 pub(crate) const EMBEDDING_STORE_TIMEOUT_MS: u64 = 5000;
@@ -40,8 +37,10 @@ pub struct McpServer {
     pub(crate) session_id: Option<SessionId>,
     pub(crate) db_path: String,
     pub(crate) credential_store: CredentialStore,
-    /// Ollama client for embedding generation (initialized lazily)
-    pub(crate) ollama_client: Option<OllamaClient>,
+    /// LLM client for embedding generation
+    pub(crate) ollama_client: Option<LlmClient>,
+    /// Model name to use for embedding calls
+    pub(crate) embed_model: String,
     /// Embedding store for vector search (initialized lazily)
     pub(crate) embedding_store: Option<EmbeddingStore>,
     /// Tokio runtime for async operations
@@ -68,16 +67,17 @@ impl McpServer {
             .build()
             .context("Failed to create Tokio runtime")?;
 
-        // Initialize Ollama client with custom timeout for embeddings
-        let ollama_config = OllamaConfig {
-            timeout_ms: EMBEDDING_TIMEOUT_MS,
-            ..OllamaConfig::default()
-        };
-        let ollama_client = match OllamaClient::new(ollama_config) {
+        // Initialize LLM client for embeddings via factory
+        let cfg = Config::load().unwrap_or_default();
+        let embed_model = cfg
+            .capability_route(Capability::Embeddings)
+            .map(|r| r.model.clone())
+            .unwrap_or_default();
+        let ollama_client = match cfg.create_llm_client(Capability::Embeddings) {
             Ok(client) => Some(client),
             Err(e) => {
                 warn!(
-                    "Failed to create Ollama client: {}. Embeddings will be disabled.",
+                    "Failed to create LLM client: {}. Embeddings will be disabled.",
                     e
                 );
                 None
@@ -114,6 +114,7 @@ impl McpServer {
             db_path,
             credential_store,
             ollama_client,
+            embed_model,
             embedding_store,
             runtime,
         })

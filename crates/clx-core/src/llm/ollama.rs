@@ -571,12 +571,6 @@ impl LocalLlmBackend for OllamaBackend {
     }
 }
 
-/// Deprecated alias kept for the duration of the refactor (Tasks 3-4). Will be
-/// removed once all callsites switch to `LlmClient`.
-#[deprecated(note = "use clx_core::llm::LlmClient via Config::create_llm_client instead")]
-#[allow(dead_code)]
-pub type OllamaClient = OllamaBackend;
-
 #[cfg(test)]
 mod tests {
     use super::*;

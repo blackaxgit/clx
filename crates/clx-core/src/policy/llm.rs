@@ -8,8 +8,7 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 use crate::config::PromptSensitivity;
-use crate::llm::LocalLlmBackend;
-use crate::ollama::OllamaClient;
+use crate::llm::LlmClient;
 
 use super::PolicyEngine;
 use super::cache::{ValidationCache, compute_cache_key};
@@ -71,12 +70,14 @@ impl PolicyEngine {
     /// - Risk score 4-7: Ask (with reasoning)
     /// - Risk score 8-10: Deny (with reasoning)
     /// - On error/timeout: Ask with "LLM unavailable" reason
+    #[allow(clippy::too_many_arguments)]
     pub async fn evaluate_with_llm(
         &self,
         _tool_name: &str,
         command: &str,
         working_dir: &str,
-        ollama: &OllamaClient,
+        ollama: &LlmClient,
+        model: &str,
         cache: Option<&ValidationCache>,
         sensitivity: &PromptSensitivity,
     ) -> PolicyDecision {
@@ -118,8 +119,8 @@ impl PolicyEngine {
 
         debug!("L1 evaluating command: {} in {}", command, working_dir);
 
-        // Call Ollama for LLM inference
-        let result = ollama.generate(&prompt, None).await;
+        // Call LLM for inference, routing to the configured model
+        let result = ollama.generate(&prompt, Some(model)).await;
 
         let decision = match result {
             Ok(response) => {

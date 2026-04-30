@@ -1,4 +1,4 @@
-use clx_core::config::{Config, ContextPressureMode, DefaultDecision};
+use clx_core::config::{Config, ContextPressureMode, DefaultDecision, OllamaConfig};
 
 use crate::dashboard::app::App;
 
@@ -119,30 +119,52 @@ pub fn set_field_value(
         // Section 2: Ollama
         (2, 0) => {
             validate_url(raw)?;
-            raw.trim().clone_into(&mut config.ollama_or_default_mut().host);
+            raw.trim()
+                .clone_into(&mut config.ollama.get_or_insert_with(OllamaConfig::default).host);
         }
         (2, 1) => {
             validate_nonempty_string(raw)?;
-            raw.trim().clone_into(&mut config.ollama_or_default_mut().model);
+            raw.trim()
+                .clone_into(&mut config.ollama.get_or_insert_with(OllamaConfig::default).model);
         }
         (2, 2) => {
             validate_nonempty_string(raw)?;
-            raw.trim().clone_into(&mut config.ollama_or_default_mut().embedding_model);
+            raw.trim().clone_into(
+                &mut config
+                    .ollama
+                    .get_or_insert_with(OllamaConfig::default)
+                    .embedding_model,
+            );
         }
         (2, 3) => {
-            config.ollama_or_default_mut().embedding_dim = validate_usize(raw, 1, 65536)?;
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .embedding_dim = validate_usize(raw, 1, 65536)?;
         }
         (2, 4) => {
-            config.ollama_or_default_mut().timeout_ms = validate_u64(raw, 100, 600_000)?;
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .timeout_ms = validate_u64(raw, 100, 600_000)?;
         }
         (2, 5) => {
-            config.ollama_or_default_mut().max_retries = validate_u32(raw, 0, 10)?;
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .max_retries = validate_u32(raw, 0, 10)?;
         }
         (2, 6) => {
-            config.ollama_or_default_mut().retry_delay_ms = validate_u64(raw, 0, 60_000)?;
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .retry_delay_ms = validate_u64(raw, 0, 60_000)?;
         }
         (2, 7) => {
-            config.ollama_or_default_mut().retry_backoff = validate_f32(raw, 1.0, 10.0)?;
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .retry_backoff = validate_f32(raw, 1.0, 10.0)?;
         }
 
         // Section 3: User Learning
@@ -224,14 +246,50 @@ pub fn reset_field_to_default(config: &mut Config, section: usize, field: usize)
         (1, 2) => config.context.embedding_model = defaults.context.embedding_model,
 
         // Section 2: Ollama
-        (2, 0) => config.ollama_or_default_mut().host = defaults.ollama_or_default().host.clone(),
-        (2, 1) => config.ollama_or_default_mut().model = defaults.ollama_or_default().model.clone(),
-        (2, 2) => config.ollama_or_default_mut().embedding_model = defaults.ollama_or_default().embedding_model.clone(),
-        (2, 3) => config.ollama_or_default_mut().embedding_dim = defaults.ollama_or_default().embedding_dim,
-        (2, 4) => config.ollama_or_default_mut().timeout_ms = defaults.ollama_or_default().timeout_ms,
-        (2, 5) => config.ollama_or_default_mut().max_retries = defaults.ollama_or_default().max_retries,
-        (2, 6) => config.ollama_or_default_mut().retry_delay_ms = defaults.ollama_or_default().retry_delay_ms,
-        (2, 7) => config.ollama_or_default_mut().retry_backoff = defaults.ollama_or_default().retry_backoff,
+        (2, 0) => {
+            config.ollama.get_or_insert_with(OllamaConfig::default).host =
+                OllamaConfig::default().host;
+        }
+        (2, 1) => {
+            config.ollama.get_or_insert_with(OllamaConfig::default).model =
+                OllamaConfig::default().model;
+        }
+        (2, 2) => {
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .embedding_model = OllamaConfig::default().embedding_model;
+        }
+        (2, 3) => {
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .embedding_dim = OllamaConfig::default().embedding_dim;
+        }
+        (2, 4) => {
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .timeout_ms = OllamaConfig::default().timeout_ms;
+        }
+        (2, 5) => {
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .max_retries = OllamaConfig::default().max_retries;
+        }
+        (2, 6) => {
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .retry_delay_ms = OllamaConfig::default().retry_delay_ms;
+        }
+        (2, 7) => {
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .retry_backoff = OllamaConfig::default().retry_backoff;
+        }
 
         // Section 3: User Learning
         (3, 0) => config.user_learning.enabled = defaults.user_learning.enabled,
@@ -306,14 +364,45 @@ pub fn get_field_value(config: &Config, section: usize, field: usize) -> String 
         (1, 2) => config.context.embedding_model.clone(),
 
         // Section 2: Ollama
-        (2, 0) => config.ollama_or_default().host.clone(),
-        (2, 1) => config.ollama_or_default().model.clone(),
-        (2, 2) => config.ollama_or_default().embedding_model.clone(),
-        (2, 3) => config.ollama_or_default().embedding_dim.to_string(),
-        (2, 4) => config.ollama_or_default().timeout_ms.to_string(),
-        (2, 5) => config.ollama_or_default().max_retries.to_string(),
-        (2, 6) => config.ollama_or_default().retry_delay_ms.to_string(),
-        (2, 7) => format!("{:.1}", config.ollama_or_default().retry_backoff),
+        (2, 0) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().host, |o| o.host.clone()),
+        (2, 1) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().model, |o| o.model.clone()),
+        (2, 2) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().embedding_model, |o| o.embedding_model.clone()),
+        (2, 3) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().embedding_dim, |o| o.embedding_dim)
+            .to_string(),
+        (2, 4) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().timeout_ms, |o| o.timeout_ms)
+            .to_string(),
+        (2, 5) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().max_retries, |o| o.max_retries)
+            .to_string(),
+        (2, 6) => config
+            .ollama
+            .as_ref()
+            .map_or_else(|| OllamaConfig::default().retry_delay_ms, |o| o.retry_delay_ms)
+            .to_string(),
+        (2, 7) => format!(
+            "{:.1}",
+            config
+                .ollama
+                .as_ref()
+                .map_or_else(|| OllamaConfig::default().retry_backoff, |o| o.retry_backoff)
+        ),
 
         // Section 3: User Learning
         (3, 0) => config.user_learning.enabled.to_string(),
@@ -854,7 +943,7 @@ mod tests {
     fn test_set_field_value_url_validation() {
         let mut config = Config::default();
         set_field_value(&mut config, 2, 0, "http://custom:8080").unwrap();
-        assert_eq!(config.ollama_or_default().host, "http://custom:8080");
+        assert_eq!(config.ollama.as_ref().unwrap().host, "http://custom:8080");
 
         assert!(set_field_value(&mut config, 2, 0, "ftp://bad").is_err());
     }
@@ -863,7 +952,7 @@ mod tests {
     fn test_set_field_value_f32_roundtrip() {
         let mut config = Config::default();
         set_field_value(&mut config, 2, 7, "3.5").unwrap();
-        assert!((config.ollama_or_default().retry_backoff - 3.5).abs() < f32::EPSILON);
+        assert!((config.ollama.as_ref().unwrap().retry_backoff - 3.5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -884,7 +973,7 @@ mod tests {
     fn test_set_field_value_usize_roundtrip() {
         let mut config = Config::default();
         set_field_value(&mut config, 2, 3, "768").unwrap();
-        assert_eq!(config.ollama_or_default().embedding_dim, 768);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 768);
     }
 
     #[test]
@@ -948,9 +1037,13 @@ mod tests {
     #[test]
     fn test_reset_field_to_default_string() {
         let mut config = Config::default();
-        config.ollama_or_default_mut().host = "http://custom:9999".to_owned();
+        config.ollama.get_or_insert_with(OllamaConfig::default).host =
+            "http://custom:9999".to_owned();
         reset_field_to_default(&mut config, 2, 0);
-        assert_eq!(config.ollama_or_default().host, "http://127.0.0.1:11434");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().host,
+            "http://127.0.0.1:11434"
+        );
     }
 
     #[test]
@@ -973,7 +1066,7 @@ mod tests {
         let mut config = Config::default();
         // Modify several fields
         config.validator.layer1_timeout_ms = 1;
-        config.ollama_or_default_mut().host = "changed".to_owned();
+        config.ollama.get_or_insert_with(OllamaConfig::default).host = "changed".to_owned();
         config.context_pressure.threshold = 0.5;
 
         // Reset them
@@ -981,14 +1074,17 @@ mod tests {
         reset_field_to_default(&mut config, 2, 0);
         reset_field_to_default(&mut config, 5, 2);
 
-        let defaults = Config::default();
         assert_eq!(
             config.validator.layer1_timeout_ms,
-            defaults.validator.layer1_timeout_ms
+            Config::default().validator.layer1_timeout_ms
         );
-        assert_eq!(config.ollama_or_default().host, defaults.ollama_or_default().host);
+        assert_eq!(
+            config.ollama.as_ref().unwrap().host,
+            OllamaConfig::default().host
+        );
         assert!(
-            (config.context_pressure.threshold - defaults.context_pressure.threshold).abs()
+            (config.context_pressure.threshold - Config::default().context_pressure.threshold)
+                .abs()
                 < f64::EPSILON
         );
     }

@@ -212,7 +212,12 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
     let start = Instant::now();
     let host = config.map_or_else(
         || "http://127.0.0.1:11434".into(),
-        |c| c.ollama_or_default().host.clone(),
+        |c| {
+            c.ollama
+                .as_ref()
+                .map(|o| o.host.clone())
+                .unwrap_or_else(|| "http://127.0.0.1:11434".into())
+        },
     );
 
     let url = format!("{host}/");
@@ -263,7 +268,16 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
 async fn check_validator_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
     let (host, model) = match config {
-        Some(c) => (c.ollama_or_default().host.clone(), c.ollama_or_default().model.clone()),
+        Some(c) => {
+            let ollama = c.ollama.as_ref();
+            let host = ollama
+                .map(|o| o.host.clone())
+                .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+            let model = ollama
+                .map(|o| o.model.clone())
+                .unwrap_or_else(|| "qwen3:1.7b".into());
+            (host, model)
+        }
         None => ("http://127.0.0.1:11434".into(), "qwen3:1.7b".into()),
     };
 
@@ -275,7 +289,16 @@ async fn check_validator_model(config: Option<&clx_core::config::Config>) -> Che
 async fn check_embedding_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
     let (host, model) = match config {
-        Some(c) => (c.ollama_or_default().host.clone(), c.ollama_or_default().embedding_model.clone()),
+        Some(c) => {
+            let ollama = c.ollama.as_ref();
+            let host = ollama
+                .map(|o| o.host.clone())
+                .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+            let model = ollama
+                .map(|o| o.embedding_model.clone())
+                .unwrap_or_else(|| "nomic-embed-text".into());
+            (host, model)
+        }
         None => ("http://127.0.0.1:11434".into(), "nomic-embed-text".into()),
     };
 

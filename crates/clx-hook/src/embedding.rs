@@ -1,34 +1,41 @@
 //! Embedding generation and storage, plus path resolution utilities.
 
 use anyhow::Result;
-use clx_core::config::Config;
-use clx_core::llm::LocalLlmBackend;
-use clx_core::ollama::OllamaClient;
+use clx_core::config::{Capability, Config};
 use clx_core::storage::Storage;
 use tracing::{debug, info, warn};
 
 /// Generate and store embedding for a snapshot
 pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -> Result<()> {
     let config = Config::load().unwrap_or_default();
-    let ollama = match OllamaClient::new(config.ollama_or_default().clone()) {
-        Ok(client) => client,
+    let (client, model) = match config
+        .create_llm_client(Capability::Embeddings)
+        .and_then(|c| {
+            config
+                .capability_route(Capability::Embeddings)
+                .map(|r| (c, r.model.clone()))
+        }) {
+        Ok(pair) => pair,
         Err(e) => {
             debug!(
-                "Failed to create Ollama client for embedding: {}, skipping",
+                "Failed to create LLM client for embedding: {}, skipping",
                 e
             );
             return Ok(());
         }
     };
 
-    if !ollama.is_available().await {
-        debug!("Ollama not available, skipping embedding generation");
+    if !client.is_available().await {
+        debug!("LLM not available, skipping embedding generation");
         return Ok(());
     }
 
     // Generate embedding with timeout
     let embedding =
-        match tokio::time::timeout(std::time::Duration::from_secs(5), ollama.embed(text, None))
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.embed(text, Some(&model)),
+        )
             .await
         {
             Ok(Ok(emb)) => emb,
@@ -130,7 +137,7 @@ mod tests {
     ///
     /// The function stores the embedding to the default DB path (under HOME).
     /// We redirect HOME to a temp directory so the real ~/.clx is untouched.
-    /// Wiremock binds to 127.0.0.1, which `OllamaClient` accepts as localhost.
+    /// Wiremock binds to 127.0.0.1, which the Ollama backend accepts as localhost.
     #[tokio::test]
     async fn test_generate_and_store_embedding_success() {
         use wiremock::matchers::{method, path};

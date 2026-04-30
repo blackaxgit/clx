@@ -3,8 +3,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 
-use clx_core::config::Config;
-use clx_core::llm::LocalLlmBackend;
+use clx_core::config::{Capability, Config};
 use clx_core::storage::Storage;
 
 use crate::Cli;
@@ -32,10 +31,33 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         return Ok(());
     };
 
-    // Load config and create Ollama client
+    // Load config and create LLM client for embeddings
     let config = Config::load().context("Failed to load configuration")?;
-    let ollama = clx_core::ollama::OllamaClient::new(config.ollama_or_default().clone())
-        .context("Failed to create Ollama client")?;
+    let embed_model = config
+        .capability_route(Capability::Embeddings)
+        .map(|r| r.model.clone())
+        .unwrap_or_default();
+    let ollama = match config.create_llm_client(Capability::Embeddings) {
+        Ok(client) => client,
+        Err(_) => {
+            if cli.json {
+                let output = RecallOutput {
+                    query: query.to_string(),
+                    results: vec![],
+                };
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("{}", "Context Recall".cyan().bold());
+                println!("{}", "=".repeat(50));
+                println!();
+                println!("{}  {}", "Query:".bold(), query);
+                println!();
+                println!("{}", "Could not generate embedding for query.".yellow());
+                println!("Ollama is not configured. Run 'clx install' and ensure Ollama is running.");
+            }
+            return Ok(());
+        }
+    };
 
     // Generate embedding for the query
     let spinner = if cli.json {
@@ -47,7 +69,7 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         Some(sp)
     };
 
-    let query_embedding = match ollama.embed(query, None).await {
+    let query_embedding = match ollama.embed(query, Some(&embed_model)).await {
         Ok(emb) => emb,
         Err(e) => {
             if let Some(sp) = &spinner {

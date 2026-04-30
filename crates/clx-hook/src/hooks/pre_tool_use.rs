@@ -1,10 +1,8 @@
 //! `PreToolUse` hook handler - validate commands before execution.
 
 use anyhow::Result;
-use clx_core::config::Config;
+use clx_core::config::{Capability, Config};
 use clx_core::config::DefaultDecision;
-use clx_core::llm::LocalLlmBackend;
-use clx_core::ollama::OllamaClient;
 use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
     is_read_only_command,
@@ -273,12 +271,18 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         return Ok(());
     }
 
-    // Initialize Ollama client for L1 validation
-    let ollama = match OllamaClient::new(config.ollama_or_default().clone()) {
-        Ok(client) => client,
+    // Initialize LLM client for L1 validation
+    let (ollama, chat_model) = match config
+        .create_llm_client(Capability::Chat)
+        .and_then(|c| {
+            config
+                .capability_route(Capability::Chat)
+                .map(|r| (c, r.model.clone()))
+        }) {
+        Ok(pair) => pair,
         Err(e) => {
             debug!(
-                "Failed to create Ollama client: {}, defaulting to {}",
+                "Failed to create LLM client: {}, defaulting to {}",
                 e, config.validator.default_decision
             );
             let fallback = config.validator.default_decision.as_str();
@@ -305,19 +309,19 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     };
 
     // Check file-based health cache before network call
-    let health = clx_core::ollama_health::read_cached_health();
+    let health = clx_core::llm_health::read_cached_health();
     let ollama_available = match health {
-        clx_core::ollama_health::HealthStatus::Available => {
-            debug!("Health cache: Ollama recently available, skipping check");
+        clx_core::llm_health::HealthStatus::Available => {
+            debug!("Health cache: LLM recently available, skipping check");
             true
         }
-        clx_core::ollama_health::HealthStatus::Unavailable => {
-            debug!("Health cache: Ollama recently unavailable, skipping check");
+        clx_core::llm_health::HealthStatus::Unavailable => {
+            debug!("Health cache: LLM recently unavailable, skipping check");
             false
         }
-        clx_core::ollama_health::HealthStatus::Unknown => {
+        clx_core::llm_health::HealthStatus::Unknown => {
             let available = ollama.is_available().await;
-            clx_core::ollama_health::write_health(available);
+            clx_core::llm_health::write_health(available);
             available
         }
     };
@@ -357,6 +361,7 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             command,
             &input.cwd,
             &ollama,
+            &chat_model,
             None,
             &config.validator.prompt_sensitivity,
         )
@@ -368,7 +373,7 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     if let PolicyDecision::Ask { ref reason } = l1_decision
         && reason == "LLM unavailable"
     {
-        clx_core::ollama_health::write_health(false);
+        clx_core::llm_health::write_health(false);
         let fallback = config.validator.default_decision.as_str();
         let fallback_reason = format!("LLM unavailable — fallback: {fallback}");
         log_audit_entry(
@@ -392,7 +397,7 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     }
 
     // Update health cache after successful LLM interaction
-    clx_core::ollama_health::write_health(true);
+    clx_core::llm_health::write_health(true);
 
     match l1_decision {
         PolicyDecision::Allow => {

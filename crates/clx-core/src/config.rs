@@ -872,35 +872,6 @@ impl Config {
         Ok(crate::paths::clx_dir())
     }
 
-    // -----------------------------------------------------------------------
-    // Legacy-compat helpers (stepping-stone; removed by Task 10)
-    // -----------------------------------------------------------------------
-
-    /// Return a reference to the Ollama config, falling back to defaults.
-    ///
-    /// Callers that still use the legacy `config.ollama_or_default().*` pattern should
-    /// migrate to `Config::create_llm_client` in Task 10. Until then this
-    /// shim preserves the old behaviour.
-    #[inline]
-    pub fn ollama_or_default(&self) -> &OllamaConfig {
-        self.ollama.as_ref().unwrap_or_else(|| {
-            // SAFETY: The leak is intentional — this is a one-time static
-            // default used only for the legacy stepping-stone path.
-            static DEFAULT: std::sync::OnceLock<OllamaConfig> = std::sync::OnceLock::new();
-            DEFAULT.get_or_init(OllamaConfig::default)
-        })
-    }
-
-    /// Return a mutable reference to the Ollama config, creating it from
-    /// defaults if absent.
-    ///
-    /// Used only by the dashboard Settings tab (legacy path; Task 10 removes
-    /// this call chain entirely).
-    #[inline]
-    pub fn ollama_or_default_mut(&mut self) -> &mut OllamaConfig {
-        self.ollama.get_or_insert_with(OllamaConfig::default)
-    }
-
     /// Get the default configuration file path
     pub fn config_file_path() -> crate::Result<PathBuf> {
         Self::config_dir().map(|d| d.join("config.yaml"))
@@ -1761,12 +1732,13 @@ mod tests {
         assert!(config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "qwen3-embedding:0.6b");
 
-        // Ollama defaults
-        assert_eq!(config.ollama_or_default().host, "http://127.0.0.1:11434");
-        assert_eq!(config.ollama_or_default().model, "qwen3:1.7b");
-        assert_eq!(config.ollama_or_default().embedding_model, "qwen3-embedding:0.6b");
-        assert_eq!(config.ollama_or_default().embedding_dim, 1024);
-        assert_eq!(config.ollama_or_default().timeout_ms, 60000);
+        // Ollama defaults (config.ollama is None by default; verify via OllamaConfig::default())
+        let ollama_defaults = OllamaConfig::default();
+        assert_eq!(ollama_defaults.host, "http://127.0.0.1:11434");
+        assert_eq!(ollama_defaults.model, "qwen3:1.7b");
+        assert_eq!(ollama_defaults.embedding_model, "qwen3-embedding:0.6b");
+        assert_eq!(ollama_defaults.embedding_dim, 1024);
+        assert_eq!(ollama_defaults.timeout_ms, 60000);
 
         // User learning defaults
         assert!(config.user_learning.enabled);
@@ -1833,10 +1805,10 @@ logging:
         assert!(!config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "custom-embed");
 
-        assert_eq!(config.ollama_or_default().host, "http://localhost:8080");
-        assert_eq!(config.ollama_or_default().model, "mistral:7b");
-        assert_eq!(config.ollama_or_default().embedding_model, "custom-embed");
-        assert_eq!(config.ollama_or_default().timeout_ms, 10000);
+        assert_eq!(config.ollama.as_ref().unwrap().host, "http://localhost:8080");
+        assert_eq!(config.ollama.as_ref().unwrap().model, "mistral:7b");
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_model, "custom-embed");
+        assert_eq!(config.ollama.as_ref().unwrap().timeout_ms, 10000);
 
         assert!(!config.user_learning.enabled);
         assert_eq!(config.user_learning.auto_whitelist_threshold, 5);
@@ -1865,7 +1837,7 @@ validator:
 
         // Other sections should be entirely default
         assert!(config.context.enabled);
-        assert_eq!(config.ollama_or_default().host, "http://127.0.0.1:11434");
+        assert_eq!(OllamaConfig::default().host, "http://127.0.0.1:11434");
         assert!(config.user_learning.enabled);
         assert_eq!(config.logging.level, "info");
     }
@@ -1896,7 +1868,7 @@ validator:
 
         assert!(!config.validator.enabled);
         assert_eq!(config.validator.layer1_timeout_ms, 2000);
-        assert_eq!(config.ollama_or_default().model, "custom-model:latest");
+        assert_eq!(config.ollama.as_ref().unwrap().model, "custom-model:latest");
         assert_eq!(config.user_learning.auto_whitelist_threshold, 10);
         assert_eq!(config.logging.level, "debug");
     }
@@ -2079,10 +2051,10 @@ validator:
         assert!(!config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "test-embed");
 
-        assert_eq!(config.ollama_or_default().host, "http://test:1234");
-        assert_eq!(config.ollama_or_default().model, "test-model");
-        assert_eq!(config.ollama_or_default().embedding_model, "test-embed-model");
-        assert_eq!(config.ollama_or_default().timeout_ms, 9999);
+        assert_eq!(config.ollama.as_ref().unwrap().host, "http://test:1234");
+        assert_eq!(config.ollama.as_ref().unwrap().model, "test-model");
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_model, "test-embed-model");
+        assert_eq!(config.ollama.as_ref().unwrap().timeout_ms, 9999);
 
         assert!(!config.user_learning.enabled);
         assert_eq!(config.user_learning.auto_whitelist_threshold, 99);
@@ -2112,8 +2084,9 @@ validator:
     #[test]
     fn test_qwen3_embedding_defaults() {
         let config = Config::default();
-        assert_eq!(config.ollama_or_default().embedding_model, "qwen3-embedding:0.6b");
-        assert_eq!(config.ollama_or_default().embedding_dim, 1024);
+        let ollama_defaults = OllamaConfig::default();
+        assert_eq!(ollama_defaults.embedding_model, "qwen3-embedding:0.6b");
+        assert_eq!(ollama_defaults.embedding_dim, 1024);
         assert_eq!(config.context.embedding_model, "qwen3-embedding:0.6b");
     }
 
@@ -2131,7 +2104,7 @@ validator:
         let mut config = Config::default();
         config.apply_env_overrides();
 
-        assert_eq!(config.ollama_or_default().embedding_dim, 768);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 768);
     }
 
     #[test]
@@ -2148,7 +2121,7 @@ validator:
         let mut config = Config::default();
         config.apply_env_overrides();
 
-        assert_eq!(config.ollama_or_default().embedding_dim, 1024);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 1024);
     }
 
     #[test]
@@ -2160,8 +2133,8 @@ ollama:
 "#;
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
-        assert_eq!(config.ollama_or_default().embedding_model, "custom-model");
-        assert_eq!(config.ollama_or_default().embedding_dim, 512);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_model, "custom-model");
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 512);
     }
 
     #[test]
@@ -2172,7 +2145,7 @@ ollama:
 "#;
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
-        assert_eq!(config.ollama_or_default().embedding_dim, 1024);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 1024);
     }
 
     // --- H5: Env var validation helper tests ---
@@ -2669,7 +2642,7 @@ validator:
         // Assert: file-only values preserved without env var influence.
         assert!(!config.validator.enabled);
         // Other fields are defaults — the point is env vars play no role here.
-        assert_eq!(config.ollama_or_default().host, "http://127.0.0.1:11434");
+        assert_eq!(OllamaConfig::default().host, "http://127.0.0.1:11434");
     }
 
     // --- PromptSensitivity tests ---
