@@ -808,6 +808,15 @@ pub struct LlmRouting {
 pub struct CapabilityRoute {
     pub provider: String,
     pub model: String,
+
+    /// Optional secondary provider used when the primary fails with a
+    /// transient error. `Box` to allow recursion (each fallback could
+    /// itself have a fallback; v0.7.0 only surfaces a single level UX).
+    /// The `model` field on a fallback route is honored at fallback call
+    /// time — the caller's model name is replaced because providers don't
+    /// share model names (e.g. `gpt-5.4-mini` only exists on Azure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<CapabilityRoute>>,
 }
 
 /// Which LLM capability to route.
@@ -1288,10 +1297,12 @@ impl Config {
             chat: CapabilityRoute {
                 provider: "ollama-local".into(),
                 model: legacy.model.clone(),
+                fallback: None,
             },
             embeddings: CapabilityRoute {
                 provider: "ollama-local".into(),
                 model: legacy.embedding_model.clone(),
+                fallback: None,
             },
         });
     }
@@ -2971,5 +2982,40 @@ ollama:
             }
             Err(other) => panic!("unexpected error storing colon key: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fallback_field_round_trips() {
+        let yaml = "
+provider: azure-prod
+model: gpt-5.4-mini
+fallback:
+  provider: ollama-local
+  model: \"qwen3:1.7b\"
+";
+        let route: CapabilityRoute = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(route.provider, "azure-prod");
+        let fb = route.fallback.as_deref().expect("fallback present");
+        assert_eq!(fb.provider, "ollama-local");
+        assert_eq!(fb.model, "qwen3:1.7b");
+        assert!(fb.fallback.is_none());
+
+        let yaml2 = serde_yml::to_string(&route).unwrap();
+        let route2: CapabilityRoute = serde_yml::from_str(&yaml2).unwrap();
+        assert_eq!(route, route2);
+    }
+
+    #[test]
+    fn fallback_field_omitted_in_serialization_when_none() {
+        let route = CapabilityRoute {
+            provider: "p".into(),
+            model: "m".into(),
+            fallback: None,
+        };
+        let yaml = serde_yml::to_string(&route).unwrap();
+        assert!(
+            !yaml.contains("fallback"),
+            "skip_serializing_if not respected: {yaml}"
+        );
     }
 }
