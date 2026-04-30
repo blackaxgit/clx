@@ -2929,27 +2929,47 @@ ollama:
     /// existing `CredentialStore` validator (which rejects colons). Earlier
     /// 0.6.0 used `<provider>:api-key` (colon) and was unwriteable. 0.6.1
     /// uses `<provider>-api-key` (hyphen).
+    ///
+    /// Discriminates by error variant so headless CI (Linux without D-Bus,
+    /// sandboxed macOS keychain) still passes — those return
+    /// `ServiceUnavailable`/`Keychain`, orthogonal to the validator contract.
     #[test]
     fn azure_keychain_key_passes_credential_store_validator() {
-        let store = crate::credentials::CredentialStore::with_service("clx-test-keyfmt");
-        // The resolver-format key (with hyphen) must round-trip cleanly.
-        // Use a unique provider name so this test never collides with real data.
+        use crate::credentials::{CredentialError, CredentialStore};
+        let store = CredentialStore::with_service("clx-test-keyfmt");
         let provider = "azure-regression-test-keyfmt";
-        let key = format!("{provider}-api-key");
-        // store/get/delete should all succeed without InvalidKey.
-        store
-            .store(&key, "fake-value")
-            .expect("store must accept hyphen key");
-        let got = store.get(&key).expect("get ok").expect("value present");
-        assert_eq!(got, "fake-value");
-        store.delete(&key).expect("delete ok");
 
-        // Sanity check: the OLD colon format would have failed.
+        // 1. Hyphen-format key MUST NOT be rejected by the validator.
+        let key = format!("{provider}-api-key");
+        match store.store(&key, "fake-value") {
+            Ok(()) => {
+                let got = store.get(&key).ok().flatten();
+                assert_eq!(got.as_deref(), Some("fake-value"));
+                let _ = store.delete(&key);
+            }
+            Err(CredentialError::InvalidKey(msg)) => {
+                panic!("hyphen key '{key}' rejected by validator (regression): {msg}");
+            }
+            Err(CredentialError::ServiceUnavailable(_) | CredentialError::Keychain(_)) => {
+                // Headless CI — keychain not present. Validator contract is
+                // what we're testing; storage is incidental.
+            }
+            Err(other) => panic!("unexpected error storing hyphen key: {other:?}"),
+        }
+
+        // 2. Colon-format key MUST be rejected by the validator (the 0.6.0
+        //    bug). The validator runs before keychain access.
         let bad = format!("{provider}:api-key");
-        let res = store.store(&bad, "fake-value");
-        assert!(
-            res.is_err(),
-            "colon-keyed format must NOT pass validator (regression guard)"
-        );
+        match store.store(&bad, "fake-value") {
+            Err(CredentialError::InvalidKey(_)) => {}
+            Ok(()) => panic!("colon-keyed format must be rejected by validator"),
+            Err(CredentialError::ServiceUnavailable(_) | CredentialError::Keychain(_)) => {
+                // Lenient: don't flake on backend errors that mask the
+                // validator. If the validator ever loosens to allow colons,
+                // case 1 above would not have detected the regression
+                // either, so this lenience is consistent.
+            }
+            Err(other) => panic!("unexpected error storing colon key: {other:?}"),
+        }
     }
 }
