@@ -728,6 +728,40 @@ impl Default for McpToolsConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Azure OpenAI provider config (Task 7 — does NOT touch the root Config struct)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Azure OpenAI backend.
+///
+/// Loaded from the `azure_openai` section of `~/.clx/config.yaml` by Task 9.
+/// Added here as a standalone type so `AzureOpenAIBackend::new` has a typed
+/// config to accept.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AzureOpenAIConfig {
+    /// Full base URL, e.g. `https://my-resource.openai.azure.com`
+    pub endpoint: String,
+    /// Name of the env var whose value is the API key (optional).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Path to a file containing the API key (optional).
+    #[serde(default)]
+    pub api_key_file: Option<std::path::PathBuf>,
+    /// If set, use the dated deployment URL shape instead of `/openai/v1/…`.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// HTTP request timeout in milliseconds (default 30 000).
+    #[serde(default = "default_azure_timeout")]
+    pub timeout_ms: u64,
+    /// Retry policy (uses the shared `RetryConfig` from `llm::retry`).
+    #[serde(default)]
+    pub retry: crate::llm::retry::RetryConfig,
+}
+
+fn default_azure_timeout() -> u64 {
+    30_000
+}
+
 impl Config {
     /// Load configuration from default locations with environment variable overrides
     ///

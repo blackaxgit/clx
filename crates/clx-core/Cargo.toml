@@ -23,6 +23,7 @@ keyring.workspace = true
 secrecy.workspace = true
 sqlite-vec.workspace = true
 trait-variant.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

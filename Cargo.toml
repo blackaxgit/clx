@@ -63,6 +63,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 # Traits and utilities
 trait-variant = "0.1"
 
+# URL parsing
+url = "2"
+
 # Password input
 rpassword = "7"
 

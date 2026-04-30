@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RetryConfig {
     pub max_retries: u32,
     pub base_delay: Duration,
