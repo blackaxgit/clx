@@ -32,11 +32,9 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
 
     match action {
         EmbeddingsAction::Status => {
-            let emb_store = Storage::create_embedding_store_with_dimension(
-                &db_path,
-                ollama_cfg.embedding_dim,
-            )
-            .context("Failed to open embedding store. Run 'clx install' first.")?;
+            let emb_store =
+                Storage::create_embedding_store_with_dimension(&db_path, ollama_cfg.embedding_dim)
+                    .context("Failed to open embedding store. Run 'clx install' first.")?;
 
             let model = &ollama_cfg.embedding_model;
             let dim = ollama_cfg.embedding_dim;
@@ -80,11 +78,9 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
             }
         }
         EmbeddingsAction::Rebuild { dry_run } => {
-            let mut emb_store = Storage::create_embedding_store_with_dimension(
-                &db_path,
-                ollama_cfg.embedding_dim,
-            )
-            .context("Failed to open embedding store. Run 'clx install' first.")?;
+            let mut emb_store =
+                Storage::create_embedding_store_with_dimension(&db_path, ollama_cfg.embedding_dim)
+                    .context("Failed to open embedding store. Run 'clx install' first.")?;
 
             // Get all snapshots to regenerate
             let storage = Storage::open_default().context("Failed to open database")?;

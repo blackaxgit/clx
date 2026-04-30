@@ -7,7 +7,7 @@
 //! (`/openai/deployments/<deployment>/...?api-version=<v>`).
 
 use crate::config::AzureOpenAIConfig;
-use crate::llm::retry::{with_backoff, RetryConfig};
+use crate::llm::retry::{RetryConfig, with_backoff};
 use crate::llm::{LlmError, LocalLlmBackend};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,11 @@ impl AzureOpenAIBackend {
 
         // Allow override for dev tenants / emulators / wiremock tests.
         if let Ok(allowlist) = std::env::var("CLX_ALLOW_AZURE_HOSTS") {
-            for h in allowlist.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for h in allowlist
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 if host == h {
                     return Ok(());
                 }
@@ -338,7 +342,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
 mod tests {
     use super::*;
     use secrecy::SecretString;
-    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
     fn cfg(endpoint: String) -> AzureOpenAIConfig {
         AzureOpenAIConfig {
@@ -379,7 +383,10 @@ mod tests {
             SecretString::new("test-key".to_string().into()),
         )
         .unwrap();
-        let out = backend.generate("hello", Some("gpt-5.4-mini")).await.unwrap();
+        let out = backend
+            .generate("hello", Some("gpt-5.4-mini"))
+            .await
+            .unwrap();
         assert_eq!(out, "hello back");
     }
 
@@ -441,16 +448,12 @@ mod tests {
         let mock = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/openai/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_string("deployment not found"),
-            )
+            .respond_with(ResponseTemplate::new(404).set_body_string("deployment not found"))
             .mount(&mock)
             .await;
-        let backend = AzureOpenAIBackend::new(
-            &cfg(mock.uri()),
-            SecretString::new("k".to_string().into()),
-        )
-        .unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
         let r = backend.generate("hi", Some("does-not-exist")).await;
         assert!(matches!(r, Err(LlmError::DeploymentNotFound(_))));
     }
@@ -468,11 +471,9 @@ mod tests {
             )
             .mount(&mock)
             .await;
-        let backend = AzureOpenAIBackend::new(
-            &cfg(mock.uri()),
-            SecretString::new("k".to_string().into()),
-        )
-        .unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
         let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
         match r {
             Err(LlmError::RateLimit { retry_after }) => {
@@ -493,11 +494,9 @@ mod tests {
             ))
             .mount(&mock)
             .await;
-        let backend = AzureOpenAIBackend::new(
-            &cfg(mock.uri()),
-            SecretString::new("k".to_string().into()),
-        )
-        .unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
         let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
         assert!(matches!(r, Err(LlmError::ContentFilter(_))));
     }
@@ -511,11 +510,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
             .mount(&mock)
             .await;
-        let backend = AzureOpenAIBackend::new(
-            &cfg(mock.uri()),
-            SecretString::new("k".to_string().into()),
-        )
-        .unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
         let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
         assert!(matches!(r, Err(LlmError::Server { status: 500, .. })));
     }
@@ -526,17 +523,12 @@ mod tests {
         let mock = MockServer::start().await;
         Mock::given(matchers::method("GET"))
             .and(matchers::path("/openai/v1/models"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"data":[]})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":[]})))
             .mount(&mock)
             .await;
-        let backend = AzureOpenAIBackend::new(
-            &cfg(mock.uri()),
-            SecretString::new("k".to_string().into()),
-        )
-        .unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
         assert!(backend.is_available().await);
     }
 
@@ -549,11 +541,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&mock)
             .await;
-        let backend = AzureOpenAIBackend::new(
-            &cfg(mock.uri()),
-            SecretString::new("k".to_string().into()),
-        )
-        .unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
         assert!(!backend.is_available().await);
     }
 }

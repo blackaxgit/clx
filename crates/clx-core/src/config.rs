@@ -1310,10 +1310,7 @@ impl Config {
         &self,
         capability: Capability,
     ) -> Result<&CapabilityRoute, LlmConfigError> {
-        let llm = self
-            .llm
-            .as_ref()
-            .ok_or(LlmConfigError::MissingLlmRouting)?;
+        let llm = self.llm.as_ref().ok_or(LlmConfigError::MissingLlmRouting)?;
         Ok(match capability {
             Capability::Chat => &llm.chat,
             Capability::Embeddings => &llm.embeddings,
@@ -1367,8 +1364,8 @@ impl Config {
                 Ok(crate::llm::LlmClient::Ollama(backend))
             }
             ProviderConfig::AzureOpenai(c) => {
-                let secret = resolve_azure_credential(name, c)
-                    .map_err(LlmConfigError::ProviderInit)?;
+                let secret =
+                    resolve_azure_credential(name, c).map_err(LlmConfigError::ProviderInit)?;
                 let backend = crate::llm::AzureOpenAIBackend::new(c, secret)
                     .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
                 Ok(crate::llm::LlmClient::Azure(backend))
@@ -1448,8 +1445,8 @@ fn resolve_azure_credential(
 #[cfg(unix)]
 fn read_file_credential(path: &std::path::Path) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("io error reading {}: {e}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("io error reading {}: {e}", path.display()))?;
     let mode = metadata.permissions().mode() & 0o777;
     if mode != 0o600 {
         return Err(format!(
@@ -1805,9 +1802,15 @@ logging:
         assert!(!config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "custom-embed");
 
-        assert_eq!(config.ollama.as_ref().unwrap().host, "http://localhost:8080");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().host,
+            "http://localhost:8080"
+        );
         assert_eq!(config.ollama.as_ref().unwrap().model, "mistral:7b");
-        assert_eq!(config.ollama.as_ref().unwrap().embedding_model, "custom-embed");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().embedding_model,
+            "custom-embed"
+        );
         assert_eq!(config.ollama.as_ref().unwrap().timeout_ms, 10000);
 
         assert!(!config.user_learning.enabled);
@@ -2053,7 +2056,10 @@ validator:
 
         assert_eq!(config.ollama.as_ref().unwrap().host, "http://test:1234");
         assert_eq!(config.ollama.as_ref().unwrap().model, "test-model");
-        assert_eq!(config.ollama.as_ref().unwrap().embedding_model, "test-embed-model");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().embedding_model,
+            "test-embed-model"
+        );
         assert_eq!(config.ollama.as_ref().unwrap().timeout_ms, 9999);
 
         assert!(!config.user_learning.enabled);
@@ -2133,7 +2139,10 @@ ollama:
 "#;
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
-        assert_eq!(config.ollama.as_ref().unwrap().embedding_model, "custom-model");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().embedding_model,
+            "custom-model"
+        );
         assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 512);
     }
 

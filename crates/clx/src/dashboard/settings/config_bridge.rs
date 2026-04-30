@@ -124,8 +124,12 @@ pub fn set_field_value(
         }
         (2, 1) => {
             validate_nonempty_string(raw)?;
-            raw.trim()
-                .clone_into(&mut config.ollama.get_or_insert_with(OllamaConfig::default).model);
+            raw.trim().clone_into(
+                &mut config
+                    .ollama
+                    .get_or_insert_with(OllamaConfig::default)
+                    .model,
+            );
         }
         (2, 2) => {
             validate_nonempty_string(raw)?;
@@ -251,8 +255,10 @@ pub fn reset_field_to_default(config: &mut Config, section: usize, field: usize)
                 OllamaConfig::default().host;
         }
         (2, 1) => {
-            config.ollama.get_or_insert_with(OllamaConfig::default).model =
-                OllamaConfig::default().model;
+            config
+                .ollama
+                .get_or_insert_with(OllamaConfig::default)
+                .model = OllamaConfig::default().model;
         }
         (2, 2) => {
             config
@@ -372,14 +378,17 @@ pub fn get_field_value(config: &Config, section: usize, field: usize) -> String 
             .ollama
             .as_ref()
             .map_or_else(|| OllamaConfig::default().model, |o| o.model.clone()),
-        (2, 2) => config
-            .ollama
-            .as_ref()
-            .map_or_else(|| OllamaConfig::default().embedding_model, |o| o.embedding_model.clone()),
+        (2, 2) => config.ollama.as_ref().map_or_else(
+            || OllamaConfig::default().embedding_model,
+            |o| o.embedding_model.clone(),
+        ),
         (2, 3) => config
             .ollama
             .as_ref()
-            .map_or_else(|| OllamaConfig::default().embedding_dim, |o| o.embedding_dim)
+            .map_or_else(
+                || OllamaConfig::default().embedding_dim,
+                |o| o.embedding_dim,
+            )
             .to_string(),
         (2, 4) => config
             .ollama
@@ -394,14 +403,17 @@ pub fn get_field_value(config: &Config, section: usize, field: usize) -> String 
         (2, 6) => config
             .ollama
             .as_ref()
-            .map_or_else(|| OllamaConfig::default().retry_delay_ms, |o| o.retry_delay_ms)
+            .map_or_else(
+                || OllamaConfig::default().retry_delay_ms,
+                |o| o.retry_delay_ms,
+            )
             .to_string(),
         (2, 7) => format!(
             "{:.1}",
-            config
-                .ollama
-                .as_ref()
-                .map_or_else(|| OllamaConfig::default().retry_backoff, |o| o.retry_backoff)
+            config.ollama.as_ref().map_or_else(
+                || OllamaConfig::default().retry_backoff,
+                |o| o.retry_backoff
+            )
         ),
 
         // Section 3: User Learning

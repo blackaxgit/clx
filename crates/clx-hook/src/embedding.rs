@@ -17,10 +17,7 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
         }) {
         Ok(pair) => pair,
         Err(e) => {
-            debug!(
-                "Failed to create LLM client for embedding: {}, skipping",
-                e
-            );
+            debug!("Failed to create LLM client for embedding: {}, skipping", e);
             return Ok(());
         }
     };
@@ -33,23 +30,22 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
     }
 
     // Generate embedding with timeout
-    let embedding =
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.embed(text, Some(&model)),
-        )
-            .await
-        {
-            Ok(Ok(emb)) => emb,
-            Ok(Err(e)) => {
-                warn!("Failed to generate embedding: {}", e);
-                return Ok(());
-            }
-            Err(_) => {
-                warn!("Embedding generation timed out");
-                return Ok(());
-            }
-        };
+    let embedding = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.embed(text, Some(&model)),
+    )
+    .await
+    {
+        Ok(Ok(emb)) => emb,
+        Ok(Err(e)) => {
+            warn!("Failed to generate embedding: {}", e);
+            return Ok(());
+        }
+        Err(_) => {
+            warn!("Embedding generation timed out");
+            return Ok(());
+        }
+    };
 
     debug!(
         "Generated embedding for snapshot {} ({} dimensions)",

@@ -8,9 +8,9 @@
 
 pub mod config;
 pub mod credentials;
-pub mod llm;
 pub mod embeddings;
 pub mod error;
+pub mod llm;
 pub mod llm_health;
 pub mod paths;
 pub mod policy;

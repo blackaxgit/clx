@@ -53,7 +53,9 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
                 println!("{}  {}", "Query:".bold(), query);
                 println!();
                 println!("{}", "Could not generate embedding for query.".yellow());
-                println!("Ollama is not configured. Run 'clx install' and ensure Ollama is running.");
+                println!(
+                    "Ollama is not configured. Run 'clx install' and ensure Ollama is running."
+                );
             }
             return Ok(());
         }

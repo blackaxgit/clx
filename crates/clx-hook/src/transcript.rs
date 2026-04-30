@@ -134,13 +134,11 @@ pub(crate) async fn process_transcript(
 
     // Generate summary using LLM
     let config = Config::load().unwrap_or_default();
-    let (ollama, chat_model) = match config
-        .create_llm_client(Capability::Chat)
-        .and_then(|c| {
-            config
-                .capability_route(Capability::Chat)
-                .map(|r| (c, r.model.clone()))
-        }) {
+    let (ollama, chat_model) = match config.create_llm_client(Capability::Chat).and_then(|c| {
+        config
+            .capability_route(Capability::Chat)
+            .map(|r| (c, r.model.clone()))
+    }) {
         Ok(pair) => pair,
         Err(e) => {
             warn!("Failed to create LLM client for summarization: {}", e);

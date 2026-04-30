@@ -1,8 +1,8 @@
 //! `PreToolUse` hook handler - validate commands before execution.
 
 use anyhow::Result;
-use clx_core::config::{Capability, Config};
 use clx_core::config::DefaultDecision;
+use clx_core::config::{Capability, Config};
 use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
     is_read_only_command,
@@ -272,13 +272,11 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     }
 
     // Initialize LLM client for L1 validation
-    let (ollama, chat_model) = match config
-        .create_llm_client(Capability::Chat)
-        .and_then(|c| {
-            config
-                .capability_route(Capability::Chat)
-                .map(|r| (c, r.model.clone()))
-        }) {
+    let (ollama, chat_model) = match config.create_llm_client(Capability::Chat).and_then(|c| {
+        config
+            .capability_route(Capability::Chat)
+            .map(|r| (c, r.model.clone()))
+    }) {
         Ok(pair) => pair,
         Err(e) => {
             debug!(

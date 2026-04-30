@@ -1,12 +1,12 @@
 //! Provider-neutral LLM client surface and backend abstractions.
 
-mod ollama;
 mod azure;
+mod ollama;
 pub mod retry;
 
-pub use ollama::{OllamaBackend, OllamaError};
 pub use azure::AzureOpenAIBackend;
-pub use retry::{with_backoff, RetryConfig};
+pub use ollama::{OllamaBackend, OllamaError};
+pub use retry::{RetryConfig, with_backoff};
 
 use std::time::Duration;
 use thiserror::Error;
