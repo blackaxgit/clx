@@ -230,3 +230,27 @@ When reporting a bug, include:
 For feature requests, describe the problem you are trying to solve rather than jumping straight to a proposed solution — this helps the maintainers understand the use case.
 
 For security issues, do NOT open a public issue. Please report them through [GitHub Security Advisories](https://github.com/blackaxgit/clx/security/advisories).
+
+---
+
+## Azure OpenAI smoke test
+
+Run before tagging any release that includes Azure backend changes. Requires a real Azure OpenAI tenant with at least one chat deployment.
+
+1. Set `AZURE_OPENAI_API_KEY` (or `clx credentials set azure-prod:api-key <key>`).
+2. Add an `azure-prod` provider to `~/.clx/config.yaml`:
+   ```yaml
+   providers:
+     azure-prod:
+       kind: azure_openai
+       endpoint: https://<your-resource>.openai.azure.com
+       api_key_env: AZURE_OPENAI_API_KEY
+       timeout_ms: 30000
+   llm:
+     chat: { provider: azure-prod, model: gpt-5.4-mini }
+     embeddings: { provider: ollama-local, model: qwen3-embedding:0.6b }
+   ```
+3. `clx health` — every configured provider must report healthy. Routing summary at the bottom must show `chat → azure-prod/gpt-5.4-mini`.
+4. Issue a non-trivial command in a Claude Code session (e.g. `rm -rf /tmp/test`) — the L1 risk-assessment must return without errors and route through Azure.
+5. `clx recall "anything"` — must complete (returns hits or an empty set, never `embedding model changed` unless you also switched the embedding provider).
+6. If switching from Ollama to Azure embeddings: run `clx embeddings rebuild` first; the progress prints `via azure-prod:text-embedding-3-large`. Subsequent `clx recall` works.
