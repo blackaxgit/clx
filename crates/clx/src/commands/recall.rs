@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 
 use clx_core::config::Config;
+use clx_core::llm::LocalLlmBackend;
 use clx_core::storage::Storage;
 
 use crate::Cli;

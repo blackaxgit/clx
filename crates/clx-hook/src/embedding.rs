@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clx_core::config::Config;
+use clx_core::llm::LocalLlmBackend;
 use clx_core::ollama::OllamaClient;
 use clx_core::storage::Storage;
 use tracing::{debug, info, warn};

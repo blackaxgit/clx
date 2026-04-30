@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clx_core::config::Config;
 use clx_core::config::DefaultDecision;
+use clx_core::llm::LocalLlmBackend;
 use clx_core::ollama::OllamaClient;
 use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::embeddings::EmbeddingStore;
+use crate::llm::LocalLlmBackend;
 use crate::ollama::OllamaClient;
 use crate::storage::Storage;
 

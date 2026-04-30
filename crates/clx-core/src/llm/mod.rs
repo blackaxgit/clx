@@ -2,11 +2,11 @@
 
 mod ollama;
 mod azure;
-mod retry;
+pub mod retry;
 
-pub use ollama::OllamaBackend;
+pub use ollama::{OllamaBackend, OllamaError};
 pub use azure::AzureOpenAIBackend;
-// pub use retry::with_backoff; — stub only, Task 3 adds the symbol
+pub use retry::{with_backoff, RetryConfig};
 
 use std::time::Duration;
 use thiserror::Error;

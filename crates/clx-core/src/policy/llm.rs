@@ -8,6 +8,7 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 use crate::config::PromptSensitivity;
+use crate::llm::LocalLlmBackend;
 use crate::ollama::OllamaClient;
 
 use super::PolicyEngine;

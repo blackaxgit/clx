@@ -3,6 +3,7 @@
 use crate::embedding::truncate_to_char_boundary;
 use crate::types::{SUMMARIZE_PROMPT, SummaryResponse, TranscriptEntry, TranscriptResult};
 use clx_core::config::Config;
+use clx_core::llm::LocalLlmBackend;
 use clx_core::ollama::OllamaClient;
 use clx_core::types::estimate_tokens;
 use std::fs::File;
