@@ -254,3 +254,19 @@ Run before tagging any release that includes Azure backend changes. Requires a r
 4. Issue a non-trivial command in a Claude Code session (e.g. `rm -rf /tmp/test`) — the L1 risk-assessment must return without errors and route through Azure.
 5. `clx recall "anything"` — must complete (returns hits or an empty set, never `embedding model changed` unless you also switched the embedding provider).
 6. If switching from Ollama to Azure embeddings: run `clx embeddings rebuild` first; the progress prints `via azure-prod:text-embedding-3-large`. Subsequent `clx recall` works.
+
+### Fallback smoke test
+
+If the release includes provider-fallback changes, validate the fallback path:
+
+1. Configure `llm.chat.fallback` to point at `ollama-local` with a real model
+   (e.g., `qwen3:1.7b`).
+2. Temporarily set `llm.chat.model` to a non-existent Azure deployment
+   (e.g., `gpt-5.4-mini-doesnotexist`).
+3. Trigger the L1 validator (issue a non-trivial command in Claude Code).
+4. The risk score must come from the fallback (Ollama). The log must contain
+   one `WARN ... primary failed; falling back`.
+5. Issue a second validation immediately. The primary must NOT be re-tried
+   (cooldown active). Ollama serves both calls.
+6. Wait 31 seconds, repeat. Primary is re-tried (cooldown expired).
+7. Restore the correct deployment name in `llm.chat.model`.
