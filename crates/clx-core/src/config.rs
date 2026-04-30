@@ -2937,7 +2937,9 @@ ollama:
         let provider = "azure-regression-test-keyfmt";
         let key = format!("{provider}-api-key");
         // store/get/delete should all succeed without InvalidKey.
-        store.store(&key, "fake-value").expect("store must accept hyphen key");
+        store
+            .store(&key, "fake-value")
+            .expect("store must accept hyphen key");
         let got = store.get(&key).expect("get ok").expect("value present");
         assert_eq!(got, "fake-value");
         store.delete(&key).expect("delete ok");
