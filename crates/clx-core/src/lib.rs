@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod credentials;
+pub mod llm;
 pub mod embeddings;
 pub mod error;
 pub mod ollama;
