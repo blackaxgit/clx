@@ -48,6 +48,34 @@ pub enum LlmError {
     Serialization(#[from] serde_json::Error),
 }
 
+impl LlmError {
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            LlmError::Timeout | LlmError::Connection(_) | LlmError::RateLimit { .. }
+        ) || matches!(
+            self,
+            LlmError::Server { status, .. } if (500..=599).contains(status) || *status == 408
+        )
+    }
+
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            LlmError::Connection(_) => "connection",
+            LlmError::Timeout => "timeout",
+            LlmError::Auth(_) => "auth",
+            LlmError::RateLimit { .. } => "rate_limit",
+            LlmError::DeploymentNotFound(_) => "deployment_not_found",
+            LlmError::ContentFilter(_) => "content_filter",
+            LlmError::Server { .. } => "server",
+            LlmError::InvalidResponse(_) => "invalid_response",
+            LlmError::Serialization(_) => "serialization",
+        }
+    }
+}
+
 /// Static-dispatch wrapper that owns one of the concrete backend types and
 /// forwards trait calls. Avoids `Box<dyn LlmBackend>` and the heap allocation
 /// it forces on every async call.

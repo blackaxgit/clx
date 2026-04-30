@@ -163,16 +163,6 @@ struct EmbedDatum {
 
 // --- Helpers -------------------------------------------------------------
 
-fn is_transient(e: &LlmError) -> bool {
-    matches!(
-        e,
-        LlmError::Timeout | LlmError::RateLimit { .. } | LlmError::Connection(_)
-    ) || matches!(
-        e,
-        LlmError::Server { status, .. } if (500..=599).contains(status) || *status == 408
-    )
-}
-
 fn retry_after_for(e: &LlmError) -> Option<Duration> {
     match e {
         LlmError::RateLimit { retry_after } => *retry_after,
@@ -288,7 +278,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
         let resp = with_backoff(
             self.retry,
             || post_chat(self, &url, &body),
-            is_transient,
+            LlmError::is_transient,
             retry_after_for,
         )
         .await?;
@@ -312,7 +302,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
         let resp = with_backoff(
             self.retry,
             || post_embed(self, &url, &body),
-            is_transient,
+            LlmError::is_transient,
             retry_after_for,
         )
         .await?;
