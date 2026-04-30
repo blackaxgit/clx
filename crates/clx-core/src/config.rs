@@ -1340,7 +1340,17 @@ impl Config {
         capability: Capability,
     ) -> Result<crate::llm::LlmClient, LlmConfigError> {
         let route = self.capability_route(capability)?;
-        self.build_client_for_provider(&route.provider)
+        let primary = self.build_client_for_provider(&route.provider)?;
+        if let Some(fb) = route.fallback.as_deref() {
+            let fallback = self.build_client_for_provider(&fb.provider)?;
+            let wrapper = crate::llm::FallbackClient::new(
+                primary,
+                fallback,
+                Some(fb.model.clone()),
+            );
+            return Ok(crate::llm::LlmClient::Fallback(wrapper));
+        }
+        Ok(primary)
     }
 
     /// Construct an `LlmClient` for a named provider, bypassing routing.
