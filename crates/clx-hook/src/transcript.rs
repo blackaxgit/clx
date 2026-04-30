@@ -136,7 +136,7 @@ pub(crate) async fn process_transcript(
 
     // Generate summary using Ollama
     let config = Config::load().unwrap_or_default();
-    let ollama = match OllamaClient::new(config.ollama) {
+    let ollama = match OllamaClient::new(config.ollama_or_default().clone()) {
         Ok(client) => client,
         Err(e) => {
             warn!("Failed to create Ollama client for summarization: {}", e);

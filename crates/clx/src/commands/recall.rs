@@ -34,7 +34,7 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
 
     // Load config and create Ollama client
     let config = Config::load().context("Failed to load configuration")?;
-    let ollama = clx_core::ollama::OllamaClient::new(config.ollama.clone())
+    let ollama = clx_core::ollama::OllamaClient::new(config.ollama_or_default().clone())
         .context("Failed to create Ollama client")?;
 
     // Generate embedding for the query

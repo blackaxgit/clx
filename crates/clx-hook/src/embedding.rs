@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 /// Generate and store embedding for a snapshot
 pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -> Result<()> {
     let config = Config::load().unwrap_or_default();
-    let ollama = match OllamaClient::new(config.ollama) {
+    let ollama = match OllamaClient::new(config.ollama_or_default().clone()) {
         Ok(client) => client,
         Err(e) => {
             debug!(

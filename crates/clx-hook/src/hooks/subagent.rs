@@ -94,7 +94,7 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
     let ollama_config = clx_core::config::OllamaConfig {
         timeout_ms: config.auto_recall.timeout_ms.saturating_sub(50),
         max_retries: 0,
-        ..config.ollama.clone()
+        ..config.ollama_or_default().clone()
     };
     let ollama = match clx_core::ollama::OllamaClient::new(ollama_config) {
         Ok(client) => Some(client),
@@ -106,7 +106,7 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
 
     let embedding_store = match clx_core::embeddings::EmbeddingStore::open_with_dimension(
         &db_path,
-        config.ollama.embedding_dim,
+        config.ollama_or_default().embedding_dim,
     ) {
         Ok(store) => Some(store),
         Err(e) => {

@@ -274,7 +274,7 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     }
 
     // Initialize Ollama client for L1 validation
-    let ollama = match OllamaClient::new(config.ollama.clone()) {
+    let ollama = match OllamaClient::new(config.ollama_or_default().clone()) {
         Ok(client) => client,
         Err(e) => {
             debug!(

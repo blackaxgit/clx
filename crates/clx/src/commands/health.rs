@@ -212,7 +212,7 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
     let start = Instant::now();
     let host = config.map_or_else(
         || "http://127.0.0.1:11434".into(),
-        |c| c.ollama.host.clone(),
+        |c| c.ollama_or_default().host.clone(),
     );
 
     let url = format!("{host}/");
@@ -263,7 +263,7 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
 async fn check_validator_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
     let (host, model) = match config {
-        Some(c) => (c.ollama.host.clone(), c.ollama.model.clone()),
+        Some(c) => (c.ollama_or_default().host.clone(), c.ollama_or_default().model.clone()),
         None => ("http://127.0.0.1:11434".into(), "qwen3:1.7b".into()),
     };
 
@@ -275,7 +275,7 @@ async fn check_validator_model(config: Option<&clx_core::config::Config>) -> Che
 async fn check_embedding_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
     let (host, model) = match config {
-        Some(c) => (c.ollama.host.clone(), c.ollama.embedding_model.clone()),
+        Some(c) => (c.ollama_or_default().host.clone(), c.ollama_or_default().embedding_model.clone()),
         None => ("http://127.0.0.1:11434".into(), "nomic-embed-text".into()),
     };
 
