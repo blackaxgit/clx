@@ -2,9 +2,11 @@
 
 mod azure;
 mod ollama;
+pub mod fallback;
 pub mod retry;
 
 pub use azure::AzureOpenAIBackend;
+pub use fallback::FallbackClient;
 pub use ollama::{OllamaBackend, OllamaError};
 pub use retry::{RetryConfig, with_backoff};
 
@@ -82,6 +84,17 @@ impl LlmError {
 pub enum LlmClient {
     Ollama(OllamaBackend),
     Azure(AzureOpenAIBackend),
+    Fallback(FallbackClient),
+}
+
+impl std::fmt::Debug for LlmClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ollama(_) => f.write_str("LlmClient::Ollama(..)"),
+            Self::Azure(_) => f.write_str("LlmClient::Azure(..)"),
+            Self::Fallback(_) => f.write_str("LlmClient::Fallback(..)"),
+        }
+    }
 }
 
 impl LlmClient {
@@ -89,6 +102,7 @@ impl LlmClient {
         match self {
             Self::Ollama(b) => b.generate(prompt, model).await,
             Self::Azure(b) => b.generate(prompt, model).await,
+            Self::Fallback(b) => b.generate(prompt, model).await,
         }
     }
 
@@ -96,6 +110,7 @@ impl LlmClient {
         match self {
             Self::Ollama(b) => b.embed(text, model).await,
             Self::Azure(b) => b.embed(text, model).await,
+            Self::Fallback(b) => b.embed(text, model).await,
         }
     }
 
@@ -103,6 +118,7 @@ impl LlmClient {
         match self {
             Self::Ollama(b) => b.is_available().await,
             Self::Azure(b) => b.is_available().await,
+            Self::Fallback(b) => b.is_available().await,
         }
     }
 }
