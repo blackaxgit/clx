@@ -1,8 +1,8 @@
 //! Provider-neutral LLM client surface and backend abstractions.
 
 mod azure;
-mod ollama;
 pub mod fallback;
+mod ollama;
 pub mod retry;
 
 pub use azure::AzureOpenAIBackend;

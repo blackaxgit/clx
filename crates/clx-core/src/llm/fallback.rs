@@ -38,14 +38,21 @@ impl FallbackClient {
     }
 
     fn use_fallback_directly(&self) -> bool {
-        match *self.last_primary_failure.lock().expect("poisoned cooldown lock") {
+        match *self
+            .last_primary_failure
+            .lock()
+            .expect("poisoned cooldown lock")
+        {
             Some(t) => t.elapsed() < COOLDOWN,
             None => false,
         }
     }
 
     fn record_primary_failure(&self) {
-        *self.last_primary_failure.lock().expect("poisoned cooldown lock") = Some(Instant::now());
+        *self
+            .last_primary_failure
+            .lock()
+            .expect("poisoned cooldown lock") = Some(Instant::now());
     }
 
     fn fb_model<'a>(&'a self, caller: Option<&'a str>) -> Option<&'a str> {
@@ -104,19 +111,19 @@ impl LocalLlmBackend for FallbackClient {
 
     async fn is_available(&self) -> bool {
         // Either backend healthy means "fallback path is alive."
-        Box::pin(self.primary.is_available()).await
-            || Box::pin(self.fallback.is_available()).await
+        Box::pin(self.primary.is_available()).await || Box::pin(self.fallback.is_available()).await
     }
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::config::AzureOpenAIConfig;
     use crate::llm::AzureOpenAIBackend;
     use crate::llm::retry::RetryConfig;
     use secrecy::SecretString;
-    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
     fn cfg(endpoint: String) -> AzureOpenAIConfig {
         AzureOpenAIConfig {
@@ -125,20 +132,23 @@ mod tests {
             api_key_file: None,
             api_version: None,
             timeout_ms: 5_000,
-            retry: RetryConfig { max_retries: 0, ..Default::default() },
+            retry: RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
         }
     }
 
     fn allow_local() {
         // SAFETY: test-only env var manipulation
-        unsafe { std::env::set_var("CLX_ALLOW_AZURE_HOSTS", "127.0.0.1,localhost"); }
+        unsafe {
+            std::env::set_var("CLX_ALLOW_AZURE_HOSTS", "127.0.0.1,localhost");
+        }
     }
 
     fn azure(uri: String) -> LlmClient {
-        let backend = AzureOpenAIBackend::new(
-            &cfg(uri),
-            SecretString::new("k".to_string().into()),
-        ).unwrap();
+        let backend =
+            AzureOpenAIBackend::new(&cfg(uri), SecretString::new("k".to_string().into())).unwrap();
         LlmClient::Azure(backend)
     }
 
@@ -152,7 +162,8 @@ mod tests {
             .and(matchers::path("/openai/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
             .expect(1)
-            .mount(&primary_mock).await;
+            .mount(&primary_mock)
+            .await;
 
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/openai/v1/chat/completions"))
@@ -160,7 +171,8 @@ mod tests {
                 "choices": [{ "message": { "content": "from fallback" } }]
             })))
             .expect(1)
-            .mount(&fallback_mock).await;
+            .mount(&fallback_mock)
+            .await;
 
         let fc = FallbackClient::new(
             azure(primary_mock.uri()),
@@ -181,18 +193,16 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
             .expect(1)
-            .mount(&primary_mock).await;
+            .mount(&primary_mock)
+            .await;
 
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string("should not fire"))
             .expect(0)
-            .mount(&fallback_mock).await;
+            .mount(&fallback_mock)
+            .await;
 
-        let fc = FallbackClient::new(
-            azure(primary_mock.uri()),
-            azure(fallback_mock.uri()),
-            None,
-        );
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
 
         let r = fc.generate("hi", Some("m")).await;
         assert!(matches!(r, Err(LlmError::Auth(_))));
@@ -207,20 +217,18 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(503))
             .expect(1)
-            .mount(&primary_mock).await;
+            .mount(&primary_mock)
+            .await;
 
         Mock::given(matchers::method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{ "message": { "content": "ok" } }]
             })))
             .expect(2)
-            .mount(&fallback_mock).await;
+            .mount(&fallback_mock)
+            .await;
 
-        let fc = FallbackClient::new(
-            azure(primary_mock.uri()),
-            azure(fallback_mock.uri()),
-            None,
-        );
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
 
         let _ = fc.generate("hi", Some("m")).await.unwrap();
         assert!(fc.cooldown_active());
