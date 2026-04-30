@@ -10,6 +10,15 @@ use clx_core::storage::Storage;
 
 use crate::Cli;
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Format the `model_ident` tag written into every embedding row.
+fn make_model_ident(provider: &str, model: &str) -> String {
+    format!("{provider}:{model}")
+}
+
 #[derive(Debug, Subcommand)]
 pub enum EmbeddingsAction {
     /// Show embedding model info and status
@@ -82,9 +91,22 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 Storage::create_embedding_store_with_dimension(&db_path, ollama_cfg.embedding_dim)
                     .context("Failed to open embedding store. Run 'clx install' first.")?;
 
-            // Get all snapshots to regenerate
-            let storage = Storage::open_default().context("Failed to open database")?;
-            let snapshots = storage.list_all_snapshots()?;
+            // Resolve provider + model before anything else so dry-run can show them.
+            // Fall back to legacy ollama defaults when no routing section is present.
+            let (embed_model, provider_name) = match config.capability_route(Capability::Embeddings)
+            {
+                Ok(r) => (r.model.clone(), r.provider.clone()),
+                Err(_) => (
+                    ollama_cfg.embedding_model.clone(),
+                    "ollama-local".to_owned(),
+                ),
+            };
+            let model_ident = make_model_ident(&provider_name, &embed_model);
+
+            // Snapshot list comes from the embedding store itself (uses its connection).
+            let snapshots = emb_store
+                .iter_snapshots_for_rebuild()
+                .context("Failed to read snapshots")?;
 
             let dim = ollama_cfg.embedding_dim;
             let needs_migration = emb_store.needs_dimension_migration(dim);
@@ -96,7 +118,9 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                         "{}",
                         serde_json::json!({
                             "dry_run": true,
-                            "model": ollama_cfg.embedding_model,
+                            "provider": provider_name,
+                            "model": embed_model,
+                            "model_ident": model_ident,
                             "target_dimension": dim,
                             "needs_dimension_migration": needs_migration,
                             "existing_embeddings": existing_count,
@@ -108,10 +132,8 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                     println!("{}", "Embedding Rebuild (dry run)".cyan().bold());
                     println!("{}", "=".repeat(50));
                     println!();
-                    println!(
-                        "  Model:                {}",
-                        ollama_cfg.embedding_model.green()
-                    );
+                    println!("  Provider:             {}", provider_name.green());
+                    println!("  Model:                {}", embed_model.green());
                     println!("  Target dimension:     {dim}");
                     println!(
                         "  Dimension migration:  {}",
@@ -161,49 +183,67 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 }
             }
 
-            // Step 2: Create LLM client and regenerate embeddings
-            let embed_model = config
-                .capability_route(Capability::Embeddings)
-                .map_or_else(|_| ollama_cfg.embedding_model.clone(), |r| r.model.clone());
-            let ollama = config
-                .create_llm_client(Capability::Embeddings)
-                .context("Failed to create LLM client")?;
+            // Step 2: Check provider availability before doing any work.
+            let client = match config.create_llm_client(Capability::Embeddings) {
+                Ok(c) => c,
+                Err(e) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "error": format!("Failed to create LLM client: {e}"),
+                                "provider": provider_name,
+                                "table_rebuilt": true,
+                                "embeddings_generated": 0
+                            })
+                        );
+                    } else {
+                        println!();
+                        println!(
+                            "{}",
+                            format!("Failed to create LLM client for '{provider_name}': {e}")
+                                .yellow()
+                        );
+                        println!("Table was rebuilt but embeddings could not be regenerated.");
+                    }
+                    return Ok(());
+                }
+            };
 
-            if !ollama.is_available().await {
+            if !client.is_available().await {
                 if cli.json {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "error": "Ollama not available",
-                            "hint": "Make sure Ollama is running: ollama serve",
+                            "error": format!("Provider '{}' is not available", provider_name),
+                            "provider": provider_name,
                             "table_rebuilt": true,
                             "embeddings_generated": 0
                         })
                     );
                 } else {
                     println!();
-                    println!("{}", "Ollama not available.".yellow());
+                    println!(
+                        "{}",
+                        format!("Provider '{provider_name}' is not available.").yellow()
+                    );
                     println!("Table was rebuilt but embeddings could not be regenerated.");
-                    println!("Make sure Ollama is running and then run: clx embed-backfill");
+                    println!("Check the provider configuration and then run: clx embed-backfill");
                 }
                 return Ok(());
             }
+
+            // Step 3: Re-read snapshots after table rebuild (connection is the same store).
+            let snapshots = emb_store
+                .iter_snapshots_for_rebuild()
+                .context("Failed to read snapshots after table rebuild")?;
 
             let total = snapshots.len();
             let mut processed = 0usize;
             let mut skipped = 0usize;
             let mut errors = 0usize;
 
-            for (i, snapshot) in snapshots.iter().enumerate() {
-                let snapshot_id = snapshot.id.unwrap_or(0);
-
-                let text = format!(
-                    "{}\n{}\n{}",
-                    snapshot.summary.as_deref().unwrap_or(""),
-                    snapshot.key_facts.as_deref().unwrap_or(""),
-                    snapshot.todos.as_deref().unwrap_or("")
-                );
-
+            for (i, (snapshot_id, text)) in snapshots.iter().enumerate() {
                 if text.trim().is_empty() {
                     skipped += 1;
                     continue;
@@ -219,9 +259,11 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                     io::stdout().flush()?;
                 }
 
-                match ollama.embed(&text, Some(&embed_model)).await {
+                match client.embed(text, Some(&embed_model)).await {
                     Ok(embedding) => {
-                        if let Err(e) = emb_store.store_embedding(snapshot_id, embedding) {
+                        if let Err(e) =
+                            emb_store.store_with_model(*snapshot_id, embedding, &model_ident)
+                        {
                             if !cli.json {
                                 println!("{}", format!("Error: {e}").red());
                             }
@@ -248,7 +290,9 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                         "skipped": skipped,
                         "errors": errors,
                         "dimension": dim,
-                        "model": ollama_cfg.embedding_model,
+                        "provider": provider_name,
+                        "model": embed_model,
+                        "model_ident": model_ident,
                     })
                 );
             } else {
@@ -262,7 +306,8 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                     println!("  Errors:           {errors}");
                 }
                 println!("  Dimension:        {dim}");
-                println!("  Model:            {}", ollama_cfg.embedding_model);
+                println!("  Provider:         {provider_name}");
+                println!("  Model:            {embed_model}");
             }
         }
     }
@@ -270,31 +315,35 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
     Ok(())
 }
 
-/// Generate embeddings for existing snapshots
+/// Generate embeddings for existing snapshots that do not yet have one.
 pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
-    // Get database path
     let db_path = clx_core::paths::database_path();
 
     // Open embedding store
     let emb_store = Storage::create_embedding_store(&db_path)
         .context("Failed to open embedding store. Run 'clx install' first.")?;
 
-    // Load config and create LLM client for embeddings
+    // Load config and resolve provider/model.
     let config = Config::load().context("Failed to load configuration")?;
     let backfill_defaults = OllamaConfig::default();
     let backfill_cfg = config.ollama.as_ref().unwrap_or(&backfill_defaults);
-    let embed_model = config.capability_route(Capability::Embeddings).map_or_else(
-        |_| backfill_cfg.embedding_model.clone(),
-        |r| r.model.clone(),
-    );
-    let ollama = match config.create_llm_client(Capability::Embeddings) {
-        Ok(client) => client,
+    let (embed_model, provider_name) = match config.capability_route(Capability::Embeddings) {
+        Ok(r) => (r.model.clone(), r.provider.clone()),
+        Err(_) => (
+            backfill_cfg.embedding_model.clone(),
+            "ollama-local".to_owned(),
+        ),
+    };
+    let model_ident = make_model_ident(&provider_name, &embed_model);
+
+    let client = match config.create_llm_client(Capability::Embeddings) {
+        Ok(c) => c,
         Err(e) => {
             if cli.json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "error": format!("Failed to create LLM client: {}", e),
+                        "error": format!("Failed to create LLM client: {e}"),
                         "hint": "Check LLM configuration"
                     })
                 );
@@ -305,54 +354,49 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
         }
     };
 
-    // Check if Ollama is available
-    if !ollama.is_available().await {
+    // Check provider availability.
+    if !client.is_available().await {
         if cli.json {
             println!(
                 "{}",
                 serde_json::json!({
-                    "error": "Ollama not available",
-                    "hint": "Make sure Ollama is running: ollama serve"
+                    "error": format!("Provider '{}' is not available", provider_name),
+                    "provider": provider_name,
+                    "hint": "Check provider configuration"
                 })
             );
         } else {
-            println!("{}", "Ollama not available.".yellow());
-            println!("Make sure Ollama is running: ollama serve");
+            println!(
+                "{}",
+                format!("Provider '{provider_name}' is not available.").yellow()
+            );
+            println!("Check provider configuration before running backfill.");
         }
         return Ok(());
     }
 
-    // Get all snapshots
-    let storage = Storage::open_default().context("Failed to open database")?;
-    let snapshots = storage.list_all_snapshots()?;
+    // Get all snapshots via the embedding store's own connection.
+    let all_snapshots = emb_store
+        .iter_snapshots_for_rebuild()
+        .context("Failed to read snapshots")?;
 
     if !cli.json {
         println!("{}", "Embedding Backfill".cyan().bold());
         println!("{}", "=".repeat(50));
         println!();
-        println!("Found {} snapshots", snapshots.len());
+        println!("Found {} snapshots", all_snapshots.len());
     }
 
-    let mut processed = 0;
-    let mut skipped = 0;
-    let mut errors = 0;
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
 
-    for snapshot in &snapshots {
-        let snapshot_id = snapshot.id.unwrap_or(0);
-
-        // Check if embedding already exists
-        if emb_store.has_embedding(snapshot_id)? {
+    for (snapshot_id, text) in &all_snapshots {
+        // Skip snapshots that already have an embedding.
+        if emb_store.has_embedding(*snapshot_id)? {
             skipped += 1;
             continue;
         }
-
-        // Create text to embed from snapshot content
-        let text = format!(
-            "{}\n{}\n{}",
-            snapshot.summary.as_deref().unwrap_or(""),
-            snapshot.key_facts.as_deref().unwrap_or(""),
-            snapshot.todos.as_deref().unwrap_or("")
-        );
 
         if text.trim().is_empty() {
             skipped += 1;
@@ -374,11 +418,11 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
             }
             processed += 1;
         } else {
-            // Generate embedding
-            match ollama.embed(&text, Some(&embed_model)).await {
+            match client.embed(text, Some(&embed_model)).await {
                 Ok(embedding) => {
-                    // Store embedding
-                    if let Err(e) = emb_store.store_embedding(snapshot_id, embedding) {
+                    if let Err(e) =
+                        emb_store.store_with_model(*snapshot_id, embedding, &model_ident)
+                    {
                         if !cli.json {
                             println!("{}", format!("Error: {e}").red());
                         }
@@ -404,17 +448,19 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::json!({
-                "total": snapshots.len(),
+                "total": all_snapshots.len(),
                 "processed": processed,
                 "skipped": skipped,
                 "errors": errors,
+                "provider": provider_name,
+                "model": embed_model,
                 "dry_run": dry_run
             })
         );
     } else {
         println!();
         println!("{}", "Summary:".bold());
-        println!("  Total snapshots: {}", snapshots.len());
+        println!("  Total snapshots: {}", all_snapshots.len());
         println!("  Processed: {processed}");
         println!("  Skipped (already have embedding): {skipped}");
         if errors > 0 {
