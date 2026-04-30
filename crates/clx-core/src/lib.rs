@@ -16,7 +16,10 @@ pub mod error;
 pub mod ollama {
     pub use crate::llm::{OllamaBackend as OllamaClient, OllamaError};
 }
-pub mod ollama_health;
+pub mod llm_health;
+/// Deprecation shim. Old name during the multi-provider transition.
+#[deprecated(note = "use clx_core::llm_health instead")]
+pub use llm_health as ollama_health;
 pub mod paths;
 pub mod policy;
 pub mod recall;
