@@ -63,6 +63,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 # Traits and utilities
 trait-variant = "0.1"
 
+# Layered configuration
+figment = { version = "0.10", features = ["yaml", "env"] }
+
 # URL parsing
 url = "2"
 
