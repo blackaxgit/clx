@@ -9,7 +9,7 @@ expression: rendered
 ┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
 │> Validator         ││                                                        │
 │  Context           ││                                                        │
-│  Ollama            ││                                                        │
+│  LLM               ││                                                        │
 │  User Learning     ││                                                        │
 │  Logging           ││                                                        │
 │  Ctx Pressure      ││                                                        │

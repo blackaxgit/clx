@@ -206,9 +206,18 @@ pub struct Config {
     #[serde(default)]
     pub context: ContextConfig,
 
-    /// Ollama configuration
+    /// Ollama configuration (legacy; prefer `providers:` + `llm:` sections)
     #[serde(default)]
-    pub ollama: OllamaConfig,
+    pub ollama: Option<OllamaConfig>,
+
+    /// Named provider configs. Keys are arbitrary provider names like
+    /// `"ollama-local"` or `"azure-prod"`.
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, ProviderConfig>,
+
+    /// LLM routing: which provider+model handles chat vs embeddings.
+    #[serde(default)]
+    pub llm: Option<LlmRouting>,
 
     /// User learning configuration
     #[serde(default)]
@@ -728,6 +737,86 @@ impl Default for McpToolsConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Azure OpenAI provider config (Task 7 — does NOT touch the root Config struct)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Azure `OpenAI` backend.
+///
+/// Loaded from the `azure_openai` section of `~/.clx/config.yaml` by Task 9.
+/// Added here as a standalone type so `AzureOpenAIBackend::new` has a typed
+/// config to accept.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AzureOpenAIConfig {
+    /// Full base URL, e.g. `https://my-resource.openai.azure.com`
+    pub endpoint: String,
+    /// Name of the env var whose value is the API key (optional).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Path to a file containing the API key (optional).
+    #[serde(default)]
+    pub api_key_file: Option<std::path::PathBuf>,
+    /// If set, use the dated deployment URL shape instead of `/openai/v1/…`.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// HTTP request timeout in milliseconds (default 30 000).
+    #[serde(default = "default_azure_timeout")]
+    pub timeout_ms: u64,
+    /// Retry policy (uses the shared `RetryConfig` from `llm::retry`).
+    #[serde(default)]
+    pub retry: crate::llm::retry::RetryConfig,
+}
+
+fn default_azure_timeout() -> u64 {
+    30_000
+}
+
+// ---------------------------------------------------------------------------
+// New provider/routing schema (Task 9)
+// ---------------------------------------------------------------------------
+
+/// A discriminated union of provider configs, tagged by `kind:` in YAML.
+///
+/// ```yaml
+/// providers:
+///   my-ollama:
+///     kind: ollama
+///     host: "http://127.0.0.1:11434"
+///     model: "qwen3:1.7b"
+///   my-azure:
+///     kind: azure_openai
+///     endpoint: "https://x.openai.azure.com"
+///     api_key_env: "AZURE_KEY"
+///     timeout_ms: 30000
+/// ```
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    Ollama(OllamaConfig),
+    AzureOpenai(AzureOpenAIConfig),
+}
+
+/// Top-level LLM routing: which provider+model handles each capability.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct LlmRouting {
+    pub chat: CapabilityRoute,
+    pub embeddings: CapabilityRoute,
+}
+
+/// A single capability → (provider name, model) binding.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CapabilityRoute {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Which LLM capability to route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    Chat,
+    Embeddings,
+}
+
 impl Config {
     /// Load configuration from default locations with environment variable overrides
     ///
@@ -753,6 +842,9 @@ impl Config {
             Config::default()
         };
 
+        // Translate legacy `ollama:` block into providers/llm (in-memory only)
+        config.translate_legacy_in_place();
+
         // Apply environment variable overrides
         config.apply_env_overrides();
 
@@ -767,7 +859,9 @@ impl Config {
         let config_path = Self::config_dir()?.join("config.yaml");
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
-            Ok(serde_yml::from_str(&content)?)
+            let mut cfg: Self = serde_yml::from_str(&content)?;
+            cfg.translate_legacy_in_place();
+            Ok(cfg)
         } else {
             Ok(Config::default())
         }
@@ -917,37 +1011,69 @@ impl Config {
             );
         }
 
-        // Ollama overrides
-        if let Ok(val) = env::var("CLX_OLLAMA_HOST") {
-            apply_string_override(&val, "CLX_OLLAMA_HOST", &mut self.ollama.host);
+        // Ollama overrides. If any CLX_OLLAMA_* env var is set and the legacy
+        // `ollama:` block is absent, synthesize a default block so the env
+        // vars still take effect (preserves pre-Task-9 behaviour for users
+        // who relied on env-only configuration).
+        const OLLAMA_ENV_VARS: &[&str] = &[
+            "CLX_OLLAMA_HOST",
+            "CLX_OLLAMA_MODEL",
+            "CLX_OLLAMA_EMBEDDING_MODEL",
+            "CLX_EMBEDDING_DIM",
+            "CLX_OLLAMA_TIMEOUT_MS",
+        ];
+        if self.ollama.is_none() && OLLAMA_ENV_VARS.iter().any(|v| env::var(v).is_ok()) {
+            self.ollama = Some(OllamaConfig::default());
         }
-        if let Ok(val) = env::var("CLX_OLLAMA_MODEL") {
-            apply_string_override(&val, "CLX_OLLAMA_MODEL", &mut self.ollama.model);
+
+        if let Some(ref mut ollama) = self.ollama {
+            if let Ok(val) = env::var("CLX_OLLAMA_HOST") {
+                apply_string_override(&val, "CLX_OLLAMA_HOST", &mut ollama.host);
+            }
+            if let Ok(val) = env::var("CLX_OLLAMA_MODEL") {
+                apply_string_override(&val, "CLX_OLLAMA_MODEL", &mut ollama.model);
+            }
+            if let Ok(val) = env::var("CLX_OLLAMA_EMBEDDING_MODEL") {
+                apply_string_override(
+                    &val,
+                    "CLX_OLLAMA_EMBEDDING_MODEL",
+                    &mut ollama.embedding_model,
+                );
+            }
+            if let Ok(val) = env::var("CLX_EMBEDDING_DIM") {
+                apply_usize_override(
+                    &val,
+                    "CLX_EMBEDDING_DIM",
+                    1,
+                    65536,
+                    &mut ollama.embedding_dim,
+                );
+            }
+            if let Ok(val) = env::var("CLX_OLLAMA_TIMEOUT_MS") {
+                apply_u64_override(
+                    &val,
+                    "CLX_OLLAMA_TIMEOUT_MS",
+                    1000,
+                    600_000,
+                    &mut ollama.timeout_ms,
+                );
+            }
         }
-        if let Ok(val) = env::var("CLX_OLLAMA_EMBEDDING_MODEL") {
-            apply_string_override(
-                &val,
-                "CLX_OLLAMA_EMBEDDING_MODEL",
-                &mut self.ollama.embedding_model,
-            );
-        }
-        if let Ok(val) = env::var("CLX_EMBEDDING_DIM") {
-            apply_usize_override(
-                &val,
-                "CLX_EMBEDDING_DIM",
-                1,
-                65536,
-                &mut self.ollama.embedding_dim,
-            );
-        }
-        if let Ok(val) = env::var("CLX_OLLAMA_TIMEOUT_MS") {
-            apply_u64_override(
-                &val,
-                "CLX_OLLAMA_TIMEOUT_MS",
-                1000,
-                600_000,
-                &mut self.ollama.timeout_ms,
-            );
+
+        // LLM routing overrides
+        if let Some(ref mut llm) = self.llm {
+            if let Ok(v) = env::var("CLX_LLM_CHAT_PROVIDER") {
+                llm.chat.provider = v;
+            }
+            if let Ok(v) = env::var("CLX_LLM_CHAT_MODEL") {
+                llm.chat.model = v;
+            }
+            if let Ok(v) = env::var("CLX_LLM_EMBEDDINGS_PROVIDER") {
+                llm.embeddings.provider = v;
+            }
+            if let Ok(v) = env::var("CLX_LLM_EMBEDDINGS_MODEL") {
+                llm.embeddings.model = v;
+            }
         }
 
         // User learning overrides
@@ -1130,6 +1256,215 @@ impl Config {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Legacy translation
+    // -----------------------------------------------------------------------
+
+    /// Convert a legacy `ollama:` block into synthesized `providers:` + `llm:`
+    /// sections in memory. The on-disk file is NOT touched. Idempotent: a no-op
+    /// if `providers:` or `llm:` are already populated.
+    pub fn translate_legacy_in_place(&mut self) {
+        let has_new = !self.providers.is_empty() || self.llm.is_some();
+        let has_old = self.ollama.is_some();
+
+        if has_new && has_old {
+            tracing::warn!(
+                "config has both legacy 'ollama:' block and new 'providers:'/'llm:' sections; \
+                 new sections win, legacy block ignored"
+            );
+            return;
+        }
+        if has_new || !has_old {
+            return;
+        }
+
+        let legacy = self.ollama.clone().expect("has_old guard");
+        self.providers.insert(
+            "ollama-local".into(),
+            ProviderConfig::Ollama(legacy.clone()),
+        );
+        self.llm = Some(LlmRouting {
+            chat: CapabilityRoute {
+                provider: "ollama-local".into(),
+                model: legacy.model.clone(),
+            },
+            embeddings: CapabilityRoute {
+                provider: "ollama-local".into(),
+                model: legacy.embedding_model.clone(),
+            },
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Factory: capability routing + client construction
+    // -----------------------------------------------------------------------
+
+    /// Return the route definition for a capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no `llm:` routing section exists (and no legacy block
+    /// has been translated yet).
+    pub fn capability_route(
+        &self,
+        capability: Capability,
+    ) -> Result<&CapabilityRoute, LlmConfigError> {
+        let llm = self.llm.as_ref().ok_or(LlmConfigError::MissingLlmRouting)?;
+        Ok(match capability {
+            Capability::Chat => &llm.chat,
+            Capability::Embeddings => &llm.embeddings,
+        })
+    }
+
+    /// Construct the `LlmClient` for the configured provider of a capability.
+    /// Credentials are resolved at call time (env → keychain → file).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when routing is missing, the provider name is unknown, or
+    /// credential resolution fails.
+    pub fn create_llm_client(
+        &self,
+        capability: Capability,
+    ) -> Result<crate::llm::LlmClient, LlmConfigError> {
+        let route = self.capability_route(capability)?;
+        self.build_client_for_provider(&route.provider)
+    }
+
+    /// Construct an `LlmClient` for a named provider, bypassing routing.
+    ///
+    /// Useful for `clx health` and similar diagnostics that address a specific
+    /// provider directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the provider name is unknown or credential resolution
+    /// fails.
+    pub fn create_llm_client_by_name(
+        &self,
+        name: &str,
+    ) -> Result<crate::llm::LlmClient, LlmConfigError> {
+        self.build_client_for_provider(name)
+    }
+
+    fn build_client_for_provider(
+        &self,
+        name: &str,
+    ) -> Result<crate::llm::LlmClient, LlmConfigError> {
+        let provider = self
+            .providers
+            .get(name)
+            .ok_or_else(|| LlmConfigError::UnknownProvider(name.to_owned()))?;
+
+        match provider {
+            ProviderConfig::Ollama(c) => {
+                let backend = crate::llm::OllamaBackend::new(c.clone())
+                    .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                Ok(crate::llm::LlmClient::Ollama(backend))
+            }
+            ProviderConfig::AzureOpenai(c) => {
+                let secret =
+                    resolve_azure_credential(name, c).map_err(LlmConfigError::ProviderInit)?;
+                let backend = crate::llm::AzureOpenAIBackend::new(c, secret)
+                    .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                Ok(crate::llm::LlmClient::Azure(backend))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LLM config error type
+// ---------------------------------------------------------------------------
+
+/// Errors returned by `Config::create_llm_client` and related factory methods.
+#[derive(Debug, thiserror::Error)]
+pub enum LlmConfigError {
+    #[error("config has no `llm:` routing section and no legacy `ollama:` block")]
+    MissingLlmRouting,
+    #[error("unknown provider: '{0}'")]
+    UnknownProvider(String),
+    #[error("provider init failed: {0}")]
+    ProviderInit(String),
+}
+
+// ---------------------------------------------------------------------------
+// Azure credential resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve an Azure provider's API key.
+///
+/// Resolution order:
+/// 1. Env var named in `cfg.api_key_env` (if set and non-empty).
+/// 2. `CredentialStore` entry keyed `"<provider_name>:api-key"`.
+/// 3. File at `cfg.api_key_file` (Unix: must be mode 0600).
+/// 4. Error.
+fn resolve_azure_credential(
+    provider_name: &str,
+    cfg: &AzureOpenAIConfig,
+) -> Result<secrecy::SecretString, String> {
+    use secrecy::SecretString;
+
+    // 1. env var
+    if let Some(name) = cfg.api_key_env.as_deref()
+        && let Ok(v) = std::env::var(name)
+        && !v.is_empty()
+    {
+        return Ok(SecretString::new(v.into()));
+    }
+
+    // 2. CredentialStore (system keychain)
+    let store = crate::credentials::CredentialStore::new();
+    let key = format!("{provider_name}:api-key");
+    match store.get(&key) {
+        Ok(Some(v)) => return Ok(SecretString::new(v.into())),
+        Ok(None) => {} // fall through
+        Err(e) => {
+            // headless Linux without D-Bus, etc. — log and fall through.
+            tracing::warn!(
+                provider = %provider_name,
+                error = %e,
+                "keychain unavailable, falling back to file credential"
+            );
+        }
+    }
+
+    // 3. file
+    if let Some(path) = cfg.api_key_file.as_deref() {
+        return read_file_credential(path).map(|s| SecretString::new(s.into()));
+    }
+
+    Err(format!(
+        "no credentials available for provider '{provider_name}' \
+         (checked env var, keychain key '{key}', and api_key_file)"
+    ))
+}
+
+#[cfg(unix)]
+fn read_file_credential(path: &std::path::Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("io error reading {}: {e}", path.display()))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(format!(
+            "file mode for {} is {mode:o}; refusing to read (must be 0600)",
+            path.display()
+        ));
+    }
+    let value = std::fs::read_to_string(path)
+        .map_err(|e| format!("io error reading {}: {e}", path.display()))?;
+    tracing::warn!(
+        path = %path.display(),
+        "api key loaded from plaintext file; consider running 'clx credentials set'"
+    );
+    Ok(value.trim().to_string())
+}
+
+#[cfg(not(unix))]
+fn read_file_credential(_path: &std::path::Path) -> Result<String, String> {
+    Err("file credential is not supported on this OS".into())
 }
 
 /// Parse a string to boolean, supporting common representations
@@ -1393,12 +1728,13 @@ mod tests {
         assert!(config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "qwen3-embedding:0.6b");
 
-        // Ollama defaults
-        assert_eq!(config.ollama.host, "http://127.0.0.1:11434");
-        assert_eq!(config.ollama.model, "qwen3:1.7b");
-        assert_eq!(config.ollama.embedding_model, "qwen3-embedding:0.6b");
-        assert_eq!(config.ollama.embedding_dim, 1024);
-        assert_eq!(config.ollama.timeout_ms, 60000);
+        // Ollama defaults (config.ollama is None by default; verify via OllamaConfig::default())
+        let ollama_defaults = OllamaConfig::default();
+        assert_eq!(ollama_defaults.host, "http://127.0.0.1:11434");
+        assert_eq!(ollama_defaults.model, "qwen3:1.7b");
+        assert_eq!(ollama_defaults.embedding_model, "qwen3-embedding:0.6b");
+        assert_eq!(ollama_defaults.embedding_dim, 1024);
+        assert_eq!(ollama_defaults.timeout_ms, 60000);
 
         // User learning defaults
         assert!(config.user_learning.enabled);
@@ -1465,10 +1801,16 @@ logging:
         assert!(!config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "custom-embed");
 
-        assert_eq!(config.ollama.host, "http://localhost:8080");
-        assert_eq!(config.ollama.model, "mistral:7b");
-        assert_eq!(config.ollama.embedding_model, "custom-embed");
-        assert_eq!(config.ollama.timeout_ms, 10000);
+        assert_eq!(
+            config.ollama.as_ref().unwrap().host,
+            "http://localhost:8080"
+        );
+        assert_eq!(config.ollama.as_ref().unwrap().model, "mistral:7b");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().embedding_model,
+            "custom-embed"
+        );
+        assert_eq!(config.ollama.as_ref().unwrap().timeout_ms, 10000);
 
         assert!(!config.user_learning.enabled);
         assert_eq!(config.user_learning.auto_whitelist_threshold, 5);
@@ -1497,7 +1839,7 @@ validator:
 
         // Other sections should be entirely default
         assert!(config.context.enabled);
-        assert_eq!(config.ollama.host, "http://127.0.0.1:11434");
+        assert_eq!(OllamaConfig::default().host, "http://127.0.0.1:11434");
         assert!(config.user_learning.enabled);
         assert_eq!(config.logging.level, "info");
     }
@@ -1528,7 +1870,7 @@ validator:
 
         assert!(!config.validator.enabled);
         assert_eq!(config.validator.layer1_timeout_ms, 2000);
-        assert_eq!(config.ollama.model, "custom-model:latest");
+        assert_eq!(config.ollama.as_ref().unwrap().model, "custom-model:latest");
         assert_eq!(config.user_learning.auto_whitelist_threshold, 10);
         assert_eq!(config.logging.level, "debug");
     }
@@ -1711,10 +2053,13 @@ validator:
         assert!(!config.context.auto_snapshot);
         assert_eq!(config.context.embedding_model, "test-embed");
 
-        assert_eq!(config.ollama.host, "http://test:1234");
-        assert_eq!(config.ollama.model, "test-model");
-        assert_eq!(config.ollama.embedding_model, "test-embed-model");
-        assert_eq!(config.ollama.timeout_ms, 9999);
+        assert_eq!(config.ollama.as_ref().unwrap().host, "http://test:1234");
+        assert_eq!(config.ollama.as_ref().unwrap().model, "test-model");
+        assert_eq!(
+            config.ollama.as_ref().unwrap().embedding_model,
+            "test-embed-model"
+        );
+        assert_eq!(config.ollama.as_ref().unwrap().timeout_ms, 9999);
 
         assert!(!config.user_learning.enabled);
         assert_eq!(config.user_learning.auto_whitelist_threshold, 99);
@@ -1744,8 +2089,9 @@ validator:
     #[test]
     fn test_qwen3_embedding_defaults() {
         let config = Config::default();
-        assert_eq!(config.ollama.embedding_model, "qwen3-embedding:0.6b");
-        assert_eq!(config.ollama.embedding_dim, 1024);
+        let ollama_defaults = OllamaConfig::default();
+        assert_eq!(ollama_defaults.embedding_model, "qwen3-embedding:0.6b");
+        assert_eq!(ollama_defaults.embedding_dim, 1024);
         assert_eq!(config.context.embedding_model, "qwen3-embedding:0.6b");
     }
 
@@ -1763,7 +2109,7 @@ validator:
         let mut config = Config::default();
         config.apply_env_overrides();
 
-        assert_eq!(config.ollama.embedding_dim, 768);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 768);
     }
 
     #[test]
@@ -1780,7 +2126,7 @@ validator:
         let mut config = Config::default();
         config.apply_env_overrides();
 
-        assert_eq!(config.ollama.embedding_dim, 1024);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 1024);
     }
 
     #[test]
@@ -1792,8 +2138,11 @@ ollama:
 "#;
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
-        assert_eq!(config.ollama.embedding_model, "custom-model");
-        assert_eq!(config.ollama.embedding_dim, 512);
+        assert_eq!(
+            config.ollama.as_ref().unwrap().embedding_model,
+            "custom-model"
+        );
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 512);
     }
 
     #[test]
@@ -1804,7 +2153,7 @@ ollama:
 "#;
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
-        assert_eq!(config.ollama.embedding_dim, 1024);
+        assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 1024);
     }
 
     // --- H5: Env var validation helper tests ---
@@ -2301,7 +2650,7 @@ validator:
         // Assert: file-only values preserved without env var influence.
         assert!(!config.validator.enabled);
         // Other fields are defaults — the point is env vars play no role here.
-        assert_eq!(config.ollama.host, "http://127.0.0.1:11434");
+        assert_eq!(OllamaConfig::default().host, "http://127.0.0.1:11434");
     }
 
     // --- PromptSensitivity tests ---
@@ -2464,5 +2813,109 @@ validator:
                 prop_assert_eq!(decision.as_str(), variant.as_str());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_ollama_block_translated() {
+        let yaml = r#"
+ollama:
+  host: "http://127.0.0.1:11434"
+  model: "qwen3:1.7b"
+  embedding_model: "qwen3-embedding:0.6b"
+  embedding_dim: 1024
+  timeout_ms: 60000
+  max_retries: 3
+  retry_delay_ms: 100
+  retry_backoff: 2.0
+"#;
+        let mut cfg: Config = serde_yml::from_str(yaml).unwrap();
+        cfg.translate_legacy_in_place();
+        assert!(cfg.providers.contains_key("ollama-local"));
+        let llm = cfg.llm.as_ref().unwrap();
+        assert_eq!(llm.chat.provider, "ollama-local");
+        assert_eq!(llm.chat.model, "qwen3:1.7b");
+        assert_eq!(llm.embeddings.model, "qwen3-embedding:0.6b");
+    }
+
+    #[test]
+    fn new_schema_passes_through() {
+        let yaml = r#"
+providers:
+  azure-prod:
+    kind: azure_openai
+    endpoint: "https://x.openai.azure.com"
+    api_key_env: "AZURE_OPENAI_API_KEY"
+    timeout_ms: 30000
+llm:
+  chat: { provider: "azure-prod", model: "gpt-4o-mini" }
+  embeddings: { provider: "azure-prod", model: "text-embedding-3-large" }
+"#;
+        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.llm.as_ref().unwrap().chat.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn both_blocks_present_new_wins() {
+        let yaml = r#"
+ollama:
+  host: "http://127.0.0.1:11434"
+  model: "old-model"
+  embedding_model: "old-embed"
+  embedding_dim: 1024
+  timeout_ms: 60000
+  max_retries: 3
+  retry_delay_ms: 100
+  retry_backoff: 2.0
+providers:
+  azure-prod:
+    kind: azure_openai
+    endpoint: "https://x.openai.azure.com"
+    api_key_env: "X"
+    timeout_ms: 30000
+llm:
+  chat: { provider: "azure-prod", model: "new-model" }
+  embeddings: { provider: "azure-prod", model: "new-embed" }
+"#;
+        let mut cfg: Config = serde_yml::from_str(yaml).unwrap();
+        cfg.translate_legacy_in_place();
+        // new section wins
+        assert_eq!(cfg.llm.as_ref().unwrap().chat.model, "new-model");
+        // legacy must NOT have injected ollama-local
+        assert!(!cfg.providers.contains_key("ollama-local"));
+        assert!(cfg.providers.contains_key("azure-prod"));
+    }
+
+    #[test]
+    fn capability_route_missing_returns_error() {
+        let cfg = Config::default();
+        assert!(matches!(
+            cfg.capability_route(Capability::Chat),
+            Err(LlmConfigError::MissingLlmRouting)
+        ));
+    }
+
+    #[test]
+    fn translate_is_idempotent() {
+        let yaml = r#"
+ollama:
+  host: "http://127.0.0.1:11434"
+  model: "qwen3:1.7b"
+  embedding_model: "qwen3-embedding:0.6b"
+  embedding_dim: 1024
+  timeout_ms: 60000
+  max_retries: 3
+  retry_delay_ms: 100
+  retry_backoff: 2.0
+"#;
+        let mut cfg: Config = serde_yml::from_str(yaml).unwrap();
+        cfg.translate_legacy_in_place();
+        cfg.translate_legacy_in_place(); // second call must be a no-op
+        assert_eq!(cfg.providers.len(), 1);
     }
 }

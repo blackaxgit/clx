@@ -71,7 +71,5 @@ pub(super) fn validate_session_id(id: &str) -> crate::Result<()> {
 
 /// Parse an RFC3339 datetime string, falling back to the Unix epoch on error
 pub(super) fn parse_datetime(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or(DateTime::UNIX_EPOCH)
+    DateTime::parse_from_rfc3339(s).map_or(DateTime::UNIX_EPOCH, |dt| dt.with_timezone(&Utc))
 }

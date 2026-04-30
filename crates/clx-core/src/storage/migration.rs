@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 4;
+pub(super) const SCHEMA_VERSION: i32 = 5;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -64,6 +64,10 @@ impl Storage {
 
             if current_version < 4 {
                 self.migrate_to_v4()?;
+            }
+
+            if current_version < 5 {
+                self.migrate_to_v5()?;
             }
 
             self.conn.execute(
@@ -302,6 +306,28 @@ impl Storage {
 
         tx.commit()?;
         info!("Completed migration to schema version 4 (validation cache)");
+        Ok(())
+    }
+
+    /// Migrate to schema version 5 - track embedding model identity per snapshot row.
+    ///
+    /// Pre-existing rows receive the sentinel `'<unknown-pre-migration>'` so that
+    /// `EmbeddingStore::current_model()` can filter them out and avoid false mismatch
+    /// errors on databases that pre-date this migration.
+    pub(super) fn migrate_to_v5(&self) -> crate::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        if !self.column_exists("snapshots", "embedding_model") {
+            alter_table_add_column(
+                &self.conn,
+                "snapshots",
+                "embedding_model",
+                "TEXT NOT NULL DEFAULT '<unknown-pre-migration>'",
+            )?;
+        }
+
+        tx.commit()?;
+        info!("Completed migration to schema version 5 (embedding model identity)");
         Ok(())
     }
 }

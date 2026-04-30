@@ -103,7 +103,7 @@ impl McpServer {
         let embedding_result = self.runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_millis(EMBEDDING_STORE_TIMEOUT_MS),
-                ollama.embed(text, None),
+                ollama.embed(text, Some(&self.embed_model)),
             )
             .await
         });

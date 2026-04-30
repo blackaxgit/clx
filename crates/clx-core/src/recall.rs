@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::embeddings::EmbeddingStore;
-use crate::ollama::OllamaClient;
+use crate::llm::LlmClient;
 use crate::storage::Storage;
 
 /// A single recall search result.
@@ -62,8 +62,13 @@ pub struct RecallQueryConfig {
 /// Engine that performs hybrid search across stored snapshots.
 pub struct RecallEngine<'a> {
     storage: &'a Storage,
-    ollama: Option<&'a OllamaClient>,
+    ollama: Option<&'a LlmClient>,
     embedding_store: Option<&'a EmbeddingStore>,
+    /// The model identifier (`"<provider>:<model>"`) that the current config
+    /// would use for new embeddings.  When `Some`, mismatch detection is
+    /// active: `check_model_mismatch` returns the stored vs. configured pair
+    /// when they differ.
+    configured_model_ident: Option<String>,
 }
 
 impl<'a> RecallEngine<'a> {
@@ -71,13 +76,42 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn new(
         storage: &'a Storage,
-        ollama: Option<&'a OllamaClient>,
+        ollama: Option<&'a LlmClient>,
         embedding_store: Option<&'a EmbeddingStore>,
     ) -> Self {
         Self {
             storage,
             ollama,
             embedding_store,
+            configured_model_ident: None,
+        }
+    }
+
+    /// Attach the configured embedding model identifier so that mismatch
+    /// detection works.  The identifier should be `"<provider>:<model>"`.
+    #[must_use]
+    pub fn with_model_ident(mut self, ident: impl Into<String>) -> Self {
+        self.configured_model_ident = Some(ident.into());
+        self
+    }
+
+    /// Check whether the stored model identifier differs from the configured one.
+    ///
+    /// Returns `Some((stored, configured))` when a mismatch is detected.
+    /// Returns `None` when:
+    /// - no embedding store is attached,
+    /// - `configured_model_ident` was not set,
+    /// - the database is empty / all rows carry the pre-migration sentinel, or
+    /// - the identifiers match.
+    #[must_use]
+    pub fn check_model_mismatch(&self) -> Option<(String, String)> {
+        let configured = self.configured_model_ident.as_deref()?;
+        let emb_store = self.embedding_store?;
+        let stored = emb_store.current_model().ok().flatten()?;
+        if stored == configured {
+            None
+        } else {
+            Some((stored, configured.to_string()))
         }
     }
 
@@ -115,7 +149,7 @@ impl<'a> RecallEngine<'a> {
     async fn try_semantic(
         &self,
         query: &str,
-        ollama: &OllamaClient,
+        ollama: &LlmClient,
         emb_store: &EmbeddingStore,
         config: &RecallQueryConfig,
     ) -> Vec<RecallHit> {
@@ -729,8 +763,10 @@ mod tests {
             max_retries: 0,
             ..crate::config::OllamaConfig::default()
         };
-        let ollama = crate::ollama::OllamaClient::new(ollama_config)
-            .expect("failed to create OllamaClient for test");
+        let ollama = crate::llm::LlmClient::Ollama(
+            crate::llm::OllamaBackend::new(ollama_config)
+                .expect("failed to create OllamaBackend for test"),
+        );
 
         let engine = RecallEngine::new(&storage, Some(&ollama), Some(&emb_store));
         let config = RecallQueryConfig {

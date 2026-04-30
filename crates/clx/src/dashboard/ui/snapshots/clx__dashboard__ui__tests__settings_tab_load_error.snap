@@ -8,7 +8,7 @@ expression: rendered
 ┌ Sections ──────────┐┌ Settings - <HOME>/.clx/config.yaml ────────────────────┐
 │> Validator         ││Failed to load configuration                            │
 │  Context           ││                                                        │
-│  Ollama            ││Cannot open config file                                 │
+│  LLM               ││Cannot open config file                                 │
 │  User Learning     ││                                                        │
 │  Logging           ││Editing is disabled. Fix the config file manually or    │
 │  Ctx Pressure      ││press [r] to retry.                                     │

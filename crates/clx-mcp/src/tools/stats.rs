@@ -17,11 +17,7 @@ impl McpServer {
 
         // Get session counts
         let total_sessions = self.storage.count_sessions(Some(since)).unwrap_or(0);
-        let active_sessions = self
-            .storage
-            .list_active_sessions()
-            .map(|s| s.len())
-            .unwrap_or(0);
+        let active_sessions = self.storage.list_active_sessions().map_or(0, |s| s.len());
 
         // Get audit log statistics
         let decision_counts = self

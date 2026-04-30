@@ -6,12 +6,12 @@
 //! # Example
 //!
 //! ```no_run
-//! use clx_core::ollama::OllamaClient;
+//! use clx_core::llm::{OllamaBackend, LlmError, LocalLlmBackend};
 //! use clx_core::config::OllamaConfig;
 //!
-//! # async fn example() -> Result<(), clx_core::ollama::OllamaError> {
+//! # async fn example() -> Result<(), LlmError> {
 //! let config = OllamaConfig::default();
-//! let client = OllamaClient::new(config)?;
+//! let client = OllamaBackend::new(config).map_err(|e| LlmError::Connection(e.to_string()))?;
 //!
 //! // Check if Ollama is available
 //! if client.is_available().await {
@@ -169,7 +169,7 @@ fn is_private_or_internal(host: &str) -> bool {
 
 /// Async HTTP client for Ollama
 #[derive(Debug, Clone)]
-pub struct OllamaClient {
+pub struct OllamaBackend {
     /// HTTP client instance
     client: Client,
     /// Ollama server host URL
@@ -190,7 +190,7 @@ pub struct OllamaClient {
     request_semaphore: Arc<Semaphore>,
 }
 
-impl OllamaClient {
+impl OllamaBackend {
     /// Create a new Ollama client from configuration
     ///
     /// # Errors
@@ -283,7 +283,7 @@ impl OllamaClient {
     /// Returns true if the server is reachable and responding.
     /// Retries up to `max_retries` times with exponential backoff to handle
     /// transient failures (e.g., Ollama briefly busy loading a model).
-    pub async fn is_available(&self) -> bool {
+    pub async fn is_available_inner(&self) -> bool {
         let url = format!("{}/api/tags", self.host);
         let health_timeout = Duration::from_millis(HEALTH_CHECK_TIMEOUT_MS);
         let mut attempt = 0u32;
@@ -396,7 +396,7 @@ impl OllamaClient {
     /// # Returns
     ///
     /// The generated text response
-    pub async fn generate(
+    pub(crate) async fn generate_inner(
         &self,
         prompt: &str,
         model: Option<&str>,
@@ -443,7 +443,7 @@ impl OllamaClient {
     /// # Returns
     ///
     /// A vector of floating-point embedding values
-    pub async fn embed(
+    pub(crate) async fn embed_inner(
         &self,
         text: &str,
         model: Option<&str>,
@@ -528,6 +528,48 @@ impl OllamaClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LlmBackend trait implementation
+// ---------------------------------------------------------------------------
+
+use crate::llm::{LlmError, LocalLlmBackend};
+
+impl From<OllamaError> for LlmError {
+    fn from(e: OllamaError) -> Self {
+        match e {
+            OllamaError::ConnectionFailed(s) => LlmError::Connection(s),
+            // Timeout(u64) — drop the millisecond value; LlmError::Timeout is unit
+            OllamaError::Timeout(_ms) => LlmError::Timeout,
+            // HttpError wraps reqwest::Error directly (no status/body decomposition)
+            OllamaError::HttpError(re) => LlmError::Server {
+                status: re.status().map_or(500, |s| s.as_u16()),
+                body: re.to_string(),
+            },
+            OllamaError::InvalidResponse(s) => LlmError::InvalidResponse(s),
+            OllamaError::ModelNotFound(s) => LlmError::DeploymentNotFound(s),
+            OllamaError::ServerError(s) => LlmError::Server {
+                status: 500,
+                body: s,
+            },
+            OllamaError::SerializationError(e) => LlmError::Serialization(e),
+        }
+    }
+}
+
+impl LocalLlmBackend for OllamaBackend {
+    async fn generate(&self, prompt: &str, model: Option<&str>) -> Result<String, LlmError> {
+        self.generate_inner(prompt, model)
+            .await
+            .map_err(LlmError::from)
+    }
+    async fn embed(&self, text: &str, model: Option<&str>) -> Result<Vec<f32>, LlmError> {
+        self.embed_inner(text, model).await.map_err(LlmError::from)
+    }
+    async fn is_available(&self) -> bool {
+        self.is_available_inner().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,19 +583,19 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        /// Start a wiremock server and build an `OllamaClient` pointed at it.
+        /// Start a wiremock server and build an `OllamaBackend` pointed at it.
         ///
         /// `max_retries` is set to 0 so tests observe exactly one attempt and
         /// never sleep between retries. `timeout_ms` is kept at the default
         /// 60 s so only the dedicated timeout test overrides it.
-        async fn mock_ollama() -> (MockServer, OllamaClient) {
+        async fn mock_ollama() -> (MockServer, OllamaBackend) {
             let server = MockServer::start().await;
             let config = OllamaConfig {
                 host: server.uri(),
                 max_retries: 0,
                 ..OllamaConfig::default()
             };
-            let client = OllamaClient::new(config).expect("failed to build OllamaClient in test");
+            let client = OllamaBackend::new(config).expect("failed to build OllamaBackend in test");
             (server, client)
         }
 
@@ -575,7 +617,7 @@ mod tests {
                 .await;
 
             // Act
-            let result = client.embed("hello", None).await;
+            let result = client.embed_inner("hello", None).await;
 
             // Assert
             let embedding = result.expect("embed should succeed");
@@ -593,7 +635,7 @@ mod tests {
                 .await;
 
             // Act
-            let result = client.embed("hello", None).await;
+            let result = client.embed_inner("hello", None).await;
 
             // Assert
             assert!(result.is_err(), "expected Err on HTTP 500");
@@ -609,7 +651,7 @@ mod tests {
                 timeout_ms: 100, // 100 ms client timeout
                 ..OllamaConfig::default()
             };
-            let client = OllamaClient::new(config).expect("failed to build OllamaClient in test");
+            let client = OllamaBackend::new(config).expect("failed to build OllamaBackend in test");
 
             Mock::given(method("POST"))
                 .and(path("/api/embeddings"))
@@ -620,7 +662,7 @@ mod tests {
                 .await;
 
             // Act
-            let result = client.embed("hello", None).await;
+            let result = client.embed_inner("hello", None).await;
 
             // Assert
             assert!(result.is_err(), "expected Err on timeout");
@@ -640,7 +682,7 @@ mod tests {
                 .await;
 
             // Act — pass an explicit model name instead of relying on the default
-            let result = client.embed("hello", Some("nomic-embed-text")).await;
+            let result = client.embed_inner("hello", Some("nomic-embed-text")).await;
 
             // Assert
             let embedding = result.expect("embed with explicit model should succeed");
@@ -665,7 +707,7 @@ mod tests {
                 .await;
 
             // Act
-            let result = client.generate("Hello", None).await;
+            let result = client.generate_inner("Hello", None).await;
 
             // Assert
             let text = result.expect("generate should succeed");
@@ -689,7 +731,7 @@ mod tests {
                 .await;
 
             // Act
-            let result = client.generate("Hello", None).await;
+            let result = client.generate_inner("Hello", None).await;
 
             // Assert
             let text = result.expect("generate with empty response should succeed");
@@ -707,7 +749,7 @@ mod tests {
                 .await;
 
             // Act
-            let result = client.generate("Hello", None).await;
+            let result = client.generate_inner("Hello", None).await;
 
             // Assert
             assert!(result.is_err(), "expected Err on HTTP 503");
@@ -730,7 +772,7 @@ mod tests {
                 .await;
 
             // Act
-            let available = client.is_available().await;
+            let available = client.is_available_inner().await;
 
             // Assert
             assert!(available, "client should report server as available");
@@ -747,7 +789,7 @@ mod tests {
             let _ = &server;
 
             // Act
-            let available = client.is_available().await;
+            let available = client.is_available_inner().await;
 
             // Assert
             assert!(!available, "client should report server as unavailable");
@@ -764,7 +806,7 @@ mod tests {
                 .await;
 
             // Act
-            let available = client.is_available().await;
+            let available = client.is_available_inner().await;
 
             // Assert — a 500 response is not a success; the client must report unavailable
             assert!(
@@ -874,7 +916,7 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let config = OllamaConfig::default();
-        let client = OllamaClient::new(config).expect("Failed to create client in test");
+        let client = OllamaBackend::new(config).expect("Failed to create client in test");
 
         assert_eq!(client.host(), "http://127.0.0.1:11434");
         assert_eq!(client.timeout_ms(), 60000);
@@ -882,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_client_with_custom_host() {
-        let client = OllamaClient::with_host("http://localhost:8080", 10000)
+        let client = OllamaBackend::with_host("http://localhost:8080", 10000)
             .expect("Failed to create client in test");
 
         assert_eq!(client.host(), "http://localhost:8080");
@@ -986,7 +1028,7 @@ mod tests {
     #[test]
     fn test_client_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<OllamaClient>();
+        assert_send_sync::<OllamaBackend>();
     }
 
     #[test]
@@ -1003,7 +1045,7 @@ mod tests {
             host: "http://127.0.0.1:11434".to_string(),
             ..Default::default()
         };
-        assert!(OllamaClient::new(config).is_ok());
+        assert!(OllamaBackend::new(config).is_ok());
     }
 
     #[test]
@@ -1012,7 +1054,7 @@ mod tests {
             host: "http://localhost:11434".to_string(),
             ..Default::default()
         };
-        assert!(OllamaClient::new(config).is_ok());
+        assert!(OllamaBackend::new(config).is_ok());
     }
 
     #[test]
@@ -1022,7 +1064,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            OllamaClient::new(config).is_ok(),
+            OllamaBackend::new(config).is_ok(),
             "IPv6 loopback [::1] should be allowed"
         );
     }
@@ -1041,7 +1083,7 @@ mod tests {
             host: "http://192.168.1.100:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("192.168.1.100"));
@@ -1062,7 +1104,7 @@ mod tests {
             host: "http://ollama.example.com:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("ollama.example.com"));
@@ -1074,7 +1116,7 @@ mod tests {
             host: "not-a-valid-url".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid Ollama URL"));
@@ -1096,7 +1138,7 @@ mod tests {
             host: "http://8.8.8.8:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_ok(), "Public IP should be allowed with override");
 
         // Public hostname should also be allowed
@@ -1104,7 +1146,7 @@ mod tests {
             host: "http://ollama.example.com:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(
             result.is_ok(),
             "Public hostname should be allowed with override"
@@ -1127,7 +1169,7 @@ mod tests {
             host: "http://192.168.1.100:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err(), "192.168.x should be blocked");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1140,7 +1182,7 @@ mod tests {
             host: "http://10.0.0.1:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err(), "10.x should be blocked");
 
         // 172.16.x.x — private
@@ -1148,7 +1190,7 @@ mod tests {
             host: "http://172.16.0.1:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err(), "172.16.x should be blocked");
 
         // 172.31.x.x — upper bound of 172.16.0.0/12
@@ -1156,7 +1198,7 @@ mod tests {
             host: "http://172.31.255.255:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err(), "172.31.x should be blocked");
     }
 
@@ -1176,7 +1218,7 @@ mod tests {
             host: "http://169.254.1.1:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err(), "169.254.x (link-local) should be blocked");
 
         // AWS/GCP metadata endpoint
@@ -1184,7 +1226,7 @@ mod tests {
             host: "http://169.254.169.254:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(
             result.is_err(),
             "169.254.169.254 (metadata) should be blocked"
@@ -1207,7 +1249,7 @@ mod tests {
             host: "http://[fd12:3456:789a::1]:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(result.is_err(), "IPv6 ULA (fd..) should be blocked");
 
         // Link-local fe80::/10
@@ -1215,7 +1257,7 @@ mod tests {
             host: "http://[fe80::1]:11434".to_string(),
             ..Default::default()
         };
-        let result = OllamaClient::new(config);
+        let result = OllamaBackend::new(config);
         assert!(
             result.is_err(),
             "IPv6 link-local (fe80::) should be blocked"
@@ -1247,7 +1289,7 @@ mod tests {
                 host: format!("http://{host}:11434"),
                 ..Default::default()
             };
-            let result = OllamaClient::new(config);
+            let result = OllamaBackend::new(config);
             assert!(
                 result.is_err(),
                 "Internal hostname '{host}' should be blocked"

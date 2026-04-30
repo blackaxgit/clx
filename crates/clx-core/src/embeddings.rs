@@ -301,6 +301,76 @@ impl EmbeddingStore {
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
+
+    /// Store an embedding and record which model produced it.
+    ///
+    /// Writes the vector via [`store_embedding`] then updates the
+    /// `embedding_model` column on the corresponding `snapshots` row.
+    pub fn store_with_model(
+        &self,
+        snapshot_id: i64,
+        vector: Vec<f32>,
+        model_ident: &str,
+    ) -> crate::Result<()> {
+        self.store_embedding(snapshot_id, vector)?;
+        self.conn.execute(
+            "UPDATE snapshots SET embedding_model = ?2 WHERE id = ?1",
+            rusqlite::params![snapshot_id, model_ident],
+        )?;
+        debug!(
+            "Tagged snapshot {} with embedding model '{}'",
+            snapshot_id, model_ident
+        );
+        Ok(())
+    }
+
+    /// Return the most-recently-stored model identifier, ignoring the
+    /// pre-migration sentinel `'<unknown-pre-migration>'`.
+    ///
+    /// Returns `None` when the database is empty or every row still
+    /// carries the migration sentinel (i.e. no vector has been stored
+    /// after schema v5 was applied).
+    pub fn current_model(&self) -> crate::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let v = self
+            .conn
+            .query_row(
+                "SELECT embedding_model FROM snapshots
+                 WHERE embedding_model != '<unknown-pre-migration>'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Return every snapshot's `(id, full_text)` for a complete rebuild.
+    ///
+    /// `full_text` is the concatenation of `summary`, `key_facts`, and
+    /// `todos` separated by newlines, matching what the hook writes when
+    /// generating embeddings for new snapshots.
+    pub fn iter_snapshots_for_rebuild(&self) -> crate::Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,
+                    COALESCE(summary, ''),
+                    COALESCE(key_facts, ''),
+                    COALESCE(todos, '')
+             FROM snapshots ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let summary: String = r.get(1)?;
+            let key_facts: String = r.get(2)?;
+            let todos: String = r.get(3)?;
+            Ok((id, format!("{summary}\n{key_facts}\n{todos}")))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 /// Convert an embedding vector to a blob for sqlite-vec
@@ -547,6 +617,124 @@ mod tests {
         assert!(
             returned_ids.contains(&42),
             "find_similar should include the stored snapshot_id 42 in results, got: {returned_ids:?}"
+        );
+    }
+
+    // =========================================================================
+    // Helpers for store_with_model / current_model tests
+    // =========================================================================
+
+    /// Create a test store whose underlying connection also has the minimal
+    /// `snapshots` table (so `UPDATE snapshots ... WHERE id = ?1` and
+    /// `SELECT embedding_model FROM snapshots` work correctly).
+    fn create_test_store_with_snapshots() -> EmbeddingStore {
+        crate::init_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal snapshots table matching the v5 schema.
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL DEFAULT 'test',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z',
+                trigger TEXT NOT NULL DEFAULT 'auto',
+                summary TEXT,
+                key_facts TEXT,
+                todos TEXT,
+                embedding_model TEXT NOT NULL DEFAULT '<unknown-pre-migration>'
+            );",
+        )
+        .unwrap();
+        EmbeddingStore::with_dimension(conn, DEFAULT_EMBEDDING_DIM).unwrap()
+    }
+
+    /// Insert a snapshot row into the store's connection and return its id.
+    fn insert_snapshot(store: &EmbeddingStore, summary: &str) -> i64 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO snapshots (summary) VALUES (?1)",
+                rusqlite::params![summary],
+            )
+            .unwrap();
+        store.conn.last_insert_rowid()
+    }
+
+    // =========================================================================
+    // store_with_model / current_model tests
+    // =========================================================================
+
+    #[test]
+    fn current_model_returns_none_on_empty_db() {
+        let store = create_test_store_with_snapshots();
+        assert_eq!(
+            store.current_model().unwrap(),
+            None,
+            "empty db should return None"
+        );
+    }
+
+    #[test]
+    fn store_with_model_persists_identifier() {
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "hello world");
+        let vec = vec![0.1f32; DEFAULT_EMBEDDING_DIM];
+        store
+            .store_with_model(snap_id, vec, "ollama-local:qwen3-embedding:0.6b")
+            .unwrap();
+        assert_eq!(
+            store.current_model().unwrap().as_deref(),
+            Some("ollama-local:qwen3-embedding:0.6b"),
+            "current_model should return the stored identifier"
+        );
+    }
+
+    #[test]
+    fn pre_migration_marker_ignored_in_current_model() {
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "old snapshot");
+        // store_embedding without setting model — leaves the default sentinel.
+        store
+            .store_embedding(snap_id, vec![0.1f32; DEFAULT_EMBEDDING_DIM])
+            .unwrap();
+        assert_eq!(
+            store.current_model().unwrap(),
+            None,
+            "sentinel '<unknown-pre-migration>' must be ignored by current_model"
+        );
+    }
+
+    #[test]
+    fn iter_snapshots_for_rebuild_returns_all_rows() {
+        let store = create_test_store_with_snapshots();
+        insert_snapshot(&store, "first summary");
+        insert_snapshot(&store, "second summary");
+        let rows = store.iter_snapshots_for_rebuild().unwrap();
+        assert_eq!(rows.len(), 2, "should return both snapshot rows");
+        assert!(
+            rows[0].1.contains("first summary"),
+            "first row text should include its summary"
+        );
+        assert!(
+            rows[1].1.contains("second summary"),
+            "second row text should include its summary"
+        );
+    }
+
+    #[test]
+    fn store_with_model_overwrites_sentinel() {
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "snapshot text");
+        // Row starts with the sentinel default.
+        assert_eq!(store.current_model().unwrap(), None);
+
+        let vec = vec![0.5f32; DEFAULT_EMBEDDING_DIM];
+        store
+            .store_with_model(snap_id, vec, "azure-prod:text-embedding-3-large")
+            .unwrap();
+        assert_eq!(
+            store.current_model().unwrap().as_deref(),
+            Some("azure-prod:text-embedding-3-large"),
+            "store_with_model must overwrite the sentinel"
         );
     }
 }

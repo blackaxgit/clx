@@ -803,10 +803,10 @@ fn test_analytics_with_project_filter() {
 // =========================================================================
 
 #[test]
-fn test_schema_version_is_4() {
+fn test_schema_version_is_5() {
     let storage = create_test_storage();
     let version = storage.schema_version().unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]

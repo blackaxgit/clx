@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 
+use clx_core::config::{Config, ProviderConfig};
 use clx_core::credentials::CredentialStore;
 
 use crate::Cli;
@@ -112,6 +113,10 @@ pub fn cmd_credentials(cli: &Cli, action: &CredentialsAction) -> Result<()> {
         CredentialsAction::List => {
             let keys = store.list().context("Failed to list credentials")?;
 
+            // Load providers for annotation (best-effort; ignore errors so the
+            // list command still works when the config is absent or malformed).
+            let providers = Config::load().map(|c| c.providers).unwrap_or_default();
+
             if cli.json {
                 let output = CredentialsListOutput {
                     credentials: keys.clone(),
@@ -126,7 +131,20 @@ pub fn cmd_credentials(cli: &Cli, action: &CredentialsAction) -> Result<()> {
                     println!("{}", "No credentials stored.".dimmed());
                 } else {
                     for key in &keys {
-                        println!("  {} {}", "*".green(), key);
+                        // Annotate keys of the form `<provider-name>:api-key` when
+                        // that provider name is present in the loaded config.
+                        let annotation = key
+                            .strip_suffix(":api-key")
+                            .and_then(|provider_name| providers.get(provider_name))
+                            .map(|pc| {
+                                let kind = match pc {
+                                    ProviderConfig::Ollama(_) => "ollama",
+                                    ProviderConfig::AzureOpenai(_) => "azure_openai",
+                                };
+                                format!(" ({kind})")
+                            })
+                            .unwrap_or_default();
+                        println!("  {} {}{}", "*".green(), key, annotation.dimmed());
                     }
                     println!();
                     println!(

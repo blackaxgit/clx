@@ -182,16 +182,12 @@ pub(crate) fn track_user_decision(
                         "Skipping auto-blacklist for critical dev command: {}",
                         pattern
                     );
-                } else if storage
-                    .get_rules()
-                    .map(|rules| {
-                        rules
-                            .iter()
-                            .filter(|r| r.rule_type == RuleType::Deny)
-                            .count()
-                    })
-                    .unwrap_or(0)
-                    >= MAX_AUTO_BLACKLIST_ENTRIES
+                } else if storage.get_rules().map_or(0, |rules| {
+                    rules
+                        .iter()
+                        .filter(|r| r.rule_type == RuleType::Deny)
+                        .count()
+                }) >= MAX_AUTO_BLACKLIST_ENTRIES
                 {
                     debug!(
                         "Skipping auto-blacklist: cap of {} deny rules reached",

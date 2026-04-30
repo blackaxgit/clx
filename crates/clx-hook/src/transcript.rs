@@ -2,8 +2,7 @@
 
 use crate::embedding::truncate_to_char_boundary;
 use crate::types::{SUMMARIZE_PROMPT, SummaryResponse, TranscriptEntry, TranscriptResult};
-use clx_core::config::Config;
-use clx_core::ollama::OllamaClient;
+use clx_core::config::{Capability, Config};
 use clx_core::types::estimate_tokens;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -133,12 +132,16 @@ pub(crate) async fn process_transcript(
         };
     }
 
-    // Generate summary using Ollama
+    // Generate summary using LLM
     let config = Config::load().unwrap_or_default();
-    let ollama = match OllamaClient::new(config.ollama) {
-        Ok(client) => client,
+    let (ollama, chat_model) = match config.create_llm_client(Capability::Chat).and_then(|c| {
+        config
+            .capability_route(Capability::Chat)
+            .map(|r| (c, r.model.clone()))
+    }) {
+        Ok(pair) => pair,
         Err(e) => {
-            warn!("Failed to create Ollama client for summarization: {}", e);
+            warn!("Failed to create LLM client for summarization: {}", e);
             return TranscriptResult {
                 summary: Some(format!(
                     "Session with {message_count} messages (LLM unavailable)"
@@ -167,7 +170,7 @@ pub(crate) async fn process_transcript(
     // Generate summary
     let prompt = SUMMARIZE_PROMPT.replace("{{transcript}}", &transcript_text);
 
-    match ollama.generate(&prompt, None).await {
+    match ollama.generate(&prompt, Some(&chat_model)).await {
         Ok(response) => {
             // Try to parse as JSON
             if let Ok(summary_data) = parse_summary_response(&response) {
@@ -350,7 +353,7 @@ mod tests {
 
     /// T16-1: `process_transcript` with a mock Ollama server returns a non-empty summary.
     ///
-    /// Wiremock binds to 127.0.0.1 (loopback), which `OllamaClient` accepts.
+    /// Wiremock binds to 127.0.0.1 (loopback), which the Ollama backend accepts.
     /// `CLX_OLLAMA_HOST` is overridden per-test via a scoped env var guard so that
     /// `Config::load()` picks up the mock server URL.
     #[tokio::test]
@@ -422,7 +425,7 @@ mod tests {
     /// T16-2: `process_transcript` falls back gracefully when Ollama is unavailable.
     ///
     /// Port 19999 is chosen as an unused local port that will refuse connections
-    /// immediately. `OllamaClient::new()` validates the host is localhost, which
+    /// immediately. The Ollama backend validates the host is localhost, which
     /// 127.0.0.1 satisfies, so it constructs but `is_available()` returns false.
     #[tokio::test]
     async fn test_process_transcript_fallback_when_ollama_unavailable() {

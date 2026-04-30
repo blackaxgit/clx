@@ -24,7 +24,7 @@ impl RateLimiter {
     pub fn check(&self) -> bool {
         if let Ok(mut start) = self.window_start.lock() {
             let now = Instant::now();
-            if now.duration_since(*start) > Duration::from_secs(60) {
+            if now.duration_since(*start) > Duration::from_mins(1) {
                 *start = now;
                 self.request_count.store(0, Ordering::Relaxed);
             }

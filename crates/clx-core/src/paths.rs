@@ -19,6 +19,12 @@ pub fn data_dir() -> PathBuf {
     clx_dir().join("data")
 }
 
+/// Cache directory: ~/.clx/cache
+#[must_use]
+pub fn cache_dir() -> PathBuf {
+    clx_dir().join("cache")
+}
+
 /// Database path: ~/.clx/data/clx.db
 #[must_use]
 pub fn database_path() -> PathBuf {
@@ -124,6 +130,7 @@ mod tests {
     #[case(bin_dir())]
     #[case(logs_dir())]
     #[case(learned_dir())]
+    #[case(cache_dir())]
     fn each_dir_is_child_of_clx_dir(#[case] path: PathBuf) {
         let base = clx_dir();
         assert!(

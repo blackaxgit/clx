@@ -246,7 +246,7 @@ fn test_hook_trust_mode_expired_token_falls_through() {
 
     // Set modification time to 2 hours ago using File::set_times (stable since Rust 1.75)
     use std::time::{Duration, SystemTime};
-    let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
+    let two_hours_ago = SystemTime::now() - Duration::from_hours(2);
     let times = std::fs::FileTimes::new()
         .set_modified(two_hours_ago)
         .set_accessed(two_hours_ago);
