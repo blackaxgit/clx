@@ -5,6 +5,19 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-04-30
+
+### Fixed
+- Azure provider keychain credential resolution: 0.6.0 looked up the entry as
+  `<provider>:api-key`, but `CredentialStore` rejects colons in user keys, so
+  the entry was unwriteable through `clx credentials set`. 0.6.1 uses
+  `<provider>-api-key` (hyphen). Users who configured Azure via env var
+  (`AZURE_OPENAI_API_KEY`) are unaffected. Users who tried the keychain path
+  on 0.6.0 should retry with:
+  `clx credentials set <provider-name>-api-key '<your-key>'`
+- Error message when no credentials are available now prints the exact
+  `clx credentials set …` command to run as a fix.
+
 ## [0.6.0] - 2026-04-30
 
 ### Added
