@@ -23,8 +23,8 @@ pub const SECTIONS: &[SectionDef] = &[
         field_count: 3,
     },
     SectionDef {
-        key: "ollama",
-        title: "Ollama",
+        key: "llm",
+        title: "LLM",
         field_count: 8,
     },
     SectionDef {

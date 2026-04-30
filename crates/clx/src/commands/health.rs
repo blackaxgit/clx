@@ -2,6 +2,7 @@
 //!
 //! Runs 9 concurrent validators to verify all CLX components are working
 //! correctly and reports status in a clear, actionable format.
+//! Also probes every configured LLM provider and shows routing assignments.
 
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,8 @@ struct HealthReport {
     version: String,
     checks: Vec<CheckResult>,
     summary: Summary,
+    providers: Vec<ProviderRow>,
+    routing: RoutingSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,10 +51,89 @@ struct Summary {
     total: usize,
 }
 
+/// Status of a single LLM provider availability probe.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderRow {
+    pub name: String,
+    pub kind: String,
+    pub endpoint: String,
+    pub healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Routing assignments shown below the provider table.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingSummary {
+    pub chat: String,
+    pub embeddings: String,
+}
+
+/// Probe every provider in `cfg.providers` and return one row per provider.
+async fn check_providers(config: &clx_core::config::Config) -> (Vec<ProviderRow>, RoutingSummary) {
+    use clx_core::config::{Capability, ProviderConfig};
+
+    let mut rows = Vec::new();
+
+    // Collect providers into a Vec so we can probe them concurrently via
+    // join_all — BTreeMap iteration order is deterministic (alphabetical).
+    let entries: Vec<(String, &ProviderConfig)> = config
+        .providers
+        .iter()
+        .map(|(k, v)| (k.clone(), v))
+        .collect();
+
+    // Probe each provider sequentially (they are fast timeout probes; no need
+    // for complex concurrency scaffolding here).
+    for (name, provider_cfg) in entries {
+        let (kind, endpoint) = match provider_cfg {
+            ProviderConfig::Ollama(o) => ("ollama".to_owned(), o.host.clone()),
+            ProviderConfig::AzureOpenai(a) => ("azure_openai".to_owned(), a.endpoint.clone()),
+        };
+
+        let (healthy, error) = match config.create_llm_client_by_name(&name) {
+            Ok(client) => {
+                if client.is_available().await {
+                    (true, None)
+                } else {
+                    (false, Some(format!("provider '{name}' did not respond")))
+                }
+            }
+            Err(e) => (false, Some(e.to_string())),
+        };
+
+        rows.push(ProviderRow {
+            name,
+            kind,
+            endpoint,
+            healthy,
+            error,
+        });
+    }
+
+    // Build routing summary strings.
+    let chat_route = config.capability_route(Capability::Chat).map_or_else(
+        |_| "not configured".to_owned(),
+        |r| format!("{}/{}", r.provider, r.model),
+    );
+    let embed_route = config.capability_route(Capability::Embeddings).map_or_else(
+        |_| "not configured".to_owned(),
+        |r| format!("{}/{}", r.provider, r.model),
+    );
+
+    let routing = RoutingSummary {
+        chat: chat_route,
+        embeddings: embed_route,
+    };
+
+    (rows, routing)
+}
+
 /// Run the health check command.
 ///
-/// Executes all 9 validators concurrently and prints results as either
-/// a colored table (default) or structured JSON (`--json`).
+/// Executes all 9 validators concurrently, then probes each configured LLM
+/// provider and prints results as either a colored table (default) or
+/// structured JSON (`--json`).
 ///
 /// # Exit codes
 /// - 0: all checks passed or only warnings
@@ -74,10 +156,24 @@ pub async fn cmd_health(json: bool) -> anyhow::Result<()> {
 
     let results = vec![r1, r2, r3, r4, r5, r6, r7, r8, r9];
 
+    // Provider probes (sequential, fast — each uses a short HTTP timeout).
+    let (provider_rows, routing) = if let Some(cfg) = &config {
+        check_providers(cfg).await
+    } else {
+        (
+            Vec::new(),
+            RoutingSummary {
+                chat: "config unavailable".to_owned(),
+                embeddings: "config unavailable".to_owned(),
+            },
+        )
+    };
+
     if json {
-        print_json(&results)?;
+        print_json(&results, &provider_rows, &routing)?;
     } else {
         print_table(&results);
+        print_providers(&provider_rows, &routing);
     }
 
     let has_failure = results.iter().any(|r| r.status == CheckStatus::Fail);
@@ -212,7 +308,11 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
     let start = Instant::now();
     let host = config.map_or_else(
         || "http://127.0.0.1:11434".into(),
-        |c| c.ollama.host.clone(),
+        |c| {
+            c.ollama
+                .as_ref()
+                .map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone())
+        },
     );
 
     let url = format!("{host}/");
@@ -263,7 +363,12 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
 async fn check_validator_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
     let (host, model) = match config {
-        Some(c) => (c.ollama.host.clone(), c.ollama.model.clone()),
+        Some(c) => {
+            let ollama = c.ollama.as_ref();
+            let host = ollama.map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone());
+            let model = ollama.map_or_else(|| "qwen3:1.7b".into(), |o| o.model.clone());
+            (host, model)
+        }
         None => ("http://127.0.0.1:11434".into(), "qwen3:1.7b".into()),
     };
 
@@ -275,7 +380,13 @@ async fn check_validator_model(config: Option<&clx_core::config::Config>) -> Che
 async fn check_embedding_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
     let (host, model) = match config {
-        Some(c) => (c.ollama.host.clone(), c.ollama.embedding_model.clone()),
+        Some(c) => {
+            let ollama = c.ollama.as_ref();
+            let host = ollama.map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone());
+            let model =
+                ollama.map_or_else(|| "nomic-embed-text".into(), |o| o.embedding_model.clone());
+            (host, model)
+        }
         None => ("http://127.0.0.1:11434".into(), "nomic-embed-text".into()),
     };
 
@@ -520,7 +631,11 @@ fn print_table(results: &[CheckResult]) {
     println!();
 }
 
-fn print_json(results: &[CheckResult]) -> anyhow::Result<()> {
+fn print_json(
+    results: &[CheckResult],
+    providers: &[ProviderRow],
+    routing: &RoutingSummary,
+) -> anyhow::Result<()> {
     let passed = results
         .iter()
         .filter(|r| r.status == CheckStatus::Pass)
@@ -543,10 +658,59 @@ fn print_json(results: &[CheckResult]) -> anyhow::Result<()> {
             failed,
             total: results.len(),
         },
+        providers: providers.to_vec(),
+        routing: routing.clone(),
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn print_providers(rows: &[ProviderRow], routing: &RoutingSummary) {
+    if rows.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{}", "LLM Providers".cyan().bold());
+    let separator = "\u{2550}".repeat(50);
+    println!("{}", separator.dimmed());
+    println!();
+
+    let max_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    let max_kind = rows.iter().map(|r| r.kind.len()).max().unwrap_or(0);
+
+    for row in rows {
+        let symbol = if row.healthy {
+            "\u{2713}".green().bold()
+        } else {
+            "\u{2717}".red().bold()
+        };
+        println!(
+            "{} {:<name_w$}  {:<kind_w$}  {}",
+            symbol,
+            row.name,
+            row.kind,
+            row.endpoint,
+            name_w = max_name,
+            kind_w = max_kind,
+        );
+        if let Some(err) = &row.error {
+            println!(
+                "  {:<name_w$}  {} {}",
+                "",
+                "\u{2192}".dimmed(),
+                err.dimmed(),
+                name_w = max_name,
+            );
+        }
+    }
+
+    println!();
+    println!("{}", separator.dimmed());
+    println!("  chat       \u{2192}  {}", routing.chat.green());
+    println!("  embeddings \u{2192}  {}", routing.embeddings.green());
+    println!();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -706,6 +870,11 @@ mod tests {
                 failed: 1,
                 total: 2,
             },
+            providers: vec![],
+            routing: RoutingSummary {
+                chat: "ollama-local/qwen3:1.7b".into(),
+                embeddings: "ollama-local/nomic-embed-text".into(),
+            },
         };
 
         let json = serde_json::to_value(&report).unwrap();
@@ -714,5 +883,7 @@ mod tests {
         assert_eq!(json["summary"]["passed"], 1);
         assert_eq!(json["summary"]["failed"], 1);
         assert_eq!(json["summary"]["total"], 2);
+        assert!(json["providers"].as_array().unwrap().is_empty());
+        assert_eq!(json["routing"]["chat"], "ollama-local/qwen3:1.7b");
     }
 }

@@ -1,4 +1,4 @@
-use clx_core::config::Config;
+use clx_core::config::{Config, ProviderConfig};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
@@ -172,6 +172,11 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect()
     };
 
+    // For LLM section (section 2), append per-provider rows and routing summary
+    if app.settings_section_idx == 2 {
+        append_provider_rows(config, &mut rows, value_max_width);
+    }
+
     // For MCP Tools section (section 7), append command_tools entries as read-only rows
     if app.settings_section_idx == 7 {
         let command_tools = &config.mcp_tools.command_tools;
@@ -221,6 +226,118 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .begin_symbol(Some("\u{2191}"))
         .end_symbol(Some("\u{2193}"));
     frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+}
+
+/// Infer the credential source label for an Azure provider without calling
+/// keychain APIs.  Returns `"Env (<VAR>)"` when the named env var is set and
+/// non-empty, otherwise `"Keychain/file"` when an env var name is configured
+/// but the var is absent, or `"Not configured"` when no env var is set.
+///
+/// The secret value is never read here — only the env var *name* is inspected.
+fn azure_credential_source(cfg: &clx_core::config::AzureOpenAIConfig) -> String {
+    match cfg.api_key_env.as_deref() {
+        Some(var) if !var.is_empty() => {
+            if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+                format!("Env ({var})")
+            } else {
+                "Keychain/file".to_owned()
+            }
+        }
+        _ => {
+            // No env var configured; credential comes from keychain or file
+            // if api_key_file is set, indicate that — otherwise "Not configured"
+            if cfg.api_key_file.is_some() {
+                "File".to_owned()
+            } else {
+                "Not configured".to_owned()
+            }
+        }
+    }
+}
+
+/// Append per-provider and routing read-only rows to the LLM section field list.
+fn append_provider_rows(config: &Config, rows: &mut Vec<Row<'_>>, value_max_width: usize) {
+    // ── Providers ───────────────────────────────────────────────────────────
+    rows.push(Row::new(vec![Cell::from(Span::styled(
+        "── Providers ──",
+        Style::default().fg(Color::Blue).bold(),
+    ))]));
+
+    if config.providers.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(
+                "  (none)",
+                Style::default().fg(Color::DarkGray).italic(),
+            )),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+    } else {
+        for (name, provider) in &config.providers {
+            let (kind_label, endpoint_val) = match provider {
+                ProviderConfig::Ollama(c) => ("ollama".to_owned(), c.host.clone()),
+                ProviderConfig::AzureOpenai(c) => ("azure_openai".to_owned(), c.endpoint.clone()),
+            };
+
+            let endpoint_display = truncate_value(&endpoint_val, value_max_width);
+            rows.push(Row::new(vec![
+                Cell::from(format!("  {name}")).style(Style::default().fg(Color::Cyan)),
+                Cell::from(format!("{kind_label}  {endpoint_display}"))
+                    .style(Style::default().fg(Color::White)),
+                Cell::from(""),
+            ]));
+
+            // For Azure: show credential source (never the secret value)
+            if let ProviderConfig::AzureOpenai(c) = provider {
+                let cred = azure_credential_source(c);
+                rows.push(Row::new(vec![
+                    Cell::from("    credential").style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(cred).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(""),
+                ]));
+            }
+        }
+    }
+
+    // ── Routing ─────────────────────────────────────────────────────────────
+    rows.push(Row::new(vec![Cell::from(Span::styled(
+        "── Routing ──",
+        Style::default().fg(Color::Blue).bold(),
+    ))]));
+
+    match &config.llm {
+        None => {
+            rows.push(Row::new(vec![
+                Cell::from(Span::styled(
+                    "  (no llm: section)",
+                    Style::default().fg(Color::DarkGray).italic(),
+                )),
+                Cell::from(""),
+                Cell::from(""),
+            ]));
+        }
+        Some(llm) => {
+            let chat_val = truncate_value(
+                &format!("{}/{}", llm.chat.provider, llm.chat.model),
+                value_max_width,
+            );
+            rows.push(Row::new(vec![
+                Cell::from("  chat").style(Style::default().fg(Color::DarkGray)),
+                Cell::from(chat_val).style(Style::default().fg(Color::White)),
+                Cell::from(""),
+            ]));
+
+            let emb_val = truncate_value(
+                &format!("{}/{}", llm.embeddings.provider, llm.embeddings.model),
+                value_max_width,
+            );
+            rows.push(Row::new(vec![
+                Cell::from("  embeddings").style(Style::default().fg(Color::DarkGray)),
+                Cell::from(emb_val).style(Style::default().fg(Color::White)),
+                Cell::from(""),
+            ]));
+        }
+    }
 }
 
 /// Create a centered `Rect` within `area`.

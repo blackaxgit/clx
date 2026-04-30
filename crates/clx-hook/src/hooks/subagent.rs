@@ -89,31 +89,28 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
     let db_path = clx_core::paths::database_path();
     let storage = clx_core::storage::Storage::open(&db_path).ok()?;
 
-    // Build OllamaClient with a tighter timeout (leave 50ms for formatting).
-    // Hook process is short-lived (one prompt), so no need for static caching.
-    let ollama_config = clx_core::config::OllamaConfig {
-        timeout_ms: config.auto_recall.timeout_ms.saturating_sub(50),
-        max_retries: 0,
-        ..config.ollama.clone()
-    };
-    let ollama = match clx_core::ollama::OllamaClient::new(ollama_config) {
+    // Build LLM client for embeddings via factory.
+    let ollama = match config.create_llm_client(clx_core::config::Capability::Embeddings) {
         Ok(client) => Some(client),
         Err(e) => {
-            warn!("Auto-recall: failed to create OllamaClient: {e}");
+            warn!("Auto-recall: failed to create LLM client: {e}");
             None
         }
     };
 
-    let embedding_store = match clx_core::embeddings::EmbeddingStore::open_with_dimension(
-        &db_path,
-        config.ollama.embedding_dim,
-    ) {
-        Ok(store) => Some(store),
-        Err(e) => {
-            warn!("Auto-recall: failed to open EmbeddingStore: {e}");
-            None
-        }
-    };
+    let embed_dim = config.ollama.as_ref().map_or_else(
+        || clx_core::config::OllamaConfig::default().embedding_dim,
+        |o| o.embedding_dim,
+    );
+
+    let embedding_store =
+        match clx_core::embeddings::EmbeddingStore::open_with_dimension(&db_path, embed_dim) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                warn!("Auto-recall: failed to open EmbeddingStore: {e}");
+                None
+            }
+        };
 
     let recall_config = clx_core::recall::RecallQueryConfig {
         max_results: config.auto_recall.max_results,

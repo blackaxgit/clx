@@ -228,8 +228,7 @@ fn has_homebrew() -> bool {
     Command::new("which")
         .arg("brew")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Install Ollama via Homebrew.
@@ -282,8 +281,7 @@ async fn check_ollama_prerequisites() -> OllamaStatus {
     let binary_installed = std::process::Command::new("which")
         .arg("ollama")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
 
     let all_models = vec![
         clx_core::config::default_ollama_model(),
@@ -359,7 +357,7 @@ async fn check_ollama_prerequisites() -> OllamaStatus {
 /// Pull an Ollama model via the API.
 async fn pull_ollama_model(model: &str) -> Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .timeout(std::time::Duration::from_mins(10))
         .build()?;
 
     let resp = client

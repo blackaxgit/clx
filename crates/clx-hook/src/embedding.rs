@@ -1,45 +1,51 @@
 //! Embedding generation and storage, plus path resolution utilities.
 
 use anyhow::Result;
-use clx_core::config::Config;
-use clx_core::ollama::OllamaClient;
+use clx_core::config::{Capability, Config};
 use clx_core::storage::Storage;
 use tracing::{debug, info, warn};
 
 /// Generate and store embedding for a snapshot
 pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -> Result<()> {
     let config = Config::load().unwrap_or_default();
-    let ollama = match OllamaClient::new(config.ollama) {
-        Ok(client) => client,
+    let (client, route) = match config
+        .create_llm_client(Capability::Embeddings)
+        .and_then(|c| {
+            config
+                .capability_route(Capability::Embeddings)
+                .map(|r| (c, r))
+        }) {
+        Ok(pair) => pair,
         Err(e) => {
-            debug!(
-                "Failed to create Ollama client for embedding: {}, skipping",
-                e
-            );
+            debug!("Failed to create LLM client for embedding: {}, skipping", e);
             return Ok(());
         }
     };
+    let model = route.model.clone();
+    let model_ident = format!("{}:{}", route.provider, route.model);
 
-    if !ollama.is_available().await {
-        debug!("Ollama not available, skipping embedding generation");
+    if !client.is_available().await {
+        debug!("LLM not available, skipping embedding generation");
         return Ok(());
     }
 
     // Generate embedding with timeout
-    let embedding =
-        match tokio::time::timeout(std::time::Duration::from_secs(5), ollama.embed(text, None))
-            .await
-        {
-            Ok(Ok(emb)) => emb,
-            Ok(Err(e)) => {
-                warn!("Failed to generate embedding: {}", e);
-                return Ok(());
-            }
-            Err(_) => {
-                warn!("Embedding generation timed out");
-                return Ok(());
-            }
-        };
+    let embedding = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.embed(text, Some(&model)),
+    )
+    .await
+    {
+        Ok(Ok(emb)) => emb,
+        Ok(Err(e)) => {
+            warn!("Failed to generate embedding: {}", e);
+            return Ok(());
+        }
+        Err(_) => {
+            warn!("Embedding generation timed out");
+            return Ok(());
+        }
+    };
 
     debug!(
         "Generated embedding for snapshot {} ({} dimensions)",
@@ -52,10 +58,13 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
     match Storage::create_embedding_store(&db_path) {
         Ok(emb_store) => {
             if emb_store.is_vector_search_enabled() {
-                if let Err(e) = emb_store.store_embedding(snapshot_id, embedding) {
+                if let Err(e) = emb_store.store_with_model(snapshot_id, embedding, &model_ident) {
                     warn!("Failed to store embedding: {}", e);
                 } else {
-                    info!("Stored embedding for snapshot {}", snapshot_id);
+                    info!(
+                        "Stored embedding for snapshot {} (model={})",
+                        snapshot_id, model_ident
+                    );
                 }
             } else {
                 debug!("Vector search not enabled, skipping embedding storage");
@@ -129,7 +138,7 @@ mod tests {
     ///
     /// The function stores the embedding to the default DB path (under HOME).
     /// We redirect HOME to a temp directory so the real ~/.clx is untouched.
-    /// Wiremock binds to 127.0.0.1, which `OllamaClient` accepts as localhost.
+    /// Wiremock binds to 127.0.0.1, which the Ollama backend accepts as localhost.
     #[tokio::test]
     async fn test_generate_and_store_embedding_success() {
         use wiremock::matchers::{method, path};

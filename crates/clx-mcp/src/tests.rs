@@ -26,6 +26,7 @@ fn create_test_server() -> McpServer {
         credential_store: CredentialStore::with_service("com.clx.credentials.test"),
         ollama_client: None,   // Disable Ollama in tests by default
         embedding_store: None, // Disable embeddings in tests by default
+        embed_model: String::new(),
         runtime,
     }
 }

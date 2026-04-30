@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use clx_core::ollama_health::{self, HealthStatus};
+use clx_core::llm_health::{self as ollama_health, HealthStatus};
 use clx_core::storage::Storage;
 use clx_core::types::{Snapshot, SnapshotTrigger};
 use tracing::{debug, info, warn};
@@ -15,7 +15,7 @@ use crate::types::HookInput;
 /// Maximum time the `SessionEnd` handler may run before being cancelled.
 /// Claude Code enforces a 1.5 s timeout on `SessionEnd` hooks; we use 1.0 s
 /// to leave a 500 ms margin for process startup and I/O flush.
-const SESSION_END_TIMEOUT: Duration = Duration::from_millis(1000);
+const SESSION_END_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Maximum elapsed time before we skip embedding generation.
 /// Embeddings are expensive; if we have already spent this much time on
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn timeout_constant_is_at_most_one_second() {
-        assert!(SESSION_END_TIMEOUT <= Duration::from_millis(1000));
+        assert!(SESSION_END_TIMEOUT <= Duration::from_secs(1));
     }
 
     #[test]

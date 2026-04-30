@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use crate::credentials::CredentialError;
-use crate::ollama::OllamaError;
+use crate::llm::OllamaError;
 
 /// Main error type for CLX operations
 #[non_exhaustive]
