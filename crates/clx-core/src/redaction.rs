@@ -294,7 +294,7 @@ mod tests {
     fn test_redact_export_token_double_quoted() {
         let input = r#"export API_TOKEN="mytokenvalue""#;
         let redacted = redact_secrets(input);
-        assert!(redacted.contains("***REDACTED***"), "got: {redacted}",);
+        assert!(redacted.contains("***REDACTED***"), "got: {redacted}");
         assert!(!redacted.contains("mytokenvalue"));
     }
 
@@ -302,7 +302,7 @@ mod tests {
     fn test_redact_export_password_single_quoted() {
         let input = "export DB_PASSWORD='hunter2secret'";
         let redacted = redact_secrets(input);
-        assert!(redacted.contains("***REDACTED***"), "got: {redacted}",);
+        assert!(redacted.contains("***REDACTED***"), "got: {redacted}");
         assert!(!redacted.contains("hunter2secret"));
     }
 
@@ -310,7 +310,7 @@ mod tests {
     fn test_redact_export_credential() {
         let input = "export SOME_CREDENTIAL=abc123def456";
         let redacted = redact_secrets(input);
-        assert!(redacted.contains("***REDACTED***"), "got: {redacted}",);
+        assert!(redacted.contains("***REDACTED***"), "got: {redacted}");
         assert!(!redacted.contains("abc123def456"));
     }
 
@@ -318,7 +318,7 @@ mod tests {
     fn test_redact_export_api_key() {
         let input = "export MY_API_KEY=myapikey999";
         let redacted = redact_secrets(input);
-        assert!(redacted.contains("***REDACTED***"), "got: {redacted}",);
+        assert!(redacted.contains("***REDACTED***"), "got: {redacted}");
         assert!(!redacted.contains("myapikey999"));
     }
 

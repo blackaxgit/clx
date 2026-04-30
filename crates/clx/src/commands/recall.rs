@@ -37,28 +37,23 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         .capability_route(Capability::Embeddings)
         .map(|r| r.model.clone())
         .unwrap_or_default();
-    let ollama = match config.create_llm_client(Capability::Embeddings) {
-        Ok(client) => client,
-        Err(_) => {
-            if cli.json {
-                let output = RecallOutput {
-                    query: query.to_string(),
-                    results: vec![],
-                };
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else {
-                println!("{}", "Context Recall".cyan().bold());
-                println!("{}", "=".repeat(50));
-                println!();
-                println!("{}  {}", "Query:".bold(), query);
-                println!();
-                println!("{}", "Could not generate embedding for query.".yellow());
-                println!(
-                    "Ollama is not configured. Run 'clx install' and ensure Ollama is running."
-                );
-            }
-            return Ok(());
+    let Ok(ollama) = config.create_llm_client(Capability::Embeddings) else {
+        if cli.json {
+            let output = RecallOutput {
+                query: query.to_string(),
+                results: vec![],
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!("{}", "Context Recall".cyan().bold());
+            println!("{}", "=".repeat(50));
+            println!();
+            println!("{}  {}", "Query:".bold(), query);
+            println!();
+            println!("{}", "Could not generate embedding for query.".yellow());
+            println!("Ollama is not configured. Run 'clx install' and ensure Ollama is running.");
         }
+        return Ok(());
     };
 
     // Generate embedding for the query

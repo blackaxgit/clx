@@ -98,11 +98,10 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
         }
     };
 
-    let embed_dim = config
-        .ollama
-        .as_ref()
-        .map(|o| o.embedding_dim)
-        .unwrap_or_else(|| clx_core::config::OllamaConfig::default().embedding_dim);
+    let embed_dim = config.ollama.as_ref().map_or_else(
+        || clx_core::config::OllamaConfig::default().embedding_dim,
+        |o| o.embedding_dim,
+    );
 
     let embedding_store =
         match clx_core::embeddings::EmbeddingStore::open_with_dimension(&db_path, embed_dim) {

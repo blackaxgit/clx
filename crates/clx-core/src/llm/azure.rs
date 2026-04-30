@@ -1,4 +1,4 @@
-//! Azure OpenAI backend (hand-rolled reqwest client).
+//! Azure `OpenAI` backend (hand-rolled reqwest client).
 //!
 //! Targets the v1 OpenAI-compatible path by default
 //! (`/openai/v1/chat/completions`, `/openai/v1/embeddings`,
@@ -479,7 +479,7 @@ mod tests {
             Err(LlmError::RateLimit { retry_after }) => {
                 assert_eq!(retry_after, Some(Duration::from_secs(2)));
             }
-            other => panic!("expected RateLimit, got {:?}", other),
+            other => panic!("expected RateLimit, got {other:?}"),
         }
     }
 

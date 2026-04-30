@@ -226,10 +226,7 @@ impl DashboardData {
 
         // Sessions count
         data.total_sessions = storage.count_sessions(since).unwrap_or(0);
-        data.active_sessions = storage
-            .list_active_sessions()
-            .map(|s| s.len() as i64)
-            .unwrap_or(0);
+        data.active_sessions = storage.list_active_sessions().map_or(0, |s| s.len() as i64);
 
         // Token totals
         if let Ok((input, output)) = storage.get_token_totals(since) {

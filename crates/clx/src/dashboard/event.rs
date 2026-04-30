@@ -56,12 +56,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => app.should_quit = true,
-        KeyCode::Enter => {
+        KeyCode::Enter
             // Drill into session detail when on Sessions tab
-            if app.current_tab == DashboardTab::Sessions && !app.data.sessions.is_empty() {
+            if app.current_tab == DashboardTab::Sessions && !app.data.sessions.is_empty() => {
                 app.enter_session_detail();
             }
-        }
         KeyCode::Tab => {
             app.next_tab();
             on_tab_switch(app);
@@ -226,25 +225,22 @@ fn handle_settings_nav(app: &mut App, key: KeyEvent) {
         KeyCode::Char('l' | ']') | KeyCode::Right => {
             app.settings_next_section();
         }
-        KeyCode::Char(' ') | KeyCode::Enter => {
+        KeyCode::Char(' ') | KeyCode::Enter
             // Don't allow editing if config failed to load
-            if app.settings_load_error.is_none() {
+            if app.settings_load_error.is_none() => {
                 handle_settings_edit_field(app);
             }
-        }
         KeyCode::Char('s') => {
             app.settings_save();
         }
-        KeyCode::Char('d') => {
-            if app.settings_load_error.is_none() {
+        KeyCode::Char('d')
+            if app.settings_load_error.is_none() => {
                 handle_settings_reset_field(app);
             }
-        }
-        KeyCode::Char('R') => {
-            if app.settings_is_dirty {
+        KeyCode::Char('R')
+            if app.settings_is_dirty => {
                 app.settings_confirm_reset = true;
             }
-        }
         KeyCode::Char('r') => {
             if app.settings_is_dirty {
                 app.settings_reload_confirm = true;

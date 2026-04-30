@@ -164,8 +164,7 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
             // Step 2: Create LLM client and regenerate embeddings
             let embed_model = config
                 .capability_route(Capability::Embeddings)
-                .map(|r| r.model.clone())
-                .unwrap_or_else(|_| ollama_cfg.embedding_model.clone());
+                .map_or_else(|_| ollama_cfg.embedding_model.clone(), |r| r.model.clone());
             let ollama = config
                 .create_llm_client(Capability::Embeddings)
                 .context("Failed to create LLM client")?;
@@ -284,10 +283,10 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
     let config = Config::load().context("Failed to load configuration")?;
     let backfill_defaults = OllamaConfig::default();
     let backfill_cfg = config.ollama.as_ref().unwrap_or(&backfill_defaults);
-    let embed_model = config
-        .capability_route(Capability::Embeddings)
-        .map(|r| r.model.clone())
-        .unwrap_or_else(|_| backfill_cfg.embedding_model.clone());
+    let embed_model = config.capability_route(Capability::Embeddings).map_or_else(
+        |_| backfill_cfg.embedding_model.clone(),
+        |r| r.model.clone(),
+    );
     let ollama = match config.create_llm_client(Capability::Embeddings) {
         Ok(client) => client,
         Err(e) => {

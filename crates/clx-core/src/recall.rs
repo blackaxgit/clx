@@ -103,14 +103,15 @@ impl<'a> RecallEngine<'a> {
     /// - `configured_model_ident` was not set,
     /// - the database is empty / all rows carry the pre-migration sentinel, or
     /// - the identifiers match.
+    #[must_use]
     pub fn check_model_mismatch(&self) -> Option<(String, String)> {
         let configured = self.configured_model_ident.as_deref()?;
         let emb_store = self.embedding_store?;
         let stored = emb_store.current_model().ok().flatten()?;
-        if stored != configured {
-            Some((stored, configured.to_string()))
-        } else {
+        if stored == configured {
             None
+        } else {
+            Some((stored, configured.to_string()))
         }
     }
 

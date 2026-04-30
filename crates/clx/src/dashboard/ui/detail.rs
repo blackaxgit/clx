@@ -191,11 +191,9 @@ fn render_info(
     let rs = &data.risk_stats;
 
     let pct = |n: usize, total: usize| -> String {
-        if total == 0 {
-            "0%".to_string()
-        } else {
-            format!("{}%", n * 100 / total)
-        }
+        (n * 100)
+            .checked_div(total)
+            .map_or_else(|| "0%".to_string(), |v| format!("{v}%"))
     };
 
     let cyan_style = Style::default().fg(Color::Cyan).bold();

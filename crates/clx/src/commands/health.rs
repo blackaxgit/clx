@@ -215,8 +215,7 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
         |c| {
             c.ollama
                 .as_ref()
-                .map(|o| o.host.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:11434".into())
+                .map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone())
         },
     );
 
@@ -270,12 +269,8 @@ async fn check_validator_model(config: Option<&clx_core::config::Config>) -> Che
     let (host, model) = match config {
         Some(c) => {
             let ollama = c.ollama.as_ref();
-            let host = ollama
-                .map(|o| o.host.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:11434".into());
-            let model = ollama
-                .map(|o| o.model.clone())
-                .unwrap_or_else(|| "qwen3:1.7b".into());
+            let host = ollama.map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone());
+            let model = ollama.map_or_else(|| "qwen3:1.7b".into(), |o| o.model.clone());
             (host, model)
         }
         None => ("http://127.0.0.1:11434".into(), "qwen3:1.7b".into()),
@@ -291,12 +286,9 @@ async fn check_embedding_model(config: Option<&clx_core::config::Config>) -> Che
     let (host, model) = match config {
         Some(c) => {
             let ollama = c.ollama.as_ref();
-            let host = ollama
-                .map(|o| o.host.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:11434".into());
-            let model = ollama
-                .map(|o| o.embedding_model.clone())
-                .unwrap_or_else(|| "nomic-embed-text".into());
+            let host = ollama.map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone());
+            let model =
+                ollama.map_or_else(|| "nomic-embed-text".into(), |o| o.embedding_model.clone());
             (host, model)
         }
         None => ("http://127.0.0.1:11434".into(), "nomic-embed-text".into()),

@@ -542,7 +542,7 @@ impl From<OllamaError> for LlmError {
             OllamaError::Timeout(_ms) => LlmError::Timeout,
             // HttpError wraps reqwest::Error directly (no status/body decomposition)
             OllamaError::HttpError(re) => LlmError::Server {
-                status: re.status().map(|s| s.as_u16()).unwrap_or(500),
+                status: re.status().map_or(500, |s| s.as_u16()),
                 body: re.to_string(),
             },
             OllamaError::InvalidResponse(s) => LlmError::InvalidResponse(s),

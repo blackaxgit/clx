@@ -741,7 +741,7 @@ impl Default for McpToolsConfig {
 // Azure OpenAI provider config (Task 7 — does NOT touch the root Config struct)
 // ---------------------------------------------------------------------------
 
-/// Configuration for the Azure OpenAI backend.
+/// Configuration for the Azure `OpenAI` backend.
 ///
 /// Loaded from the `azure_openai` section of `~/.clx/config.yaml` by Task 9.
 /// Added here as a standalone type so `AzureOpenAIBackend::new` has a typed
@@ -1407,12 +1407,11 @@ fn resolve_azure_credential(
     use secrecy::SecretString;
 
     // 1. env var
-    if let Some(name) = cfg.api_key_env.as_deref() {
-        if let Ok(v) = std::env::var(name) {
-            if !v.is_empty() {
-                return Ok(SecretString::new(v.into()));
-            }
-        }
+    if let Some(name) = cfg.api_key_env.as_deref()
+        && let Ok(v) = std::env::var(name)
+        && !v.is_empty()
+    {
+        return Ok(SecretString::new(v.into()));
     }
 
     // 2. CredentialStore (system keychain)

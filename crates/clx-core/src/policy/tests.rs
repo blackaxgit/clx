@@ -1179,11 +1179,11 @@ fn test_shell_escape_blacklist() {
 fn test_cache_ttl_configuration() {
     // Default cache with 5-minute TTL
     let cache1 = ValidationCache::new();
-    assert_eq!(cache1.ttl, Duration::from_secs(5 * 60));
+    assert_eq!(cache1.ttl, Duration::from_mins(5));
 
     // Custom TTL
-    let cache2 = ValidationCache::with_ttl(Duration::from_secs(60));
-    assert_eq!(cache2.ttl, Duration::from_secs(60));
+    let cache2 = ValidationCache::with_ttl(Duration::from_mins(1));
+    assert_eq!(cache2.ttl, Duration::from_mins(1));
 }
 
 #[test]
@@ -1320,7 +1320,7 @@ fn test_prompt_injection_detection() {
 
 #[test]
 fn test_cache_max_entries_eviction() {
-    let cache = ValidationCache::with_ttl(Duration::from_secs(300)).with_max_entries(5);
+    let cache = ValidationCache::with_ttl(Duration::from_mins(5)).with_max_entries(5);
 
     // Insert 5 entries (at capacity)
     for i in 0..5u64 {
@@ -1341,9 +1341,9 @@ fn test_cache_with_max_entries_builder() {
     let cache = ValidationCache::new().with_max_entries(50);
     assert_eq!(cache.max_entries, 50);
 
-    let cache2 = ValidationCache::with_ttl(Duration::from_secs(60)).with_max_entries(200);
+    let cache2 = ValidationCache::with_ttl(Duration::from_mins(1)).with_max_entries(200);
     assert_eq!(cache2.max_entries, 200);
-    assert_eq!(cache2.ttl, Duration::from_secs(60));
+    assert_eq!(cache2.ttl, Duration::from_mins(1));
 }
 
 #[test]

@@ -50,7 +50,7 @@ impl ValidationCache {
     /// Create a new empty cache
     #[must_use]
     pub fn new() -> Self {
-        Self::with_ttl(Duration::from_secs(5 * 60))
+        Self::with_ttl(Duration::from_mins(5))
     }
 
     /// Create a cache with a custom TTL
@@ -132,7 +132,7 @@ impl ValidationCache {
 
     /// Get the number of cached entries
     pub fn len(&self) -> usize {
-        self.entries.lock().map(|e| e.len()).unwrap_or(0)
+        self.entries.lock().map_or(0, |e| e.len())
     }
 
     /// Check if the cache is empty

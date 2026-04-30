@@ -130,7 +130,7 @@ mod tests {
 
         // Backdate mtime to 60 seconds ago (well past 30s TTL)
         use std::time::{Duration, SystemTime};
-        let past = SystemTime::now() - Duration::from_secs(60);
+        let past = SystemTime::now() - Duration::from_mins(1);
         let times = std::fs::FileTimes::new()
             .set_modified(past)
             .set_accessed(past);
