@@ -8,12 +8,12 @@ use tracing::{debug, info, warn};
 /// Generate and store embedding for a snapshot
 pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -> Result<()> {
     let config = Config::load().unwrap_or_default();
-    let (client, model) = match config
+    let (client, route) = match config
         .create_llm_client(Capability::Embeddings)
         .and_then(|c| {
             config
                 .capability_route(Capability::Embeddings)
-                .map(|r| (c, r.model.clone()))
+                .map(|r| (c, r))
         }) {
         Ok(pair) => pair,
         Err(e) => {
@@ -24,6 +24,8 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
             return Ok(());
         }
     };
+    let model = route.model.clone();
+    let model_ident = format!("{}:{}", route.provider, route.model);
 
     if !client.is_available().await {
         debug!("LLM not available, skipping embedding generation");
@@ -60,10 +62,13 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
     match Storage::create_embedding_store(&db_path) {
         Ok(emb_store) => {
             if emb_store.is_vector_search_enabled() {
-                if let Err(e) = emb_store.store_embedding(snapshot_id, embedding) {
+                if let Err(e) = emb_store.store_with_model(snapshot_id, embedding, &model_ident) {
                     warn!("Failed to store embedding: {}", e);
                 } else {
-                    info!("Stored embedding for snapshot {}", snapshot_id);
+                    info!(
+                        "Stored embedding for snapshot {} (model={})",
+                        snapshot_id, model_ident
+                    );
                 }
             } else {
                 debug!("Vector search not enabled, skipping embedding storage");

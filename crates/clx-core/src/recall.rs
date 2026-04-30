@@ -64,6 +64,11 @@ pub struct RecallEngine<'a> {
     storage: &'a Storage,
     ollama: Option<&'a LlmClient>,
     embedding_store: Option<&'a EmbeddingStore>,
+    /// The model identifier (`"<provider>:<model>"`) that the current config
+    /// would use for new embeddings.  When `Some`, mismatch detection is
+    /// active: `check_model_mismatch` returns the stored vs. configured pair
+    /// when they differ.
+    configured_model_ident: Option<String>,
 }
 
 impl<'a> RecallEngine<'a> {
@@ -78,6 +83,34 @@ impl<'a> RecallEngine<'a> {
             storage,
             ollama,
             embedding_store,
+            configured_model_ident: None,
+        }
+    }
+
+    /// Attach the configured embedding model identifier so that mismatch
+    /// detection works.  The identifier should be `"<provider>:<model>"`.
+    #[must_use]
+    pub fn with_model_ident(mut self, ident: impl Into<String>) -> Self {
+        self.configured_model_ident = Some(ident.into());
+        self
+    }
+
+    /// Check whether the stored model identifier differs from the configured one.
+    ///
+    /// Returns `Some((stored, configured))` when a mismatch is detected.
+    /// Returns `None` when:
+    /// - no embedding store is attached,
+    /// - `configured_model_ident` was not set,
+    /// - the database is empty / all rows carry the pre-migration sentinel, or
+    /// - the identifiers match.
+    pub fn check_model_mismatch(&self) -> Option<(String, String)> {
+        let configured = self.configured_model_ident.as_deref()?;
+        let emb_store = self.embedding_store?;
+        let stored = emb_store.current_model().ok().flatten()?;
+        if stored != configured {
+            Some((stored, configured.to_string()))
+        } else {
+            None
         }
     }
 
