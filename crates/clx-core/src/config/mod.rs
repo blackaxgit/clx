@@ -2986,6 +2986,15 @@ ollama:
     /// `ServiceUnavailable`/`Keychain`, orthogonal to the validator contract.
     #[test]
     fn azure_keychain_key_passes_credential_store_validator() {
+        // GitHub Actions macOS runners have a headless keychain that hangs
+        // indefinitely on access (PR #22 observed 19 min before timeout in
+        // the Coverage job). Skip on CI; the test still runs locally and
+        // on Linux CI (where keychain is unavailable, returning a clean
+        // ServiceUnavailable error that the test handles).
+        if std::env::var("GITHUB_ACTIONS").is_ok() && cfg!(target_os = "macos") {
+            eprintln!("skipping: keychain access hangs on GitHub Actions macOS runners");
+            return;
+        }
         use crate::credentials::{CredentialError, CredentialStore};
         let store = CredentialStore::with_service("clx-test-keyfmt");
         let provider = "azure-regression-test-keyfmt";
