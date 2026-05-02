@@ -119,8 +119,11 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
         include_key_facts: config.auto_recall.include_key_facts,
     };
 
-    let engine =
+    let mut engine =
         clx_core::recall::RecallEngine::new(&storage, ollama.as_ref(), embedding_store.as_ref());
+    if let Ok(route) = config.capability_route(clx_core::config::Capability::Embeddings) {
+        engine = engine.with_embedding_model(route.model.clone());
+    }
     let hits = engine.query(prompt, &recall_config).await;
 
     if hits.is_empty() {

@@ -30,7 +30,8 @@ impl McpServer {
             &self.storage,
             self.ollama_client.as_ref(),
             self.embedding_store.as_ref(),
-        );
+        )
+        .with_embedding_model(self.embed_model.clone());
 
         // MCP recall uses a more permissive threshold (0.25) than auto-recall (0.35)
         // because it is user-invoked and benefits from broader results.

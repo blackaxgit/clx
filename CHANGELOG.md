@@ -5,6 +5,20 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] - 2026-05-02
+
+### Fixed
+- Auto-recall (`UserPromptSubmit` hook) silently produced no semantic
+  context when embeddings were routed to Azure OpenAI. The recall path
+  called `embed(query, None)`; Azure rejects `None` with
+  `DeploymentNotFound` (only Ollama tolerated it via its own
+  baked-in default). `RecallEngine` now accepts an explicit embedding
+  model via `with_embedding_model(...)`, and both production callers
+  (`clx-hook` auto-recall and `clx-mcp` `clx_recall` tool) pass the
+  configured `llm.embeddings.model`. FTS5 fallback was working all
+  along, but the headline semantic-recall feature was dark on
+  Azure-routed embeddings until this fix.
+
 ## [0.7.1] - 2026-05-02
 
 ### Fixed
