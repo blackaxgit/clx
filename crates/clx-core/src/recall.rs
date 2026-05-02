@@ -69,6 +69,11 @@ pub struct RecallEngine<'a> {
     /// active: `check_model_mismatch` returns the stored vs. configured pair
     /// when they differ.
     configured_model_ident: Option<String>,
+    /// The bare embedding model / deployment name to pass to the backend
+    /// when generating the query embedding. Required for backends that do
+    /// not have a baked-in default model (e.g., `AzureOpenAIBackend`). Optional because
+    /// Ollama tolerates `None` by falling back to its configured default.
+    embedding_model: Option<String>,
 }
 
 impl<'a> RecallEngine<'a> {
@@ -84,7 +89,18 @@ impl<'a> RecallEngine<'a> {
             ollama,
             embedding_store,
             configured_model_ident: None,
+            embedding_model: None,
         }
+    }
+
+    /// Attach the bare embedding model / deployment name. Required for
+    /// Azure-routed embeddings (Azure backend errors with
+    /// `DeploymentNotFound` when called with `None`); Ollama tolerates
+    /// missing model and falls back to its config default.
+    #[must_use]
+    pub fn with_embedding_model(mut self, model: impl Into<String>) -> Self {
+        self.embedding_model = Some(model.into());
+        self
     }
 
     /// Attach the configured embedding model identifier so that mismatch
@@ -153,8 +169,9 @@ impl<'a> RecallEngine<'a> {
         emb_store: &EmbeddingStore,
         config: &RecallQueryConfig,
     ) -> Vec<RecallHit> {
-        // Generate embedding for the query
-        let embedding = match ollama.embed(query, None).await {
+        // Generate embedding for the query. Pass the configured embedding
+        // model so backends without a baked-in default (Azure) work.
+        let embedding = match ollama.embed(query, self.embedding_model.as_deref()).await {
             Ok(emb) => emb,
             Err(e) => {
                 warn!("Recall semantic embedding failed: {e}");
@@ -885,5 +902,31 @@ mod tests {
             score,
             search_type,
         }
+    }
+
+    /// Regression for the 0.7.1 bug: `auto_recall` passed `None` for the
+    /// embeddings model, which Azure rejects with `DeploymentNotFound`.
+    /// 0.7.2 plumbs the configured model through `with_embedding_model`.
+    /// This test asserts the builder stores the model so `try_semantic`
+    /// will pass it to the backend.
+    #[test]
+    fn embedding_model_builder_persists_value() {
+        let storage = Storage::open_in_memory().unwrap();
+        let engine =
+            RecallEngine::new(&storage, None, None).with_embedding_model("text-embedding-3-small");
+        assert_eq!(
+            engine.embedding_model.as_deref(),
+            Some("text-embedding-3-small")
+        );
+    }
+
+    #[test]
+    fn embedding_model_default_is_none_for_back_compat() {
+        let storage = Storage::open_in_memory().unwrap();
+        let engine = RecallEngine::new(&storage, None, None);
+        assert!(
+            engine.embedding_model.is_none(),
+            "default must be None so existing callers keep relying on Ollama's baked-in default"
+        );
     }
 }
