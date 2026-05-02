@@ -5,6 +5,19 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-05-02
+
+### Fixed
+- Audit log foreign-key constraint failure on every L0-decided hook call.
+  `Storage::create_audit_log` now ensures the referenced session row exists
+  via `INSERT OR IGNORE` before the audit insert. Synthetic / fast-path /
+  fabricated session IDs no longer trip the FK.
+- File logging was never wired up — `logging.file: ~/.clx/logs/clx.log` in
+  the config was silently ignored. `clx-hook` now opens the configured log
+  path (with `~` expansion already implemented in `Config::log_file_path`)
+  and writes WARN+ events there. stderr remains ERROR-only so Claude Code's
+  hook stderr-handling is unaffected.
+
 ## [0.7.0] - 2026-04-30
 
 ### Added
