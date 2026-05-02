@@ -66,14 +66,43 @@ async fn main() -> Result<()> {
 
     clx_core::init_sqlite_vec();
 
-    // Initialize tracing - only ERROR level to avoid confusing Claude Code
-    // Claude Code interprets any stderr output as hook errors
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Initialize tracing.
+    // - stderr: ERROR only (Claude Code treats hook stderr as failure noise).
+    // - file: WARN+ to the configured log file (created by hook on first write).
+    //   Ensures the user-visible "log file silently dropped" surprise is fixed.
+    let log_path = clx_core::config::Config::load().ok().and_then(|c| {
+        let p = c.log_file_path();
+        std::fs::create_dir_all(p.parent()?).ok()?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&p)
+            .ok()
+            .map(std::sync::Mutex::new)
+            .map(std::sync::Arc::new)
+    });
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::ERROR.into()),
-        )
-        .with_writer(std::io::stderr)
+        );
+    let file_layer = log_path.as_ref().map(|f| {
+        let f = f.clone();
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || MutexFile(f.clone()))
+            .with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+    });
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
         .init();
 
     // Read JSON input from stdin (limited to 1MB to prevent DoS via memory exhaustion)
@@ -139,4 +168,23 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Adapter so `Arc<Mutex<File>>` can serve as a tracing-subscriber writer.
+/// Each write acquires the mutex; fine for a short-lived hook process.
+struct MutexFile(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for MutexFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("file mutex poisoned"))?
+            .write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("file mutex poisoned"))?
+            .flush()
+    }
 }

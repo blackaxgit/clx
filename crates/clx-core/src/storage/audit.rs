@@ -11,8 +11,19 @@ use super::util::parse_datetime;
 use crate::types::{AuditDecision, AuditLogEntry, UserDecision};
 
 impl Storage {
-    /// Create an audit log entry
+    /// Create an audit log entry.
+    ///
+    /// First ensures the referenced session row exists (INSERT OR IGNORE with
+    /// safe defaults). Without this guard, fast-path / synthetic / fabricated
+    /// session IDs trip the `audit_log` → `sessions` FOREIGN KEY constraint.
     pub fn create_audit_log(&self, entry: &AuditLogEntry) -> crate::Result<i64> {
+        // Ensure the FK target exists. No-op if the session was already created
+        // by SessionStart hook; a synthetic placeholder otherwise.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, project_path, started_at, source, status) \
+             VALUES (?1, '', datetime('now'), 'audit-placeholder', 'active')",
+            params![entry.session_id],
+        )?;
         self.conn.execute(
             "INSERT INTO audit_log (session_id, timestamp, command, working_dir, layer, decision, risk_score, reasoning, user_decision)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
