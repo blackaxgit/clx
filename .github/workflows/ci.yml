@@ -124,6 +124,21 @@ jobs:
     name: Coverage (macOS)
     runs-on: macos-latest
     needs: check
+    # Job-level cap. Without this, a hung instrumented test (we hit one in
+    # PR #20: 6h5m) burns billable CI minutes. 30 min is ~6x historical
+    # green-run wall time; genuine slowdowns still pass.
+    timeout-minutes: 30
+    # Coverage is informational, not a merge gate. Decoupling it from the
+    # PR check rollup means a single instrumentation flake does not block
+    # user-facing fixes from merging.
+    continue-on-error: true
+
+    env:
+      # Serialize tests under instrumentation. The wiremock + serial_test +
+      # tokio combo can deadlock under llvm-cov instrumentation when
+      # parallel; single-threaded execution avoids that class of hang at
+      # the cost of ~1-2 min extra wall-clock.
+      RUST_TEST_THREADS: "1"
 
     steps:
       - name: Checkout repository
@@ -152,7 +167,9 @@ jobs:
 
       # Generate the LCOV report. --all-features ensures every code path
       # gated behind a feature flag is included in the measurement.
+      # Step-level timeout: hangs fail in 20 min, not 6h.
       - name: Generate LCOV coverage report
+        timeout-minutes: 20
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
       # Hard gate: fail the job if line coverage is below 70%.
@@ -160,6 +177,7 @@ jobs:
       # (event.rs, mod.rs) and complex UI render code (settings/render.rs)
       # are inherently untestable in CI (terminal I/O, crossterm events).
       - name: Enforce 70% line coverage threshold
+        timeout-minutes: 5
         run: cargo llvm-cov --all-features --workspace --fail-under-lines 70
 
       # Upload lcov.info so it can be inspected in the Actions UI or fed
