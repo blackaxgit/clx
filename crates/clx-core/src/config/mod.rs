@@ -45,6 +45,8 @@
 //! - `CLX_AUTO_RECALL_INCLUDE_KEY_FACTS`
 //! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
+pub(crate) mod project;
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt;
@@ -808,6 +810,15 @@ pub struct LlmRouting {
 pub struct CapabilityRoute {
     pub provider: String,
     pub model: String,
+
+    /// Optional secondary provider used when the primary fails with a
+    /// transient error. `Box` to allow recursion (each fallback could
+    /// itself have a fallback; v0.7.0 only surfaces a single level UX).
+    /// The `model` field on a fallback route is honored at fallback call
+    /// time — the caller's model name is replaced because providers don't
+    /// share model names (e.g. `gpt-5.4-mini` only exists on Azure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<CapabilityRoute>>,
 }
 
 /// Which LLM capability to route.
@@ -825,30 +836,61 @@ impl Config {
     /// 2. ~/.clx/config.yaml (if exists)
     /// 3. Environment variables (highest priority)
     pub fn load() -> crate::Result<Self> {
-        // Ensure config directory exists
+        use figment::Figment;
+        use figment::providers::{Env, Format, Yaml};
+
+        // Ensure config directory and logs directory exist
         let config_dir = Self::config_dir()?;
         Self::ensure_dir_exists(&config_dir)?;
-
-        // Ensure logs directory exists
         let logs_dir = config_dir.join("logs");
         Self::ensure_dir_exists(&logs_dir)?;
 
-        // Load base config from file or use defaults
-        let config_path = config_dir.join("config.yaml");
-        let mut config = if config_path.exists() {
-            let content = fs::read_to_string(&config_path)?;
-            serde_yml::from_str(&content)?
-        } else {
-            Config::default()
-        };
+        let global_path = config_dir.join("config.yaml");
 
-        // Translate legacy `ollama:` block into providers/llm (in-memory only)
-        config.translate_legacy_in_place();
+        let mut fig = Figment::new();
 
-        // Apply environment variable overrides
-        config.apply_env_overrides();
+        // Layer 1 (lowest): global ~/.clx/config.yaml (if it exists).
+        if global_path.is_file() {
+            fig = fig.merge(Yaml::file_exact(&global_path));
+        }
 
-        Ok(config)
+        // Layer 2: project .clx/config.yaml (filtered through inert allowlist).
+        // We read and filter the raw YAML ourselves; figment sees a clean string.
+        // Use config_dir.parent() (i.e. the home dir as resolved by config_dir())
+        // as the walk-up stop boundary. This ensures that the project walk-up
+        // stops at exactly the same home that produced global_path, even when
+        // HOME is overridden (e.g. in tests).
+        let home_boundary = config_dir.parent().map(std::path::Path::to_path_buf);
+        if let Some(proj) =
+            crate::config::project::project_config_path_with_stop(home_boundary.as_deref())
+            && let Ok(raw) = fs::read_to_string(&proj)
+        {
+            let filtered = crate::config::project::filter_inert_only(&raw);
+            if !filtered.is_empty() {
+                fig = fig.merge(Yaml::string(&filtered));
+            }
+        }
+
+        // Layer 3 (highest): env vars via figment (flat, no auto-nesting).
+        // NOTE: figment's Env::prefixed uses `.` as the nesting separator, but
+        // CLX_ vars use `_` in non-nesting positions. We keep apply_env_overrides()
+        // below for the full validated env-var logic; this layer is a safety net
+        // for any keys that map cleanly (e.g. simple top-level booleans exposed
+        // via CLX_VALIDATOR_ENABLED etc. are handled by apply_env_overrides).
+        fig = fig.merge(Env::prefixed("CLX_"));
+
+        let mut cfg: Config = fig
+            .extract()
+            .map_err(|e| crate::Error::Config(format!("figment merge failed: {e}")))?;
+
+        // Translate legacy `ollama:` block into providers/llm (in-memory only).
+        cfg.translate_legacy_in_place();
+
+        // Apply validated, range-checked env-var overrides (kept as authoritative
+        // env-var mechanism; figment layer above is additive safety net only).
+        cfg.apply_env_overrides();
+
+        Ok(cfg)
     }
 
     /// Load configuration from file only (no environment variable overrides).
@@ -1288,10 +1330,12 @@ impl Config {
             chat: CapabilityRoute {
                 provider: "ollama-local".into(),
                 model: legacy.model.clone(),
+                fallback: None,
             },
             embeddings: CapabilityRoute {
                 provider: "ollama-local".into(),
                 model: legacy.embedding_model.clone(),
+                fallback: None,
             },
         });
     }
@@ -1329,7 +1373,14 @@ impl Config {
         capability: Capability,
     ) -> Result<crate::llm::LlmClient, LlmConfigError> {
         let route = self.capability_route(capability)?;
-        self.build_client_for_provider(&route.provider)
+        let primary = self.build_client_for_provider(&route.provider)?;
+        if let Some(fb) = route.fallback.as_deref() {
+            let fallback = self.build_client_for_provider(&fb.provider)?;
+            let wrapper =
+                crate::llm::FallbackClient::new(primary, fallback, Some(fb.model.clone()));
+            return Ok(crate::llm::LlmClient::Fallback(wrapper));
+        }
+        Ok(primary)
     }
 
     /// Construct an `LlmClient` for a named provider, bypassing routing.
@@ -2970,6 +3021,78 @@ ollama:
                 // either, so this lenience is consistent.
             }
             Err(other) => panic!("unexpected error storing colon key: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_field_round_trips() {
+        let yaml = "
+provider: azure-prod
+model: gpt-5.4-mini
+fallback:
+  provider: ollama-local
+  model: \"qwen3:1.7b\"
+";
+        let route: CapabilityRoute = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(route.provider, "azure-prod");
+        let fb = route.fallback.as_deref().expect("fallback present");
+        assert_eq!(fb.provider, "ollama-local");
+        assert_eq!(fb.model, "qwen3:1.7b");
+        assert!(fb.fallback.is_none());
+
+        let yaml2 = serde_yml::to_string(&route).unwrap();
+        let route2: CapabilityRoute = serde_yml::from_str(&yaml2).unwrap();
+        assert_eq!(route, route2);
+    }
+
+    #[test]
+    fn fallback_field_omitted_in_serialization_when_none() {
+        let route = CapabilityRoute {
+            provider: "p".into(),
+            model: "m".into(),
+            fallback: None,
+        };
+        let yaml = serde_yml::to_string(&route).unwrap();
+        assert!(
+            !yaml.contains("fallback"),
+            "skip_serializing_if not respected: {yaml}"
+        );
+    }
+
+    // ---- Tasks 6+7: per-project config discovery integration tests ----
+
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn project_config_path_walks_up_to_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".clx");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("config.yaml");
+        std::fs::write(&path, "logging:\n  level: debug\n").unwrap();
+
+        // SAFETY: test-only env var manipulation; serialized via serial_test.
+        unsafe {
+            std::env::set_var("CLX_CONFIG_PROJECT", path.to_str().unwrap());
+        }
+        let resolved = crate::config::project::project_config_path_with_stop(None);
+        assert_eq!(resolved.as_deref(), Some(path.as_path()));
+        unsafe {
+            std::env::remove_var("CLX_CONFIG_PROJECT");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn project_config_disabled_via_env_none() {
+        // SAFETY: test-only env var manipulation; serialized via serial_test.
+        unsafe {
+            std::env::set_var("CLX_CONFIG_PROJECT", "none");
+        }
+        assert!(crate::config::project::project_config_path_with_stop(None).is_none());
+        unsafe {
+            std::env::remove_var("CLX_CONFIG_PROJECT");
         }
     }
 }
