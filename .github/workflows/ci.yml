@@ -133,13 +133,6 @@ jobs:
     # user-facing fixes from merging.
     continue-on-error: true
 
-    env:
-      # Serialize tests under instrumentation. The wiremock + serial_test +
-      # tokio combo can deadlock under llvm-cov instrumentation when
-      # parallel; single-threaded execution avoids that class of hang at
-      # the cost of ~1-2 min extra wall-clock.
-      RUST_TEST_THREADS: "1"
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
