@@ -2992,9 +2992,7 @@ ollama:
         // on Linux CI (where keychain is unavailable, returning a clean
         // ServiceUnavailable error that the test handles).
         if std::env::var("GITHUB_ACTIONS").is_ok() && cfg!(target_os = "macos") {
-            eprintln!(
-                "skipping: keychain access hangs on GitHub Actions macOS runners"
-            );
+            eprintln!("skipping: keychain access hangs on GitHub Actions macOS runners");
             return;
         }
         use crate::credentials::{CredentialError, CredentialStore};
