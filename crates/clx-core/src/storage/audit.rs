@@ -15,7 +15,7 @@ impl Storage {
     ///
     /// First ensures the referenced session row exists (INSERT OR IGNORE with
     /// safe defaults). Without this guard, fast-path / synthetic / fabricated
-    /// session IDs trip the audit_log → sessions FOREIGN KEY constraint.
+    /// session IDs trip the `audit_log` → `sessions` FOREIGN KEY constraint.
     pub fn create_audit_log(&self, entry: &AuditLogEntry) -> crate::Result<i64> {
         // Ensure the FK target exists. No-op if the session was already created
         // by SessionStart hook; a synthetic placeholder otherwise.

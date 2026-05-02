@@ -70,19 +70,17 @@ async fn main() -> Result<()> {
     // - stderr: ERROR only (Claude Code treats hook stderr as failure noise).
     // - file: WARN+ to the configured log file (created by hook on first write).
     //   Ensures the user-visible "log file silently dropped" surprise is fixed.
-    let log_path = clx_core::config::Config::load()
-        .ok()
-        .and_then(|c| {
-            let p = c.log_file_path();
-            std::fs::create_dir_all(p.parent()?).ok()?;
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&p)
-                .ok()
-                .map(std::sync::Mutex::new)
-                .map(std::sync::Arc::new)
-        });
+    let log_path = clx_core::config::Config::load().ok().and_then(|c| {
+        let p = c.log_file_path();
+        std::fs::create_dir_all(p.parent()?).ok()?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&p)
+            .ok()
+            .map(std::sync::Mutex::new)
+            .map(std::sync::Arc::new)
+    });
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(
