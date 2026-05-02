@@ -123,6 +123,7 @@ mod tests {
     use crate::llm::AzureOpenAIBackend;
     use crate::llm::retry::RetryConfig;
     use secrecy::SecretString;
+    use serial_test::serial;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
     fn cfg(endpoint: String) -> AzureOpenAIConfig {
@@ -153,6 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn fallback_on_primary_503_succeeds() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -185,6 +187,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn fallback_not_used_on_terminal_error() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -209,6 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn cooldown_skips_primary_after_failure() {
         allow_local();
         let primary_mock = MockServer::start().await;
