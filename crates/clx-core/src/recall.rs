@@ -71,7 +71,7 @@ pub struct RecallEngine<'a> {
     configured_model_ident: Option<String>,
     /// The bare embedding model / deployment name to pass to the backend
     /// when generating the query embedding. Required for backends that do
-    /// not have a baked-in default model (e.g., AzureOpenAIBackend). Optional because
+    /// not have a baked-in default model (e.g., `AzureOpenAIBackend`). Optional because
     /// Ollama tolerates `None` by falling back to its configured default.
     embedding_model: Option<String>,
 }
