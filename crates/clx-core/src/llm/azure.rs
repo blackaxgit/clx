@@ -163,16 +163,6 @@ struct EmbedDatum {
 
 // --- Helpers -------------------------------------------------------------
 
-fn is_transient(e: &LlmError) -> bool {
-    matches!(
-        e,
-        LlmError::Timeout | LlmError::RateLimit { .. } | LlmError::Connection(_)
-    ) || matches!(
-        e,
-        LlmError::Server { status, .. } if (500..=599).contains(status) || *status == 408
-    )
-}
-
 fn retry_after_for(e: &LlmError) -> Option<Duration> {
     match e {
         LlmError::RateLimit { retry_after } => *retry_after,
@@ -288,7 +278,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
         let resp = with_backoff(
             self.retry,
             || post_chat(self, &url, &body),
-            is_transient,
+            LlmError::is_transient,
             retry_after_for,
         )
         .await?;
@@ -312,7 +302,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
         let resp = with_backoff(
             self.retry,
             || post_embed(self, &url, &body),
-            is_transient,
+            LlmError::is_transient,
             retry_after_for,
         )
         .await?;
@@ -342,6 +332,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
 mod tests {
     use super::*;
     use secrecy::SecretString;
+    use serial_test::serial;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
     fn cfg(endpoint: String) -> AzureOpenAIConfig {
@@ -367,6 +358,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn chat_happy_path() {
         allow_local();
         let mock = MockServer::start().await;
@@ -391,6 +383,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn embed_happy_path() {
         allow_local();
         let mock = MockServer::start().await;
@@ -414,6 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn host_outside_allowlist_rejected() {
         // SAFETY: single-threaded at this point in the test; no concurrent readers.
         unsafe { std::env::remove_var("CLX_ALLOW_AZURE_HOSTS") };
@@ -425,6 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn auth_401_maps_to_auth_error() {
         allow_local();
         let mock = MockServer::start().await;
@@ -443,6 +438,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn deployment_not_found_404() {
         allow_local();
         let mock = MockServer::start().await;
@@ -459,6 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn rate_limit_with_retry_after() {
         allow_local();
         let mock = MockServer::start().await;
@@ -484,6 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn content_filter_400() {
         allow_local();
         let mock = MockServer::start().await;
@@ -502,6 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn server_500_after_no_retries_surfaced() {
         allow_local();
         let mock = MockServer::start().await;
@@ -518,6 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn is_available_true_on_2xx() {
         allow_local();
         let mock = MockServer::start().await;
@@ -533,6 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(env_azure_hosts)]
     async fn is_available_false_on_5xx() {
         allow_local();
         let mock = MockServer::start().await;

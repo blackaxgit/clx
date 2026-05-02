@@ -24,6 +24,7 @@ secrecy.workspace = true
 sqlite-vec.workspace = true
 trait-variant.workspace = true
 url.workspace = true
+figment.workspace = true
 
 [lints]
 workspace = true

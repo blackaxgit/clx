@@ -1,10 +1,12 @@
 //! Provider-neutral LLM client surface and backend abstractions.
 
 mod azure;
+pub mod fallback;
 mod ollama;
 pub mod retry;
 
 pub use azure::AzureOpenAIBackend;
+pub use fallback::FallbackClient;
 pub use ollama::{OllamaBackend, OllamaError};
 pub use retry::{RetryConfig, with_backoff};
 
@@ -48,12 +50,51 @@ pub enum LlmError {
     Serialization(#[from] serde_json::Error),
 }
 
+impl LlmError {
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            LlmError::Timeout | LlmError::Connection(_) | LlmError::RateLimit { .. }
+        ) || matches!(
+            self,
+            LlmError::Server { status, .. } if (500..=599).contains(status) || *status == 408
+        )
+    }
+
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            LlmError::Connection(_) => "connection",
+            LlmError::Timeout => "timeout",
+            LlmError::Auth(_) => "auth",
+            LlmError::RateLimit { .. } => "rate_limit",
+            LlmError::DeploymentNotFound(_) => "deployment_not_found",
+            LlmError::ContentFilter(_) => "content_filter",
+            LlmError::Server { .. } => "server",
+            LlmError::InvalidResponse(_) => "invalid_response",
+            LlmError::Serialization(_) => "serialization",
+        }
+    }
+}
+
 /// Static-dispatch wrapper that owns one of the concrete backend types and
 /// forwards trait calls. Avoids `Box<dyn LlmBackend>` and the heap allocation
 /// it forces on every async call.
 pub enum LlmClient {
     Ollama(OllamaBackend),
     Azure(AzureOpenAIBackend),
+    Fallback(FallbackClient),
+}
+
+impl std::fmt::Debug for LlmClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ollama(_) => f.write_str("LlmClient::Ollama(..)"),
+            Self::Azure(_) => f.write_str("LlmClient::Azure(..)"),
+            Self::Fallback(_) => f.write_str("LlmClient::Fallback(..)"),
+        }
+    }
 }
 
 impl LlmClient {
@@ -61,6 +102,7 @@ impl LlmClient {
         match self {
             Self::Ollama(b) => b.generate(prompt, model).await,
             Self::Azure(b) => b.generate(prompt, model).await,
+            Self::Fallback(b) => b.generate(prompt, model).await,
         }
     }
 
@@ -68,6 +110,7 @@ impl LlmClient {
         match self {
             Self::Ollama(b) => b.embed(text, model).await,
             Self::Azure(b) => b.embed(text, model).await,
+            Self::Fallback(b) => b.embed(text, model).await,
         }
     }
 
@@ -75,6 +118,7 @@ impl LlmClient {
         match self {
             Self::Ollama(b) => b.is_available().await,
             Self::Azure(b) => b.is_available().await,
+            Self::Fallback(b) => b.is_available().await,
         }
     }
 }

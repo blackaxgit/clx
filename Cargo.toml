@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 license = "MPL-2.0"
 authors = ["CLX Contributors"]
@@ -62,6 +62,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 
 # Traits and utilities
 trait-variant = "0.1"
+
+# Layered configuration
+figment = { version = "0.10", features = ["yaml", "env"] }
 
 # URL parsing
 url = "2"

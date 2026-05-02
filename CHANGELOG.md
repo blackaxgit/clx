@@ -5,6 +5,43 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-04-30
+
+### Added
+- Automatic primary→secondary LLM provider fallback. New `fallback:` field on
+  each capability route in `llm.chat` / `llm.embeddings`. When the primary
+  fails with a transient error (Connection, Timeout, RateLimit, 5xx, 408),
+  the configured fallback runs automatically. The fallback's `model` field
+  overrides the caller's model name (providers don't share model identifiers).
+- 30-second in-process cooldown after a fallback event — primary is skipped
+  during the cooldown window so sustained outages don't pay the latency
+  penalty of always retrying the primary first.
+- Per-project config override at `<repo>/.clx/config.yaml`, discovered by
+  walking from CWD up to `$HOME`. Env-var escape: `CLX_CONFIG_PROJECT=/path`
+  or `CLX_CONFIG_PROJECT=none` to disable.
+- Layered config loading via `figment`: built-in defaults → global →
+  project → `CLX_*` env vars → CLI flags (lowest to highest precedence).
+- Inert-keys allowlist for project configs: only routing-related keys
+  (provider, model, fallback, validator thresholds, auto_recall, etc.)
+  take effect from a project file. Security-sensitive keys
+  (`providers.*`, `logging.file`, `validator.enabled`) are silently
+  dropped with a single `WARN` per dropped key.
+- New `LlmClient::Fallback(FallbackClient)` enum variant. Single insertion
+  point at the factory; zero production call sites changed.
+
+### Changed
+- `is_transient` is now a method on `LlmError` (was a private free function
+  in `azure.rs`). Backends and the new fallback wrapper share one predicate.
+- `Config::load` now goes through `figment` instead of direct
+  `serde_yml::from_str`. Existing single-file configs continue to work
+  unchanged.
+
+### Deferred to v0.7.x
+- `clx trust <repo>` UX command for promoting non-inert project keys past
+  the allowlist (mise-style trust gating).
+- Multi-fallback chains (`fallback: [a, b, c]`).
+- Cross-process cooldown persistence.
+
 ## [0.6.1] - 2026-04-30
 
 ### Fixed
