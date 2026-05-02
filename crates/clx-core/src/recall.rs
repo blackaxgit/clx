@@ -71,7 +71,7 @@ pub struct RecallEngine<'a> {
     configured_model_ident: Option<String>,
     /// The bare embedding model / deployment name to pass to the backend
     /// when generating the query embedding. Required for backends that do
-    /// not have a baked-in default model (Azure OpenAI). Optional because
+    /// not have a baked-in default model (e.g., AzureOpenAIBackend). Optional because
     /// Ollama tolerates `None` by falling back to its configured default.
     embedding_model: Option<String>,
 }
@@ -904,7 +904,7 @@ mod tests {
         }
     }
 
-    /// Regression for the 0.7.1 bug: auto_recall passed `None` for the
+    /// Regression for the 0.7.1 bug: `auto_recall` passed `None` for the
     /// embeddings model, which Azure rejects with `DeploymentNotFound`.
     /// 0.7.2 plumbs the configured model through `with_embedding_model`.
     /// This test asserts the builder stores the model so `try_semantic`
@@ -912,8 +912,8 @@ mod tests {
     #[test]
     fn embedding_model_builder_persists_value() {
         let storage = Storage::open_in_memory().unwrap();
-        let engine = RecallEngine::new(&storage, None, None)
-            .with_embedding_model("text-embedding-3-small");
+        let engine =
+            RecallEngine::new(&storage, None, None).with_embedding_model("text-embedding-3-small");
         assert_eq!(
             engine.embedding_model.as_deref(),
             Some("text-embedding-3-small")
