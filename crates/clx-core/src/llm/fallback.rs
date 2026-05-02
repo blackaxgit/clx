@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(env_azure_hosts)]
+    #[serial(env_azure_hosts_fallback)]
     async fn fallback_on_primary_503_succeeds() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(env_azure_hosts)]
+    #[serial(env_azure_hosts_fallback)]
     async fn fallback_not_used_on_terminal_error() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(env_azure_hosts)]
+    #[serial(env_azure_hosts_fallback)]
     async fn cooldown_skips_primary_after_failure() {
         allow_local();
         let primary_mock = MockServer::start().await;
