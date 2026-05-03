@@ -391,6 +391,130 @@ fn test_create_and_get_audit_log() {
     assert_eq!(retrieved.risk_score, Some(100));
 }
 
+/// TC-AUD-002 — Regression for the 0.7.1 fix: `create_audit_log` must
+/// auto-create the referenced session row when it does not exist.
+/// Without this guard, fast-path / synthetic / fabricated session IDs
+/// trip the audit_log → sessions FK constraint.
+#[test]
+fn test_audit_log_auto_creates_missing_session() {
+    let storage = create_test_storage();
+
+    let synthetic_id = "synthetic-session-not-in-table";
+    // Note: deliberately NOT calling create_session() first.
+    let entry = AuditLogEntry::new(
+        SessionId::new(synthetic_id),
+        "echo hi".to_string(),
+        "layer0".to_string(),
+        AuditDecision::Allowed,
+    );
+
+    let id = storage
+        .create_audit_log(&entry)
+        .expect("audit log must succeed even when session row does not exist");
+    assert!(id > 0, "audit log should have a generated ID");
+
+    // The session row must now exist (auto-created).
+    let session = storage
+        .get_session(synthetic_id)
+        .expect("get_session call ok")
+        .expect("session row should have been auto-created");
+    assert_eq!(session.id, SessionId::new(synthetic_id));
+}
+
+/// TC-AUD-003 — Auto-created session has the documented placeholder
+/// fields so it's distinguishable from a real session.
+#[test]
+fn test_audit_log_auto_created_session_has_placeholder_source() {
+    let storage = create_test_storage();
+    let synthetic_id = "synthetic-placeholder-check";
+    let entry = AuditLogEntry::new(
+        SessionId::new(synthetic_id),
+        "any cmd".to_string(),
+        "layer0".to_string(),
+        AuditDecision::Allowed,
+    );
+    storage.create_audit_log(&entry).unwrap();
+
+    // Query the raw row to verify the source/status defaults from the
+    // INSERT OR IGNORE in `create_audit_log`.
+    let (source, status): (String, String) = storage
+        .conn
+        .query_row(
+            "SELECT source, status FROM sessions WHERE id = ?1",
+            [synthetic_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("session row exists");
+    assert_eq!(source, "audit-placeholder");
+    assert_eq!(status, "active");
+}
+
+/// TC-AUD-008 — Privacy property: secrets in the `command` field of an
+/// `AuditLogEntry` must be redacted before they hit the persistent
+/// audit log table. Without this, every `clx-hook` audit row could
+/// archive an API key the user pasted on a CLI invocation.
+///
+/// Note: redaction happens upstream in `clx_hook::audit::log_audit_entry`
+/// (calls `redact_secrets`). This test asserts the redaction pipeline
+/// works on a representative input — if `redact_secrets` regresses,
+/// production audit rows would silently store cleartext.
+#[test]
+fn test_audit_command_redaction_pipeline() {
+    use crate::redaction::redact_secrets;
+
+    let raw = "curl -H 'Authorization: Bearer sk-abc123def456ghi789jkl012mno345pq' https://api.example.com";
+    let redacted = redact_secrets(raw);
+
+    assert!(
+        !redacted.contains("sk-abc123def456ghi789jkl012mno345pq"),
+        "raw key must not survive redaction: {redacted}"
+    );
+    assert!(
+        redacted.contains("REDACTED") || redacted.contains("***"),
+        "redacted output should contain a redaction marker: {redacted}"
+    );
+    // Round-trip through audit log — verify the SAME redacted form
+    // round-trips into and out of the table.
+    let storage = create_test_storage();
+    let entry = AuditLogEntry::new(
+        SessionId::new("redaction-test-session"),
+        redacted.clone(),
+        "layer0".to_string(),
+        AuditDecision::Allowed,
+    );
+    let id = storage.create_audit_log(&entry).unwrap();
+    let retrieved = storage.get_audit_log(id).unwrap().unwrap();
+    assert_eq!(retrieved.command, redacted);
+    assert!(
+        !retrieved.command.contains("sk-abc123"),
+        "audit log row must not contain raw secret"
+    );
+}
+
+/// TC-MIG-006 — `column_exists` is hardened against SQL injection via a
+/// `VALID_TABLES` allowlist. Calling with an unsafe table name must
+/// return false (not panic, not execute the injected SQL).
+#[test]
+fn test_column_exists_rejects_unsafe_table_names() {
+    let storage = create_test_storage();
+    // Each of these is a classic injection or unknown-table attempt.
+    let bad_tables = [
+        "'; DROP TABLE sessions; --",
+        "sessions; DELETE FROM audit_log;",
+        "../etc/passwd",
+        "unknown_table",
+        "",
+    ];
+    for bad in bad_tables {
+        assert!(
+            !storage.column_exists(bad, "id"),
+            "column_exists should reject unsafe table name: {bad:?}"
+        );
+    }
+    // Sanity: a known table still works.
+    assert!(storage.column_exists("sessions", "id"));
+}
+
 #[test]
 fn test_get_audit_log_by_session() {
     let storage = create_test_storage();

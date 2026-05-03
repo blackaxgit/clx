@@ -547,4 +547,72 @@ mod tests {
                 .unwrap();
         assert!(!backend.is_available().await);
     }
+
+    /// TC-AZ-013 — Dated URL shape: when `api_version` is set, URL builders
+    /// switch to `/openai/deployments/<deployment>/...?api-version=<v>`.
+    /// Default (None) uses the v1 path. Pure URL-construction assertion;
+    /// no mock needed.
+    #[test]
+    #[serial(env_azure_hosts)]
+    fn dated_url_shape_when_api_version_set() {
+        allow_local();
+        let mut c = cfg("http://127.0.0.1:9999".to_string());
+        c.api_version = Some("2024-10-21".to_string());
+        let backend =
+            AzureOpenAIBackend::new(&c, SecretString::new("k".to_string().into())).unwrap();
+
+        let chat = backend.chat_url("gpt-5.4-mini");
+        assert_eq!(chat.path(), "/openai/deployments/gpt-5.4-mini/chat/completions");
+        assert_eq!(chat.query(), Some("api-version=2024-10-21"));
+
+        let embed = backend.embeddings_url("text-embedding-3-small");
+        assert_eq!(
+            embed.path(),
+            "/openai/deployments/text-embedding-3-small/embeddings"
+        );
+        assert_eq!(embed.query(), Some("api-version=2024-10-21"));
+
+        let models = backend.models_url();
+        assert_eq!(models.path(), "/openai/models");
+        assert_eq!(models.query(), Some("api-version=2024-10-21"));
+    }
+
+    /// TC-AZ-013 (companion) — Default v1 path when `api_version` is None.
+    #[test]
+    #[serial(env_azure_hosts)]
+    fn v1_url_shape_when_api_version_unset() {
+        allow_local();
+        let backend = AzureOpenAIBackend::new(
+            &cfg("http://127.0.0.1:9999".to_string()),
+            SecretString::new("k".to_string().into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            backend.chat_url("d").path(),
+            "/openai/v1/chat/completions"
+        );
+        assert!(backend.chat_url("d").query().is_none());
+        assert_eq!(
+            backend.embeddings_url("d").path(),
+            "/openai/v1/embeddings"
+        );
+        assert_eq!(backend.models_url().path(), "/openai/v1/models");
+    }
+
+    /// TC-CRED-011 — `SecretString::Debug` redacts the secret value.
+    /// Uses `secrecy` crate's built-in redaction; this test pins the
+    /// behavior so a future dep update or accidental `Debug` derive
+    /// addition somewhere downstream cannot leak the value.
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        let s = SecretString::new("super-secret-value-not-to-be-leaked".to_string().into());
+        let debug_output = format!("{s:?}");
+        assert!(
+            !debug_output.contains("super-secret-value-not-to-be-leaked"),
+            "Debug output must not contain the secret value: got {debug_output:?}"
+        );
+        // secrecy crate prints either "Secret(...)" or "[REDACTED]" depending
+        // on version. Both are acceptable; we just need the value gone.
+    }
 }
