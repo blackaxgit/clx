@@ -394,7 +394,7 @@ fn test_create_and_get_audit_log() {
 /// TC-AUD-002 — Regression for the 0.7.1 fix: `create_audit_log` must
 /// auto-create the referenced session row when it does not exist.
 /// Without this guard, fast-path / synthetic / fabricated session IDs
-/// trip the audit_log → sessions FK constraint.
+/// trip the `audit_log` → `sessions` FK constraint.
 #[test]
 fn test_audit_log_auto_creates_missing_session() {
     let storage = create_test_storage();

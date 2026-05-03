@@ -562,7 +562,10 @@ mod tests {
             AzureOpenAIBackend::new(&c, SecretString::new("k".to_string().into())).unwrap();
 
         let chat = backend.chat_url("gpt-5.4-mini");
-        assert_eq!(chat.path(), "/openai/deployments/gpt-5.4-mini/chat/completions");
+        assert_eq!(
+            chat.path(),
+            "/openai/deployments/gpt-5.4-mini/chat/completions"
+        );
         assert_eq!(chat.query(), Some("api-version=2024-10-21"));
 
         let embed = backend.embeddings_url("text-embedding-3-small");
@@ -588,15 +591,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            backend.chat_url("d").path(),
-            "/openai/v1/chat/completions"
-        );
+        assert_eq!(backend.chat_url("d").path(), "/openai/v1/chat/completions");
         assert!(backend.chat_url("d").query().is_none());
-        assert_eq!(
-            backend.embeddings_url("d").path(),
-            "/openai/v1/embeddings"
-        );
+        assert_eq!(backend.embeddings_url("d").path(), "/openai/v1/embeddings");
         assert_eq!(backend.models_url().path(), "/openai/v1/models");
     }
 
