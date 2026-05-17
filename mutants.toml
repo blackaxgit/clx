@@ -1,9 +1,10 @@
 # cargo-mutants configuration for CLX
 #
 # Pinned to cargo-mutants v27 schema (see .github/workflows/mutants.yml).
-# This file scopes mutation testing to the five "hot" modules where a silent
-# mutation would corrupt retrieval ranking, provider fallback, schema
-# migrations, the MCP allow/deny boundary, or the secret redactor.
+# This file scopes mutation testing to the seven "hot" modules where a silent
+# mutation would corrupt retrieval ranking (recall + rrf + decay), provider
+# fallback, schema migrations, the MCP allow/deny boundary, or the secret
+# redactor.
 #
 # References:
 #   - specs/2026-05-05-0.8.0-memory-skills-coverage-design.md (section 3.9)

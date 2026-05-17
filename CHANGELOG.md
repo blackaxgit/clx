@@ -123,8 +123,46 @@ across 13 atomic commits.
 - `Config::load` now applies a per-project trust gate before the inert
   filter via the new `apply_project_layer`. Untrusted configs see the
   pre-existing `filter_inert_only` behavior, unchanged.
-- `Storage` schema version bumped from 5 to 6 (`tool_events` table +
-  two supporting indexes; additive, no destructive changes).
+- `Storage` schema version bumped from 5 to 7. Schema-v6 adds the
+  `tool_events` table plus two supporting indexes; schema-v7 adds a
+  UNIQUE INDEX on `(session_id, tool_name, IFNULL(target,''), window_end_unix/60)`
+  enabling atomic `INSERT ... ON CONFLICT DO UPDATE` upserts so parallel
+  hook processes cannot race-insert duplicate aggregation rows.
+- `fastembed` dev/runtime dep bumped 4 -> 5 (ort 2.0 stable, away from
+  rc.9; v5 `TextRerank::rerank` now takes `&mut self` so the cached
+  model is held in a `Mutex<Option<TextRerank>>` under the existing
+  `Arc` wrapper).
+- `criterion` dev dep bumped 0.5 -> 0.8.
+- `redact_secrets` is unchanged for string inputs; the new
+  `redact_json_value(&serde_json::Value) -> Value` walks objects/arrays
+  recursively and redacts values under 20 sensitive key patterns
+  (`api_key`, `password`, `secret`, `token`, `authorization`,
+  `credential`, `bearer`, ...) case-insensitive. `PostToolUse` now
+  routes `tool_input` and `tool_response` through this richer path
+  before persisting to the events table.
+- `clx model fetch` now verifies the cached model directory contains
+  non-zero `tokenizer.json`, `special_tokens_map.json`, `config.json`,
+  and `model.onnx` (at root or `onnx/` subdir) before writing the
+  `.ready` sentinel, and acquires `.fetch.lock` BEFORE any
+  `--force`-driven `remove_dir_all`. fastembed-rs continues to verify
+  per-blob LFS SHA-256 during download; our gate catches partial /
+  poisoned caches.
+- `FastembedReranker::score` lazy-loads the ONNX session inside the
+  same `tokio::task::spawn_blocking` as the rerank call, so the outer
+  `tokio::time::timeout` budget governs cold loads instead of being
+  bypassed by a synchronous `ensure_loaded()`.
+- `stop_auto_summary` re-reads the last `AutoSummary` snapshot
+  timestamp immediately before its own write; if another handler
+  landed a summary inside the active window, the duplicate write is
+  skipped.
+- Plugin manifest (`plugin/.claude-plugin/plugin.json`) drops the
+  non-spec `mcp_servers: {}` field (the 2026 schema uses a separate
+  `.mcp.json` file at plugin root) and adds the optional `author` /
+  `license` fields per the official Claude Code plugin reference. All
+  six `SKILL.md` frontmatters drop the non-spec `version:` field; the
+  Claude Code 2026 skill spec only defines `description` as
+  recommended and several functional optional keys. Skill versioning
+  now lives exclusively in `plugin.json`.
 
 ### Decisions (resolved with user, 2026-05-16)
 

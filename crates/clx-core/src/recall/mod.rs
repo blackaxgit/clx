@@ -3,10 +3,13 @@
 //! Shared logic used by both the MCP `clx_recall` tool and the
 //! `UserPromptSubmit` hook for auto-context recall.
 //!
-//! Helper sub-modules `rrf` and `decay` are pure-function libraries staged
-//! for the 0.8.0 recall pipeline upgrade. They are not yet wired into
-//! `RecallEngine::query`; that integration lands in Wave 2 alongside the
-//! `bge-reranker-v2-m3` adapter.
+//! Pipeline (each stage gated by a `RecallQueryConfig` flag, default-on):
+//! 1. Parallel candidate generation (embedding top-50 + FTS5 top-50)
+//! 2. Reciprocal Rank Fusion (`rrf::rrf_fuse`, `k = 60`)
+//! 3. Cross-encoder rerank (`rerank::apply_reranker`, `bge-reranker-v2-m3`,
+//!    250 ms `tokio::time::timeout` with graceful RRF-only fallback)
+//! 4. Multiplicative time-decay (`decay::apply_time_decay`, 30-day half-life)
+//! 5. Percentile gate (`decay::apply_percentile_gate`, p70 by default)
 
 pub(crate) mod decay;
 pub mod fastembed;
