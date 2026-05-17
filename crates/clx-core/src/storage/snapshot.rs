@@ -167,18 +167,16 @@ impl Storage {
         })
     }
 
-    /// Count assistant-side turns since the last `AutoSummary` snapshot.
+    /// Count mutating tool turns since the last `AutoSummary` snapshot.
     ///
-    /// HEURISTIC: the `events` table does not record a `role` column today,
-    /// so this query approximates "assistant turn" as
-    /// `event_type = 'message'`. The count is used only to decide when the
-    /// next auto-summary snapshot fires; over- or under-counting only
-    /// changes *when* the summary fires, not whether snapshots are correct.
+    /// Production hook writers record mutating assistant work in
+    /// `tool_events`, so the threshold follows the same source that
+    /// `had_mutator_activity_since_last_auto_summary` uses.
     ///
     /// Behavior:
     /// - If no `auto_summary` snapshot exists for the session, return the
-    ///   total `message` event count for that session.
-    /// - Otherwise, return the count of `message` events strictly after the
+    ///   total `tool_events` count for that session.
+    /// - Otherwise, return the count of `tool_events` strictly after the
     ///   most recent `auto_summary` snapshot's `created_at`.
     pub fn turns_since_last_auto_summary(&self, session_id: &str) -> crate::Result<u32> {
         let last_ts: Option<String> = self
@@ -194,16 +192,14 @@ impl Storage {
 
         let count: i64 = match last_ts {
             Some(ts) => self.conn.query_row(
-                "SELECT COUNT(*) FROM events \
+                "SELECT COUNT(*) FROM tool_events \
                  WHERE session_id = ?1 \
-                   AND event_type = 'message' \
-                   AND timestamp > ?2",
+                   AND created_at > ?2",
                 rusqlite::params![session_id, ts],
                 |row| row.get(0),
             )?,
             None => self.conn.query_row(
-                "SELECT COUNT(*) FROM events \
-                 WHERE session_id = ?1 AND event_type = 'message'",
+                "SELECT COUNT(*) FROM tool_events WHERE session_id = ?1",
                 [session_id],
                 |row| row.get(0),
             )?,
@@ -270,7 +266,7 @@ impl Storage {
 #[cfg(test)]
 mod auto_summary_tests {
     use super::*;
-    use crate::types::{Event, EventType, Snapshot, SnapshotTrigger, ToolEvent, ToolOutcome};
+    use crate::types::{Snapshot, SnapshotTrigger, ToolEvent, ToolOutcome};
 
     fn mk_storage() -> Storage {
         Storage::open_in_memory().expect("open in-memory storage")
@@ -286,10 +282,18 @@ mod auto_summary_tests {
             .expect("seed session");
     }
 
-    fn append_message(s: &Storage, session: &str) {
-        let mut e = Event::new(crate::types::SessionId::new(session), EventType::Message);
-        e.tool_name = None;
-        s.append_event(&e).expect("append message event");
+    fn append_tool_event(s: &Storage, session: &str, idx: usize) {
+        let summary = format!("edit src/{idx}.rs");
+        let ev = ToolEvent::new(
+            crate::types::SessionId::new(session),
+            "Edit",
+            Some(format!("src/{idx}.rs")),
+            &summary,
+            ToolOutcome::Success,
+            1_000,
+        );
+        s.append_or_extend_tool_event(&ev)
+            .expect("append tool event");
     }
 
     fn append_auto_summary(s: &Storage, session: &str) {
@@ -298,7 +302,8 @@ mod auto_summary_tests {
             SnapshotTrigger::AutoSummary,
         );
         snap.summary = Some("prior auto-summary".to_string());
-        s.create_snapshot(&snap).expect("create auto_summary snapshot");
+        s.create_snapshot(&snap)
+            .expect("create auto_summary snapshot");
     }
 
     #[test]
@@ -310,11 +315,11 @@ mod auto_summary_tests {
     }
 
     #[test]
-    fn turns_since_counts_all_messages_when_no_prior_summary() {
+    fn turns_since_counts_all_tool_events_when_no_prior_summary() {
         let s = mk_storage();
         seed_session(&s, "sess-A");
-        for _ in 0..3 {
-            append_message(&s, "sess-A");
+        for idx in 0..3 {
+            append_tool_event(&s, "sess-A", idx);
         }
         let n = s.turns_since_last_auto_summary("sess-A").unwrap();
         assert_eq!(n, 3);
@@ -324,27 +329,27 @@ mod auto_summary_tests {
     fn turns_since_counts_only_after_last_summary() {
         let s = mk_storage();
         seed_session(&s, "sess-A");
-        // 2 messages before summary, then summary, then 4 after.
-        append_message(&s, "sess-A");
-        append_message(&s, "sess-A");
-        // Sleep one second so DATETIME() bucket increments — sqlite stores
+        // 2 tool events before summary, then summary, then 4 after.
+        append_tool_event(&s, "sess-A", 0);
+        append_tool_event(&s, "sess-A", 1);
+        // Sleep one second so DATETIME() bucket increments, sqlite stores
         // RFC3339 strings; comparisons are lexicographic.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         append_auto_summary(&s, "sess-A");
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        for _ in 0..4 {
-            append_message(&s, "sess-A");
+        for idx in 2..6 {
+            append_tool_event(&s, "sess-A", idx);
         }
         let n = s.turns_since_last_auto_summary("sess-A").unwrap();
-        assert_eq!(n, 4, "should only count post-summary messages");
+        assert_eq!(n, 4, "should only count post-summary tool events");
     }
 
     #[test]
     fn turns_since_exactly_n_returns_n() {
         let s = mk_storage();
         seed_session(&s, "sess-A");
-        for _ in 0..5 {
-            append_message(&s, "sess-A");
+        for idx in 0..5 {
+            append_tool_event(&s, "sess-A", idx);
         }
         let n = s.turns_since_last_auto_summary("sess-A").unwrap();
         assert_eq!(n, 5);
