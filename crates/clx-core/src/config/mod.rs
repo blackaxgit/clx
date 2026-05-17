@@ -277,8 +277,12 @@ pub struct RetentionConfig {
     pub snapshots_days: u32,
 }
 
-fn default_retention_tool_events_days() -> u32 { 30 }
-fn default_retention_events_days() -> u32 { 7 }
+fn default_retention_tool_events_days() -> u32 {
+    30
+}
+fn default_retention_events_days() -> u32 {
+    7
+}
 
 impl Default for RetentionConfig {
     fn default() -> Self {
@@ -340,6 +344,22 @@ pub struct AutoRecallConfig {
     #[serde(default)]
     pub pin_recent_sessions: PinRecentSessionsConfig,
 
+    /// Use Reciprocal Rank Fusion for hybrid recall ranking.
+    #[serde(default = "default_true")]
+    pub rrf_enabled: bool,
+
+    /// RRF k parameter. The standard literature value is 60.
+    #[serde(default = "default_auto_recall_rrf_k")]
+    pub rrf_k: u32,
+
+    /// Multiplicative time-decay half-life in days. Set to 0 to disable.
+    #[serde(default = "default_auto_recall_time_decay_half_life_days")]
+    pub time_decay_half_life_days: f64,
+
+    /// Percentile gate as a fraction from 0.0 to 1.0. Set to 0 to disable.
+    #[serde(default = "default_auto_recall_percentile_gate")]
+    pub percentile_gate: f64,
+
     /// Enable the cross-encoder rerank stage (bge-reranker-v2-m3).
     /// When `false`, recall uses RRF only. Default `true` per the
     /// 0.8.0 design; first-run UX downloads the model in the
@@ -366,6 +386,10 @@ impl Default for AutoRecallConfig {
             include_key_facts: default_true(),
             min_prompt_len: default_auto_recall_min_prompt_len(),
             pin_recent_sessions: PinRecentSessionsConfig::default(),
+            rrf_enabled: default_true(),
+            rrf_k: default_auto_recall_rrf_k(),
+            time_decay_half_life_days: default_auto_recall_time_decay_half_life_days(),
+            percentile_gate: default_auto_recall_percentile_gate(),
             reranker_enabled: default_true(),
             reranker_timeout_ms: default_reranker_timeout_ms(),
         }
@@ -821,6 +845,18 @@ fn default_auto_recall_min_prompt_len() -> usize {
     10
 }
 
+fn default_auto_recall_rrf_k() -> u32 {
+    60
+}
+
+fn default_auto_recall_time_decay_half_life_days() -> f64 {
+    30.0
+}
+
+fn default_auto_recall_percentile_gate() -> f64 {
+    0.70
+}
+
 fn default_reranker_timeout_ms() -> u64 {
     250
 }
@@ -920,7 +956,7 @@ impl Default for McpToolsConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Azure OpenAI provider config (Task 7 — does NOT touch the root Config struct)
+// Azure OpenAI provider config (Task 7, does NOT touch the root Config struct)
 // ---------------------------------------------------------------------------
 
 /// Configuration for the Azure `OpenAI` backend.
@@ -995,7 +1031,7 @@ pub struct CapabilityRoute {
     /// transient error. `Box` to allow recursion (each fallback could
     /// itself have a fallback; v0.7.0 only surfaces a single level UX).
     /// The `model` field on a fallback route is honored at fallback call
-    /// time — the caller's model name is replaced because providers don't
+    /// time. The caller's model name is replaced because providers don't
     /// share model names (e.g. `gpt-5.4-mini` only exists on Azure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Box<CapabilityRoute>>,
@@ -1481,6 +1517,40 @@ impl Config {
                 &mut self.auto_recall.min_prompt_len,
             );
         }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_RRF_ENABLED") {
+            apply_bool_override(
+                &val,
+                "CLX_AUTO_RECALL_RRF_ENABLED",
+                &mut self.auto_recall.rrf_enabled,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_RRF_K") {
+            apply_u32_override(
+                &val,
+                "CLX_AUTO_RECALL_RRF_K",
+                1,
+                1000,
+                &mut self.auto_recall.rrf_k,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_TIME_DECAY_HALF_LIFE_DAYS") {
+            apply_f64_override(
+                &val,
+                "CLX_AUTO_RECALL_TIME_DECAY_HALF_LIFE_DAYS",
+                0.0,
+                3650.0,
+                &mut self.auto_recall.time_decay_half_life_days,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_PERCENTILE_GATE") {
+            apply_f64_override(
+                &val,
+                "CLX_AUTO_RECALL_PERCENTILE_GATE",
+                0.0,
+                1.0,
+                &mut self.auto_recall.percentile_gate,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1633,7 +1703,7 @@ pub enum LlmConfigError {
 /// Resolution order:
 /// 1. Env var named in `cfg.api_key_env` (if set and non-empty).
 /// 2. `CredentialStore` entry keyed `"<provider_name>-api-key"`.
-///    (Hyphen — not colon — because `CredentialStore` rejects colons in user
+///    (Hyphen, not colon, because `CredentialStore` rejects colons in user
 ///    keys. Earlier 0.6.0 used a colon, which made the entry impossible to
 ///    write via `clx credentials set`. See RUSTSEC-style note: contract
 ///    mismatch fixed in 0.6.1.)
@@ -1660,7 +1730,7 @@ fn resolve_azure_credential(
         Ok(Some(v)) => return Ok(SecretString::new(v.into())),
         Ok(None) => {} // fall through
         Err(e) => {
-            // headless Linux without D-Bus, etc. — log and fall through.
+            // headless Linux without D-Bus, etc. Log and fall through.
             tracing::warn!(
                 provider = %provider_name,
                 error = %e,
@@ -2745,6 +2815,12 @@ auto_recall:
   fallback_to_fts: false
   include_key_facts: false
   min_prompt_len: 20
+  rrf_enabled: false
+  rrf_k: 42
+  time_decay_half_life_days: 14.5
+  percentile_gate: 0.6
+  reranker_enabled: false
+  reranker_timeout_ms: 125
 ";
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
@@ -2756,6 +2832,12 @@ auto_recall:
         assert!(!config.auto_recall.fallback_to_fts);
         assert!(!config.auto_recall.include_key_facts);
         assert_eq!(config.auto_recall.min_prompt_len, 20);
+        assert!(!config.auto_recall.rrf_enabled);
+        assert_eq!(config.auto_recall.rrf_k, 42);
+        assert!((config.auto_recall.time_decay_half_life_days - 14.5).abs() < f64::EPSILON);
+        assert!((config.auto_recall.percentile_gate - 0.6).abs() < f64::EPSILON);
+        assert!(!config.auto_recall.reranker_enabled);
+        assert_eq!(config.auto_recall.reranker_timeout_ms, 125);
     }
 
     #[test]
@@ -2770,6 +2852,12 @@ auto_recall:
         assert!(config.auto_recall.fallback_to_fts);
         assert!(config.auto_recall.include_key_facts);
         assert_eq!(config.auto_recall.min_prompt_len, 10);
+        assert!(config.auto_recall.rrf_enabled);
+        assert_eq!(config.auto_recall.rrf_k, 60);
+        assert!((config.auto_recall.time_decay_half_life_days - 30.0).abs() < f64::EPSILON);
+        assert!((config.auto_recall.percentile_gate - 0.70).abs() < f64::EPSILON);
+        assert!(config.auto_recall.reranker_enabled);
+        assert_eq!(config.auto_recall.reranker_timeout_ms, 250);
     }
 
     #[test]
@@ -2785,6 +2873,10 @@ auto_recall:
         assert_eq!(config.auto_recall.max_results, 3);
         assert!(config.auto_recall.fallback_to_fts);
         assert!(config.auto_recall.include_key_facts);
+        assert!(config.auto_recall.rrf_enabled);
+        assert_eq!(config.auto_recall.rrf_k, 60);
+        assert!((config.auto_recall.percentile_gate - 0.70).abs() < f64::EPSILON);
+        assert!(config.auto_recall.reranker_enabled);
     }
 
     #[test]
@@ -2889,7 +2981,7 @@ validator:
 
         // Assert: file-only values preserved without env var influence.
         assert!(!config.validator.enabled);
-        // Other fields are defaults — the point is env vars play no role here.
+        // Other fields are defaults. The point is env vars play no role here.
         assert_eq!(OllamaConfig::default().host, "http://127.0.0.1:11434");
     }
 
@@ -3166,7 +3258,7 @@ ollama:
     /// uses `<provider>-api-key` (hyphen).
     ///
     /// Discriminates by error variant so headless CI (Linux without D-Bus,
-    /// sandboxed macOS keychain) still passes — those return
+    /// sandboxed macOS keychain) still passes. Those return
     /// `ServiceUnavailable`/`Keychain`, orthogonal to the validator contract.
     #[test]
     fn azure_keychain_key_passes_credential_store_validator() {
@@ -3195,7 +3287,7 @@ ollama:
                 panic!("hyphen key '{key}' rejected by validator (regression): {msg}");
             }
             Err(CredentialError::ServiceUnavailable(_) | CredentialError::Keychain(_)) => {
-                // Headless CI — keychain not present. Validator contract is
+                // Headless CI, keychain not present. Validator contract is
                 // what we're testing; storage is incidental.
             }
             Err(other) => panic!("unexpected error storing hyphen key: {other:?}"),

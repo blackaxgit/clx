@@ -133,7 +133,7 @@ fn check_recall_preconditions<'a>(
 
 /// Build recall context from the user prompt, respecting config and timeout.
 ///
-/// Returns `None` on any error or if recall is not applicable — the hook must
+/// Returns `None` on any error or if recall is not applicable. The hook must
 /// always produce output regardless of recall availability.
 async fn build_recall_context(input: &HookInput) -> Option<String> {
     let config = clx_core::config::Config::load().ok()?;
@@ -190,13 +190,27 @@ async fn do_recall(
         similarity_threshold: config.auto_recall.similarity_threshold,
         fallback_to_fts: config.auto_recall.fallback_to_fts,
         include_key_facts: config.auto_recall.include_key_facts,
+        rrf_enabled: config.auto_recall.rrf_enabled,
+        rrf_k: config.auto_recall.rrf_k,
+        time_decay_half_life_days: config.auto_recall.time_decay_half_life_days,
+        percentile_gate: query_percentile_gate(config.auto_recall.percentile_gate),
+        reranker_enabled: config.auto_recall.reranker_enabled,
+        reranker_timeout_ms: config.auto_recall.reranker_timeout_ms,
         ..Default::default()
     };
+
+    let reranker = config
+        .auto_recall
+        .reranker_enabled
+        .then(|| clx_core::recall::FastembedReranker::new(clx_core::paths::model_cache_dir()));
 
     let mut engine =
         clx_core::recall::RecallEngine::new(&storage, ollama.as_ref(), embedding_store.as_ref());
     if let Ok(route) = config.capability_route(clx_core::config::Capability::Embeddings) {
         engine = engine.with_embedding_model(route.model.clone());
+    }
+    if let Some(reranker) = reranker.as_ref() {
+        engine = engine.with_reranker(reranker);
     }
     let hits = engine.query(prompt, &recall_config).await;
 
@@ -225,11 +239,19 @@ async fn do_recall(
     }
 }
 
+fn query_percentile_gate(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        (value.clamp(0.0, 1.0) * 100.0).round() as u32
+    }
+}
+
 /// Build the pinned recent-sessions block when configured.
 ///
 /// Returns `None` if pinning is disabled, the storage query errors, or the
 /// database has no eligible sessions. Errors are logged at warn but never
-/// propagated — the recall hook must always make forward progress.
+/// propagated. The recall hook must always make forward progress.
 fn build_pinned_block(
     storage: &clx_core::storage::Storage,
     session_id: &str,

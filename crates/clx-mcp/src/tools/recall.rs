@@ -1,4 +1,4 @@
-//! `clx_recall` tool — Semantic search for relevant context.
+//! `clx_recall` tool - Semantic search for relevant context.
 //!
 //! Delegates to `RecallEngine` for hybrid semantic + FTS5 search,
 //! then formats results as verbose JSON for the MCP protocol.
@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use tracing::debug;
 
+use clx_core::config::Config;
 use clx_core::recall::{RecallEngine, RecallQueryConfig, RecallSearchType};
 
 use crate::server::{MAX_SEMANTIC_RESULTS, McpServer, SEMANTIC_DISTANCE_THRESHOLD};
@@ -26,12 +27,20 @@ impl McpServer {
 
         debug!("Recall query: {}", query);
 
-        let engine = RecallEngine::new(
+        let auto_recall = Config::load().unwrap_or_default().auto_recall;
+        let reranker = auto_recall
+            .reranker_enabled
+            .then(|| clx_core::recall::FastembedReranker::new(clx_core::paths::model_cache_dir()));
+
+        let mut engine = RecallEngine::new(
             &self.storage,
             self.ollama_client.as_ref(),
             self.embedding_store.as_ref(),
         )
         .with_embedding_model(self.embed_model.clone());
+        if let Some(reranker) = reranker.as_ref() {
+            engine = engine.with_reranker(reranker);
+        }
 
         // MCP recall uses a more permissive threshold (0.25) than auto-recall (0.35)
         // because it is user-invoked and benefits from broader results.
@@ -39,7 +48,13 @@ impl McpServer {
             max_results: MAX_SEMANTIC_RESULTS,
             similarity_threshold: 1.0 - (SEMANTIC_DISTANCE_THRESHOLD / 2.0),
             fallback_to_fts: true,
-            include_key_facts: true,
+            include_key_facts: auto_recall.include_key_facts,
+            rrf_enabled: auto_recall.rrf_enabled,
+            rrf_k: auto_recall.rrf_k,
+            time_decay_half_life_days: auto_recall.time_decay_half_life_days,
+            percentile_gate: query_percentile_gate(auto_recall.percentile_gate),
+            reranker_enabled: auto_recall.reranker_enabled,
+            reranker_timeout_ms: auto_recall.reranker_timeout_ms,
             ..Default::default()
         };
 
@@ -104,5 +119,13 @@ impl McpServer {
                 "text": response_text
             }]
         }))
+    }
+}
+
+fn query_percentile_gate(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        (value.clamp(0.0, 1.0) * 100.0).round() as u32
     }
 }
