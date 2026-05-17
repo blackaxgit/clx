@@ -17,6 +17,7 @@ mod analytics;
 mod audit;
 mod event;
 mod migration;
+mod recall_repo;
 mod rules;
 mod session;
 mod snapshot;
@@ -25,6 +26,7 @@ mod traits;
 mod util;
 mod validation_cache;
 
+pub use recall_repo::StorageSnapshotRepo;
 pub use traits::StorageBackend;
 pub use validation_cache::CachedDecision;
 

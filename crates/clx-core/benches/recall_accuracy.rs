@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use clx_core::recall::{RecallEngine, RecallQueryConfig};
-use clx_core::storage::Storage;
+use clx_core::storage::{Storage, StorageSnapshotRepo};
 use clx_core::types::{Session, SessionId, Snapshot, SnapshotTrigger};
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -303,7 +303,8 @@ async fn evaluate(
     pairs: &[GoldenPair],
     config: &RecallQueryConfig,
 ) -> Metrics {
-    let engine = RecallEngine::new(&seeded.storage, None, None);
+    let repo = StorageSnapshotRepo::new(&seeded.storage, None);
+    let engine = RecallEngine::new(&repo);
     let k = config.max_results as f64;
 
     let mut precisions = Vec::with_capacity(pairs.len());

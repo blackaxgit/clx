@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use clx_core::config::Config;
-use clx_core::recall::{RecallEngine, RecallQueryConfig, RecallSearchType};
+use clx_core::recall::{LlmQueryEmbedder, RecallEngine, RecallQueryConfig, RecallSearchType};
+use clx_core::storage::StorageSnapshotRepo;
 
 use crate::server::{MAX_SEMANTIC_RESULTS, McpServer, SEMANTIC_DISTANCE_THRESHOLD};
 use crate::validation::{MAX_QUERY_LEN, validate_string_param};
@@ -32,12 +33,18 @@ impl McpServer {
             .reranker_enabled
             .then(|| clx_core::recall::FastembedReranker::new(clx_core::paths::model_cache_dir()));
 
-        let mut engine = RecallEngine::new(
-            &self.storage,
-            self.ollama_client.as_ref(),
-            self.embedding_store.as_ref(),
-        )
-        .with_embedding_model(self.embed_model.clone());
+        // Build domain ports (Hexagonal Architecture, 0.8.0). Infrastructure
+        // types are confined to the adapters.
+        let repo = StorageSnapshotRepo::new(&self.storage, self.embedding_store.as_ref());
+        let embedder = self
+            .ollama_client
+            .as_ref()
+            .map(|client| LlmQueryEmbedder::new(client, Some(self.embed_model.as_str())));
+
+        let mut engine = RecallEngine::new(&repo);
+        if let Some(ref e) = embedder {
+            engine = engine.with_embedder(e);
+        }
         if let Some(reranker) = reranker.as_ref() {
             engine = engine.with_reranker(reranker);
         }

@@ -163,6 +163,21 @@ across 13 atomic commits.
   Claude Code 2026 skill spec only defines `description` as
   recommended and several functional optional keys. Skill versioning
   now lives exclusively in `plugin.json`.
+- **Recall pipeline layering refactor.** The Domain layer in
+  `crates/clx-core/src/recall/` no longer imports `Storage`,
+  `LlmClient`, or `EmbeddingStore` directly. Two new ports live in
+  `recall/ports.rs`: `SnapshotRepo` (sync, snapshot reads) and
+  `QueryEmbedder` (async, query embedding). `RecallEngine` (now in
+  `recall/engine.rs`) depends only on the trait references; the
+  concrete `Storage` impl lives in the new
+  `crates/clx-core/src/storage/recall_repo.rs::StorageSnapshotRepo`
+  and the `LlmClient + EmbeddingStore + Option<model>` adapter lives
+  in `recall/adapters.rs::LlmQueryEmbedder`. Existing call sites
+  (`clx-hook::subagent::do_recall`, `clx-mcp::tools::recall`,
+  recall_accuracy bench) wire the adapters at construction time. The
+  public builder API (`with_reranker`, `with_embedding_model`,
+  `with_model_ident`) is preserved. Layering proof: production
+  Domain modules import zero infrastructure types.
 
 ### Decisions (resolved with user, 2026-05-16)
 

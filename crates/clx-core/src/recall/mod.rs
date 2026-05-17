@@ -10,23 +10,33 @@
 //!    250 ms `tokio::time::timeout` with graceful RRF-only fallback)
 //! 4. Multiplicative time-decay (`decay::apply_time_decay`, 30-day half-life)
 //! 5. Percentile gate (`decay::apply_percentile_gate`, p70 by default)
+//!
+//! ## Layering (0.8.0)
+//!
+//! This module is the **Domain layer** of recall. It no longer imports
+//! `Storage`, `LlmClient`, or `EmbeddingStore`. Those Infrastructure types
+//! are wired in at the call site through the [`ports`] traits
+//! (`SnapshotRepo`, `QueryEmbedder`) and the adapters in [`adapters`]
+//! and `crate::storage::recall_repo`.
 
+pub mod adapters;
 pub(crate) mod decay;
+pub mod engine;
 pub mod fastembed;
+pub mod ports;
 pub mod rerank;
 pub(crate) mod rrf;
 
+pub use adapters::LlmQueryEmbedder;
+pub use engine::RecallEngine;
 pub use fastembed::FastembedReranker;
+pub use ports::{QueryEmbedder, SnapshotRepo};
 pub use rerank::{Reranker, apply_reranker};
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
-use crate::embeddings::EmbeddingStore;
-use crate::llm::LlmClient;
-use crate::storage::Storage;
 use crate::types::SessionSummary;
 
 /// A single recall search result.
@@ -113,335 +123,18 @@ impl Default for RecallQueryConfig {
     }
 }
 
-/// Engine that performs hybrid search across stored snapshots.
-pub struct RecallEngine<'a> {
-    storage: &'a Storage,
-    ollama: Option<&'a LlmClient>,
-    embedding_store: Option<&'a EmbeddingStore>,
-    /// The model identifier (`"<provider>:<model>"`) that the current config
-    /// would use for new embeddings.  When `Some`, mismatch detection is
-    /// active: `check_model_mismatch` returns the stored vs. configured pair
-    /// when they differ.
-    configured_model_ident: Option<String>,
-    /// The bare embedding model / deployment name to pass to the backend
-    /// when generating the query embedding. Required for backends that do
-    /// not have a baked-in default model (e.g., `AzureOpenAIBackend`). Optional because
-    /// Ollama tolerates `None` by falling back to its configured default.
-    embedding_model: Option<String>,
-    /// Optional cross-encoder rerank backend (D2). When `Some` AND
-    /// `config.reranker_enabled == true` AND `backend.is_ready()`, the
-    /// pipeline runs `apply_reranker` between RRF fusion and time-decay.
-    /// Borrowed so the heavy ONNX session can live for the lifetime of
-    /// the hook process.
-    reranker: Option<&'a dyn rerank::Reranker>,
-}
-
-impl<'a> RecallEngine<'a> {
-    /// Create a new recall engine.
-    #[must_use]
-    pub fn new(
-        storage: &'a Storage,
-        ollama: Option<&'a LlmClient>,
-        embedding_store: Option<&'a EmbeddingStore>,
-    ) -> Self {
-        Self {
-            storage,
-            ollama,
-            embedding_store,
-            configured_model_ident: None,
-            embedding_model: None,
-            reranker: None,
-        }
-    }
-
-    /// Attach the bare embedding model / deployment name. Required for
-    /// Azure-routed embeddings (Azure backend errors with
-    /// `DeploymentNotFound` when called with `None`); Ollama tolerates
-    /// missing model and falls back to its config default.
-    #[must_use]
-    pub fn with_embedding_model(mut self, model: impl Into<String>) -> Self {
-        self.embedding_model = Some(model.into());
-        self
-    }
-
-    /// Attach a cross-encoder rerank backend. When attached AND the
-    /// per-query config has `reranker_enabled = true` AND the backend
-    /// reports `is_ready() == true`, the recall pipeline will run the
-    /// rerank stage between RRF fusion and time-decay.
-    #[must_use]
-    pub fn with_reranker(mut self, backend: &'a dyn rerank::Reranker) -> Self {
-        self.reranker = Some(backend);
-        self
-    }
-
-    /// Attach the configured embedding model identifier so that mismatch
-    /// detection works.  The identifier should be `"<provider>:<model>"`.
-    #[must_use]
-    pub fn with_model_ident(mut self, ident: impl Into<String>) -> Self {
-        self.configured_model_ident = Some(ident.into());
-        self
-    }
-
-    /// Check whether the stored model identifier differs from the configured one.
-    ///
-    /// Returns `Some((stored, configured))` when a mismatch is detected.
-    /// Returns `None` when:
-    /// - no embedding store is attached,
-    /// - `configured_model_ident` was not set,
-    /// - the database is empty / all rows carry the pre-migration sentinel, or
-    /// - the identifiers match.
-    #[must_use]
-    pub fn check_model_mismatch(&self) -> Option<(String, String)> {
-        let configured = self.configured_model_ident.as_deref()?;
-        let emb_store = self.embedding_store?;
-        let stored = emb_store.current_model().ok().flatten()?;
-        if stored == configured {
-            None
-        } else {
-            Some((stored, configured.to_string()))
-        }
-    }
-
-    /// Run hybrid search: FTS5 first (fast), then semantic if available.
-    ///
-    /// FTS5 runs first because it completes in <10ms, guaranteeing baseline
-    /// results even if the Ollama embedding call consumes most of the timeout.
-    pub async fn query(&self, query: &str, config: &RecallQueryConfig) -> Vec<RecallHit> {
-        let mut fts_hits = Vec::new();
-        let mut semantic_hits = Vec::new();
-
-        // FTS5 first — always fast (<10ms), provides baseline results
-        if config.fallback_to_fts {
-            fts_hits = self.try_fts(query, config);
-        }
-
-        // Then try semantic search (may be slow due to Ollama embedding)
-        if let (Some(ollama), Some(emb_store)) = (self.ollama, self.embedding_store)
-            && emb_store.is_vector_search_enabled()
-        {
-            semantic_hits = self.try_semantic(query, ollama, emb_store, config).await;
-        }
-
-        // If FTS5 was skipped and semantic found nothing, try FTS5 as last resort
-        if !config.fallback_to_fts && semantic_hits.is_empty() {
-            fts_hits = self.try_fts(query, config);
-        }
-
-        let mut fused = if config.rrf_enabled {
-            rrf::rrf_fuse(
-                &[semantic_hits, fts_hits],
-                config.rrf_k,
-                config.max_results,
-            )
-        } else {
-            hybrid_merge(semantic_hits, fts_hits, config.max_results)
-        };
-
-        // Stage 3: cross-encoder rerank (D2).
-        // Only runs when (a) a backend is attached AND (b) config opts
-        // in AND (c) backend reports ready AND (d) we have at least
-        // one candidate. On timeout or any error, `apply_reranker`
-        // returns its input unchanged so we keep the RRF ordering.
-        if config.reranker_enabled
-            && let Some(backend) = self.reranker
-            && !fused.is_empty()
-        {
-            let timeout = std::time::Duration::from_millis(config.reranker_timeout_ms);
-            fused = rerank::apply_reranker(fused, query, backend, timeout).await;
-        }
-
-        if config.time_decay_half_life_days > 0.0 {
-            decay::apply_time_decay(
-                &mut fused,
-                config.time_decay_half_life_days,
-                chrono::Utc::now(),
-            );
-        }
-
-        if config.percentile_gate > 0 {
-            fused = decay::apply_percentile_gate(fused, config.percentile_gate);
-        }
-
-        fused
-    }
-
-    /// Attempt embedding-based semantic search.
-    ///
-    /// Returns an empty vec on any error (logged as warning).
-    async fn try_semantic(
-        &self,
-        query: &str,
-        ollama: &LlmClient,
-        emb_store: &EmbeddingStore,
-        config: &RecallQueryConfig,
-    ) -> Vec<RecallHit> {
-        // Generate embedding for the query. Pass the configured embedding
-        // model so backends without a baked-in default (Azure) work.
-        let embedding = match ollama.embed(query, self.embedding_model.as_deref()).await {
-            Ok(emb) => emb,
-            Err(e) => {
-                warn!("Recall semantic embedding failed: {e}");
-                return Vec::new();
-            }
-        };
-
-        debug!(
-            "Generated recall query embedding with {} dimensions",
-            embedding.len()
-        );
-
-        // Fetch extra candidates for filtering
-        let fetch_limit = config.max_results * 2;
-        let similar = match emb_store.find_similar(&embedding, fetch_limit) {
-            Ok(results) => results,
-            Err(e) => {
-                warn!("Recall vector search failed: {e}");
-                return Vec::new();
-            }
-        };
-
-        if similar.is_empty() {
-            debug!("No similar embeddings found for recall");
-            return Vec::new();
-        }
-
-        debug!("Found {} similar embeddings for recall", similar.len());
-
-        // Convert threshold to distance: higher threshold => lower max distance
-        let max_distance = distance_from_threshold(config.similarity_threshold);
-
-        let mut hits = Vec::new();
-        for (snapshot_id, distance) in similar {
-            if distance > max_distance {
-                debug!(
-                    "Skipping snapshot {snapshot_id} with distance {distance} (above max {max_distance})"
-                );
-                continue;
-            }
-
-            match self.storage.get_snapshot(snapshot_id) {
-                Ok(Some(snapshot)) => {
-                    let score = f64::from(score_from_distance(distance));
-                    hits.push(RecallHit {
-                        snapshot_id,
-                        session_id: snapshot.session_id.to_string(),
-                        created_at: snapshot.created_at.to_rfc3339(),
-                        summary: snapshot.summary,
-                        key_facts: snapshot.key_facts,
-                        score,
-                        search_type: RecallSearchType::Semantic,
-                    });
-                }
-                Ok(None) => {
-                    debug!("Snapshot {snapshot_id} not found in storage");
-                }
-                Err(e) => {
-                    debug!("Error fetching snapshot {snapshot_id}: {e}");
-                }
-            }
-        }
-
-        hits
-    }
-
-    /// Attempt FTS5 search with substring fallback.
-    fn try_fts(&self, query: &str, config: &RecallQueryConfig) -> Vec<RecallHit> {
-        let fetch_limit = config.max_results * 2;
-
-        // Try FTS5 first
-        match self.storage.search_snapshots_fts(query, fetch_limit) {
-            Ok(fts_results) if !fts_results.is_empty() => {
-                debug!("FTS5 recall returned {} results", fts_results.len());
-                return fts_results
-                    .into_iter()
-                    .filter_map(|(snapshot, bm25_score)| {
-                        let snapshot_id = snapshot.id?;
-                        Some(RecallHit {
-                            snapshot_id,
-                            session_id: snapshot.session_id.to_string(),
-                            created_at: snapshot.created_at.to_rfc3339(),
-                            summary: snapshot.summary,
-                            key_facts: snapshot.key_facts,
-                            score: bm25_score,
-                            search_type: RecallSearchType::Fts5,
-                        })
-                    })
-                    .collect();
-            }
-            Ok(_) => {
-                debug!("FTS5 recall returned no results, trying substring fallback");
-            }
-            Err(e) => {
-                warn!("FTS5 recall failed, trying substring fallback: {e}");
-            }
-        }
-
-        // Substring fallback
-        self.try_substring_fallback(query, fetch_limit)
-    }
-
-    /// Fallback substring search across active sessions.
-    fn try_substring_fallback(&self, query: &str, limit: usize) -> Vec<RecallHit> {
-        let query_lower = query.chars().take(500).collect::<String>().to_lowercase();
-        let mut hits = Vec::new();
-
-        let sessions = match self.storage.list_active_sessions() {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to list sessions for substring recall: {e}");
-                return Vec::new();
-            }
-        };
-
-        for session in sessions.iter().take(limit.max(5)) {
-            if let Ok(snapshots) = self.storage.get_snapshots_by_session(session.id.as_str()) {
-                for snapshot in snapshots.iter().take(3) {
-                    let matches_summary = snapshot
-                        .summary
-                        .as_ref()
-                        .is_some_and(|s| s.to_lowercase().contains(&query_lower));
-                    let matches_facts = snapshot
-                        .key_facts
-                        .as_ref()
-                        .is_some_and(|s| s.to_lowercase().contains(&query_lower));
-
-                    if (matches_summary || matches_facts)
-                        && let Some(snapshot_id) = snapshot.id
-                    {
-                        hits.push(RecallHit {
-                            snapshot_id,
-                            session_id: snapshot.session_id.to_string(),
-                            created_at: snapshot.created_at.to_rfc3339(),
-                            summary: snapshot.summary.clone(),
-                            key_facts: snapshot.key_facts.clone(),
-                            score: 0.5, // Default relevance for substring matches
-                            search_type: RecallSearchType::Text,
-                        });
-                    }
-
-                    if hits.len() >= limit {
-                        return hits;
-                    }
-                }
-            }
-        }
-
-        hits
-    }
-}
-
 /// Convert a similarity threshold (0.0-1.0) to a distance ceiling.
 ///
 /// Higher threshold means stricter matching (lower max distance).
 /// Formula: `(1.0 - threshold) * 2.0`
-fn distance_from_threshold(threshold: f32) -> f32 {
+pub(crate) fn distance_from_threshold(threshold: f32) -> f32 {
     (1.0 - threshold) * 2.0
 }
 
 /// Convert a vector distance to a relevance score (0.0-1.0).
 ///
 /// Lower distance = higher score.
-fn score_from_distance(distance: f32) -> f32 {
+pub(crate) fn score_from_distance(distance: f32) -> f32 {
     1.0_f32 - (distance / 2.0_f32).min(1.0_f32)
 }
 
@@ -449,7 +142,7 @@ fn score_from_distance(distance: f32) -> f32 {
 ///
 /// Hybrid scoring: semantic weight 0.6, FTS5 weight 0.4.
 /// Results are sorted descending by score and truncated to `max_results`.
-fn hybrid_merge(
+pub(crate) fn hybrid_merge(
     semantic_hits: Vec<RecallHit>,
     fts_hits: Vec<RecallHit>,
     max_results: usize,
@@ -591,6 +284,7 @@ pub fn format_pinned_block(summaries: &[SessionSummary], max_chars_each: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageSnapshotRepo;
 
     #[test]
     fn test_recall_hit_score_from_distance() {
@@ -806,7 +500,8 @@ mod tests {
         let (storage, _snapshot_id) =
             setup_test_storage("Implemented authentication module", "auth, JWT, tokens");
 
-        let engine = RecallEngine::new(&storage, None, None);
+        let repo = StorageSnapshotRepo::new(&storage, None);
+        let engine = RecallEngine::new(&repo);
         let config = RecallQueryConfig {
             max_results: 5,
             similarity_threshold: 0.35,
@@ -833,7 +528,8 @@ mod tests {
     async fn test_recall_engine_query_no_results() {
         let (storage, _) = setup_test_storage("Database migration completed", "postgres, schema");
 
-        let engine = RecallEngine::new(&storage, None, None);
+        let repo = StorageSnapshotRepo::new(&storage, None);
+        let engine = RecallEngine::new(&repo);
         let config = RecallQueryConfig {
             max_results: 5,
             similarity_threshold: 0.35,
@@ -859,7 +555,8 @@ mod tests {
             "redis, cache, performance",
         );
 
-        let engine = RecallEngine::new(&storage, None, None);
+        let repo = StorageSnapshotRepo::new(&storage, None);
+        let engine = RecallEngine::new(&repo);
         let config = RecallQueryConfig {
             max_results: 5,
             similarity_threshold: 0.35,
@@ -926,7 +623,9 @@ mod tests {
                 .expect("failed to create OllamaBackend for test"),
         );
 
-        let engine = RecallEngine::new(&storage, Some(&ollama), Some(&emb_store));
+        let repo = StorageSnapshotRepo::new(&storage, Some(&emb_store));
+        let embedder = LlmQueryEmbedder::new(&ollama, None);
+        let engine = RecallEngine::new(&repo).with_embedder(&embedder);
         let config = RecallQueryConfig {
             max_results: 5,
             similarity_threshold: 0.0, // accept all distances
@@ -958,7 +657,8 @@ mod tests {
             "CI, pipeline, yaml",
         );
 
-        let engine = RecallEngine::new(&storage, None, None);
+        let repo = StorageSnapshotRepo::new(&storage, None);
+        let engine = RecallEngine::new(&repo);
         let config = RecallQueryConfig {
             max_results: 5,
             similarity_threshold: 0.35,
@@ -989,7 +689,8 @@ mod tests {
         // Arrange: completely empty in-memory storage (no sessions, no snapshots)
         let storage = crate::storage::Storage::open_in_memory().unwrap();
 
-        let engine = RecallEngine::new(&storage, None, None);
+        let repo = StorageSnapshotRepo::new(&storage, None);
+        let engine = RecallEngine::new(&repo);
         let config = RecallQueryConfig {
             max_results: 10,
             similarity_threshold: 0.35,
@@ -1016,7 +717,8 @@ mod tests {
             "graphql, schema, resolver",
         );
 
-        let engine = RecallEngine::new(&storage, None, None);
+        let repo = StorageSnapshotRepo::new(&storage, None);
+        let engine = RecallEngine::new(&repo);
         let config = RecallQueryConfig {
             max_results: 10,
             similarity_threshold: 0.35,
@@ -1047,32 +749,6 @@ mod tests {
             score,
             search_type,
         }
-    }
-
-    /// Regression for the 0.7.1 bug: `auto_recall` passed `None` for the
-    /// embeddings model, which Azure rejects with `DeploymentNotFound`.
-    /// 0.7.2 plumbs the configured model through `with_embedding_model`.
-    /// This test asserts the builder stores the model so `try_semantic`
-    /// will pass it to the backend.
-    #[test]
-    fn embedding_model_builder_persists_value() {
-        let storage = Storage::open_in_memory().unwrap();
-        let engine =
-            RecallEngine::new(&storage, None, None).with_embedding_model("text-embedding-3-small");
-        assert_eq!(
-            engine.embedding_model.as_deref(),
-            Some("text-embedding-3-small")
-        );
-    }
-
-    #[test]
-    fn embedding_model_default_is_none_for_back_compat() {
-        let storage = Storage::open_in_memory().unwrap();
-        let engine = RecallEngine::new(&storage, None, None);
-        assert!(
-            engine.embedding_model.is_none(),
-            "default must be None so existing callers keep relying on Ollama's baked-in default"
-        );
     }
 
     // --- format_pinned_block (Phase C2: pin recent sessions) ---

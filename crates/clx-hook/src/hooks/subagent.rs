@@ -204,10 +204,21 @@ async fn do_recall(
         .reranker_enabled
         .then(|| clx_core::recall::FastembedReranker::new(clx_core::paths::model_cache_dir()));
 
-    let mut engine =
-        clx_core::recall::RecallEngine::new(&storage, ollama.as_ref(), embedding_store.as_ref());
-    if let Ok(route) = config.capability_route(clx_core::config::Capability::Embeddings) {
-        engine = engine.with_embedding_model(route.model.clone());
+    // Build domain ports (Hexagonal Architecture, 0.8.0). The engine speaks
+    // only to traits; concrete Storage / EmbeddingStore / LlmClient stay in
+    // the Infrastructure layer behind these adapters.
+    let repo = clx_core::storage::StorageSnapshotRepo::new(&storage, embedding_store.as_ref());
+    let embedding_model = config
+        .capability_route(clx_core::config::Capability::Embeddings)
+        .ok()
+        .map(|route| route.model.clone());
+    let embedder = ollama
+        .as_ref()
+        .map(|client| clx_core::recall::LlmQueryEmbedder::new(client, embedding_model.as_deref()));
+
+    let mut engine = clx_core::recall::RecallEngine::new(&repo);
+    if let Some(ref e) = embedder {
+        engine = engine.with_embedder(e);
     }
     if let Some(reranker) = reranker.as_ref() {
         engine = engine.with_reranker(reranker);
