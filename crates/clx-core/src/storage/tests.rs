@@ -1567,3 +1567,144 @@ fn test_open_default_path_resolves_to_expected_components() {
         "parent of database file must be 'data'"
     );
 }
+
+// =========================================================================
+// recent_session_summaries (pin recent sessions, Phase C2)
+// =========================================================================
+
+/// Seed a session that started `secs_ago` seconds before `Utc::now()` and
+/// (optionally) a snapshot with `summary` created shortly after. Returns
+/// the inserted session id for follow-up assertions.
+fn seed_session_with_summary(
+    storage: &Storage,
+    id: &str,
+    secs_ago: i64,
+    summary: Option<&str>,
+) -> String {
+    let now = chrono::Utc::now();
+    let started = now - chrono::Duration::seconds(secs_ago);
+    let mut session = Session::new(SessionId::new(id), "/tmp/proj".to_string());
+    session.started_at = started;
+    storage.create_session(&session).unwrap();
+
+    if let Some(s) = summary {
+        let mut snap = Snapshot::new(SessionId::new(id), SnapshotTrigger::Auto);
+        // Snapshot timestamp slightly after session start.
+        snap.created_at = started + chrono::Duration::seconds(1);
+        snap.summary = Some(s.to_string());
+        storage.create_snapshot(&snap).unwrap();
+    }
+    id.to_string()
+}
+
+#[test]
+fn recent_session_summaries_empty_db_returns_empty_vec() {
+    let storage = create_test_storage();
+    let result = storage.recent_session_summaries(5, None).unwrap();
+    assert!(
+        result.is_empty(),
+        "empty DB must yield zero summaries, got {}",
+        result.len()
+    );
+}
+
+#[test]
+fn recent_session_summaries_returns_n_most_recent_descending() {
+    let storage = create_test_storage();
+    seed_session_with_summary(&storage, "sess-oldest", 500, Some("oldest summary"));
+    seed_session_with_summary(&storage, "sess-mid", 200, Some("middle summary"));
+    seed_session_with_summary(&storage, "sess-newest", 50, Some("newest summary"));
+
+    let result = storage.recent_session_summaries(3, None).unwrap();
+    assert_eq!(result.len(), 3, "should return all 3 sessions");
+    assert_eq!(result[0].session_id.as_str(), "sess-newest");
+    assert_eq!(result[1].session_id.as_str(), "sess-mid");
+    assert_eq!(result[2].session_id.as_str(), "sess-oldest");
+    assert_eq!(result[0].summary, "newest summary");
+}
+
+#[test]
+fn recent_session_summaries_excludes_current_session() {
+    let storage = create_test_storage();
+    seed_session_with_summary(&storage, "sess-a", 300, Some("a"));
+    seed_session_with_summary(&storage, "sess-current", 100, Some("current"));
+    seed_session_with_summary(&storage, "sess-b", 200, Some("b"));
+
+    let result = storage
+        .recent_session_summaries(10, Some("sess-current"))
+        .unwrap();
+    let ids: Vec<&str> = result.iter().map(|s| s.session_id.as_str()).collect();
+    assert!(
+        !ids.contains(&"sess-current"),
+        "current session must be excluded, got {ids:?}"
+    );
+    assert_eq!(ids, vec!["sess-b", "sess-a"]);
+}
+
+#[test]
+fn recent_session_summaries_empty_exclude_id_returns_all() {
+    // Edge case: `Some("")` must NOT accidentally filter out all rows.
+    // Session ids are validated non-empty so "" can never match a stored id.
+    let storage = create_test_storage();
+    seed_session_with_summary(&storage, "sess-1", 100, Some("hello"));
+    let result = storage.recent_session_summaries(5, Some("")).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "empty exclude id should still return all sessions"
+    );
+}
+
+#[test]
+fn recent_session_summaries_skips_sessions_with_null_summary() {
+    let storage = create_test_storage();
+    seed_session_with_summary(&storage, "sess-with", 100, Some("real summary"));
+    seed_session_with_summary(&storage, "sess-without", 50, None);
+
+    let result = storage.recent_session_summaries(5, None).unwrap();
+    let ids: Vec<&str> = result.iter().map(|s| s.session_id.as_str()).collect();
+    assert!(
+        ids.contains(&"sess-with"),
+        "session with non-null summary must be included"
+    );
+    assert!(
+        !ids.contains(&"sess-without"),
+        "session without summary must be filtered out, got {ids:?}"
+    );
+}
+
+#[test]
+fn recent_session_summaries_fewer_than_n_returns_available() {
+    let storage = create_test_storage();
+    seed_session_with_summary(&storage, "sess-1", 100, Some("only one"));
+    let result = storage.recent_session_summaries(10, None).unwrap();
+    assert_eq!(result.len(), 1, "should return 1 even though 10 requested");
+}
+
+#[test]
+fn recent_session_summaries_zero_count_returns_empty() {
+    let storage = create_test_storage();
+    seed_session_with_summary(&storage, "sess-1", 100, Some("hi"));
+    let result = storage.recent_session_summaries(0, None).unwrap();
+    assert!(result.is_empty(), "count=0 must yield empty vec");
+}
+
+#[test]
+fn recent_session_summaries_picks_latest_snapshot_per_session() {
+    let storage = create_test_storage();
+    let id = "sess-multi";
+    seed_session_with_summary(&storage, id, 1000, Some("old summary"));
+
+    // Add a newer snapshot to the same session.
+    let mut newer = Snapshot::new(SessionId::new(id), SnapshotTrigger::Auto);
+    newer.created_at = chrono::Utc::now();
+    newer.summary = Some("newer summary".to_string());
+    storage.create_snapshot(&newer).unwrap();
+
+    let result = storage.recent_session_summaries(5, None).unwrap();
+    assert_eq!(result.len(), 1, "still one session row");
+    assert_eq!(
+        result[0].summary, "newer summary",
+        "should pick the latest snapshot summary per session"
+    );
+}

@@ -248,6 +248,12 @@ pub struct Config {
     /// Retention policy for storage tables.
     #[serde(default)]
     pub retention: RetentionConfig,
+
+    /// Memory aggregation features (auto-summarize, etc.).
+    ///
+    /// Opt-in. Default values preserve 0.7.x behavior (no auto-summary fires).
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 /// Retention policy for storage tables.
@@ -323,6 +329,28 @@ pub struct AutoRecallConfig {
     /// Minimum prompt length to trigger auto-recall
     #[serde(default = "default_auto_recall_min_prompt_len")]
     pub min_prompt_len: usize,
+
+    /// Pin recent session summaries on every `UserPromptSubmit` recall.
+    ///
+    /// Opt-in. When `pin_recent_sessions.enabled = true`, the hook prepends
+    /// the last N session summaries (newest first, excluding the current
+    /// session) regardless of whether the recall query produced semantic
+    /// or FTS5 hits.
+    #[serde(default)]
+    pub pin_recent_sessions: PinRecentSessionsConfig,
+
+    /// Enable the cross-encoder rerank stage (bge-reranker-v2-m3).
+    /// When `false`, recall uses RRF only. Default `true` per the
+    /// 0.8.0 design; first-run UX downloads the model in the
+    /// background via `clx model fetch`.
+    #[serde(default = "default_true")]
+    pub reranker_enabled: bool,
+
+    /// Per-query timeout for the rerank stage in milliseconds.
+    /// On expiry the pipeline falls back to RRF-only ordering so the
+    /// recall request never errors. Default: 250 ms (per design §3.1).
+    #[serde(default = "default_reranker_timeout_ms")]
+    pub reranker_timeout_ms: u64,
 }
 
 impl Default for AutoRecallConfig {
@@ -336,8 +364,118 @@ impl Default for AutoRecallConfig {
             fallback_to_fts: default_true(),
             include_key_facts: default_true(),
             min_prompt_len: default_auto_recall_min_prompt_len(),
+            pin_recent_sessions: PinRecentSessionsConfig::default(),
+            reranker_enabled: default_true(),
+            reranker_timeout_ms: default_reranker_timeout_ms(),
         }
     }
+}
+
+/// Configuration for pinning the most recent session summaries into recall
+/// context on every `UserPromptSubmit` (independent of hit matching).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PinRecentSessionsConfig {
+    /// Enable pinned-session header. Default: `false` (preserves 0.7.x behavior).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Number of recent sessions to pin. Default: 3.
+    #[serde(default = "default_pin_recent_count")]
+    pub count: usize,
+
+    /// Maximum characters per pinned summary (chars, not bytes). Default: 300.
+    #[serde(default = "default_pin_recent_max_chars")]
+    pub max_chars_each: usize,
+}
+
+impl Default for PinRecentSessionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            count: default_pin_recent_count(),
+            max_chars_each: default_pin_recent_max_chars(),
+        }
+    }
+}
+
+fn default_pin_recent_count() -> usize {
+    3
+}
+
+fn default_pin_recent_max_chars() -> usize {
+    300
+}
+
+/// Memory aggregation features (Phase 10 / 0.8.0).
+///
+/// Container for opt-in memory features. Today this holds only
+/// `auto_summarize`; future features (e.g. rolling key-fact ledgers) plug in
+/// here without expanding the top-level `Config` surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MemoryConfig {
+    /// Configuration for rolling N-turn auto-summarization on `Stop`.
+    #[serde(default)]
+    pub auto_summarize: AutoSummarizeConfig,
+}
+
+/// Rolling N-turn auto-summarize configuration.
+///
+/// When `enabled = true`, the `Stop` hook handler counts the assistant
+/// turns since the last `AutoSummary` snapshot for the session and, when
+/// the threshold is reached, summarizes the recent transcript span into
+/// a new snapshot tagged with `SnapshotTrigger::AutoSummary`.
+///
+/// All fields have safe defaults. The `enabled` flag is the single gate
+/// keeping 0.7.x behavior intact for users who have not opted in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoSummarizeConfig {
+    /// Enable auto-summarize. Default: `false` (preserves 0.7.x behavior).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Number of assistant turns between auto-summary snapshots. Default: 5.
+    #[serde(default = "default_auto_summarize_every_n_turns")]
+    pub every_n_turns: u32,
+
+    /// Capability used to construct the summarizer LLM client. Default:
+    /// `"chat"`. Falls back to `Capability::Chat` when the string is not a
+    /// known capability name.
+    #[serde(default = "default_summarizer_capability")]
+    pub summarizer_capability: String,
+
+    /// Maximum characters (not bytes) for the produced summary. Default: 500.
+    #[serde(default = "default_max_summary_chars")]
+    pub max_summary_chars: usize,
+
+    /// Skip the auto-summary when no mutating tool events have been
+    /// recorded since the last summary (i.e. read-only session). Default:
+    /// `true`. Uses the `tool_events` table (schema v6) for the lookup.
+    #[serde(default = "default_true")]
+    pub skip_when_idle: bool,
+}
+
+impl Default for AutoSummarizeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_n_turns: default_auto_summarize_every_n_turns(),
+            summarizer_capability: default_summarizer_capability(),
+            max_summary_chars: default_max_summary_chars(),
+            skip_when_idle: true,
+        }
+    }
+}
+
+fn default_auto_summarize_every_n_turns() -> u32 {
+    5
+}
+
+fn default_summarizer_capability() -> String {
+    "chat".to_string()
+}
+
+fn default_max_summary_chars() -> usize {
+    500
 }
 
 /// Validator configuration
@@ -680,6 +818,10 @@ fn default_auto_recall_timeout_ms() -> u64 {
 
 fn default_auto_recall_min_prompt_len() -> usize {
     10
+}
+
+fn default_reranker_timeout_ms() -> u64 {
+    250
 }
 
 impl Default for ValidatorConfig {

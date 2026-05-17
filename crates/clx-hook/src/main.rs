@@ -30,7 +30,8 @@ use tracing::{debug, error, warn};
 
 use hooks::{
     handle_post_tool_use, handle_pre_compact, handle_pre_tool_use, handle_session_end,
-    handle_session_start, handle_subagent_start, handle_user_prompt_submit,
+    handle_session_start, handle_stop_auto_summary, handle_subagent_start,
+    handle_user_prompt_submit,
 };
 use output::output_decision;
 use types::{HookInput, MAX_INPUT_SIZE};
@@ -146,7 +147,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Route based on hook event name
+    // Route based on hook event name. The Stop event is special: it
+    // additionally runs the opt-in auto-summary handler. The handler is
+    // guarded by `memory.auto_summarize.enabled` (defaults to false) and
+    // swallows every error path, so it cannot affect the Stop event's
+    // primary outcome.
     let result = match input.hook_event_name.as_str() {
         "PreToolUse" => handle_pre_tool_use(input).await,
         "PostToolUse" => handle_post_tool_use(input).await,
@@ -155,6 +160,7 @@ async fn main() -> Result<()> {
         "SessionEnd" => handle_session_end(input).await,
         "SubagentStart" => handle_subagent_start(input).await,
         "UserPromptSubmit" => handle_user_prompt_submit(input).await,
+        "Stop" => handle_stop_auto_summary(input).await,
         unknown => {
             warn!("Unknown hook event: {}", unknown);
             output_decision("allow", None, None, None);

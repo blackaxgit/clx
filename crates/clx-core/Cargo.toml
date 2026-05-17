@@ -25,6 +25,13 @@ sqlite-vec.workspace = true
 trait-variant.workspace = true
 url.workspace = true
 figment.workspace = true
+async-trait = "0.1"
+regex.workspace = true
+
+# Reranker (D2). Pinned at 4.x; capture exact in Cargo.lock after first build.
+# Disable default features to keep the dependency footprint small; we only
+# need TextRerank which the crate exposes without optional features by default.
+fastembed = "4"
 
 [lints]
 workspace = true

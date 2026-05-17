@@ -8,6 +8,65 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use tracing::warn;
 
+/// Owned (role, content) pair extracted from a transcript JSONL file.
+///
+/// Produced by `last_n_turns`. Kept owned (not a `TurnSlice<'a>`) because
+/// the JSONL line buffer the data was parsed from is dropped at the end
+/// of each `BufRead::lines()` iteration; lifetimes can't bridge that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Read the most recent `n` `user`/`assistant` turns from a transcript
+/// JSONL file. Used by the `stop_auto_summary` hook handler to build the
+/// summarization prompt.
+///
+/// Returns an empty `Vec` when the file is unreadable or contains no
+/// valid turns; never panics. Order is chronological (oldest first within
+/// the trailing window).
+pub(crate) fn last_n_turns(transcript_path: &str, n: usize) -> Vec<OwnedTurn> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let Ok(file) = File::open(transcript_path) else {
+        return Vec::new();
+    };
+
+    let reader = BufReader::new(file);
+    let mut all: Vec<OwnedTurn> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) else {
+            continue;
+        };
+        let role = match entry.entry_type.as_deref() {
+            Some(r @ ("user" | "assistant")) => r.to_string(),
+            _ => continue,
+        };
+        let content = entry
+            .message
+            .as_ref()
+            .map(|m| m.content().to_string())
+            .unwrap_or_default();
+        if content.is_empty() {
+            continue;
+        }
+        all.push(OwnedTurn { role, content });
+    }
+    // Keep only the trailing `n` turns. `split_off` would copy; `drain`
+    // from the front avoids a clone on the kept tail.
+    let len = all.len();
+    if len > n {
+        all.drain(0..len - n);
+    }
+    all
+}
+
 /// Fast token count from transcript file (no LLM calls, no async).
 /// Returns (`input_tokens`, `output_tokens`, `message_count`).
 pub(crate) fn count_transcript_tokens(transcript_path: &str) -> (i64, i64, i32) {

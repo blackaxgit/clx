@@ -9,7 +9,12 @@
 //! `bge-reranker-v2-m3` adapter.
 
 pub(crate) mod decay;
+pub mod fastembed;
+pub mod rerank;
 pub(crate) mod rrf;
+
+pub use fastembed::FastembedReranker;
+pub use rerank::{Reranker, apply_reranker};
 
 use std::collections::HashMap;
 
@@ -19,6 +24,7 @@ use tracing::{debug, warn};
 use crate::embeddings::EmbeddingStore;
 use crate::llm::LlmClient;
 use crate::storage::Storage;
+use crate::types::SessionSummary;
 
 /// A single recall search result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +81,16 @@ pub struct RecallQueryConfig {
     /// Percentile gate (0-100). Keep only hits with score >= `p_th` percentile.
     /// `0` disables the gate.
     pub percentile_gate: u32,
+    /// Enable the cross-encoder rerank stage (bge-reranker-v2-m3).
+    /// When `false`, the pipeline skips reranking entirely. The actual
+    /// backend is injected at engine construction time via
+    /// `RecallEngine::with_reranker`; if no backend is attached, this
+    /// flag has no effect (the stage is silently skipped).
+    pub reranker_enabled: bool,
+    /// Per-query timeout for the rerank stage in milliseconds. On
+    /// expiry the pipeline falls back to RRF-only ordering so the
+    /// recall request never errors.
+    pub reranker_timeout_ms: u64,
 }
 
 impl Default for RecallQueryConfig {
@@ -88,6 +104,8 @@ impl Default for RecallQueryConfig {
             rrf_k: 60,
             time_decay_half_life_days: 30.0,
             percentile_gate: 70,
+            reranker_enabled: true,
+            reranker_timeout_ms: 250,
         }
     }
 }
@@ -107,6 +125,12 @@ pub struct RecallEngine<'a> {
     /// not have a baked-in default model (e.g., `AzureOpenAIBackend`). Optional because
     /// Ollama tolerates `None` by falling back to its configured default.
     embedding_model: Option<String>,
+    /// Optional cross-encoder rerank backend (D2). When `Some` AND
+    /// `config.reranker_enabled == true` AND `backend.is_ready()`, the
+    /// pipeline runs `apply_reranker` between RRF fusion and time-decay.
+    /// Borrowed so the heavy ONNX session can live for the lifetime of
+    /// the hook process.
+    reranker: Option<&'a dyn rerank::Reranker>,
 }
 
 impl<'a> RecallEngine<'a> {
@@ -123,6 +147,7 @@ impl<'a> RecallEngine<'a> {
             embedding_store,
             configured_model_ident: None,
             embedding_model: None,
+            reranker: None,
         }
     }
 
@@ -133,6 +158,16 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn with_embedding_model(mut self, model: impl Into<String>) -> Self {
         self.embedding_model = Some(model.into());
+        self
+    }
+
+    /// Attach a cross-encoder rerank backend. When attached AND the
+    /// per-query config has `reranker_enabled = true` AND the backend
+    /// reports `is_ready() == true`, the recall pipeline will run the
+    /// rerank stage between RRF fusion and time-decay.
+    #[must_use]
+    pub fn with_reranker(mut self, backend: &'a dyn rerank::Reranker) -> Self {
+        self.reranker = Some(backend);
         self
     }
 
@@ -198,6 +233,19 @@ impl<'a> RecallEngine<'a> {
         } else {
             hybrid_merge(semantic_hits, fts_hits, config.max_results)
         };
+
+        // Stage 3: cross-encoder rerank (D2).
+        // Only runs when (a) a backend is attached AND (b) config opts
+        // in AND (c) backend reports ready AND (d) we have at least
+        // one candidate. On timeout or any error, `apply_reranker`
+        // returns its input unchanged so we keep the RRF ordering.
+        if config.reranker_enabled
+            && let Some(backend) = self.reranker
+            && !fused.is_empty()
+        {
+            let timeout = std::time::Duration::from_millis(config.reranker_timeout_ms);
+            fused = rerank::apply_reranker(fused, query, backend, timeout).await;
+        }
 
         if config.time_decay_half_life_days > 0.0 {
             decay::apply_time_decay(
@@ -503,6 +551,38 @@ pub fn format_recall_context(
     output.push_str(CLOSING_TAG);
 
     Some(output)
+}
+
+/// Format a list of recent session summaries into a Markdown-style block
+/// prepended to the recall context for the `pin_recent_sessions` feature.
+///
+/// Returns `None` when `summaries` is empty so callers can skip emission
+/// cleanly. Each summary is truncated to `max_chars_each` characters
+/// (chars, not bytes) on a UTF-8 safe boundary.
+#[must_use]
+pub fn format_pinned_block(summaries: &[SessionSummary], max_chars_each: usize) -> Option<String> {
+    if summaries.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("## Pinned recent sessions\n");
+    for s in summaries {
+        let date = s.started_at.format("%Y-%m-%d");
+        let truncated: String = s.summary.chars().take(max_chars_each).collect();
+        let suffix = if truncated.chars().count() < s.summary.chars().count() {
+            "..."
+        } else {
+            ""
+        };
+        // Single-line entry; replace embedded newlines with spaces so the
+        // bullet list stays parseable.
+        let one_line = truncated.replace(['\n', '\r'], " ");
+        out.push_str(&format!(
+            "- {date} [{sid}]: {one_line}{suffix}\n",
+            sid = s.session_id.as_str()
+        ));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -990,5 +1070,90 @@ mod tests {
             engine.embedding_model.is_none(),
             "default must be None so existing callers keep relying on Ollama's baked-in default"
         );
+    }
+
+    // --- format_pinned_block (Phase C2: pin recent sessions) ---
+
+    fn make_summary(id: &str, year: i32, summary: &str) -> SessionSummary {
+        use chrono::TimeZone;
+        SessionSummary {
+            session_id: crate::types::SessionId::new(id),
+            started_at: chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap(),
+            summary: summary.to_string(),
+        }
+    }
+
+    #[test]
+    fn format_pinned_block_empty_returns_none() {
+        assert!(format_pinned_block(&[], 300).is_none());
+    }
+
+    #[test]
+    fn format_pinned_block_renders_header_and_rows() {
+        let summaries = vec![
+            make_summary("sess-A", 2026, "Implemented Azure backend"),
+            make_summary("sess-B", 2025, "Fixed audit FK constraint"),
+        ];
+        let out = format_pinned_block(&summaries, 300).unwrap();
+        assert!(
+            out.starts_with("## Pinned recent sessions\n"),
+            "must begin with header, got: {out}"
+        );
+        assert!(out.contains("[sess-A]"), "must include session id A");
+        assert!(out.contains("[sess-B]"), "must include session id B");
+        assert!(out.contains("Implemented Azure backend"));
+        assert!(out.contains("Fixed audit FK constraint"));
+        assert!(out.contains("2026-01-01"), "must include formatted date");
+    }
+
+    #[test]
+    fn format_pinned_block_truncates_per_max_chars() {
+        let long = "x".repeat(500);
+        let summaries = vec![make_summary("s", 2026, &long)];
+        let out = format_pinned_block(&summaries, 50).unwrap();
+        assert!(out.contains("..."), "should mark truncation");
+        // count x's in the output and confirm at most 50
+        let x_count = out.matches('x').count();
+        assert!(
+            x_count <= 50,
+            "truncated body must contain at most 50 x chars, got {x_count}"
+        );
+    }
+
+    #[test]
+    fn format_pinned_block_preserves_order() {
+        let summaries = vec![
+            make_summary("first", 2026, "alpha"),
+            make_summary("second", 2025, "beta"),
+            make_summary("third", 2024, "gamma"),
+        ];
+        let out = format_pinned_block(&summaries, 300).unwrap();
+        let pos_first = out.find("first").unwrap();
+        let pos_second = out.find("second").unwrap();
+        let pos_third = out.find("third").unwrap();
+        assert!(pos_first < pos_second);
+        assert!(pos_second < pos_third);
+    }
+
+    #[test]
+    fn format_pinned_block_multibyte_safe() {
+        // Multi-byte chars must not panic on truncation at a non-byte boundary.
+        let multibyte = "日本語テスト".repeat(20);
+        let summaries = vec![make_summary("jp", 2026, &multibyte)];
+        let out = format_pinned_block(&summaries, 5).unwrap();
+        assert!(out.contains("..."), "should mark truncation");
+    }
+
+    #[test]
+    fn format_pinned_block_flattens_newlines() {
+        let summaries = vec![make_summary("nl", 2026, "line1\nline2\rline3")];
+        let out = format_pinned_block(&summaries, 300).unwrap();
+        // Embedded \n / \r should not produce broken bullet rows. The bullet
+        // line itself ends with the single trailing newline written by us.
+        let bullet_line = out
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .expect("must have one bullet line");
+        assert!(bullet_line.contains("line1 line2 line3"));
     }
 }

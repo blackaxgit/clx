@@ -32,6 +32,10 @@ rpassword.workspace = true
 ratatui = "0.30"
 crossterm = "0.28"
 
+# D2 reranker: shared with clx-core via re-export; the CLI also calls
+# fastembed directly for `clx model fetch` so it can stream progress.
+fastembed = "4"
+
 [lints]
 workspace = true
 

@@ -79,6 +79,17 @@ pub fn learned_dir() -> PathBuf {
     clx_dir().join("learned")
 }
 
+/// Model cache directory: ~/.clx/models
+///
+/// Used by the recall pipeline's cross-encoder reranker (D2) and by the
+/// `clx model fetch` command. The reranker treats this as its
+/// HuggingFace cache root; the actual model lives under
+/// `~/.clx/models/bge-reranker-v2-m3/`.
+#[must_use]
+pub fn model_cache_dir() -> PathBuf {
+    clx_dir().join("models")
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
