@@ -117,6 +117,7 @@ async fn do_recall(prompt: &str, config: &clx_core::config::Config) -> Option<St
         similarity_threshold: config.auto_recall.similarity_threshold,
         fallback_to_fts: config.auto_recall.fallback_to_fts,
         include_key_facts: config.auto_recall.include_key_facts,
+        ..Default::default()
     };
 
     let mut engine =

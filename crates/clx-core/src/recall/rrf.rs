@@ -149,10 +149,14 @@ mod tests {
     #[test]
     fn rrf_full_disagreement_returns_all_with_partial_contributions() {
         // Semantic: [A, B, C], FTS: [C, B, A]
-        // RRF(A) = 1/(60+1) + 1/(60+3) = 1/61 + 1/63
-        // RRF(B) = 1/(60+2) + 1/(60+2) = 2/62
-        // RRF(C) = 1/(60+3) + 1/(60+1) = 1/63 + 1/61
-        // A and C are tied; B has highest score in our tie-break check below.
+        // RRF(A) = 1/(60+1) + 1/(60+3) = 1/61 + 1/63 = 124/3843
+        // RRF(B) = 1/(60+2) + 1/(60+2) = 2/62      = 124/3844
+        // RRF(C) = 1/(60+3) + 1/(60+1) = 1/63 + 1/61 = 124/3843
+        //
+        // A and C are tied at 124/3843 and are both higher than B at 124/3844
+        // (smaller denominator wins). Tie-break by `snapshot_id` descending
+        // puts C (30) before A (10) per the contract documented at the top
+        // of this module.
         let semantic = vec![
             hit(10, 0.9, RecallSearchType::Semantic), // A
             hit(20, 0.8, RecallSearchType::Semantic), // B
@@ -165,19 +169,19 @@ mod tests {
         ];
         let fused = rrf_fuse(&[semantic, fts], 60, 10);
 
-        let score_a = 1.0 / 61.0 + 1.0 / 63.0;
-        let score_b = 2.0 / 62.0;
-        let score_c = 1.0 / 63.0 + 1.0 / 61.0;
+        let score_a: f64 = 1.0 / 61.0 + 1.0 / 63.0;
+        let score_b: f64 = 2.0 / 62.0;
+        let score_c: f64 = 1.0 / 63.0 + 1.0 / 61.0;
 
-        // B should be top because its rank-2 in both lists beats A's and C's
-        // mix of rank-1 and rank-3.
-        assert_eq!(fused[0].snapshot_id, 20, "B should win the disagreement");
-        assert!((fused[0].score - score_b).abs() < 1e-12);
-
-        // A and C are tied; both have the same score. Tie-break by snapshot_id descending
-        // means 30 (C) comes before 10 (A).
         assert_eq!(fused.len(), 3);
-        assert!((score_a - score_c).abs() < 1e-12);
+
+        // C wins on snapshot_id tie-break ahead of A.
+        assert_eq!(fused[0].snapshot_id, 30, "C wins the descending-id tiebreak");
+        assert!((fused[0].score - score_c).abs() < 1e-12_f64);
+        assert_eq!(fused[1].snapshot_id, 10, "A follows the descending-id tiebreak");
+        assert!((fused[1].score - score_a).abs() < 1e-12_f64);
+        assert_eq!(fused[2].snapshot_id, 20, "B is last with the smaller score");
+        assert!((fused[2].score - score_b).abs() < 1e-12_f64);
     }
 
     #[test]

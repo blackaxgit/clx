@@ -40,6 +40,7 @@ impl McpServer {
             similarity_threshold: 1.0 - (SEMANTIC_DISTANCE_THRESHOLD / 2.0),
             fallback_to_fts: true,
             include_key_facts: true,
+            ..Default::default()
         };
 
         let hits = self.runtime.block_on(engine.query(&query, &config));

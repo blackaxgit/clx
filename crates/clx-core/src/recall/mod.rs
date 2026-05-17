@@ -65,6 +65,31 @@ pub struct RecallQueryConfig {
     pub fallback_to_fts: bool,
     /// Include key facts in results.
     pub include_key_facts: bool,
+    /// Use Reciprocal Rank Fusion instead of linear 0.6/0.4 hybrid merge.
+    /// Default: true (0.8.0). Set false to reproduce 0.7.x linear behaviour.
+    pub rrf_enabled: bool,
+    /// RRF `k` parameter (Cormack et al. 2009 standard: 60).
+    pub rrf_k: u32,
+    /// Multiplicative time-decay half-life in days. `0` disables decay.
+    pub time_decay_half_life_days: f64,
+    /// Percentile gate (0-100). Keep only hits with score >= `p_th` percentile.
+    /// `0` disables the gate.
+    pub percentile_gate: u32,
+}
+
+impl Default for RecallQueryConfig {
+    fn default() -> Self {
+        Self {
+            max_results: 10,
+            similarity_threshold: 0.35,
+            fallback_to_fts: true,
+            include_key_facts: true,
+            rrf_enabled: true,
+            rrf_k: 60,
+            time_decay_half_life_days: 30.0,
+            percentile_gate: 70,
+        }
+    }
 }
 
 /// Engine that performs hybrid search across stored snapshots.
@@ -164,7 +189,29 @@ impl<'a> RecallEngine<'a> {
             fts_hits = self.try_fts(query, config);
         }
 
-        hybrid_merge(semantic_hits, fts_hits, config.max_results)
+        let mut fused = if config.rrf_enabled {
+            rrf::rrf_fuse(
+                &[semantic_hits, fts_hits],
+                config.rrf_k,
+                config.max_results,
+            )
+        } else {
+            hybrid_merge(semantic_hits, fts_hits, config.max_results)
+        };
+
+        if config.time_decay_half_life_days > 0.0 {
+            decay::apply_time_decay(
+                &mut fused,
+                config.time_decay_half_life_days,
+                chrono::Utc::now(),
+            );
+        }
+
+        if config.percentile_gate > 0 {
+            fused = decay::apply_percentile_gate(fused, config.percentile_gate);
+        }
+
+        fused
     }
 
     /// Attempt embedding-based semantic search.
@@ -682,6 +729,7 @@ mod tests {
             similarity_threshold: 0.35,
             fallback_to_fts: true,
             include_key_facts: true,
+            ..Default::default()
         };
 
         let hits = engine.query("authentication", &config).await;
@@ -708,6 +756,7 @@ mod tests {
             similarity_threshold: 0.35,
             fallback_to_fts: true,
             include_key_facts: true,
+            ..Default::default()
         };
 
         let hits = engine.query("xyzzy_nonexistent_topic_qqq", &config).await;
@@ -733,6 +782,7 @@ mod tests {
             similarity_threshold: 0.35,
             fallback_to_fts: false,
             include_key_facts: true,
+            ..Default::default()
         };
 
         // semantic_hits will be empty (no ollama/embedding_store),
@@ -799,6 +849,7 @@ mod tests {
             similarity_threshold: 0.0, // accept all distances
             fallback_to_fts: false,
             include_key_facts: true,
+            ..Default::default()
         };
 
         // Act
@@ -830,6 +881,7 @@ mod tests {
             similarity_threshold: 0.35,
             fallback_to_fts: true,
             include_key_facts: false,
+            ..Default::default()
         };
 
         // Act — "pipeline" appears in the seeded summary
@@ -860,6 +912,7 @@ mod tests {
             similarity_threshold: 0.35,
             fallback_to_fts: true,
             include_key_facts: false,
+            ..Default::default()
         };
 
         // Act
@@ -886,6 +939,7 @@ mod tests {
             similarity_threshold: 0.35,
             fallback_to_fts: true,
             include_key_facts: false,
+            ..Default::default()
         };
 
         // Act — this term does not appear anywhere in the seeded data
