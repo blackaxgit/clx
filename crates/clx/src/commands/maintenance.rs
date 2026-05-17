@@ -17,9 +17,9 @@ use crate::Cli;
 
 #[derive(Subcommand, Clone)]
 pub enum MaintenanceAction {
-    /// Apply retention windows to long-lived tables (tool_events, audit_log).
+    /// Apply retention windows to long-lived tables (`tool_events`, `audit_log`).
     Trim {
-        /// Override retention.tool_events_days (days). 0 disables sweep.
+        /// Override `retention.tool_events_days` (days). 0 disables sweep.
         #[arg(long)]
         tool_events_days: Option<u32>,
         /// Override audit log retention (days). 0 disables sweep.

@@ -944,7 +944,7 @@ mod render_snapshots {
             .join("\n")
     }
 
-    /// Deterministic UTC timestamp: 2023-11-14T22:13:20Z (Unix 1_700_000_000).
+    /// Deterministic UTC timestamp: 2023-11-14T22:13:20Z (Unix `1_700_000_000`).
     fn fixed_started_at() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }

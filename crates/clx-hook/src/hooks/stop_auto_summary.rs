@@ -112,12 +112,9 @@ async fn run_inner(input: HookInput) -> Result<()> {
         }
     }
 
-    let transcript_path = match input.transcript_path.as_deref() {
-        Some(p) => p,
-        None => {
-            debug!("auto-summary: no transcript_path on hook envelope");
-            return Ok(());
-        }
+    let Some(transcript_path) = input.transcript_path.as_deref() else {
+        debug!("auto-summary: no transcript_path on hook envelope");
+        return Ok(());
     };
     let sample = turns_to_sample(&cfg);
     let turns_owned = last_n_turns(transcript_path, sample);

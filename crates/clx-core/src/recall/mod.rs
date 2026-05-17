@@ -273,10 +273,12 @@ pub fn format_pinned_block(summaries: &[SessionSummary], max_chars_each: usize) 
         // Single-line entry; replace embedded newlines with spaces so the
         // bullet list stays parseable.
         let one_line = truncated.replace(['\n', '\r'], " ");
-        out.push_str(&format!(
-            "- {date} [{sid}]: {one_line}{suffix}\n",
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "- {date} [{sid}]: {one_line}{suffix}",
             sid = s.session_id.as_str()
-        ));
+        );
     }
     Some(out)
 }

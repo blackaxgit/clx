@@ -1,9 +1,9 @@
 //! `clx model` subcommand: manage the bge-reranker-v2-m3 model.
 //!
 //! Orchestration layer for the D2 reranker. This module owns the
-//! HuggingFace download flow, the lockfile-based concurrency guard, and
+//! `HuggingFace` download flow, the lockfile-based concurrency guard, and
 //! the `.ready` sentinel that downstream code (the recall pipeline +
-//! the UserPromptSubmit hook) reads to gate the rerank stage.
+//! the `UserPromptSubmit` hook) reads to gate the rerank stage.
 //!
 //! Subcommands:
 //!
@@ -56,7 +56,7 @@ pub async fn cmd_model(cli: &Cli, action: &ModelAction) -> Result<()> {
 /// Required filenames that must exist (with non-zero size) under
 /// `model_dir` before we write the `.ready` sentinel.
 ///
-/// fastembed-rs already validates HuggingFace LFS checksums for each
+/// fastembed-rs already validates `HuggingFace` LFS checksums for each
 /// blob it pulls. Our extra guard is a post-download integrity check
 /// that the cache directory actually contains every required artifact,
 /// so a partial / interrupted download cannot be mistaken for a healthy
@@ -218,6 +218,7 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
 }
 
 /// Show installed model info.
+#[allow(clippy::unnecessary_wraps)]
 fn cmd_status(cli: &Cli) -> Result<()> {
     let cache_dir = clx_core::paths::model_cache_dir();
     let model_dir = cache_dir.join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
@@ -225,7 +226,7 @@ fn cmd_status(cli: &Cli) -> Result<()> {
         model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
     let ready = ready_path.exists();
     let size_bytes = if model_dir.exists() {
-        dir_size(&model_dir).unwrap_or(0)
+        dir_size(&model_dir)
     } else {
         0
     };
@@ -292,6 +293,7 @@ fn cmd_status(cli: &Cli) -> Result<()> {
 /// List known models. Today this is just the bge-reranker-v2-m3 entry;
 /// the command exists so we can grow the catalog without a breaking CLI
 /// change.
+#[allow(clippy::unnecessary_wraps)]
 fn cmd_list(cli: &Cli) -> Result<()> {
     if cli.json {
         println!(
@@ -311,10 +313,9 @@ fn cmd_list(cli: &Cli) -> Result<()> {
         println!("{}", "Available Models".cyan().bold());
         println!("{}", "=".repeat(50));
         println!(
-            "  {:25} {:>10}  {}",
+            "  {:25} {:>10}  recall cross-encoder rerank",
             "bge-reranker-v2-m3".green(),
             "568 MB",
-            "recall cross-encoder rerank"
         );
     }
     Ok(())
@@ -367,15 +368,14 @@ fn verify_model_dir_complete(model_dir: &Path) -> Result<()> {
 /// Return `true` if `p` exists, is a regular file, and has non-zero
 /// length. Treats any IO error as `false`.
 fn is_nonempty_file(p: &Path) -> bool {
-    fs::metadata(p)
-        .map(|m| m.is_file() && m.len() > 0)
-        .unwrap_or(false)
+    fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 /// Remove `*.tmp` / `*.part` partial-download files that some HTTP
 /// clients leave behind when interrupted. Best-effort: any IO error is
 /// silently ignored because the verification step that follows will
 /// fail loudly if anything important is missing.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn cleanup_partial_downloads(model_dir: &Path) {
     let Ok(entries) = fs::read_dir(model_dir) else {
         return;
@@ -416,6 +416,7 @@ struct LockFile {
 }
 
 impl LockFile {
+    #[allow(clippy::duration_suboptimal_units)]
     fn acquire(cache_dir: &Path) -> Result<Self> {
         let path = cache_dir.join(".fetch.lock");
         match fs::OpenOptions::new()
@@ -451,7 +452,7 @@ impl Drop for LockFile {
 }
 
 /// Sum the sizes of every regular file under `root`.
-fn dir_size(root: &Path) -> Result<u64> {
+fn dir_size(root: &Path) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -467,7 +468,7 @@ fn dir_size(root: &Path) -> Result<u64> {
             }
         }
     }
-    Ok(total)
+    total
 }
 
 /// Render bytes as a short human-readable string (kB, MB, GB).
@@ -508,7 +509,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(tmp.path().join("a/foo.bin"), vec![0u8; 100]).unwrap();
         fs::write(sub.join("bar.bin"), vec![0u8; 250]).unwrap();
-        let total = dir_size(tmp.path()).unwrap();
+        let total = dir_size(tmp.path());
         assert_eq!(total, 350);
     }
 

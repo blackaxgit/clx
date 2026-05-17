@@ -139,7 +139,7 @@ fn apply_state_to_app(app: &mut App, s: &AppState) {
         app.audit_table_state.select(s.audit_selected);
     }
     app.rules_scroll_offset = s.rules_scroll_offset;
-    app.filter_text = s.filter_text.clone();
+    app.filter_text.clone_from(&s.filter_text);
     app.sessions_sort_column = s.sessions_sort_column;
     app.sessions_sort_ascending = s.sessions_sort_ascending;
     app.audit_sort_column = s.audit_sort_column;
@@ -164,19 +164,20 @@ fn apply_state_to_app(app: &mut App, s: &AppState) {
         app.settings_field_table_state.select(Some(s.settings_field_idx));
     }
     app.settings_is_dirty = s.settings_is_dirty;
-    app.settings_edit_buffer = s.settings_edit_buffer.clone();
-    app.settings_edit_error = s.settings_edit_error.clone();
-    app.settings_save_result = s.settings_save_result.clone();
+    app.settings_edit_buffer.clone_from(&s.settings_edit_buffer);
+    app.settings_edit_error.clone_from(&s.settings_edit_error);
+    app.settings_save_result.clone_from(&s.settings_save_result);
     app.settings_confirm_reset = s.settings_confirm_reset;
     app.settings_exit_pending = s.settings_exit_pending;
     app.settings_reload_confirm = s.settings_reload_confirm;
-    app.settings_load_error = s.settings_load_error.clone();
+    app.settings_load_error.clone_from(&s.settings_load_error);
 }
 
 // ---------------------------------------------------------------------------
 // Command executor: DashboardCmd -> side effect on App
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::needless_pass_by_value)]
 fn execute_cmd(app: &mut App, cmd: DashboardCmd) {
     match cmd {
         DashboardCmd::Quit => {

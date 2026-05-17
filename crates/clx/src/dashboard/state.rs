@@ -192,6 +192,7 @@ const PAGE_SIZE: usize = 10;
 /// Applies `event` to `state`, returning the new state and a list of
 /// side-effect commands the runtime should execute (in order).
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn update(mut state: AppState, event: DashboardEvent) -> (AppState, Vec<DashboardCmd>) {
     let mut cmds: Vec<DashboardCmd> = Vec::new();
 
@@ -288,11 +289,13 @@ fn handle_detail_key(state: &mut AppState, cmds: &mut Vec<DashboardCmd>, key: Ke
         KeyCode::Char('2') => state.detail_tab = DetailTab::Commands,
         KeyCode::Char('3') => state.detail_tab = DetailTab::Audit,
         KeyCode::Char('4') => state.detail_tab = DetailTab::Snapshots,
-        KeyCode::Char('j') | KeyCode::Down
-        | KeyCode::Char('k') | KeyCode::Up
-        | KeyCode::PageDown | KeyCode::PageUp
-        | KeyCode::Char('g') | KeyCode::Home
-        | KeyCode::Char('G') | KeyCode::End => {
+        KeyCode::Char('j' | 'k' | 'g' | 'G')
+        | KeyCode::Down
+        | KeyCode::Up
+        | KeyCode::PageDown
+        | KeyCode::PageUp
+        | KeyCode::Home
+        | KeyCode::End => {
             // Detail scrolling depends on detail_data which lives on the runtime;
             // the runtime executes the scroll directly. Reducer is a no-op for
             // these so we still consume the key.

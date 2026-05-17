@@ -43,10 +43,10 @@ pub fn should_aggregate(tool: &str, input: &Value) -> bool {
     if is_text_mutator(tool) {
         return true;
     }
-    if tool == "Bash" {
-        if let Some(cmd) = input.get("command").and_then(Value::as_str) {
-            return is_mutator_bash(cmd);
-        }
+    if tool == "Bash"
+        && let Some(cmd) = input.get("command").and_then(Value::as_str)
+    {
+        return is_mutator_bash(cmd);
     }
     false
 }
@@ -72,7 +72,7 @@ pub fn is_mutator_bash(command: &str) -> bool {
 
 /// Derive the normalized target for a tool invocation.
 ///
-/// - Edit / Write / MultiEdit / NotebookEdit: canonicalize `file_path` (or
+/// - Edit / Write / `MultiEdit` / `NotebookEdit`: canonicalize `file_path` (or
 ///   `notebook_path`) via [`normalize_path`]. Returns `None` if the field
 ///   is missing.
 /// - Bash: lowercase the first verb token, joining `git X` style two-word
@@ -127,8 +127,7 @@ pub fn derive_summary(tool: &str, input: &Value, outcome: ToolOutcome) -> String
             let bytes = input
                 .get("content")
                 .and_then(Value::as_str)
-                .map(str::len)
-                .unwrap_or(0);
+                .map_or(0, str::len);
             format!("write {basename} ({bytes} bytes)")
         }
         "MultiEdit" => {
@@ -175,8 +174,7 @@ fn basename_or_unknown(path: Option<&str>) -> String {
         Some(p) => {
             let pb = PathBuf::from(p);
             pb.file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "?".to_string())
+                .map_or_else(|| "?".to_string(), |s| s.to_string_lossy().to_string())
         }
         None => "?".to_string(),
     }
@@ -223,10 +221,10 @@ pub fn derive_bash_verb(command: &str) -> String {
     }
     let mut tokens = trimmed.split_whitespace();
     let first = tokens.next().unwrap_or("").to_lowercase();
-    if first == "git" {
-        if let Some(sub) = tokens.next() {
-            return format!("git-{}", sub.to_lowercase());
-        }
+    if first == "git"
+        && let Some(sub) = tokens.next()
+    {
+        return format!("git-{}", sub.to_lowercase());
     }
     first
 }

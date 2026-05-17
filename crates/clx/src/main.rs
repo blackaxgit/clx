@@ -121,7 +121,7 @@ enum Commands {
         action: TrustAction,
     },
 
-    /// Manage trusted per-project config files (~/.clx/trusted_configs.json).
+    /// Manage trusted per-project config files (`~/.clx/trusted_configs.json`).
     /// Trusted configs are allowed to set non-inert keys (providers.*,
     /// logging.file, validator.enabled). Trust is per-machine, per-user,
     /// per-file-hash; any edit invalidates it.

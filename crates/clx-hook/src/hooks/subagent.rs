@@ -196,7 +196,6 @@ async fn do_recall(
         percentile_gate: query_percentile_gate(config.auto_recall.percentile_gate),
         reranker_enabled: config.auto_recall.reranker_enabled,
         reranker_timeout_ms: config.auto_recall.reranker_timeout_ms,
-        ..Default::default()
     };
 
     let reranker = config

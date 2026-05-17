@@ -62,7 +62,6 @@ impl McpServer {
             percentile_gate: query_percentile_gate(auto_recall.percentile_gate),
             reranker_enabled: auto_recall.reranker_enabled,
             reranker_timeout_ms: auto_recall.reranker_timeout_ms,
-            ..Default::default()
         };
 
         let hits = self.runtime.block_on(engine.query(&query, &config));

@@ -52,6 +52,7 @@ pub struct HookDeps {
 impl HookDeps {
     /// Build deps using process defaults. Falls back to a default config and
     /// the default sqlite path. Returns `None` if storage cannot be opened.
+    #[must_use]
     pub fn from_process_defaults() -> Option<Self> {
         let config = Config::load().unwrap_or_default();
         let storage = Storage::open_default().ok()?;
@@ -59,7 +60,8 @@ impl HookDeps {
     }
 
     /// Build deps suitable for tests: default config, in-memory storage.
-    #[cfg(any(test, feature = "test-fixtures"))]
+    #[cfg(test)]
+    #[must_use]
     pub fn for_test() -> Self {
         Self {
             config: Config::default(),

@@ -6,8 +6,8 @@
 //! process-level concerns: argument parsing, tracing setup, sqlite-vec
 //! init, and constructing `HookDeps` for the router.
 //!
-//! Hook handlers (in the library): PreToolUse, PostToolUse, PreCompact,
-//! SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop.
+//! Hook handlers (in the library): `PreToolUse`, `PostToolUse`, `PreCompact`,
+//! `SessionStart`, `SessionEnd`, `SubagentStart`, `UserPromptSubmit`, Stop.
 
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;

@@ -218,7 +218,7 @@ impl Storage {
     /// its snapshot, another handler in a parallel Stop event could have
     /// already written one. Re-reading this timestamp immediately before the
     /// insert lets the second handler detect the race and skip cleanly,
-    /// preventing duplicate AutoSummary snapshots for the same session/window.
+    /// preventing duplicate `AutoSummary` snapshots for the same session/window.
     pub fn last_auto_summary_at(
         &self,
         session_id: &str,

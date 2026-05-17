@@ -26,7 +26,7 @@ impl Storage {
     /// Behaviour:
     /// 1. Ensures the referenced session row exists via `INSERT OR IGNORE`
     ///    (mirrors the FK-safe pattern in `audit.rs`).
-    /// 2. Uses `INSERT ... ON CONFLICT DO UPDATE` (SQLite UPSERT, 3.24+) on
+    /// 2. Uses `INSERT ... ON CONFLICT DO UPDATE` (`SQLite` UPSERT, 3.24+) on
     ///    the v7 unique index
     ///    `(session_id, tool_name, IFNULL(target, ''), window_end_unix / 60)`.
     ///    On conflict, the existing row's `occurrence_count` is incremented
@@ -491,7 +491,7 @@ mod tests {
 
     /// v7 regression: simulate two parallel writers landing in the same
     /// dedup bucket. Each opens its own `Storage` handle against a shared
-    /// SQLite database file; the UNIQUE INDEX + UPSERT must collapse both
+    /// `SQLite` database file; the UNIQUE INDEX + UPSERT must collapse both
     /// inserts into a single row with `occurrence_count == 2`, never two
     /// duplicate rows. This is the property that broke under v6 (SELECT-
     /// then-INSERT race).

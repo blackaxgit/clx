@@ -103,12 +103,13 @@ pub async fn summarize_turns(
 #[must_use]
 pub fn build_prompt(turns: &[TurnSlice<'_>], max_chars: usize) -> String {
     let mut body = String::with_capacity(256 + turns.len() * 64);
-    body.push_str(&format!(
+    use std::fmt::Write as _;
+    let _ = write!(
+        body,
         "Summarize the following {n}-turn span into <= {max_chars} chars, \
          focusing on decisions made, files touched, and TODOs:\n\nTURNS:\n",
         n = turns.len(),
-        max_chars = max_chars,
-    ));
+    );
     for turn in turns {
         body.push_str("- [");
         body.push_str(turn.role);
@@ -155,7 +156,7 @@ pub fn deterministic_template_summary(turns_text: &str, max_chars: usize) -> Str
 fn flatten_turns(turns: &[TurnSlice<'_>]) -> String {
     let mut s = String::with_capacity(turns.len() * 128);
     for t in turns {
-        s.push_str("[");
+        s.push('[');
         s.push_str(t.role);
         s.push_str("] ");
         s.push_str(t.content);

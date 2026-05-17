@@ -52,7 +52,7 @@ pub const DEFAULT_MODEL_DIRNAME: &str = "bge-reranker-v2-m3";
 /// out-of-the-box `~/.clx/models/bge-reranker-v2-m3/` location, or via
 /// [`FastembedReranker::new`] when the user has configured a custom path.
 pub struct FastembedReranker {
-    /// Root directory under which the `fastembed` HuggingFace cache lives.
+    /// Root directory under which the `fastembed` `HuggingFace` cache lives.
     cache_dir: PathBuf,
     /// Lazily-initialised ONNX session. `None` until the first successful
     /// `score()` call. Held under a mutex because v5's
@@ -164,9 +164,10 @@ impl Reranker for FastembedReranker {
                 // call (which downloads + loads the ONNX session on first
                 // run) is now INSIDE the spawn_blocking, so the outer
                 // tokio::time::timeout can cancel the whole pipeline.
-                let mut model = match taken_model {
-                    Some(m) => m,
-                    None => {
+                let mut model = if let Some(m) = taken_model {
+                    m
+                } else {
+                    {
                         debug!(
                             "loading bge-reranker-v2-m3 from cache_dir={}",
                             cache_dir.display()
@@ -202,13 +203,13 @@ impl Reranker for FastembedReranker {
                             results.into_iter().map(|r| (r.index, r.score)).collect();
                         by_index.sort_by_key(|(idx, _)| *idx);
 
-                        if by_index.len() != expected {
+                        if by_index.len() == expected {
+                            Ok(by_index.into_iter().map(|(_, score)| score).collect())
+                        } else {
                             Err(RerankError::OutputLengthMismatch {
                                 expected,
                                 got: by_index.len(),
                             })
-                        } else {
-                            Ok(by_index.into_iter().map(|(_, score)| score).collect())
                         }
                     }
                     Err(e) => Err(RerankError::Backend(format!("fastembed rerank: {e}"))),
@@ -226,14 +227,14 @@ impl Reranker for FastembedReranker {
         // Re-install the model into the cache regardless of whether the
         // rerank itself succeeded; the session is still valid for reuse
         // after a logical error like length mismatch.
-        if let Some(model) = returned_model {
-            if let Ok(mut guard) = self.inner.lock() {
-                // Only install if no other caller has loaded in the
-                // meantime; if they did, our taken_model was None and we
-                // freshly loaded, so prefer keeping the existing one.
-                if guard.is_none() {
-                    *guard = Some(model);
-                }
+        if let Some(model) = returned_model
+            && let Ok(mut guard) = self.inner.lock()
+        {
+            // Only install if no other caller has loaded in the
+            // meantime; if they did, our taken_model was None and we
+            // freshly loaded, so prefer keeping the existing one.
+            if guard.is_none() {
+                *guard = Some(model);
             }
         }
 
@@ -352,10 +353,10 @@ mod tests {
             .map_err(|e| RerankError::Backend(format!("join: {e}")))?;
 
             // Re-install the "loaded" flag.
-            if let Ok(mut g) = loaded_ref.lock() {
-                if !*g {
-                    *g = back;
-                }
+            if let Ok(mut g) = loaded_ref.lock()
+                && !*g
+            {
+                *g = back;
             }
             result
         }
@@ -403,7 +404,7 @@ mod tests {
     }
 
     /// Second call after a successful first call must reuse the loaded
-    /// model. We assert load_count stays at 1 across two score() calls.
+    /// model. We assert `load_count` stays at 1 across two `score()` calls.
     #[tokio::test]
     async fn score_reuses_loaded_model() {
         let backend = SlowLoadBackend::new(Duration::from_millis(10));

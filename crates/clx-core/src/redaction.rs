@@ -6,8 +6,8 @@
 //!
 //! Also provides [`redact_json_value`] which walks a `serde_json::Value`
 //! recursively, redacting (a) values whose key matches a sensitive pattern
-//! (api_key, password, secret, token, authorization, credential, ...), and
-//! (b) string leaves that contain a known secret pattern.
+//! (`api_key`, `password`, `secret`, `token`, `authorization`, `credential`, ...),
+//! and (b) string leaves that contain a known secret pattern.
 
 use serde_json::Value;
 

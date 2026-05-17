@@ -22,6 +22,8 @@
 //! The bench seeds an in-memory `Storage` with the snapshot corpus
 //! embedded in the YAML and runs `RecallEngine::query` for every pair.
 
+#![allow(clippy::doc_markdown)]
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -154,7 +156,7 @@ fn load_golden_set(path: &PathBuf) -> GoldenSet {
         }
 
         match section {
-            Section::None => continue,
+            Section::None => {}
             Section::Corpus => {
                 let stripped = line.trim_start();
                 if let Some(rest) = stripped.strip_prefix("- snapshot_id:") {

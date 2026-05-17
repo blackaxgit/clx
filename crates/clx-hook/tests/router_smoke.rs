@@ -92,7 +92,7 @@ fn snapshot_parsed_fixture(snapshot_name: &str, fixture: &str) {
         r#""transcript_path": "[TRANSCRIPT_PATH]""#,
     );
     settings.add_filter(
-        r#"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"#,
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z",
         "[TIMESTAMP]",
     );
     settings.bind(|| {

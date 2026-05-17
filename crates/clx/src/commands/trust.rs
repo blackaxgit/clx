@@ -328,6 +328,7 @@ pub fn cmd_config_trust(cli: &Cli, action: ConfigTrustAction) -> Result<()> {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn handle_config_trust_add(cli: &Cli, path: PathBuf, yes: bool) -> Result<()> {
     let canonical = std::fs::canonicalize(&path)
         .with_context(|| format!("config file not found: {}", path.display()))?;

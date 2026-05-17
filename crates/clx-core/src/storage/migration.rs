@@ -384,13 +384,13 @@ impl Storage {
     /// no UNIQUE constraint. Two parallel `clx-hook` processes could both
     /// observe "no recent row" inside the same 60s window and both INSERT,
     /// creating duplicate rows. With this unique index in place,
-    /// `append_or_extend_tool_event` can use SQLite's atomic
+    /// `append_or_extend_tool_event` can use `SQLite`'s atomic
     /// `INSERT ... ON CONFLICT DO UPDATE` (UPSERT) so the database itself is
     /// the source of truth for dedup.
     ///
-    /// `IFNULL(target, '')` inside the index expression collapses NULLs to
-    /// the empty string so two events with a NULL target merge into one row
-    /// (otherwise SQLite would treat NULLs as distinct in UNIQUE indexes).
+    /// `IFNULL(target, '')` inside the index expression collapses `NULL`s to
+    /// the empty string so two events with a `NULL` target merge into one row
+    /// (otherwise `SQLite` would treat `NULL`s as distinct in UNIQUE indexes).
     pub(super) fn migrate_to_v7(&self) -> crate::Result<()> {
         self.conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS tool_events_dedup_idx \
