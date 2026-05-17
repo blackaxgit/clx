@@ -2,6 +2,14 @@
 //!
 //! Shared logic used by both the MCP `clx_recall` tool and the
 //! `UserPromptSubmit` hook for auto-context recall.
+//!
+//! Helper sub-modules `rrf` and `decay` are pure-function libraries staged
+//! for the 0.8.0 recall pipeline upgrade. They are not yet wired into
+//! `RecallEngine::query`; that integration lands in Wave 2 alongside the
+//! `bge-reranker-v2-m3` adapter.
+
+pub(crate) mod decay;
+pub(crate) mod rrf;
 
 use std::collections::HashMap;
 
