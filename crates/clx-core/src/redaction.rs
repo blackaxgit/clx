@@ -87,18 +87,91 @@ pub fn redact_secrets(text: &str) -> String {
     }
 
     // -------------------------------------------------------------------------
-    // 3. Bearer token redaction
+    // 3. Bearer / Basic auth token redaction (case-insensitive). Runs BEFORE
+    //    the whitespace-tolerant keyword scan so `Authorization: bearer xyz`
+    //    has the scheme prefix consumed first; otherwise section 2b would
+    //    eat just the `bearer` word and leave the token behind.
     // -------------------------------------------------------------------------
-    if let Some(bearer_start) = redacted.find("Bearer ") {
-        let token_start = bearer_start + 7;
-        if redacted.len() > token_start + 20 {
-            let token_end = redacted[token_start..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                .map_or(redacted.len(), |i| token_start + i);
-            if token_end - token_start >= 20 {
-                redacted.replace_range(token_start..token_end, "***REDACTED***");
+    for scheme in &["bearer ", "basic "] {
+        let lower_search = redacted.to_lowercase();
+        if let Some(scheme_start) = lower_search.find(scheme) {
+            let token_start = scheme_start + scheme.len();
+            if redacted.len() > token_start + 6 {
+                let token_end = redacted[token_start..]
+                    .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                    .map_or(redacted.len(), |i| token_start + i);
+                if token_end - token_start >= 6
+                    && !redacted[token_start..token_end].contains("***REDACTED***")
+                {
+                    redacted.replace_range(token_start..token_end, "***REDACTED***");
+                }
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // 2b. Whitespace-tolerant keyword scan (`api_key = sk_test_...`,
+    //     `authorization : Bearer ...`). Catches the gap where section 2's
+    //     exact `keyword=` literal match misses values with spaces around
+    //     the separator. Scheme tokens (`bearer`, `basic`) are skipped so
+    //     the actual credential after them stays intact for downstream code.
+    // -------------------------------------------------------------------------
+    let tolerant_keywords =
+        ["api_key", "api-key", "token", "password", "secret", "authorization"];
+    let lower = redacted.to_lowercase();
+    let mut tolerant_replacements: Vec<(usize, usize)> = Vec::new();
+    for kw in &tolerant_keywords {
+        let mut search_from = 0;
+        while let Some(idx) = lower[search_from..].find(kw) {
+            let abs = search_from + idx;
+            let mut cursor = abs + kw.len();
+            // Skip whitespace then require `=` or `:`.
+            while cursor < redacted.len()
+                && redacted.as_bytes()[cursor].is_ascii_whitespace()
+                && redacted.as_bytes()[cursor] != b'\n'
+            {
+                cursor += 1;
+            }
+            if cursor >= redacted.len()
+                || (redacted.as_bytes()[cursor] != b'=' && redacted.as_bytes()[cursor] != b':')
+            {
+                search_from = abs + kw.len();
+                continue;
+            }
+            cursor += 1; // past separator
+            while cursor < redacted.len()
+                && redacted.as_bytes()[cursor].is_ascii_whitespace()
+                && redacted.as_bytes()[cursor] != b'\n'
+            {
+                cursor += 1;
+            }
+            // Skip over scheme tokens (`Bearer`, `Basic`) so the actual
+            // credential after them is what we redact (handled in section 3
+            // above; here we just skip the marker so we don't redact the
+            // scheme name instead of the token).
+            let value_start_initial = cursor;
+            let after_word_end = redacted[value_start_initial..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .map_or(redacted.len(), |i| value_start_initial + i);
+            let first_word = &redacted[value_start_initial..after_word_end];
+            let first_word_lower = first_word.to_lowercase();
+            if first_word_lower == "bearer" || first_word_lower == "basic" {
+                // Scheme already handled above; advance past it.
+                search_from = after_word_end;
+                continue;
+            }
+            let value_start = cursor;
+            let value_end = after_word_end;
+            if value_end > value_start + 4
+                && !redacted[value_start..value_end].contains("***REDACTED***")
+            {
+                tolerant_replacements.push((value_start, value_end));
+            }
+            search_from = value_end;
+        }
+    }
+    for (s, e) in tolerant_replacements.into_iter().rev() {
+        redacted.replace_range(s..e, "***REDACTED***");
     }
 
     // -------------------------------------------------------------------------
@@ -572,5 +645,46 @@ mod tests {
         assert_eq!(r["github_token"], json!("***REDACTED***"));
         assert_eq!(r["x-api-key"], json!("***REDACTED***"));
         assert_eq!(r["client_secret_id"], json!("***REDACTED***"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Wave-4c Purple Team regressions (Red Team F1: free-text redaction gaps)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn redacts_keyword_with_whitespace_around_equals() {
+        let result = redact_secrets("user said api_key = sk_test_abcdef1234 hello");
+        assert!(
+            !result.contains("sk_test_abcdef1234"),
+            "whitespace-around-= keyword leaked: {result}"
+        );
+        assert!(result.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn redacts_keyword_with_whitespace_around_colon() {
+        let result = redact_secrets("authorization : Bearer eyJabcdef1234");
+        assert!(
+            !result.contains("eyJabcdef1234"),
+            "whitespace-around-: keyword leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn redacts_lowercase_bearer_token() {
+        let result = redact_secrets("Authorization: bearer eyJabcdefghij1234");
+        assert!(
+            !result.contains("eyJabcdefghij1234"),
+            "lowercase bearer leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn redacts_basic_auth_token() {
+        let result = redact_secrets("Authorization: Basic dXNlcjpwd2Q12345");
+        assert!(
+            !result.contains("dXNlcjpwd2Q12345"),
+            "Basic auth credential leaked: {result}"
+        );
     }
 }

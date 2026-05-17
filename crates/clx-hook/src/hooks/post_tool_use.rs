@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clx_core::config::{Config, ContextPressureMode};
 use clx_core::policy::{McpExtraction, extract_mcp_command};
-use clx_core::redaction::redact_json_value;
+use clx_core::redaction::{redact_json_value, redact_secrets};
 use clx_core::storage::Storage;
 use clx_core::types::{AuditDecision, AuditLogEntry, Event, EventType, ToolEvent, ToolOutcome};
 use tracing::{debug, warn};
@@ -121,11 +121,15 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
         }
     }
 
-    // Create audit log entry for the execution
+    // Create audit log entry for the execution.
+    // SECURITY: redact secrets from the command before persistence; the
+    // `pre_tool_use` path uses `log_audit_entry` which wraps redaction,
+    // and this path must match. Raw secrets in `audit_log.command` would
+    // violate the documented redaction promise.
     if let Some(ref command) = extracted_command {
         let mut entry = AuditLogEntry::new(
             input.session_id.clone(),
-            command.clone(),
+            redact_secrets(command),
             "PostToolUse".to_string(),
             AuditDecision::Allowed,
         );

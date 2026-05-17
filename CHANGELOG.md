@@ -163,6 +163,51 @@ across 13 atomic commits.
   Claude Code 2026 skill spec only defines `description` as
   recommended and several functional optional keys. Skill versioning
   now lives exclusively in `plugin.json`.
+
+### Security (Red/Green/Purple Team review)
+
+Three findings from the Purple Team synthesis were fixed before tag:
+
+- **F10 audit-log secret leak (HIGH)**: `PostToolUse` was writing the
+  raw extracted Bash/MCP command to `audit_log.command` without
+  redaction; the `pre_tool_use` path correctly wraps via
+  `log_audit_entry`. Fix: `post_tool_use.rs` now redacts the command
+  through `redact_secrets` before `AuditLogEntry::new`.
+- **F4 recall context XML injection (HIGH)**: stored snapshot
+  summaries and key_facts were injected verbatim into the
+  `<historical-context>` block, letting a malicious `clx_remember`
+  payload close the wrapper and inject system-style instructions. Fix:
+  `format_recall_context` now escapes `<` and `>` in summary and
+  key_facts via `sanitize_recall_text`. Regression test
+  `test_format_context_escapes_xml_in_summary`.
+- **F1 free-text redaction gaps (MEDIUM)**: `redact_secrets` missed
+  `api_key = sk_test_...` (whitespace around `=`/`:`), lowercase
+  `bearer`, and `Authorization: Basic ...`. Fix: added section 3
+  (case-insensitive `bearer ` / `basic ` scheme prefix) above a new
+  section 2b (whitespace-tolerant keyword scan). Four regression tests.
+
+### Known issues deferred to 0.8.1
+
+These were classified by the Purple Team as low-blast-radius and are
+tracked for the next minor release:
+
+- **F3** Stop auto-summary write race (TOCTOU between guard query and
+  `INSERT`) — optimistic concurrency only; narrow window; idempotent
+  failure mode. To fix in 0.8.1 via `INSERT ... WHERE NOT EXISTS` in
+  a single transaction.
+- **F5** Auto-summarize prompt content injection — attacker controls
+  only their own future summary; no cross-session blast radius.
+- **F7** Hook envelope spoofing — `clx-hook` stdin is trusted per the
+  documented threat model (Claude Code is the spawning process). A
+  local same-uid attacker has many easier paths (direct DB writes).
+  Future hardening: parent-PID check.
+- **F8** Transcript path unconstrained + no size cap — DoS bounded by
+  `HANDLER_TIMEOUT`; path comes from a trusted envelope. Future fix:
+  canonicalize + 64 MiB cap + allowlist to `~/.claude/projects`.
+- **F9** Sentinel-only reranker readiness — `fastembed-rs` validates
+  per-blob LFS SHA-256 during download; same-uid attacker who already
+  has cache write access can pre-stage poisoned ONNX. Future fix:
+  store and verify a manifest-pinned SHA-256 in the `.ready` sentinel.
 - **Recall pipeline layering refactor.** The Domain layer in
   `crates/clx-core/src/recall/` no longer imports `Storage`,
   `LlmClient`, or `EmbeddingStore` directly. Two new ports live in
