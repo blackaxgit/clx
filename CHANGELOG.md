@@ -5,6 +5,149 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-05-17
+
+The "memory and quality" release. Five user-visible outcomes plus an
+engineering coverage push. All work landed on `feat/0.8.0-memory-skills-coverage`
+across 13 atomic commits.
+
+### Added
+
+- **Recall accuracy pipeline (Phase 5).** `RecallEngine::query` now runs
+  parallel embedding + FTS5 candidate generation, fuses via Reciprocal
+  Rank Fusion (RRF) with `k = 60` (Cormack et al. 2009), reranks the top
+  candidates through `bge-reranker-v2-m3` (fastembed-rs 4.x) with a 250 ms
+  graceful timeout, then applies multiplicative time-decay (30-day default
+  half-life) and a p70 percentile gate. New config keys on
+  `AutoRecallConfig`: `rrf_enabled`, `rrf_k`, `time_decay_half_life_days`,
+  `percentile_gate`, `reranker_enabled`, `reranker_timeout_ms`. All
+  default-on. Backward compat: set `rrf_enabled: false` to reproduce the
+  0.7.x linear hybrid merge.
+- **`clx model` CLI (Phase 5b).** New `clx model fetch [--background] [--force]`,
+  `clx model status`, and `clx model list` subcommands manage the
+  `~/.clx/models/bge-reranker-v2-m3/` cache. First-run UX: the
+  `UserPromptSubmit` hook spawns `clx model fetch --background` exactly
+  once per process via `std::sync::Once` when the model is missing, emits
+  one WARN to logs, and falls back to RRF-only ordering until the
+  `.ready` sentinel appears.
+- **Model-discoverable skills (Phase 1).** Plugin layout migrated to the
+  2026 `.claude-plugin/` schema. Six narrow named skills replace the old
+  monolithic `using-clx`: `clx-recall`, `clx-remember`, `clx-checkpoint`,
+  `clx-rules`, `clx-resume`, `clx-doctor`. Frontmatter validator
+  (`plugin/scripts/validate.sh`) checks 2026 schema (name length,
+  description length, kebab-case, parent-dir match, bidirectional
+  manifest/disk orphans) with `--strict` mode enforcing the "Use when"
+  trigger-bleed guard. Migration script `plugin/scripts/migrate.sh` for
+  existing users.
+- **Pinned recent sessions (Phase 6).** Opt-in
+  `auto_recall.pin_recent_sessions.{enabled,count,max_chars_each}` config
+  injects the last-N session summaries into every `UserPromptSubmit`
+  recall, with current-session self-pin guard via SQL exclude. Backed by
+  new `Storage::recent_session_summaries(n, exclude_session_id)`.
+- **`tool_events` aggregator (Phase 4).** New schema-v6 `tool_events`
+  table records mutator tool invocations (`Edit`, `Write`, `MultiEdit`,
+  `NotebookEdit`, mutator `Bash`) with 60-second windowed dedup per
+  `(session_id, tool_name, target)`. Aggregator runs from `PostToolUse`
+  hook after the existing `events` append. New `retention.tool_events_days`
+  config key (default 30; `0` disables trimming). `clx maintenance trim`
+  command runs the retention window.
+- **Auto-summarize mode (Phase 10).** Opt-in
+  `memory.auto_summarize.{enabled,every_n_turns,summarizer_capability,max_summary_chars,skip_when_idle}`
+  config. New `Stop` hook handler reads the rolling N-turn transcript,
+  calls the configured chat LLM via the existing
+  `Config::create_llm_client` factory, and writes the result as a snapshot
+  with new `SnapshotTrigger::AutoSummary` variant. Deterministic template
+  summarizer (no LLM) is the fallback when the chat capability is
+  unavailable. `skip_when_idle` guards against firing on a no-op session
+  by checking `tool_events` count since the last `AutoSummary`.
+- **`clx config-trust` file-hash trustlist (Phase 7, §3.11).** Per-machine
+  per-user trustlist at `~/.clx/trusted_configs.json` (0600 mode) lets
+  power users bypass the inert-key filter for project configs by
+  registering the SHA-256 hash of `<repo>/.clx/config.yaml`. New
+  subcommands: `clx config-trust add <path> [-y]`, `clx config-trust list`,
+  `clx config-trust remove <hash|prefix>`. Trust does NOT propagate via
+  git. Any byte edit to the file invalidates trust automatically.
+  Parallel to and independent from the existing PR #15 trust-mode
+  auto-allow.
+- **Contract tests for hook envelopes (Phase 2).** 7 sanitized JSON
+  fixtures under `crates/clx-hook/tests/fixtures/hook_envelopes/` cover
+  `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SubagentStart`,
+  `Stop`, `SessionStart`, `PreCompact`. `insta` snapshot assertions drive
+  the new `handle_event` router and detect schema drift in both
+  directions (Claude Code spec changes and our emit changes).
+- **`handle_event` library router (Phase 2).** New `clx-hook` lib target
+  exposes `router::handle_event<R: Read, W: Write>(reader, writer, deps)
+  -> ExitCode`. Binary `main()` slimmed from 196 LoC to 126 LoC,
+  delegates to the library. Hook integration tests now drive
+  `handle_event` end-to-end with in-memory readers and writers, no
+  subprocess spawn.
+- **Dashboard reducer (Phase 3).** Pure
+  `update(state: AppState, event: DashboardEvent) -> (AppState, Vec<DashboardCmd>)`
+  reducer drives the entire event loop. `AppState` (data) is cleanly
+  separated from `AppRuntime` (terminal, mutexes, timers). All
+  `DashboardEvent` variants (`Key`, `Resize`, `Tick`, `Quit`) flow
+  through the reducer with deterministic state transitions; side effects
+  are explicit `DashboardCmd` intents executed by the runtime.
+- **Coverage push (Phase 8).** 17 deterministic `ratatui::TestBackend` +
+  `insta` snapshots cover `dashboard/ui/detail.rs` (9 snapshots: each
+  detail tab in both empty and populated states) and
+  `dashboard/settings/render.rs` (8 snapshots: each settings tab,
+  edit-mode popup, confirm-reset, reload-confirm, exit-guard).
+  Workspace `[workspace.metadata.cargo-llvm-cov]` configures
+  `ignore-filename-regex` to exclude scaffolded reducer files and
+  shell-only `main.rs` paths from the denominator.
+- **Mutation testing CI (Phase 11).** `mutants.toml` v27 schema
+  whitelists seven hot modules (`recall::mod`, `recall::rrf`,
+  `recall::decay`, `llm::fallback`, `storage::migration`,
+  `policy::mcp`, `redaction`). Two new GitHub Actions workflows:
+  `mutants.yml` (weekly Monday 06:00 UTC baseline + tracking-issue
+  comment when survivors > 24) and `mutants-pr.yml` (PR-diff
+  check-only, warn-only in 0.8.0). `docs/mutation-testing.md` documents
+  the 80% kill-rate target rationale and additive-not-substitutional
+  relationship to coverage.
+- **RAGAS-style synthetic bench (Phase 9).** 30 hand-curated synthetic
+  `(query, expected_snapshot_ids)` pairs at
+  `tests/fixtures/recall_golden.yaml` (six categories: recall, skills,
+  config, hook, trust, migration; 5 pairs each). Generator script
+  `scripts/generate_golden_set.py` is deterministic (`random.seed(0xCAFE)`)
+  and runs a forbidden-token scan before write to ensure no user content
+  or PHI leaks. New `criterion` bench `benches/recall_accuracy.rs`
+  reports `context_precision@10` and `context_recall@10` mean/p50/p95
+  across both `rrf_enabled` configurations.
+
+### Changed
+
+- `RecallQueryConfig` now derives `Default`. All call sites (clx-mcp,
+  clx-hook subagent, internal tests) use `..Default::default()` for
+  forward-compat field additions.
+- `Config::load` now applies a per-project trust gate before the inert
+  filter via the new `apply_project_layer`. Untrusted configs see the
+  pre-existing `filter_inert_only` behavior, unchanged.
+- `Storage` schema version bumped from 5 to 6 (`tool_events` table +
+  two supporting indexes; additive, no destructive changes).
+
+### Decisions (resolved with user, 2026-05-16)
+
+1. `reranker_enabled = true` by default in 0.8.0 (ships with
+   `clx model fetch` background prefetch + per-query 250 ms graceful
+   degradation to RRF-only)
+2. `retention.tool_events_days = 30` by default, configurable per
+   deployment
+3. Auto-summarize mode IS in 0.8.0, opt-in (default off)
+4. Coverage CI gate stays warn-only in 0.8.0 (hard-fail flip planned for
+   0.8.1)
+5. Golden set is synthetic-only in 0.8.0 (user-derived layer deferred to
+   0.8.1)
+
+### Notes
+
+- Plugin migration is a manual one-shot via `plugin/scripts/migrate.sh`;
+  the old `plugin/skills/` path will be removed in 0.9.0
+- `bge-reranker-v2-m3` is a 568 MB download (one-time, lazy); set
+  `auto_recall.reranker_enabled: false` to opt out
+- Existing per-project configs continue to apply only the inert-key
+  allowlist until `clx config-trust add <path>` registers their hash
+
 ## [0.7.2] - 2026-05-02
 
 ### Fixed
