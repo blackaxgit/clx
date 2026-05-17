@@ -2,6 +2,7 @@ mod app;
 mod data;
 mod event;
 pub(crate) mod settings;
+mod state;
 mod ui;
 
 use std::io;

@@ -1,12 +1,28 @@
+//! Dashboard event loop and key dispatch.
+//!
+//! Thin glue between the terminal (`crossterm` + `ratatui`) and the pure
+//! reducer in [`super::state`]. Each iteration of [`run_event_loop`]:
+//!
+//! 1. Renders the current `App` to the terminal.
+//! 2. Polls `crossterm` for a key event, with a timeout tied to the
+//!    refresh interval.
+//! 3. Builds an [`AppState`] snapshot from `App`, runs [`update`], and
+//!    applies the resulting state diff back to `App`.
+//! 4. Executes any returned [`DashboardCmd`] intents against `App`
+//!    (data fetch, settings save, etc.). These are the only places that
+//!    touch I/O or wall-clock state.
+//! 5. Quits the loop when `App::should_quit` is set.
+
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent};
 use ratatui::DefaultTerminal;
 
 use super::app::{App, DashboardTab, DetailTab, ExitTarget, InputMode, ScreenState};
 use super::settings::config_bridge;
 use super::settings::fields::{self, FieldWidget};
+use super::state::{AppState, DashboardCmd, DashboardEvent, update};
 use super::ui;
 
 pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
@@ -37,248 +53,158 @@ pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Resu
     }
 }
 
-fn handle_key_event(app: &mut App, key: KeyEvent) {
-    // If we are in the session detail view, handle those keys first.
-    if matches!(app.screen_state, ScreenState::SessionDetail(_)) {
-        handle_detail_mode(app, key);
-        return;
-    }
-
-    match app.input_mode {
-        InputMode::Normal => handle_normal_mode(app, key),
-        InputMode::Filter => handle_filter_mode(app, key),
-        InputMode::SettingsNav => handle_settings_nav(app, key),
-        InputMode::SettingsEdit => handle_settings_edit(app, key),
+/// Apply a single key event to `app` via the pure reducer.
+///
+/// Builds an [`AppState`] snapshot, runs [`update`], copies the new pure-state
+/// fields back into `app`, then executes returned [`DashboardCmd`] intents.
+pub(super) fn handle_key_event(app: &mut App, key: KeyEvent) {
+    let state = snapshot_state(app);
+    let (next_state, cmds) = update(state, DashboardEvent::Key(key));
+    apply_state_to_app(app, &next_state);
+    for cmd in cmds {
+        execute_cmd(app, cmd);
     }
 }
 
-fn handle_normal_mode(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Esc => app.should_quit = true,
-        KeyCode::Enter
-            // Drill into session detail when on Sessions tab
-            if app.current_tab == DashboardTab::Sessions && !app.data.sessions.is_empty() => {
+// ---------------------------------------------------------------------------
+// Snapshot: App -> AppState
+// ---------------------------------------------------------------------------
+
+fn snapshot_state(app: &App) -> AppState {
+    let settings_field_count = super::settings::fields::fields_for_section(app.settings_section_idx).len();
+    AppState {
+        current_tab: app.current_tab,
+        should_quit: app.should_quit,
+        input_mode: app.input_mode,
+        sessions_selected: app.sessions_table_state.selected(),
+        audit_selected: app.audit_table_state.selected(),
+        rules_scroll_offset: app.rules_scroll_offset,
+        filter_text: app.filter_text.clone(),
+        sessions_sort_column: app.sessions_sort_column,
+        sessions_sort_ascending: app.sessions_sort_ascending,
+        audit_sort_column: app.audit_sort_column,
+        audit_sort_ascending: app.audit_sort_ascending,
+        screen_state: app.screen_state.clone(),
+        detail_tab: app.detail_tab,
+        detail_commands_selected: app.detail_commands_state.selected(),
+        detail_events_selected: app.detail_events_state.selected(),
+        detail_snapshots_selected: app.detail_snapshots_state.selected(),
+        detail_scroll_offset: app.detail_scroll_offset,
+        settings_section_idx: app.settings_section_idx,
+        settings_field_idx: app.settings_field_idx,
+        settings_is_dirty: app.settings_is_dirty,
+        settings_edit_buffer: app.settings_edit_buffer.clone(),
+        settings_edit_error: app.settings_edit_error.clone(),
+        settings_save_result: app.settings_save_result.clone(),
+        settings_confirm_reset: app.settings_confirm_reset,
+        settings_exit_pending: app.settings_exit_pending,
+        settings_reload_confirm: app.settings_reload_confirm,
+        settings_load_error: app.settings_load_error.clone(),
+        sessions_count: app.data.sessions.len(),
+        audit_count: app.data.audit_entries.len(),
+        settings_field_count,
+    }
+}
+
+fn apply_state_to_app(app: &mut App, s: &AppState) {
+    app.current_tab = s.current_tab;
+    app.should_quit = s.should_quit;
+    app.input_mode = s.input_mode;
+    if app.sessions_table_state.selected() != s.sessions_selected {
+        app.sessions_table_state.select(s.sessions_selected);
+    }
+    if app.audit_table_state.selected() != s.audit_selected {
+        app.audit_table_state.select(s.audit_selected);
+    }
+    app.rules_scroll_offset = s.rules_scroll_offset;
+    app.filter_text = s.filter_text.clone();
+    app.sessions_sort_column = s.sessions_sort_column;
+    app.sessions_sort_ascending = s.sessions_sort_ascending;
+    app.audit_sort_column = s.audit_sort_column;
+    app.audit_sort_ascending = s.audit_sort_ascending;
+    app.screen_state = s.screen_state.clone();
+    app.detail_tab = s.detail_tab;
+    if app.detail_commands_state.selected() != s.detail_commands_selected {
+        app.detail_commands_state.select(s.detail_commands_selected);
+    }
+    if app.detail_events_state.selected() != s.detail_events_selected {
+        app.detail_events_state.select(s.detail_events_selected);
+    }
+    if app.detail_snapshots_state.selected() != s.detail_snapshots_selected {
+        app.detail_snapshots_state.select(s.detail_snapshots_selected);
+    }
+    app.detail_scroll_offset = s.detail_scroll_offset;
+    if app.settings_section_idx != s.settings_section_idx {
+        app.settings_section_idx = s.settings_section_idx;
+    }
+    if app.settings_field_idx != s.settings_field_idx {
+        app.settings_field_idx = s.settings_field_idx;
+        app.settings_field_table_state.select(Some(s.settings_field_idx));
+    }
+    app.settings_is_dirty = s.settings_is_dirty;
+    app.settings_edit_buffer = s.settings_edit_buffer.clone();
+    app.settings_edit_error = s.settings_edit_error.clone();
+    app.settings_save_result = s.settings_save_result.clone();
+    app.settings_confirm_reset = s.settings_confirm_reset;
+    app.settings_exit_pending = s.settings_exit_pending;
+    app.settings_reload_confirm = s.settings_reload_confirm;
+    app.settings_load_error = s.settings_load_error.clone();
+}
+
+// ---------------------------------------------------------------------------
+// Command executor: DashboardCmd -> side effect on App
+// ---------------------------------------------------------------------------
+
+fn execute_cmd(app: &mut App, cmd: DashboardCmd) {
+    match cmd {
+        DashboardCmd::Quit => {
+            app.should_quit = true;
+        }
+        DashboardCmd::RefreshData => {
+            // In detail mode, refresh_data also refreshes detail.
+            app.refresh_data();
+        }
+        DashboardCmd::EnterSessionDetail => {
+            if app.current_tab == DashboardTab::Sessions && !app.data.sessions.is_empty() {
                 app.enter_session_detail();
             }
-        KeyCode::Tab => {
-            app.next_tab();
-            on_tab_switch(app);
         }
-        KeyCode::BackTab => {
-            app.prev_tab();
-            on_tab_switch(app);
+        DashboardCmd::LeaveSessionDetail => {
+            app.leave_session_detail();
         }
-        KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
-        KeyCode::PageDown => app.page_down(),
-        KeyCode::PageUp => app.page_up(),
-        KeyCode::Char('g') | KeyCode::Home => app.scroll_to_top(),
-        KeyCode::Char('G') | KeyCode::End => app.scroll_to_bottom(),
-        KeyCode::Char('r') => app.refresh_data(),
-        KeyCode::Char('s') => app.cycle_sort_column(),
-        KeyCode::Char('S') => app.toggle_sort_direction(),
-        KeyCode::Char('/') => {
-            app.input_mode = InputMode::Filter;
-            app.filter_text.clear();
+        DashboardCmd::EnterSettings => {
+            app.on_enter_settings_tab();
         }
-        KeyCode::Char('1') => switch_to_tab(app, DashboardTab::Sessions),
-        KeyCode::Char('2') => switch_to_tab(app, DashboardTab::AuditLog),
-        KeyCode::Char('3') => switch_to_tab(app, DashboardTab::Rules),
-        KeyCode::Char('4') => switch_to_tab(app, DashboardTab::Settings),
-        _ => {}
-    }
-}
-
-fn handle_detail_mode(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.leave_session_detail(),
-        KeyCode::Tab => app.detail_next_tab(),
-        KeyCode::BackTab => app.detail_prev_tab(),
-        KeyCode::Char('1') => app.detail_tab = DetailTab::Info,
-        KeyCode::Char('2') => app.detail_tab = DetailTab::Commands,
-        KeyCode::Char('3') => app.detail_tab = DetailTab::Audit,
-        KeyCode::Char('4') => app.detail_tab = DetailTab::Snapshots,
-        KeyCode::Char('j') | KeyCode::Down => app.detail_scroll_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.detail_scroll_up(),
-        KeyCode::PageDown => app.detail_page_down(),
-        KeyCode::PageUp => app.detail_page_up(),
-        KeyCode::Char('g') | KeyCode::Home => app.detail_scroll_to_top(),
-        KeyCode::Char('G') | KeyCode::End => app.detail_scroll_to_bottom(),
-        KeyCode::Char('r') => app.refresh_data(),
-        _ => {}
-    }
-}
-
-fn handle_filter_mode(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
-            app.filter_text.clear();
-        }
-        KeyCode::Enter => app.input_mode = InputMode::Normal,
-        KeyCode::Backspace => {
-            app.filter_text.pop();
-        }
-        KeyCode::Char(c) => app.filter_text.push(c),
-        _ => {}
-    }
-}
-
-fn handle_settings_nav(app: &mut App, key: KeyEvent) {
-    // Handle dirty-exit guard prompt first
-    if let Some(target) = app.settings_exit_pending {
-        match key.code {
-            KeyCode::Char('s') => {
-                app.settings_save();
-                app.settings_exit_pending = None;
-                app.execute_exit_target(target);
-            }
-            KeyCode::Char('x') => {
-                app.settings_discard_changes();
-                app.settings_exit_pending = None;
-                app.execute_exit_target(target);
-            }
-            KeyCode::Esc => {
-                app.settings_exit_pending = None;
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    // Handle reload confirmation when dirty
-    if app.settings_reload_confirm {
-        match key.code {
-            KeyCode::Char('y') => {
-                app.settings_reload_confirm = false;
-                app.settings_reload();
-            }
-            KeyCode::Char('n') | KeyCode::Esc => {
-                app.settings_reload_confirm = false;
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    // Handle confirm-reset dialog
-    if app.settings_confirm_reset {
-        match key.code {
-            KeyCode::Char('y') => {
-                app.settings_discard_changes();
-                app.settings_confirm_reset = false;
-                app.settings_edit_error = None;
-                app.settings_edit_error_time = None;
-            }
-            KeyCode::Char('n') | KeyCode::Esc => {
-                app.settings_confirm_reset = false;
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => {
-            if app.settings_is_dirty {
-                app.settings_exit_pending = Some(ExitTarget::Quit);
-            } else {
-                app.input_mode = InputMode::Normal;
-                app.current_tab = DashboardTab::Sessions;
-            }
-        }
-        KeyCode::Tab => {
-            if app.settings_is_dirty {
-                // Compute next tab
-                let idx = app.current_tab.index();
-                let next = (idx + 1) % DashboardTab::ALL.len();
-                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::ALL[next]));
-            } else {
-                app.next_tab();
-                on_tab_switch(app);
-            }
-        }
-        KeyCode::BackTab => {
-            if app.settings_is_dirty {
-                let idx = app.current_tab.index();
-                let prev = if idx == 0 {
-                    DashboardTab::ALL.len() - 1
-                } else {
-                    idx - 1
-                };
-                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::ALL[prev]));
-            } else {
-                app.prev_tab();
-                on_tab_switch(app);
-            }
-        }
-        KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
-        KeyCode::PageDown => app.page_down(),
-        KeyCode::PageUp => app.page_up(),
-        KeyCode::Char('g') | KeyCode::Home => app.scroll_to_top(),
-        KeyCode::Char('G') | KeyCode::End => app.scroll_to_bottom(),
-        KeyCode::Char('h' | '[') | KeyCode::Left => {
-            app.settings_prev_section();
-        }
-        KeyCode::Char('l' | ']') | KeyCode::Right => {
-            app.settings_next_section();
-        }
-        KeyCode::Char(' ') | KeyCode::Enter
-            // Don't allow editing if config failed to load
-            if app.settings_load_error.is_none() => {
-                handle_settings_edit_field(app);
-            }
-        KeyCode::Char('s') => {
+        DashboardCmd::SettingsSave => {
             app.settings_save();
         }
-        KeyCode::Char('d')
-            if app.settings_load_error.is_none() => {
-                handle_settings_reset_field(app);
-            }
-        KeyCode::Char('R')
-            if app.settings_is_dirty => {
-                app.settings_confirm_reset = true;
-            }
-        KeyCode::Char('r') => {
-            if app.settings_is_dirty {
-                app.settings_reload_confirm = true;
-            } else {
-                app.settings_reload();
-            }
+        DashboardCmd::SettingsReload => {
+            app.settings_reload();
         }
-        KeyCode::Char('1') => {
-            if app.settings_is_dirty {
-                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::Sessions));
-            } else {
-                switch_to_tab(app, DashboardTab::Sessions);
-            }
+        DashboardCmd::SettingsDiscardChanges => {
+            app.settings_discard_changes();
         }
-        KeyCode::Char('2') => {
-            if app.settings_is_dirty {
-                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::AuditLog));
-            } else {
-                switch_to_tab(app, DashboardTab::AuditLog);
-            }
+        DashboardCmd::SettingsResetConfirmed => {
+            app.settings_discard_changes();
+            app.settings_edit_error = None;
+            app.settings_edit_error_time = None;
         }
-        KeyCode::Char('3') => {
-            if app.settings_is_dirty {
-                app.settings_exit_pending = Some(ExitTarget::Tab(DashboardTab::Rules));
-            } else {
-                switch_to_tab(app, DashboardTab::Rules);
-            }
+        DashboardCmd::ExecuteExitTarget(target) => {
+            app.execute_exit_target(target);
         }
-        KeyCode::Char('4') => {} // Already on Settings
-        _ => {}
+        DashboardCmd::SettingsEditField => {
+            handle_settings_edit_field(app);
+        }
+        DashboardCmd::SettingsCommitEdit => {
+            commit_settings_edit(app);
+        }
+        DashboardCmd::SettingsResetField => {
+            handle_settings_reset_field(app);
+        }
     }
 }
 
 /// Handle Space/Enter on the currently selected settings field.
-///
-/// For `Toggle` fields: flip the bool in-place.
-/// For `CycleSelect` fields: rotate to the next option.
-/// For `TextInput`/Number fields: no-op (Phase 3 will open a popup).
 fn handle_settings_edit_field(app: &mut App) {
     let section = app.settings_section_idx;
     let field = app.settings_field_idx;
@@ -298,7 +224,6 @@ fn handle_settings_edit_field(app: &mut App) {
 
     match &field_def.widget {
         FieldWidget::Toggle => {
-            // Check for trust_mode warning before toggling
             let config = app.settings_editing_config.as_ref().unwrap();
             if config_bridge::is_trust_mode_enabling(config, section, field) {
                 app.settings_edit_error =
@@ -320,7 +245,6 @@ fn handle_settings_edit_field(app: &mut App) {
             );
             config_bridge::recompute_dirty(app);
         }
-        // Text/Number fields: open popup editor
         FieldWidget::TextInput { .. }
         | FieldWidget::NumberU64 { .. }
         | FieldWidget::NumberU32 { .. }
@@ -328,7 +252,6 @@ fn handle_settings_edit_field(app: &mut App) {
         | FieldWidget::NumberF64 { .. }
         | FieldWidget::NumberF32 { .. }
         | FieldWidget::NumberUsize { .. } => {
-            // Copy current value into edit buffer
             let config = app.settings_editing_config.as_ref().unwrap();
             app.settings_edit_buffer = config_bridge::get_field_value(config, section, field);
             app.settings_edit_error = None;
@@ -339,44 +262,25 @@ fn handle_settings_edit_field(app: &mut App) {
     }
 }
 
-/// Handle `SettingsEdit` mode key events (popup is open).
-fn handle_settings_edit(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            app.settings_edit_buffer.clear();
-            app.settings_edit_error = None;
-            app.input_mode = InputMode::SettingsNav;
-        }
-        KeyCode::Enter => {
-            let section = app.settings_section_idx;
-            let field = app.settings_field_idx;
-            let raw = app.settings_edit_buffer.clone();
+/// Commit the current `settings_edit_buffer` to the selected field.
+fn commit_settings_edit(app: &mut App) {
+    let section = app.settings_section_idx;
+    let field = app.settings_field_idx;
+    let raw = app.settings_edit_buffer.clone();
 
-            if let Some(config) = app.settings_editing_config.as_mut() {
-                match config_bridge::set_field_value(config, section, field, &raw) {
-                    Ok(()) => {
-                        config_bridge::recompute_dirty(app);
-                        app.settings_edit_buffer.clear();
-                        app.settings_edit_error = None;
-                        app.input_mode = InputMode::SettingsNav;
-                    }
-                    Err(e) => {
-                        app.settings_edit_error = Some(e);
-                        app.settings_edit_error_time = Some(std::time::Instant::now());
-                    }
-                }
+    if let Some(config) = app.settings_editing_config.as_mut() {
+        match config_bridge::set_field_value(config, section, field, &raw) {
+            Ok(()) => {
+                config_bridge::recompute_dirty(app);
+                app.settings_edit_buffer.clear();
+                app.settings_edit_error = None;
+                app.input_mode = InputMode::SettingsNav;
+            }
+            Err(e) => {
+                app.settings_edit_error = Some(e);
+                app.settings_edit_error_time = Some(std::time::Instant::now());
             }
         }
-        KeyCode::Backspace => {
-            app.settings_edit_buffer.pop();
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.settings_edit_buffer.clear();
-        }
-        KeyCode::Char(c) => {
-            app.settings_edit_buffer.push(c);
-        }
-        _ => {}
     }
 }
 
@@ -391,20 +295,6 @@ fn handle_settings_reset_field(app: &mut App) {
     }
 }
 
-/// Switch to a specific tab and trigger entry logic.
-fn switch_to_tab(app: &mut App, tab: DashboardTab) {
-    app.current_tab = tab;
-    on_tab_switch(app);
-}
-
-/// Called after any tab switch to handle entry/exit logic.
-fn on_tab_switch(app: &mut App) {
-    if app.current_tab == DashboardTab::Settings {
-        app.on_enter_settings_tab();
-    } else {
-        // Leaving settings — reset to Normal mode
-        if app.input_mode == InputMode::SettingsNav || app.input_mode == InputMode::SettingsEdit {
-            app.input_mode = InputMode::Normal;
-        }
-    }
-}
+// Suppress unused-import warnings if any feature combination strips a branch.
+#[allow(dead_code)]
+fn _exhaustive_match(_: DetailTab, _: ExitTarget, _: ScreenState) {}
