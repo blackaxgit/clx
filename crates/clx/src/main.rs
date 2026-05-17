@@ -31,7 +31,9 @@ use std::io;
 use std::process;
 use tracing_subscriber::EnvFilter;
 
-use commands::{ConfigAction, CredentialsAction, EmbeddingsAction, RulesAction, TrustAction};
+use commands::{
+    ConfigAction, CredentialsAction, EmbeddingsAction, MaintenanceAction, RulesAction, TrustAction,
+};
 
 /// CLX - Claude Code Extension
 #[derive(Parser)]
@@ -134,6 +136,12 @@ enum Commands {
         #[arg(long, default_value = "2")]
         refresh: u64,
     },
+
+    /// Maintenance tasks (retention trim, etc.)
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+    },
 }
 
 #[tokio::main]
@@ -189,6 +197,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
         Some(Commands::Health { json }) => commands::health::cmd_health(*json || cli.json).await,
         Some(Commands::Dashboard { days, refresh }) => dashboard::run_dashboard(*days, *refresh)
             .map_err(|e| anyhow::anyhow!("Dashboard error: {e}")),
+        Some(Commands::Maintenance { action }) => commands::cmd_maintenance(cli, action).await,
         None => commands::cmd_default(cli),
     }
 }

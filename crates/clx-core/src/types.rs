@@ -330,6 +330,76 @@ impl FromStr for SnapshotTrigger {
     }
 }
 
+/// Outcome of a tool invocation aggregated into `tool_events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOutcome {
+    #[default]
+    Success,
+    Error,
+}
+
+impl ToolOutcome {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "error" => Self::Error,
+            _ => Self::Success,
+        }
+    }
+}
+
+/// One row of the `tool_events` table: an aggregated mutator-tool invocation
+/// inside a 60-second dedup window for a given `(session_id, tool_name, target)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolEvent {
+    pub id: Option<i64>,
+    pub session_id: SessionId,
+    pub tool_name: String,
+    pub target: Option<String>,
+    pub summary: String,
+    pub outcome: ToolOutcome,
+    pub window_start_unix: i64,
+    pub window_end_unix: i64,
+    pub occurrence_count: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ToolEvent {
+    /// Construct a fresh tool event with `occurrence_count = 1` and the window
+    /// pinned to `now_unix` on both edges. `created_at` is set to `Utc::now()`.
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        tool_name: &str,
+        target: Option<String>,
+        summary: &str,
+        outcome: ToolOutcome,
+        now_unix: i64,
+    ) -> Self {
+        Self {
+            id: None,
+            session_id,
+            tool_name: tool_name.to_string(),
+            target,
+            summary: summary.to_string(),
+            outcome,
+            window_start_unix: now_unix,
+            window_end_unix: now_unix,
+            occurrence_count: 1,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 /// A session snapshot capturing context at a point in time
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {

@@ -20,6 +20,7 @@ mod migration;
 mod rules;
 mod session;
 mod snapshot;
+mod tool_events;
 mod traits;
 mod util;
 mod validation_cache;

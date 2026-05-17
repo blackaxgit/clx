@@ -244,6 +244,43 @@ pub struct Config {
     /// Auto-recall configuration
     #[serde(default)]
     pub auto_recall: AutoRecallConfig,
+
+    /// Retention policy for storage tables.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// Retention policy for storage tables.
+///
+/// A value of `0` for any field disables trimming for that table; positive
+/// integers set the retention window in days. The `clx maintenance trim`
+/// command uses these values to delete rows older than the window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetentionConfig {
+    /// Days of `tool_events` rows to retain. Default: 30.
+    #[serde(default = "default_retention_tool_events_days")]
+    pub tool_events_days: u32,
+
+    /// Days of `events` rows to retain. Default: 7.
+    #[serde(default = "default_retention_events_days")]
+    pub events_days: u32,
+
+    /// Days of `snapshots` rows to retain. Default: 0 (keep forever).
+    #[serde(default)]
+    pub snapshots_days: u32,
+}
+
+fn default_retention_tool_events_days() -> u32 { 30 }
+fn default_retention_events_days() -> u32 { 7 }
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            tool_events_days: default_retention_tool_events_days(),
+            events_days: default_retention_events_days(),
+            snapshots_days: 0,
+        }
+    }
 }
 
 /// Auto-recall configuration for automatic context injection.

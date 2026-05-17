@@ -1,5 +1,6 @@
 //! Hook event handlers.
 
+pub(crate) mod aggregator;
 mod post_tool_use;
 mod pre_compact;
 mod pre_tool_use;

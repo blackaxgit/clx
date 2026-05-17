@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 5;
+pub(super) const SCHEMA_VERSION: i32 = 6;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -68,6 +68,10 @@ impl Storage {
 
             if current_version < 5 {
                 self.migrate_to_v5()?;
+            }
+
+            if current_version < 6 {
+                self.migrate_to_v6()?;
             }
 
             self.conn.execute(
@@ -328,6 +332,41 @@ impl Storage {
 
         tx.commit()?;
         info!("Completed migration to schema version 5 (embedding model identity)");
+        Ok(())
+    }
+
+    /// Migrate to schema version 6.
+    ///
+    /// Adds the `tool_events` table for aggregated mutator-tool invocations
+    /// captured by the `PostToolUse` hook. Each row represents one or more
+    /// invocations of a mutator tool inside a 60-second window for a given
+    /// `(session_id, tool_name, target)` triple.
+    pub(super) fn migrate_to_v6(&self) -> crate::Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS tool_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                target TEXT,
+                summary TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                window_start_unix INTEGER NOT NULL,
+                window_end_unix INTEGER NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS tool_events_session_idx
+                ON tool_events (session_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS tool_events_target_idx
+                ON tool_events (target);
+            ",
+        )?;
+
+        info!("Completed migration to schema version 6 (tool_events table)");
         Ok(())
     }
 }
