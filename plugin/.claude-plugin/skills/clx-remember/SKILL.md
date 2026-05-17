@@ -8,7 +8,6 @@ description: >
   Azure tenant routing", "note that prod uses M-series only". Do NOT use
   for transient state, draft code, speculation, secrets, PII, or large
   in-flight context (use clx-checkpoint for snapshots instead).
-version: 0.8.0
 ---
 
 # clx-remember

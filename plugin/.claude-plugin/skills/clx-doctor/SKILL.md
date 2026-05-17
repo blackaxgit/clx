@@ -9,7 +9,6 @@ description: >
   fallback status". Do NOT invoke for normal "no relevant context"
   outcomes; only for outright failures or recall results that look
   structurally wrong (e.g., wrong model id, missing snapshots).
-version: 0.8.0
 ---
 
 # clx-doctor

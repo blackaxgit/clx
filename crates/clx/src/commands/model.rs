@@ -53,6 +53,17 @@ pub async fn cmd_model(cli: &Cli, action: &ModelAction) -> Result<()> {
     }
 }
 
+/// Required filenames that must exist (with non-zero size) under
+/// `model_dir` before we write the `.ready` sentinel.
+///
+/// fastembed-rs already validates HuggingFace LFS checksums for each
+/// blob it pulls. Our extra guard is a post-download integrity check
+/// that the cache directory actually contains every required artifact,
+/// so a partial / interrupted download cannot be mistaken for a healthy
+/// install.
+const REQUIRED_MODEL_FILES: &[&str] =
+    &["tokenizer.json", "special_tokens_map.json", "config.json"];
+
 /// Fetch the bge-reranker-v2-m3 model into `~/.clx/models/`.
 async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
     let cache_dir = clx_core::paths::model_cache_dir();
@@ -67,7 +78,9 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
     let ready_path =
         model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
 
-    // Early-out: already ready and not forcing.
+    // Early-out: already ready and not forcing. Safe to check before
+    // taking the lock because (a) it's read-only, and (b) if a fetch is
+    // in flight, the sentinel has not been written yet.
     if !force && ready_path.exists() {
         if cli.json {
             println!(
@@ -88,16 +101,10 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // `--force` removes the existing directory so the downloader sees
-    // a clean slate.
-    if force && model_dir.exists() {
-        fs::remove_dir_all(&model_dir)
-            .with_context(|| format!("failed to remove {} for --force", model_dir.display()))?;
-    }
-
     // Background mode: spawn a detached child running this same binary
-    // and return immediately. The child holds the lockfile for the
-    // duration of the actual download.
+    // and return immediately. The child acquires its own lock and
+    // performs the destructive `--force` delete under that lock.
+    // We deliberately do NOT delete here (Issue 3 lock-order fix).
     if background {
         spawn_detached_fetch(force)?;
         if cli.json {
@@ -112,10 +119,28 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Issue 3 fix: acquire the lock BEFORE any destructive operation so
+    // a concurrent background fetch cannot race the `--force` delete.
+    let lock = LockFile::acquire(&cache_dir)?;
+
+    // `--force` removes the existing directory so the downloader sees a
+    // clean slate. Performed under the lock to serialize concurrent
+    // `--force` invocations.
+    if force && model_dir.exists() {
+        fs::remove_dir_all(&model_dir)
+            .with_context(|| format!("failed to remove {} for --force", model_dir.display()))?;
+    }
+
     // Foreground download. Honour a dry-run env var so CI / smoke tests
-    // can exercise the command without performing real network IO.
+    // can exercise the command without performing real network IO. We
+    // stub the required artifacts so the integrity gate passes in
+    // dry-run mode too.
     if std::env::var_os("CLX_MODEL_FETCH_DRYRUN").is_some() {
         fs::create_dir_all(&model_dir).ok();
+        for name in REQUIRED_MODEL_FILES {
+            fs::write(model_dir.join(name), b"dryrun")?;
+        }
+        fs::write(model_dir.join("model.onnx"), b"dryrun")?;
         fs::write(&ready_path, b"dryrun")?;
         if !cli.json {
             println!(
@@ -126,8 +151,6 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
         }
         return Ok(());
     }
-
-    let lock = LockFile::acquire(&cache_dir)?;
 
     if !cli.json {
         println!(
@@ -154,6 +177,20 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
     .context("download task join failed")?;
 
     download_result?;
+
+    // Issue 2 fix: verify the cache directory actually contains every
+    // required artifact (non-zero size) before promoting the install
+    // via `.ready`. fastembed-rs validates per-file LFS checksums during
+    // download; this guard catches the case where some files never
+    // landed at all (e.g. transient HTTP errors swallowed by the
+    // library, or `.tmp` partials left behind).
+    cleanup_partial_downloads(&model_dir);
+    verify_model_dir_complete(&model_dir).with_context(|| {
+        format!(
+            "model integrity check failed at {}; refusing to write .ready",
+            model_dir.display()
+        )
+    })?;
 
     fs::write(&ready_path, b"ready")
         .with_context(|| format!("failed to write {}", ready_path.display()))?;
@@ -281,6 +318,77 @@ fn cmd_list(cli: &Cli) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Verify that `model_dir` contains every required artifact (non-zero
+/// size). Returns `Err` on any missing or empty file. This is the gate
+/// that runs immediately before writing `.ready` so partial downloads
+/// cannot be promoted to a healthy install (Issue 2 from the 0.8.0
+/// Codex audit).
+///
+/// Layering note: this is orchestration-layer policy (CLI knows the
+/// concrete model name and required files). The recall pipeline reads
+/// the `.ready` sentinel and trusts that this guard has run.
+fn verify_model_dir_complete(model_dir: &Path) -> Result<()> {
+    if !model_dir.is_dir() {
+        anyhow::bail!(
+            "model directory missing: {}",
+            model_dir.display()
+        );
+    }
+
+    // The ONNX weights may live at the model root or under `onnx/`,
+    // depending on fastembed version. Either layout is acceptable.
+    let onnx_root = model_dir.join("model.onnx");
+    let onnx_sub = model_dir.join("onnx").join("model.onnx");
+    let onnx_ok = is_nonempty_file(&onnx_root) || is_nonempty_file(&onnx_sub);
+    if !onnx_ok {
+        anyhow::bail!(
+            "missing or empty model.onnx in {} (checked {} and {})",
+            model_dir.display(),
+            onnx_root.display(),
+            onnx_sub.display(),
+        );
+    }
+
+    for name in REQUIRED_MODEL_FILES {
+        let p = model_dir.join(name);
+        if !is_nonempty_file(&p) {
+            anyhow::bail!(
+                "missing or empty required file: {}",
+                p.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Return `true` if `p` exists, is a regular file, and has non-zero
+/// length. Treats any IO error as `false`.
+fn is_nonempty_file(p: &Path) -> bool {
+    fs::metadata(p)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Remove `*.tmp` / `*.part` partial-download files that some HTTP
+/// clients leave behind when interrupted. Best-effort: any IO error is
+/// silently ignored because the verification step that follows will
+/// fail loudly if anything important is missing.
+fn cleanup_partial_downloads(model_dir: &Path) {
+    let Ok(entries) = fs::read_dir(model_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".tmp") || name.ends_with(".part") {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// Spawn a detached child process running `clx model fetch [--force]`.
@@ -443,5 +551,155 @@ mod tests {
         let _ = crate::Cli::parse_from(["clx", "model", "status"]);
         let _ = crate::Cli::parse_from(["clx", "model", "list"]);
         let _ = crate::Cli::parse_from(["clx", "model", "fetch", "--force"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue 2: integrity verification before .ready
+    // -----------------------------------------------------------------
+
+    /// Helper: stage a model directory with all required files at given sizes.
+    fn stage_complete_model(root: &Path) -> PathBuf {
+        let model_dir = root.join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"x").unwrap();
+        for name in REQUIRED_MODEL_FILES {
+            fs::write(model_dir.join(name), b"y").unwrap();
+        }
+        model_dir
+    }
+
+    #[test]
+    fn verify_passes_when_all_required_files_present_at_root() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = stage_complete_model(tmp.path());
+        verify_model_dir_complete(&model_dir).expect("complete dir must verify");
+    }
+
+    #[test]
+    fn verify_passes_when_onnx_under_onnx_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = tmp.path().join("bge-reranker-v2-m3");
+        fs::create_dir_all(model_dir.join("onnx")).unwrap();
+        fs::write(model_dir.join("onnx").join("model.onnx"), b"x").unwrap();
+        for name in REQUIRED_MODEL_FILES {
+            fs::write(model_dir.join(name), b"y").unwrap();
+        }
+        verify_model_dir_complete(&model_dir).expect("subdir onnx must verify");
+    }
+
+    #[test]
+    fn verify_fails_on_missing_tokenizer() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = stage_complete_model(tmp.path());
+        fs::remove_file(model_dir.join("tokenizer.json")).unwrap();
+        let err = verify_model_dir_complete(&model_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("tokenizer.json"),
+            "error must name missing file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_fails_on_missing_model_onnx() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = stage_complete_model(tmp.path());
+        fs::remove_file(model_dir.join("model.onnx")).unwrap();
+        let err = verify_model_dir_complete(&model_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("model.onnx"),
+            "error must mention model.onnx, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_fails_on_zero_length_file() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = stage_complete_model(tmp.path());
+        // Truncate to zero bytes
+        fs::write(model_dir.join("config.json"), b"").unwrap();
+        let err = verify_model_dir_complete(&model_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("config.json"),
+            "error must name empty file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_fails_when_model_dir_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = tmp.path().join("nonexistent");
+        let err = verify_model_dir_complete(&model_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("model directory missing"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_tmp_and_part_files_only() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = stage_complete_model(tmp.path());
+        fs::write(model_dir.join("blob.tmp"), b"partial").unwrap();
+        fs::write(model_dir.join("blob.part"), b"partial").unwrap();
+        let keeper = model_dir.join("config.json");
+        cleanup_partial_downloads(&model_dir);
+        assert!(!model_dir.join("blob.tmp").exists(), "tmp must be removed");
+        assert!(!model_dir.join("blob.part").exists(), "part must be removed");
+        assert!(keeper.exists(), "non-partial files must be preserved");
+    }
+
+    #[test]
+    fn cleanup_on_missing_dir_is_noop() {
+        // Must not panic / not error.
+        let tmp = TempDir::new().unwrap();
+        cleanup_partial_downloads(&tmp.path().join("does-not-exist"));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue 3: lock acquired before --force delete
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn lock_blocks_concurrent_acquire() {
+        // Concrete proof that --force-style deletion under the lock is
+        // serialized: while one lock is held, a second acquire fails.
+        let tmp = TempDir::new().unwrap();
+        let first = LockFile::acquire(tmp.path()).expect("first lock acquires");
+        let second = LockFile::acquire(tmp.path());
+        assert!(
+            second.is_err(),
+            "second acquire must fail while first lock is held"
+        );
+        drop(first);
+        // Now a fresh acquire succeeds.
+        let third = LockFile::acquire(tmp.path()).expect("third acquires after release");
+        drop(third);
+    }
+
+    #[test]
+    fn lock_then_delete_then_restage_simulates_force_flow() {
+        // Simulate the new --force flow: acquire lock, delete model_dir,
+        // recreate, write .ready. Demonstrates that the destructive step
+        // happens while the lock is held (ordering invariant the
+        // production code now enforces).
+        let tmp = TempDir::new().unwrap();
+        let model_dir = stage_complete_model(tmp.path());
+        let ready_path = model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
+
+        let lock = LockFile::acquire(tmp.path()).expect("acquire");
+        // Lock is held: destructive delete is safe.
+        fs::remove_dir_all(&model_dir).unwrap();
+        assert!(!model_dir.exists(), "delete happened under lock");
+        // Re-stage as the real downloader would, then write .ready.
+        let _ = stage_complete_model(tmp.path());
+        verify_model_dir_complete(&model_dir).expect("re-staged dir must verify");
+        fs::write(&ready_path, b"ready").unwrap();
+        drop(lock);
+
+        assert!(ready_path.exists(), ".ready must be written");
+        assert!(
+            !tmp.path().join(".fetch.lock").exists(),
+            "lockfile released on drop"
+        );
     }
 }

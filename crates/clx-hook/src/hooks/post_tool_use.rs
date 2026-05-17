@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clx_core::config::{Config, ContextPressureMode};
 use clx_core::policy::{McpExtraction, extract_mcp_command};
-use clx_core::redaction::redact_secrets;
+use clx_core::redaction::redact_json_value;
 use clx_core::storage::Storage;
 use clx_core::types::{AuditDecision, AuditLogEntry, Event, EventType, ToolEvent, ToolOutcome};
 use tracing::{debug, warn};
@@ -35,14 +35,18 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
     let mut event = Event::new(input.session_id.clone(), EventType::ToolUse);
     event.tool_name.clone_from(&input.tool_name);
     event.tool_use_id = Some(tool_use_id.to_string());
+    // JSON-aware redaction: walks the Value recursively so that
+    // structured secrets like `{"api_key":"plainsecret"}` are scrubbed
+    // even when the secret does not appear as `key=value` in the
+    // stringified form (Issue 1 from the 0.8.0 Codex audit).
     event.tool_input = input
         .tool_input
         .as_ref()
-        .map(|v| redact_secrets(&v.to_string()));
+        .map(|v| redact_json_value(v).to_string());
     event.tool_output = input
         .tool_response
         .as_ref()
-        .map(|v| redact_secrets(&v.to_string()));
+        .map(|v| redact_json_value(v).to_string());
 
     // Store the event
     if let Err(e) = storage.append_event(&event) {

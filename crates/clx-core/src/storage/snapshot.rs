@@ -2,6 +2,7 @@
 //!
 //! Create, read, list, and search snapshots with FTS5 full-text search.
 
+use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Row, params};
 use tracing::{debug, warn};
 
@@ -207,6 +208,32 @@ impl Storage {
         // Clamp to u32 (rows fit comfortably; defensive cast keeps the
         // public surface boolean-arithmetic-friendly).
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Timestamp of the most recent `AutoSummary` snapshot for `session_id`,
+    /// or `Ok(None)` when none exists.
+    ///
+    /// Used by the Stop-hook auto-summary handler as an optimistic-concurrency
+    /// gate: between the moment the handler starts and the moment it persists
+    /// its snapshot, another handler in a parallel Stop event could have
+    /// already written one. Re-reading this timestamp immediately before the
+    /// insert lets the second handler detect the race and skip cleanly,
+    /// preventing duplicate AutoSummary snapshots for the same session/window.
+    pub fn last_auto_summary_at(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<Option<DateTime<Utc>>> {
+        let ts: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(created_at) FROM snapshots \
+                 WHERE session_id = ?1 AND trigger = 'auto_summary'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(ts.map(|s| parse_datetime(&s)))
     }
 
     /// Did any mutating tool fire since the last `AutoSummary` snapshot for

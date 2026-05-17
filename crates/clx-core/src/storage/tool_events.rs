@@ -10,7 +10,7 @@
 //! `clx-hook::hooks::aggregator` (domain / pure). This module is responsible
 //! only for transactional persistence and queries.
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Row, params};
 use tracing::{debug, warn};
 
 use super::Storage;
@@ -26,14 +26,18 @@ impl Storage {
     /// Behaviour:
     /// 1. Ensures the referenced session row exists via `INSERT OR IGNORE`
     ///    (mirrors the FK-safe pattern in `audit.rs`).
-    /// 2. Within a transaction, looks for a recent row matching
-    ///    `(tool_name, target)` whose `window_end_unix >= now - 60`.
-    /// 3. If a match is found, increments `occurrence_count`, advances
-    ///    `window_end_unix` to `now`, and replaces `outcome` and `summary`
-    ///    with the latest values.
-    /// 4. Otherwise, inserts a new row.
+    /// 2. Uses `INSERT ... ON CONFLICT DO UPDATE` (SQLite UPSERT, 3.24+) on
+    ///    the v7 unique index
+    ///    `(session_id, tool_name, IFNULL(target, ''), window_end_unix / 60)`.
+    ///    On conflict, the existing row's `occurrence_count` is incremented
+    ///    and `summary` / `outcome` / `window_end_unix` are replaced with the
+    ///    newer values.
+    /// 3. Returns the row id of the inserted or updated row.
     ///
-    /// Returns the row id of the inserted or updated row.
+    /// Concurrency: the database-level unique index makes this operation
+    /// atomic across processes. Two parallel `clx-hook` writers within the
+    /// same 60-second window will land on a single row with
+    /// `occurrence_count == 2`, not two duplicate rows.
     pub fn append_or_extend_tool_event(&self, ev: &ToolEvent) -> crate::Result<i64> {
         // FK-safe placeholder: matches the proven pattern from `create_audit_log`.
         self.conn.execute(
@@ -42,74 +46,53 @@ impl Storage {
             params![ev.session_id],
         )?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        // Atomic UPSERT keyed on the v7 unique index. The dedup bucket is
+        // `window_end_unix / 60` (integer division on the indexed expression),
+        // which matches the established 60-second window semantics. On
+        // conflict the existing row absorbs the new event:
+        //   occurrence_count += 1
+        //   summary / outcome / window_end_unix <- new values
+        // Note: `window_start_unix` and `created_at` are preserved on the
+        // existing row so the bucket retains its original start time.
+        self.conn.execute(
+            "INSERT INTO tool_events ( \
+                session_id, tool_name, target, summary, outcome, \
+                window_start_unix, window_end_unix, occurrence_count, created_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8) \
+             ON CONFLICT (session_id, tool_name, IFNULL(target, ''), (window_end_unix / 60)) \
+             DO UPDATE SET \
+                occurrence_count = tool_events.occurrence_count + 1, \
+                window_end_unix = excluded.window_end_unix, \
+                outcome = excluded.outcome, \
+                summary = excluded.summary",
+            params![
+                ev.session_id,
+                ev.tool_name,
+                ev.target,
+                ev.summary,
+                ev.outcome.as_str(),
+                ev.window_start_unix,
+                ev.window_end_unix,
+                ev.created_at.to_rfc3339(),
+            ],
+        )?;
 
-        let cutoff = ev.window_end_unix - DEDUP_WINDOW_SECS;
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM tool_events \
-                 WHERE tool_name = ?1 \
-                   AND COALESCE(target, '') = COALESCE(?2, '') \
-                   AND session_id = ?3 \
-                   AND window_end_unix >= ?4 \
-                 ORDER BY id DESC LIMIT 1",
-                params![
-                    ev.tool_name,
-                    ev.target,
-                    ev.session_id,
-                    cutoff,
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let id = if let Some(existing_id) = existing {
-            tx.execute(
-                "UPDATE tool_events \
-                 SET occurrence_count = occurrence_count + 1, \
-                     window_end_unix = ?1, \
-                     outcome = ?2, \
-                     summary = ?3 \
-                 WHERE id = ?4",
-                params![
-                    ev.window_end_unix,
-                    ev.outcome.as_str(),
-                    ev.summary,
-                    existing_id,
-                ],
-            )?;
-            debug!(
-                "Extended tool_event {} (tool={} target={:?})",
-                existing_id, ev.tool_name, ev.target
-            );
-            existing_id
-        } else {
-            tx.execute(
-                "INSERT INTO tool_events ( \
-                    session_id, tool_name, target, summary, outcome, \
-                    window_start_unix, window_end_unix, occurrence_count, created_at \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    ev.session_id,
-                    ev.tool_name,
-                    ev.target,
-                    ev.summary,
-                    ev.outcome.as_str(),
-                    ev.window_start_unix,
-                    ev.window_end_unix,
-                    ev.occurrence_count,
-                    ev.created_at.to_rfc3339(),
-                ],
-            )?;
-            let new_id = tx.last_insert_rowid();
-            debug!(
-                "Inserted tool_event {} (tool={} target={:?})",
-                new_id, ev.tool_name, ev.target
-            );
-            new_id
-        };
-
-        tx.commit()?;
+        // Look up the canonical row id for the dedup bucket. The bucket key
+        // includes a NULL-collapsed target, so we mirror that here.
+        let bucket = ev.window_end_unix / DEDUP_WINDOW_SECS;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM tool_events \
+             WHERE session_id = ?1 \
+               AND tool_name = ?2 \
+               AND IFNULL(target, '') = IFNULL(?3, '') \
+               AND (window_end_unix / 60) = ?4",
+            params![ev.session_id, ev.tool_name, ev.target, bucket],
+            |row| row.get(0),
+        )?;
+        debug!(
+            "Upserted tool_event {} (tool={} target={:?} bucket={})",
+            id, ev.tool_name, ev.target, bucket
+        );
         Ok(id)
     }
 
@@ -251,24 +234,26 @@ mod tests {
 
     #[test]
     fn append_extends_within_60s_window() {
+        // Both events fall in the same minute bucket (1200 / 60 == 1230 / 60 == 20).
         let s = mk_storage();
-        let ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v1", 1_000);
-        let ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v2", 1_030);
+        let ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v1", 1_200);
+        let ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v2", 1_230);
         let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
         let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
         assert_eq!(id1, id2, "second call should extend the same row");
         let rows = s.recent_tool_events_for_session("sess-A", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].occurrence_count, 2);
-        assert_eq!(rows[0].window_end_unix, 1_030);
+        assert_eq!(rows[0].window_end_unix, 1_230);
         assert_eq!(rows[0].summary, "edit foo.rs v2");
     }
 
     #[test]
     fn append_inserts_new_row_outside_60s_window() {
+        // 1_000 / 60 == 16, 1_260 / 60 == 21 — different buckets, separate rows.
         let s = mk_storage();
         let ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v1", 1_000);
-        let ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v2", 1_061);
+        let ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v2", 1_260);
         let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
         let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
         assert_ne!(id1, id2);
@@ -308,12 +293,13 @@ mod tests {
 
     #[test]
     fn append_null_targets_merge_with_each_other() {
+        // Both events in the same minute bucket (1_200 / 60 == 1_220 / 60).
         let s = mk_storage();
-        let ev1 = mk_event("sess-A", "Bash", None, "bash command 1", 1_000);
-        let ev2 = mk_event("sess-A", "Bash", None, "bash command 2", 1_020);
+        let ev1 = mk_event("sess-A", "Bash", None, "bash command 1", 1_200);
+        let ev2 = mk_event("sess-A", "Bash", None, "bash command 2", 1_220);
         s.append_or_extend_tool_event(&ev1).unwrap();
         s.append_or_extend_tool_event(&ev2).unwrap();
-        // COALESCE(NULL,'') = COALESCE(NULL,'') -> merge.
+        // IFNULL(NULL,'') = IFNULL(NULL,'') -> merge.
         assert_eq!(s.count_tool_events("sess-A").unwrap(), 1);
         let rows = s.recent_tool_events_for_session("sess-A", 10).unwrap();
         assert_eq!(rows[0].occurrence_count, 2);
@@ -342,12 +328,13 @@ mod tests {
 
     #[test]
     fn outcome_is_replaced_on_extend() {
+        // Both events in the same minute bucket (1_200 / 60 == 1_230 / 60).
         let s = mk_storage();
-        let mut ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "v1", 1_000);
+        let mut ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "v1", 1_200);
         ev1.outcome = ToolOutcome::Success;
         s.append_or_extend_tool_event(&ev1).unwrap();
 
-        let mut ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "v2", 1_030);
+        let mut ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "v2", 1_230);
         ev2.outcome = ToolOutcome::Error;
         s.append_or_extend_tool_event(&ev2).unwrap();
 
@@ -444,6 +431,91 @@ mod tests {
     fn count_tool_events_for_unknown_session_is_zero() {
         let s = mk_storage();
         assert_eq!(s.count_tool_events("ghost").unwrap(), 0);
+    }
+
+    /// v7 regression: a second event in the same minute bucket lands on the
+    /// same row via UPSERT — only `occurrence_count` is incremented.
+    #[test]
+    fn upsert_idempotent_within_window() {
+        let s = mk_storage();
+        let ev1 = mk_event("sess-A", "Edit", Some("src/a.rs"), "v1", 1_200);
+        let ev2 = mk_event("sess-A", "Edit", Some("src/a.rs"), "v2", 1_240);
+        let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
+        let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
+        assert_eq!(id1, id2, "UPSERT must hit the same row inside the bucket");
+        assert_eq!(s.count_tool_events("sess-A").unwrap(), 1);
+        let rows = s.recent_tool_events_for_session("sess-A", 10).unwrap();
+        assert_eq!(rows[0].occurrence_count, 2);
+    }
+
+    /// v7 regression: a second event in a different minute bucket inserts a
+    /// new row (no conflict on the unique index).
+    #[test]
+    fn upsert_new_window_inserts() {
+        let s = mk_storage();
+        let ev1 = mk_event("sess-A", "Edit", Some("src/a.rs"), "v1", 1_200);
+        // 1_260 / 60 == 21, different bucket from 1_200 / 60 == 20.
+        let ev2 = mk_event("sess-A", "Edit", Some("src/a.rs"), "v2", 1_260);
+        let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
+        let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
+        assert_ne!(id1, id2);
+        assert_eq!(s.count_tool_events("sess-A").unwrap(), 2);
+    }
+
+    /// v7 regression: distinct `target` values are distinct under the unique
+    /// index, even within the same minute bucket.
+    #[test]
+    fn upsert_distinct_targets() {
+        let s = mk_storage();
+        let ev1 = mk_event("sess-A", "Edit", Some("src/a.rs"), "v1", 1_200);
+        let ev2 = mk_event("sess-A", "Edit", Some("src/b.rs"), "v2", 1_210);
+        s.append_or_extend_tool_event(&ev1).unwrap();
+        s.append_or_extend_tool_event(&ev2).unwrap();
+        assert_eq!(s.count_tool_events("sess-A").unwrap(), 2);
+    }
+
+    /// v7 regression: two events with NULL `target` in the same bucket
+    /// collapse to one row via the `IFNULL(target, '')` index expression.
+    #[test]
+    fn upsert_null_target_merges() {
+        let s = mk_storage();
+        let ev1 = mk_event("sess-A", "Bash", None, "cmd 1", 1_200);
+        let ev2 = mk_event("sess-A", "Bash", None, "cmd 2", 1_240);
+        let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
+        let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(s.count_tool_events("sess-A").unwrap(), 1);
+        let rows = s.recent_tool_events_for_session("sess-A", 10).unwrap();
+        assert_eq!(rows[0].occurrence_count, 2);
+    }
+
+    /// v7 regression: simulate two parallel writers landing in the same
+    /// dedup bucket. Each opens its own `Storage` handle against a shared
+    /// SQLite database file; the UNIQUE INDEX + UPSERT must collapse both
+    /// inserts into a single row with `occurrence_count == 2`, never two
+    /// duplicate rows. This is the property that broke under v6 (SELECT-
+    /// then-INSERT race).
+    #[test]
+    fn upsert_concurrent_simulated() {
+        // Use a shared on-disk database to allow two distinct Storage handles
+        // to participate in the same dedup scope (in-memory connections are
+        // private to a single Connection).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("clx.db");
+        let s1 = Storage::open(&db_path).expect("open s1");
+        let s2 = Storage::open(&db_path).expect("open s2");
+
+        let ev1 = mk_event("sess-race", "Edit", Some("src/race.rs"), "writer A", 1_200);
+        let ev2 = mk_event("sess-race", "Edit", Some("src/race.rs"), "writer B", 1_240);
+
+        // Two writers, two handles, same bucket.
+        s1.append_or_extend_tool_event(&ev1).unwrap();
+        s2.append_or_extend_tool_event(&ev2).unwrap();
+
+        // The unique index must collapse both writes to exactly one row.
+        let rows = s1.recent_tool_events_for_session("sess-race", 10).unwrap();
+        assert_eq!(rows.len(), 1, "concurrent writers must produce a single row");
+        assert_eq!(rows[0].occurrence_count, 2);
     }
 
     #[test]

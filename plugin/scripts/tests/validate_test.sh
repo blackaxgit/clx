@@ -60,7 +60,6 @@ make_skill() {
 name: $name
 description: >
   $desc
-version: 0.8.0
 ---
 
 # $name
@@ -87,8 +86,7 @@ write_manifest() {
                 printf ', "./skills/%s"' "$s"
             fi
         done
-        printf '],\n'
-        printf '  "mcp_servers": {}\n'
+        printf ']\n'
         printf '}\n'
     } > "$path"
 }

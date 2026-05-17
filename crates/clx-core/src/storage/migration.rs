@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 6;
+pub(super) const SCHEMA_VERSION: i32 = 7;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -72,6 +72,10 @@ impl Storage {
 
             if current_version < 6 {
                 self.migrate_to_v6()?;
+            }
+
+            if current_version < 7 {
+                self.migrate_to_v7()?;
             }
 
             self.conn.execute(
@@ -367,6 +371,32 @@ impl Storage {
         )?;
 
         info!("Completed migration to schema version 6 (tool_events table)");
+        Ok(())
+    }
+
+    /// Migrate to schema version 7.
+    ///
+    /// Adds a UNIQUE INDEX on `tool_events` over the deduplication key
+    /// `(session_id, tool_name, IFNULL(target, ''), window_end_unix / 60)`.
+    ///
+    /// Rationale: the v6 `append_or_extend_tool_event` implementation used a
+    /// SELECT-then-UPDATE-or-INSERT pattern inside a deferred transaction with
+    /// no UNIQUE constraint. Two parallel `clx-hook` processes could both
+    /// observe "no recent row" inside the same 60s window and both INSERT,
+    /// creating duplicate rows. With this unique index in place,
+    /// `append_or_extend_tool_event` can use SQLite's atomic
+    /// `INSERT ... ON CONFLICT DO UPDATE` (UPSERT) so the database itself is
+    /// the source of truth for dedup.
+    ///
+    /// `IFNULL(target, '')` inside the index expression collapses NULLs to
+    /// the empty string so two events with a NULL target merge into one row
+    /// (otherwise SQLite would treat NULLs as distinct in UNIQUE indexes).
+    pub(super) fn migrate_to_v7(&self) -> crate::Result<()> {
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS tool_events_dedup_idx \
+                ON tool_events (session_id, tool_name, IFNULL(target, ''), (window_end_unix / 60));",
+        )?;
+        info!("Completed migration to schema version 7 (tool_events dedup unique index)");
         Ok(())
     }
 }

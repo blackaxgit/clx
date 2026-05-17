@@ -8,7 +8,6 @@ description: >
   "what did we decide about retries". Do NOT use for current-session
   context (already in the transcript), real-time data, or web search; do
   not use for secrets retrieval.
-version: 0.8.0
 ---
 
 # clx-recall

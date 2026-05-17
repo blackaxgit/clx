@@ -33,10 +33,10 @@ regex.workspace = true
 sha2 = "0.10"
 hex = "0.4"
 
-# Reranker (D2). Pinned at 4.x; capture exact in Cargo.lock after first build.
-# Disable default features to keep the dependency footprint small; we only
-# need TextRerank which the crate exposes without optional features by default.
-fastembed = "4"
+# Reranker (D2). Pinned at 5.x (ort 2.0 stable, &mut self rerank). Capture
+# exact in Cargo.lock after first build. Default features are sufficient for
+# TextRerank; we do not enable any optional GPU/CUDA features.
+fastembed = "5"
 
 [lints]
 workspace = true
@@ -50,8 +50,9 @@ insta = { version = "1", features = ["yaml", "json", "redactions"] }
 proptest = "1.5"
 tokio = { version = "1", features = ["full"] }
 # D4: RAGAS-style recall accuracy bench (`cargo bench --bench recall_accuracy`).
-# Dev-dep only; never enters the runtime crate graph.
-criterion = "0.5"
+# Dev-dep only; never enters the runtime crate graph. 0.8 uses
+# `std::hint::black_box`; we do not import the removed `criterion::black_box`.
+criterion = "0.8"
 
 [[bench]]
 name = "recall_accuracy"

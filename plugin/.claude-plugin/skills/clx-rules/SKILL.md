@@ -8,7 +8,6 @@ description: >
   coding rules apply", "refresh project rules", "remind me of the commit
   convention". Do NOT invoke at the start of every turn; rules are
   already injected via CLAUDE.md on session start.
-version: 0.8.0
 ---
 
 # clx-rules

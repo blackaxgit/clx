@@ -23,6 +23,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use clx_core::config::{AutoSummarizeConfig, Capability, Config};
 use clx_core::storage::Storage;
 use clx_core::summarize::{TurnSlice, summarize_turns};
@@ -54,6 +55,10 @@ pub(crate) async fn handle_stop_auto_summary(input: HookInput) -> Result<()> {
 }
 
 async fn run_inner(input: HookInput) -> Result<()> {
+    // Capture the moment this handler started. Used as the optimistic-
+    // concurrency reference point for the duplicate-snapshot guard below.
+    let started_at = Utc::now();
+
     let config = Config::load().unwrap_or_default();
     if !config.memory.auto_summarize.enabled {
         debug!("auto-summary: disabled in config, skipping");
@@ -129,6 +134,28 @@ async fn run_inner(input: HookInput) -> Result<()> {
             return Ok(());
         }
     };
+
+    // Optimistic-concurrency gate: re-fetch the last AutoSummary timestamp
+    // immediately before persisting. If another Stop-hook handler ran in
+    // parallel and already wrote a snapshot after this handler started,
+    // skip writing to avoid duplicate AutoSummary snapshots for the same
+    // session/window. Storage::create_snapshot is the boundary we cannot
+    // wrap in a single SQL statement; this check is the tightest possible
+    // re-read before the insert.
+    match storage.last_auto_summary_at(session_id) {
+        Ok(Some(last)) if last >= started_at => {
+            debug!(
+                "auto-summary: another handler wrote a snapshot at {} after this handler started at {}; skipping",
+                last, started_at
+            );
+            return Ok(());
+        }
+        Ok(_) => { /* no concurrent writer; proceed */ }
+        Err(e) => {
+            // Conservative on query failure: proceed rather than silently skip.
+            warn!("auto-summary: duplicate-snapshot guard query failed: {e}");
+        }
+    }
 
     let mut snap = Snapshot::new(input.session_id.clone(), SnapshotTrigger::AutoSummary);
     snap.summary = Some(summary);

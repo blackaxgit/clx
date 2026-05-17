@@ -2,7 +2,14 @@
 //!
 //! Provides [`redact_secrets`] which scrubs known secret patterns from text
 //! before it is logged, persisted, or displayed. Uses simple prefix-based and
-//! keyword-based matching — no regex dependency required.
+//! keyword-based matching, no regex dependency required.
+//!
+//! Also provides [`redact_json_value`] which walks a `serde_json::Value`
+//! recursively, redacting (a) values whose key matches a sensitive pattern
+//! (api_key, password, secret, token, authorization, credential, ...), and
+//! (b) string leaves that contain a known secret pattern.
+
+use serde_json::Value;
 
 /// Redact known secret patterns from text before logging.
 ///
@@ -185,6 +192,80 @@ pub fn redact_secrets(text: &str) -> String {
     redacted
 }
 
+// =============================================================================
+// JSON-aware redaction
+// =============================================================================
+
+/// Substring patterns (case-insensitive) that mark an object KEY as carrying a
+/// secret value. Any key whose lowercased form contains one of these patterns
+/// will have its associated value replaced with `"***REDACTED***"`.
+///
+/// Kept as a `&[&str]` (not regex) so the cost is a handful of `contains()`
+/// calls per object key — cheap enough to run in a hot hook path.
+const SENSITIVE_KEY_PATTERNS: &[&str] = &[
+    "api_key",
+    "api-key",
+    "apikey",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "authorization",
+    "auth_token",
+    "auth-token",
+    "credential",
+    "private_key",
+    "private-key",
+    "access_key",
+    "access-key",
+    "session_key",
+    "session-key",
+    "client_secret",
+    "client-secret",
+    "bearer",
+];
+
+/// Return `true` if `key` looks sensitive under case-insensitive substring
+/// matching against [`SENSITIVE_KEY_PATTERNS`].
+#[must_use]
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    SENSITIVE_KEY_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Walk a `serde_json::Value` recursively and redact secrets.
+///
+/// Rules:
+/// - `Object`: if a key matches [`is_sensitive_key`], its value is replaced
+///   with `"***REDACTED***"` regardless of variant. Otherwise the value is
+///   recursed into.
+/// - `Array`: each element is recursed into.
+/// - `String`: routed through [`redact_secrets`] so inline secrets (e.g.
+///   `Bearer ...`, `sk-...`, `export SECRET=...`) are scrubbed.
+/// - `Number`, `Bool`, `Null`: passed through unchanged.
+///
+/// This is a pure function: no IO, no panics, no allocation amplification
+/// beyond the size of the input.
+#[must_use]
+pub fn redact_json_value(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if is_sensitive_key(k) {
+                    out.insert(k.clone(), Value::String("***REDACTED***".to_string()));
+                } else {
+                    out.insert(k.clone(), redact_json_value(val));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_json_value).collect()),
+        Value::String(s) => Value::String(redact_secrets(s)),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +424,153 @@ mod tests {
         let redacted = redact_secrets(input);
         assert!(!redacted.contains("aaa"), "got: {redacted}");
         assert!(!redacted.contains("bbb"), "got: {redacted}");
+    }
+
+    // =========================================================================
+    // JSON-aware redaction (Issue 1: JSON-structured secrets bypass)
+    // =========================================================================
+
+    use serde_json::json;
+
+    #[test]
+    fn test_redact_json_object_sensitive_key() {
+        let v = json!({"api_key": "plainsecretvalue", "name": "alice"});
+        let r = redact_json_value(&v);
+        assert_eq!(r["api_key"], json!("***REDACTED***"));
+        assert_eq!(r["name"], json!("alice"));
+    }
+
+    #[test]
+    fn test_redact_json_case_insensitive_keys() {
+        let v = json!({
+            "API_KEY": "secret1",
+            "Password": "secret2",
+            "AuthToken": "secret3",
+            "AUTHORIZATION": "Bearer abc"
+        });
+        let r = redact_json_value(&v);
+        assert_eq!(r["API_KEY"], json!("***REDACTED***"));
+        assert_eq!(r["Password"], json!("***REDACTED***"));
+        assert_eq!(r["AuthToken"], json!("***REDACTED***"));
+        assert_eq!(r["AUTHORIZATION"], json!("***REDACTED***"));
+    }
+
+    #[test]
+    fn test_redact_json_nested_objects() {
+        let v = json!({
+            "request": {
+                "headers": {
+                    "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.x.y"
+                },
+                "body": {"safe_field": "ok"}
+            }
+        });
+        let r = redact_json_value(&v);
+        assert_eq!(r["request"]["headers"]["authorization"], json!("***REDACTED***"));
+        assert_eq!(r["request"]["body"]["safe_field"], json!("ok"));
+    }
+
+    #[test]
+    fn test_redact_json_array_of_objects() {
+        let v = json!([
+            {"api_key": "sec1", "id": 1},
+            {"api_key": "sec2", "id": 2}
+        ]);
+        let r = redact_json_value(&v);
+        assert_eq!(r[0]["api_key"], json!("***REDACTED***"));
+        assert_eq!(r[1]["api_key"], json!("***REDACTED***"));
+        assert_eq!(r[0]["id"], json!(1));
+    }
+
+    #[test]
+    fn test_redact_json_string_leaf_contains_secret_pattern() {
+        // A plain string value (not under a sensitive key) that itself
+        // contains a known secret pattern must still be scrubbed by the
+        // string-level pass.
+        let v = json!({"log": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.AAA.BBB"});
+        let r = redact_json_value(&v);
+        let s = r["log"].as_str().unwrap();
+        assert!(s.contains("Bearer ***REDACTED***"), "got: {s}");
+    }
+
+    #[test]
+    fn test_redact_json_empty_object_and_array() {
+        assert_eq!(redact_json_value(&json!({})), json!({}));
+        assert_eq!(redact_json_value(&json!([])), json!([]));
+        assert_eq!(redact_json_value(&json!(null)), json!(null));
+    }
+
+    #[test]
+    fn test_redact_json_non_string_types_passthrough() {
+        let v = json!({"count": 42, "ok": true, "ratio": 1.5, "missing": null});
+        let r = redact_json_value(&v);
+        assert_eq!(r["count"], json!(42));
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["ratio"], json!(1.5));
+        assert_eq!(r["missing"], json!(null));
+    }
+
+    #[test]
+    fn test_redact_json_deeply_nested_five_levels() {
+        let v = json!({
+            "a": {"b": {"c": {"d": {"secret": "deeplyhiddenvalue"}}}}
+        });
+        let r = redact_json_value(&v);
+        assert_eq!(
+            r["a"]["b"]["c"]["d"]["secret"],
+            json!("***REDACTED***")
+        );
+    }
+
+    #[test]
+    fn test_redact_json_sensitive_key_redacts_non_string_value() {
+        // Even if a sensitive key carries an object (e.g. a serialized
+        // credential blob), the whole value must be redacted to prevent
+        // partial exposure of nested fields.
+        let v = json!({"credentials": {"user": "alice", "pass": "hunter2"}});
+        let r = redact_json_value(&v);
+        assert_eq!(r["credentials"], json!("***REDACTED***"));
+    }
+
+    #[test]
+    fn test_redact_json_mixed_array_strings_and_objects() {
+        let v = json!([
+            "plain string",
+            "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+            {"token": "secrettoken"},
+            42
+        ]);
+        let r = redact_json_value(&v);
+        assert_eq!(r[0], json!("plain string"));
+        let scrubbed = r[1].as_str().unwrap();
+        assert!(scrubbed.contains("sk-***REDACTED***"), "got: {scrubbed}");
+        assert_eq!(r[2]["token"], json!("***REDACTED***"));
+        assert_eq!(r[3], json!(42));
+    }
+
+    #[test]
+    fn test_redact_json_preserves_safe_keys() {
+        let v = json!({
+            "file_path": "/tmp/foo.rs",
+            "command": "ls -la",
+            "count": 7
+        });
+        let r = redact_json_value(&v);
+        assert_eq!(r, v, "non-sensitive payload must round-trip unchanged");
+    }
+
+    #[test]
+    fn test_redact_json_partial_match_in_key() {
+        // Keys like "github_token", "x-api-key", "client_secret_id" must
+        // all be considered sensitive via substring matching.
+        let v = json!({
+            "github_token": "ghp_xxx",
+            "x-api-key": "abc",
+            "client_secret_id": "def"
+        });
+        let r = redact_json_value(&v);
+        assert_eq!(r["github_token"], json!("***REDACTED***"));
+        assert_eq!(r["x-api-key"], json!("***REDACTED***"));
+        assert_eq!(r["client_secret_id"], json!("***REDACTED***"));
     }
 }

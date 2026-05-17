@@ -8,7 +8,6 @@ description: >
   off on the Azure fallback", "continue the dashboard refactor". Do NOT
   use to start brand-new work, or to auto-replay prior steps without
   user confirmation; recalled context may be stale.
-version: 0.8.0
 ---
 
 # clx-resume

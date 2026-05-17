@@ -8,7 +8,6 @@ description: >
   "snapshot the current state before migration", "save context before
   squash". Do NOT use on every assistant turn (that is auto-summarize, off
   by default), or for single small facts (use clx-remember instead).
-version: 0.8.0
 ---
 
 # clx-checkpoint

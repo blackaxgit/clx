@@ -2,6 +2,8 @@
   "name": "clx",
   "version": "0.8.0",
   "description": "CLX persistent memory for Claude Code: cross-session recall, durable facts, pre-change checkpoints, project rules, resume protocol, and recall diagnostics. Discoverable as six narrow named skills (not generic 'memory' triggers).",
+  "author": "CLX Contributors",
+  "license": "MPL-2.0",
   "homepage": "https://github.com/blackax/clx",
   "skills": [
     "./skills/clx-recall",
@@ -10,6 +12,5 @@
     "./skills/clx-rules",
     "./skills/clx-resume",
     "./skills/clx-doctor"
-  ],
-  "mcp_servers": {}
+  ]
 }
