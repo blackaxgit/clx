@@ -32,8 +32,8 @@ use std::process;
 use tracing_subscriber::EnvFilter;
 
 use commands::{
-    ConfigAction, CredentialsAction, EmbeddingsAction, MaintenanceAction, ModelAction, RulesAction,
-    TrustAction,
+    ConfigAction, ConfigTrustAction, CredentialsAction, EmbeddingsAction, MaintenanceAction,
+    ModelAction, RulesAction, TrustAction,
 };
 
 /// CLX - Claude Code Extension
@@ -121,6 +121,15 @@ enum Commands {
         action: TrustAction,
     },
 
+    /// Manage trusted per-project config files (~/.clx/trusted_configs.json).
+    /// Trusted configs are allowed to set non-inert keys (providers.*,
+    /// logging.file, validator.enabled). Trust is per-machine, per-user,
+    /// per-file-hash; any edit invalidates it.
+    ConfigTrust {
+        #[command(subcommand)]
+        action: ConfigTrustAction,
+    },
+
     /// Check CLX system health
     Health {
         /// Output as JSON
@@ -201,6 +210,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
         }
         Some(Commands::Embeddings { action }) => commands::cmd_embeddings(cli, action).await,
         Some(Commands::Trust { action }) => commands::cmd_trust(cli, action.clone()).await,
+        Some(Commands::ConfigTrust { action }) => commands::cmd_config_trust(cli, action.clone()),
         Some(Commands::Health { json }) => commands::health::cmd_health(*json || cli.json).await,
         Some(Commands::Dashboard { days, refresh }) => dashboard::run_dashboard(*days, *refresh)
             .map_err(|e| anyhow::anyhow!("Dashboard error: {e}")),

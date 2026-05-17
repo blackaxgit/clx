@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/ui/detail.rs
+expression: rendered
+---
+┌ Session Detail: 23456789 ────────────────────────────────────────────────────────────────────────┐
+│ Info • Commands • Audit • Snapshots                                                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Commands (3) ────────────────────────────────────────────────────────────────────────────────────↑
+│  Time       Decision   Risk   Layer        Command                                               █
+│                                                                                                  █
+│→ 22:13:30   allowed    1      builtin      ls -la /tmp                                           █
+│  22:13:40   blocked    9      builtin      rm -rf /tmp/foo                                       █
+│  22:13:50   prompted   6      builtin      git push --force                                      █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  ║
+│                                                                                                  ║
+└──────────────────────────────────────────────────────────────────────────────────────────────────↓
+┌ Detail ──────────────────────────────────────────────────────────────────────────────────────────┐
+│Command: ls -la /tmp                                                                              │
+│Decision: allowed  Risk: 1  Layer: builtin                                                        │
+│Reason: matched whitelist pattern                                                                 │
+│Working Dir: /home/user/project                                                                   │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Tab:switch  j/k:select  PgUp/Dn  g/G:top/bottom  r:refresh  Esc:back  1-4:tab

@@ -1,0 +1,42 @@
+# cargo-mutants configuration for CLX
+#
+# Pinned to cargo-mutants v27 schema (see .github/workflows/mutants.yml).
+# This file scopes mutation testing to the five "hot" modules where a silent
+# mutation would corrupt retrieval ranking, provider fallback, schema
+# migrations, the MCP allow/deny boundary, or the secret redactor.
+#
+# References:
+#   - specs/2026-05-05-0.8.0-memory-skills-coverage-design.md (section 3.9)
+#   - specs/plans/0.8.0-E-coverage-mutation-trust.md (E2, E1.W5)
+#   - docs/mutation-testing.md (rationale per module, kill-rate target)
+#
+# Target kill rate per module: 80% (industry default). 100% is not aspirational
+# (some mutants are equivalent; chasing them produces test-suite gold-plating
+# without correctness gain). Equivalent mutants discovered during triage are
+# added to `exclude_re` below with a one-line justification.
+
+# Allow a generous wall-clock budget per mutant. Mutation runs rebuild and
+# re-test each variant, so the slowest legitimate test in the suite must fit
+# inside `minimum_test_timeout` even after instrumentation overhead.
+timeout_multiplier = 2.0
+minimum_test_timeout = 60
+
+# Only mutate the hot modules. Regexes match the path of each source file
+# relative to the workspace root.
+examine_re = [
+    "crates/clx-core/src/recall/mod\\.rs",
+    "crates/clx-core/src/recall/rrf\\.rs",
+    "crates/clx-core/src/recall/decay\\.rs",
+    "crates/clx-core/src/llm/fallback\\.rs",
+    "crates/clx-core/src/storage/migration\\.rs",
+    "crates/clx-core/src/policy/mcp\\.rs",
+    "crates/clx-core/src/redaction\\.rs",
+]
+
+# Never mutate test code: test files cannot validate themselves, and mutating
+# them produces meaningless survivors. `examine_re` already restricts the set;
+# `exclude_re` is the second-line filter for any nested test modules.
+exclude_re = [
+    ".*tests?\\.rs",
+    "crates/.+/tests/.+",
+]

@@ -1,0 +1,172 @@
+# Mutation testing (PR-diff) for CLX hot modules.
+#
+# Runs cargo-mutants v27 only on the slice of the diff that touches a hot
+# module (recall/{mod,rrf,decay}, llm/fallback, storage/migration,
+# policy/mcp, redaction). This keeps the PR feedback loop fast while still
+# auditing assertion quality on the most security-critical and
+# logic-dense files.
+#
+# Mode: warn-only in 0.8.0 (continue-on-error: true). The gate flips to
+# hard-fail in 0.8.1 once the baseline stabilizes at >= 80% kill rate; see
+# specs/plans/0.8.0-E-coverage-mutation-trust.md sub-phase E4.
+#
+# Version pin: cargo-mutants 27 (current as of 2026-05). Schema differences
+# from v26 (e.g., `examine_globs` -> `examine_re`) live in mutants.toml.
+#
+# Security: `github.base_ref` and `github.head_ref` are attacker-controlled
+# in fork PRs (branch names can carry shell meta-characters), so they are
+# never interpolated directly into `run:` blocks. They reach the shell only
+# via environment variables, where they are quoted naturally.
+
+name: Mutation Testing (PR diff)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/clx-core/src/recall/**"
+      - "crates/clx-core/src/llm/**"
+      - "crates/clx-core/src/storage/migration.rs"
+      - "crates/clx-core/src/policy/**"
+      - "crates/clx-core/src/redaction.rs"
+      - "mutants.toml"
+      - ".github/workflows/mutants-pr.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  mutants-pr:
+    name: cargo mutants (PR diff)
+    runs-on: ubuntu-latest
+    # PR-diff mutation runs are bounded by the diff size; in practice
+    # 5-25 mutants per PR. 60 min cap protects against runaway diffs.
+    timeout-minutes: 60
+    # Warn-only in 0.8.0. Flip to false in 0.8.1 once baseline holds.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Mutation diff needs the merge base to compute --in-diff.
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants v27
+        run: cargo install cargo-mutants --version '^27' --locked
+
+      - name: Print cargo-mutants version
+        run: cargo mutants --version
+
+      # Compute the diff against the PR base branch and feed it to
+      # `cargo mutants --in-diff`. v27 reads a unified diff file and only
+      # mutates lines whose ownership changed, drastically shrinking the
+      # mutant set for incremental changes.
+      #
+      # BASE_REF is read from env, never interpolated into the shell, to
+      # neutralize any shell meta-characters in attacker-controlled branch
+      # names on fork PRs.
+      - name: Compute diff against base branch
+        id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          diff_file="$RUNNER_TEMP/pr.diff"
+          git diff "origin/${BASE_REF}"...HEAD -- \
+            'crates/clx-core/src/recall/**' \
+            'crates/clx-core/src/llm/**' \
+            'crates/clx-core/src/storage/migration.rs' \
+            'crates/clx-core/src/policy/**' \
+            'crates/clx-core/src/redaction.rs' > "$diff_file"
+          lines=$(wc -l < "$diff_file" | tr -d ' ')
+          echo "diff_file=$diff_file" >> "$GITHUB_OUTPUT"
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+          echo "Diff size (lines): $lines"
+
+      - name: Skip when diff is empty
+        if: steps.diff.outputs.lines == '0'
+        run: echo "No hot-module changes in this PR; skipping mutation run."
+
+      # --check-only validates the mutation set is generatable without
+      # actually building each variant. This is the fast PR signal; full
+      # build+test of each mutant lives in the weekly baseline workflow.
+      # Run only when the diff is non-empty. The diff file path comes from
+      # a step output (server-controlled, safe to interpolate).
+      - name: Run cargo mutants on PR diff
+        id: mutants
+        if: steps.diff.outputs.lines != '0'
+        continue-on-error: true
+        env:
+          DIFF_FILE: ${{ steps.diff.outputs.diff_file }}
+        run: |
+          cargo mutants \
+            --in-place \
+            --check-only \
+            --no-shuffle \
+            --in-diff "$DIFF_FILE" \
+            --output target/mutants
+
+      - name: Summarize PR results
+        id: summary
+        if: always() && steps.diff.outputs.lines != '0'
+        env:
+          DIFF_LINES: ${{ steps.diff.outputs.lines }}
+        run: |
+          missed_file="target/mutants/missed.txt"
+          if [ -f "$missed_file" ]; then
+            missed_count=$(wc -l < "$missed_file" | tr -d ' ')
+          else
+            missed_count=0
+          fi
+          echo "missed=$missed_count" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Mutation testing (PR diff)"
+            echo ""
+            echo "Hot-module lines changed: $DIFF_LINES"
+            echo "Missed mutants: **$missed_count**"
+            echo ""
+            if [ -f "$missed_file" ] && [ "$missed_count" -gt 0 ]; then
+              echo "<details><summary>missed.txt</summary>"
+              echo ""
+              echo '```'
+              head -n 100 "$missed_file"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+              echo "_Warn-only in 0.8.0. The gate hard-fails in 0.8.1; see specs/plans/0.8.0-E-coverage-mutation-trust.md._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload missed.txt artifact
+        if: always() && steps.diff.outputs.lines != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-pr-missed
+          path: target/mutants/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Annotate PR with summary
+        if: steps.summary.outputs.missed != '' && fromJSON(steps.summary.outputs.missed) > 0
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Mutation testing (PR diff) found **${{ steps.summary.outputs.missed }} surviving mutants** in hot modules.
+
+            Artifact: `mutants-pr-missed` on this run.
+
+            Warn-only in 0.8.0. The gate hard-fails in 0.8.1; see `docs/mutation-testing.md`.

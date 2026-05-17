@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/settings/render.rs
+expression: rendered
+---
+┌ Sections ──────────┐┌ Validator - <CONFIG_PATH> ───────────────────────────────↑                  
+│> Validator         ││Field                    Value                      Default                 █
+│  Context           ││                                                                            █
+│  LLM               ││enabled                  true                       true                    █
+│  User Learning     ││layer1_enabled           true                       true                    █
+│  Logging           ││layer1_timeout_ms        30000                      30000                   █
+│  Ctx Pressure      ││default_decision         ask                        ask                     █
+│  Sess Recovery     ││trust_mode               false                      false                   █
+│  MCP Tools         ││auto_allow_reads         true                       true                    █
+│  Auto Recall       ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││       ┌ Reset All Changes ───────────────────┐                             █
+│                    ││       │Revert all changes to last saved?     │                             █
+│                    ││       │                                      │                             █
+│                    ││       │[y] Yes   [n/Esc] No                  │                             █
+│                    ││       └──────────────────────────────────────┘                             █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────↓

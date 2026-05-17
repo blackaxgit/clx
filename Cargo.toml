@@ -114,3 +114,8 @@ similar_names = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# Excluded from coverage: scaffolded reducer files (B2 wiring pending in
+# Wave 3-N) and shell-only main() in clx-hook binary.
+[workspace.metadata.cargo-llvm-cov]
+ignore-filename-regex = "(dashboard/event\\.rs|main\\.rs|dashboard/runtime\\.rs)"

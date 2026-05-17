@@ -46,6 +46,7 @@
 //! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
 pub(crate) mod project;
+pub mod trust;
 
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -1044,7 +1045,11 @@ impl Config {
             crate::config::project::project_config_path_with_stop(home_boundary.as_deref())
             && let Ok(raw) = fs::read_to_string(&proj)
         {
-            let filtered = crate::config::project::filter_inert_only(&raw);
+            // Trust-gated filter (§3.11): if the file hash is in the user's
+            // ~/.clx/trusted_configs.json, the raw YAML is honored. Otherwise
+            // non-inert keys (providers.*, logging.file, validator.enabled)
+            // are stripped before merge.
+            let filtered = crate::config::project::apply_project_layer(&raw, &proj);
             if !filtered.is_empty() {
                 fig = fig.merge(Yaml::string(&filtered));
             }

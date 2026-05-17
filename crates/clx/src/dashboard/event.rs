@@ -16,7 +16,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::DefaultTerminal;
 
 use super::app::{App, DashboardTab, DetailTab, ExitTarget, InputMode, ScreenState};
@@ -37,13 +37,36 @@ pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Resu
             .checked_sub(app.last_refresh.elapsed())
             .unwrap_or(Duration::ZERO);
 
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-        {
-            handle_key_event(app, key);
+        if event::poll(timeout)? {
+            match event::read()? {
+                // Ctrl-C is mapped to the reducer's explicit Quit event so
+                // the runtime treats it identically to pressing `q`. This is
+                // safer than relying on every input-mode branch to handle
+                // the chord.
+                Event::Key(key)
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    handle_dashboard_event(app, DashboardEvent::Quit);
+                }
+                Event::Key(key) => {
+                    handle_dashboard_event(app, DashboardEvent::Key(key));
+                }
+                Event::Resize(cols, rows) => {
+                    // Resize is currently a reducer no-op (layout is derived
+                    // per frame), but routing it through the reducer keeps
+                    // the runtime free of branching logic and exercises the
+                    // variant so it stays alive for future use.
+                    handle_dashboard_event(app, DashboardEvent::Resize(cols, rows));
+                }
+                _ => {}
+            }
         }
 
         if app.last_refresh.elapsed() >= app.refresh_interval {
+            // Tick is a reducer hint that wall time elapsed; the actual data
+            // fetch is still owned by the runtime since it depends on App.
+            handle_dashboard_event(app, DashboardEvent::Tick);
             app.refresh_data();
         }
 
@@ -53,13 +76,12 @@ pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Resu
     }
 }
 
-/// Apply a single key event to `app` via the pure reducer.
-///
-/// Builds an [`AppState`] snapshot, runs [`update`], copies the new pure-state
-/// fields back into `app`, then executes returned [`DashboardCmd`] intents.
-pub(super) fn handle_key_event(app: &mut App, key: KeyEvent) {
+/// Push a `DashboardEvent` through the pure reducer and execute the resulting
+/// commands. This is the single chokepoint that adapts the terminal-driven
+/// runtime to the pure [`update`] function.
+fn handle_dashboard_event(app: &mut App, ev: DashboardEvent) {
     let state = snapshot_state(app);
-    let (next_state, cmds) = update(state, DashboardEvent::Key(key));
+    let (next_state, cmds) = update(state, ev);
     apply_state_to_app(app, &next_state);
     for cmd in cmds {
         execute_cmd(app, cmd);

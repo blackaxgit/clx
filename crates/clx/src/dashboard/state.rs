@@ -12,9 +12,9 @@
 //! - [`update`] is a pure function `(AppState, DashboardEvent) -> (AppState, Vec<DashboardCmd>)`.
 //!
 //! `App` still owns the authoritative runtime state. The reducer is invoked by
-//! `event::handle_key_event` after deriving an [`AppState`] snapshot via
-//! [`AppState::from_app`]; any pure transitions are applied back to `App` via
-//! [`AppState::apply_to_app`] and emitted commands are executed by the runtime.
+//! `event::handle_dashboard_event` after taking an [`AppState`] snapshot via
+//! `event::snapshot_state`; any pure transitions are applied back to `App` via
+//! `event::apply_state_to_app` and emitted commands are executed by the runtime.
 //!
 //! Side-effecting branches (`refresh_data`, settings save/reload, popup-opening edits)
 //! are emitted as [`DashboardCmd`] variants. Pure transitions (tab nav, scrolling,
@@ -204,8 +204,12 @@ pub fn update(mut state: AppState, event: DashboardEvent) -> (AppState, Vec<Dash
             // The runtime owns the wall-clock decision of whether to refresh.
             // The reducer treats Tick as a hint; no state change here.
         }
-        DashboardEvent::Resize(_, _) => {
-            // Layout is derived in the renderer from frame area; no state change.
+        DashboardEvent::Resize(cols, rows) => {
+            // Layout is derived in the renderer from frame area; no state
+            // change here. The fields are bound (rather than `_, _`) so the
+            // payload stays observable for future reducer logic without
+            // tripping dead_code on the variant.
+            let _ = (cols, rows);
         }
         DashboardEvent::Key(key) => {
             // Session detail view takes precedence.

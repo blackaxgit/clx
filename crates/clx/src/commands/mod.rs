@@ -21,7 +21,7 @@ pub use maintenance::cmd_maintenance;
 pub use model::{ModelAction, cmd_model};
 pub use recall::cmd_recall;
 pub use rules::cmd_rules;
-pub use trust::cmd_trust;
+pub use trust::{cmd_config_trust, cmd_trust};
 pub use version::{cmd_default, cmd_version};
 
 // Re-export subcommand enums needed by the CLI dispatch
@@ -30,4 +30,4 @@ pub use credentials::CredentialsAction;
 pub use embeddings::EmbeddingsAction;
 pub use maintenance::MaintenanceAction;
 pub use rules::RulesAction;
-pub use trust::TrustAction;
+pub use trust::{ConfigTrustAction, TrustAction};

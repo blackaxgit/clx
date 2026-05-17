@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/settings/render.rs
+expression: rendered
+---
+┌ Sections ──────────┐┌ LLM - <CONFIG_PATH> ─────────────────────────────────────↑                  
+│  Validator         ││Field                    Value                      Default                 █
+│  Context           ││                                                                            █
+│> LLM               ││host                     http://127.0.0.1:11434     http://127.0.0.1:11434  █
+│  User Learning     ││model                    qwen3:1.7b                 qwen3:1.7b              █
+│  Logging           ││embedding_model          qwen3-embedding:0.6b       qwen3-embedding:0.6b    █
+│  Ctx Pressure      ││embedding_dim            1024                       1024                    █
+│  Sess Recovery     ││timeout_ms               60000                      60000                   █
+│  MCP Tools         ││max_retries              3                          3                       █
+│  Auto Recall       ││retry_delay_ms           100                        100                     █
+│                    ││retry_backoff            2.0                        2.0                     █
+│                    ││── Providers ──                                                             █
+│                    ││  (none)                                                                    █
+│                    ││── Routing ──                                                               █
+│                    ││  (no llm: section)                                                         █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────↓

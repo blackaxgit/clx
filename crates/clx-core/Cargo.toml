@@ -28,6 +28,11 @@ figment.workspace = true
 async-trait = "0.1"
 regex.workspace = true
 
+# Per-project config trust (file-hash allowlist, §3.11). sha2/hex are already
+# in the transitive graph; pin direct versions so we own the API surface.
+sha2 = "0.10"
+hex = "0.4"
+
 # Reranker (D2). Pinned at 4.x; capture exact in Cargo.lock after first build.
 # Disable default features to keep the dependency footprint small; we only
 # need TextRerank which the crate exposes without optional features by default.
@@ -44,3 +49,10 @@ rstest = "0.26"
 insta = { version = "1", features = ["yaml", "json", "redactions"] }
 proptest = "1.5"
 tokio = { version = "1", features = ["full"] }
+# D4: RAGAS-style recall accuracy bench (`cargo bench --bench recall_accuracy`).
+# Dev-dep only; never enters the runtime crate graph.
+criterion = "0.5"
+
+[[bench]]
+name = "recall_accuracy"
+harness = false
