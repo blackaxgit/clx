@@ -115,13 +115,11 @@ pub fn derive_summary(tool: &str, input: &Value, outcome: ToolOutcome) -> String
             let old_len = input
                 .get("old_string")
                 .and_then(Value::as_str)
-                .map_or(0, str::chars)
-                .count();
+                .map_or(0, |s| s.chars().count());
             let new_len = input
                 .get("new_string")
                 .and_then(Value::as_str)
-                .map_or(0, str::chars)
-                .count();
+                .map_or(0, |s| s.chars().count());
             format!("edit {basename} (chars: {old_len}->{new_len})")
         }
         "Write" => {
