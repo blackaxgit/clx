@@ -36,6 +36,89 @@ impl Storage {
         Ok(id)
     }
 
+    /// Atomically create an auto-summary snapshot only when no other
+    /// `AutoSummary`-triggered snapshot for the same session was written
+    /// within the last `within_secs` seconds.
+    ///
+    /// This closes the `TOCTOU` window in the Stop auto-summary hook: the
+    /// previous implementation re-read `last_auto_summary_at` and then
+    /// called `create_snapshot` in two separate statements, so two
+    /// concurrent Stop handlers could both pass the guard and both INSERT
+    /// duplicate snapshots. Here the guard and the INSERT are a single
+    /// `INSERT ... SELECT ... WHERE NOT EXISTS` executed inside an
+    /// `IMMEDIATE` transaction, so `SQLite` serializes the two handlers and
+    /// the second one's `WHERE NOT EXISTS` sees the first one's row.
+    ///
+    /// Returns `Ok(true)` when this call inserted the snapshot, `Ok(false)`
+    /// when a recent `AutoSummary` already existed and nothing was written
+    /// (the caller logs this at debug and returns cleanly).
+    pub fn create_snapshot_if_no_recent_auto_summary(
+        &self,
+        snapshot: &Snapshot,
+        within_secs: i64,
+    ) -> crate::Result<bool> {
+        // IMMEDIATE acquires the write lock up front so the NOT EXISTS
+        // probe and the INSERT cannot interleave with a parallel handler.
+        // `Storage` only exposes `&self`, so we drive the transaction with
+        // explicit statements (same shape as `unchecked_transaction`, but
+        // with IMMEDIATE locking instead of the default DEFERRED).
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        // RFC3339 timestamps sort lexicographically, but the freshness
+        // window is a duration so we compare against a computed lower
+        // bound. `created_at` is stored via `to_rfc3339()`; SQLite's
+        // `datetime()` parses that and `strftime('%s', ...)` yields epoch
+        // seconds for a numeric comparison that is timezone-safe.
+        let insert_result = self.conn.execute(
+            "INSERT INTO snapshots \
+                 (session_id, created_at, trigger, summary, key_facts, todos, message_count, input_tokens, output_tokens) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM snapshots \
+                 WHERE session_id = ?1 \
+                   AND trigger = 'auto_summary' \
+                   AND CAST(strftime('%s', created_at) AS INTEGER) \
+                       > (CAST(strftime('%s', ?2) AS INTEGER) - ?10) \
+             )",
+            params![
+                snapshot.session_id,
+                snapshot.created_at.to_rfc3339(),
+                snapshot.trigger.as_str(),
+                snapshot.summary,
+                snapshot.key_facts,
+                snapshot.todos,
+                snapshot.message_count,
+                snapshot.input_tokens,
+                snapshot.output_tokens,
+                within_secs,
+            ],
+        );
+
+        let inserted = match insert_result {
+            Ok(n) => n,
+            Err(e) => {
+                // Best-effort rollback; ignore secondary failure.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
+        };
+
+        self.conn.execute_batch("COMMIT")?;
+
+        if inserted == 0 {
+            debug!(
+                "create_snapshot_if_no_recent_auto_summary: a recent auto_summary already exists for session {} (within {}s); skipped",
+                snapshot.session_id, within_secs
+            );
+            return Ok(false);
+        }
+        debug!(
+            "create_snapshot_if_no_recent_auto_summary: inserted auto_summary snapshot for session {}",
+            snapshot.session_id
+        );
+        Ok(true)
+    }
+
     /// Get a snapshot by ID
     pub fn get_snapshot(&self, id: i64) -> crate::Result<Option<Snapshot>> {
         let result = self
@@ -390,6 +473,111 @@ mod auto_summary_tests {
             .had_mutator_activity_since_last_auto_summary("sess-A")
             .unwrap();
         assert!(!had, "fresh session must not show mutator activity");
+    }
+
+    fn mk_auto_summary(session: &str, body: &str) -> Snapshot {
+        let mut snap = Snapshot::new(
+            crate::types::SessionId::new(session),
+            SnapshotTrigger::AutoSummary,
+        );
+        snap.summary = Some(body.to_string());
+        snap
+    }
+
+    /// F3: a single handler still writes exactly one `AutoSummary` snapshot.
+    #[test]
+    fn f3_single_handler_writes_one_snapshot() {
+        let s = mk_storage();
+        seed_session(&s, "sess-F3a");
+        let inserted = s
+            .create_snapshot_if_no_recent_auto_summary(
+                &mk_auto_summary("sess-F3a", "first"),
+                60,
+            )
+            .unwrap();
+        assert!(inserted, "first call must insert");
+        let snaps = s.get_snapshots_by_session("sess-F3a").unwrap();
+        assert_eq!(snaps.len(), 1);
+    }
+
+    /// F3: two simulated concurrent Stop handlers against one DB produce
+    /// exactly ONE `AutoSummary` snapshot; the loser reports `Ok(false)`.
+    #[test]
+    fn f3_concurrent_handlers_produce_exactly_one_snapshot() {
+        let s = mk_storage();
+        seed_session(&s, "sess-F3b");
+
+        // Both handlers compute their guarded insert against the same DB.
+        // The second observes the first's row via WHERE NOT EXISTS inside
+        // the IMMEDIATE transaction and writes nothing.
+        let a = s
+            .create_snapshot_if_no_recent_auto_summary(
+                &mk_auto_summary("sess-F3b", "handler-A"),
+                60,
+            )
+            .unwrap();
+        let b = s
+            .create_snapshot_if_no_recent_auto_summary(
+                &mk_auto_summary("sess-F3b", "handler-B"),
+                60,
+            )
+            .unwrap();
+
+        assert!(a ^ b, "exactly one handler must win (a={a}, b={b})");
+        let snaps = s.get_snapshots_by_session("sess-F3b").unwrap();
+        assert_eq!(
+            snaps.len(),
+            1,
+            "concurrent handlers must produce exactly one AutoSummary"
+        );
+    }
+
+    /// F3: when a recent `AutoSummary` already exists within the window the
+    /// guarded insert writes nothing.
+    #[test]
+    fn f3_recent_existing_summary_blocks_new_insert() {
+        let s = mk_storage();
+        seed_session(&s, "sess-F3c");
+        append_auto_summary(&s, "sess-F3c"); // existing recent summary
+
+        let inserted = s
+            .create_snapshot_if_no_recent_auto_summary(
+                &mk_auto_summary("sess-F3c", "should-skip"),
+                3600,
+            )
+            .unwrap();
+        assert!(!inserted, "a recent AutoSummary must block the new insert");
+        let snaps = s.get_snapshots_by_session("sess-F3c").unwrap();
+        assert_eq!(snaps.len(), 1, "no duplicate AutoSummary written");
+    }
+
+    /// F3: an `AutoSummary` older than the window does NOT block a new one
+    /// (legitimate periodic summary still proceeds). The prior summary is
+    /// inserted with a `created_at` two hours in the past so it falls
+    /// outside the 60s freshness window.
+    #[test]
+    fn f3_stale_summary_allows_new_insert() {
+        let s = mk_storage();
+        seed_session(&s, "sess-F3d");
+
+        let old_ts = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        s.conn
+            .execute(
+                "INSERT INTO snapshots (session_id, created_at, trigger, summary) \
+                 VALUES ('sess-F3d', ?1, 'auto_summary', 'old')",
+                [old_ts],
+            )
+            .unwrap();
+
+        let inserted = s
+            .create_snapshot_if_no_recent_auto_summary(
+                &mk_auto_summary("sess-F3d", "fresh"),
+                60,
+            )
+            .unwrap();
+        assert!(inserted, "a stale prior summary must not block a new one");
+        let snaps = s.get_snapshots_by_session("sess-F3d").unwrap();
+        assert_eq!(snaps.len(), 2);
     }
 
     #[test]

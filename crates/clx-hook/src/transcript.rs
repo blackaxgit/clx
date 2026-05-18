@@ -6,7 +6,48 @@ use clx_core::config::{Capability, Config};
 use clx_core::types::estimate_tokens;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use tracing::warn;
+
+/// Hard ceiling on the size of a transcript file we are willing to read.
+///
+/// The `transcript_path` arrives from the hook envelope and is otherwise
+/// unconstrained. Without a cap, a hostile or accidental path such as
+/// `/dev/zero` (infinite) or a multi-gigabyte log would be streamed
+/// line-by-line until the handler timeout, wasting CPU and memory. Real
+/// Claude Code transcripts are JSONL conversation logs that stay well
+/// under this bound; 64 MiB is a generous headroom for very long
+/// sessions while still bounding the worst case.
+const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resolve `transcript_path` to a canonical path and reject it when the
+/// file is missing, unresolvable (broken symlink, traversal), or larger
+/// than [`MAX_TRANSCRIPT_BYTES`].
+///
+/// Returns `None` (caller treats as "no usable transcript") instead of
+/// erroring so the Stop/SessionEnd hooks stay non-fatal.
+///
+/// No filesystem allowlist is enforced: legitimate transcripts live under
+/// `~/.claude/projects/` in production but the existing test-suite (and
+/// users with relocated Claude config) point at arbitrary temp paths, so
+/// a hard root allowlist would break valid callers. Canonicalization plus
+/// the size cap bound the read scope without that fragility. Canonicalize
+/// also collapses `..` traversal and resolves symlinks, so the size check
+/// runs against the real target rather than a link.
+fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(transcript_path).ok()?;
+    let len = std::fs::metadata(&canonical).ok()?.len();
+    if len > MAX_TRANSCRIPT_BYTES {
+        warn!(
+            "transcript '{}' is {} bytes (> {} cap); refusing to read",
+            canonical.display(),
+            len,
+            MAX_TRANSCRIPT_BYTES
+        );
+        return None;
+    }
+    Some(canonical)
+}
 
 /// Owned (role, content) pair extracted from a transcript JSONL file.
 ///
@@ -30,7 +71,10 @@ pub(crate) fn last_n_turns(transcript_path: &str, n: usize) -> Vec<OwnedTurn> {
     if n == 0 {
         return Vec::new();
     }
-    let Ok(file) = File::open(transcript_path) else {
+    let Some(path) = safe_transcript_path(transcript_path) else {
+        return Vec::new();
+    };
+    let Ok(file) = File::open(&path) else {
         return Vec::new();
     };
 
@@ -70,7 +114,10 @@ pub(crate) fn last_n_turns(transcript_path: &str, n: usize) -> Vec<OwnedTurn> {
 /// Fast token count from transcript file (no LLM calls, no async).
 /// Returns (`input_tokens`, `output_tokens`, `message_count`).
 pub(crate) fn count_transcript_tokens(transcript_path: &str) -> (i64, i64, i32) {
-    let Ok(file) = File::open(transcript_path) else {
+    let Some(path) = safe_transcript_path(transcript_path) else {
+        return (0, 0, 0);
+    };
+    let Ok(file) = File::open(&path) else {
         return (0, 0, 0);
     };
 
@@ -113,8 +160,24 @@ pub(crate) async fn process_transcript(
     transcript_path: &str,
     ollama_available: bool,
 ) -> TranscriptResult {
-    // Read transcript file
-    let file = match File::open(transcript_path) {
+    // Read transcript file. `safe_transcript_path` canonicalizes the
+    // envelope-supplied path and rejects oversized/unresolvable files so
+    // a hostile path cannot drive an unbounded read.
+    let Some(safe_path) = safe_transcript_path(transcript_path) else {
+        warn!(
+            "Refusing transcript file '{}' (missing, unresolvable, or over size cap)",
+            transcript_path
+        );
+        return TranscriptResult {
+            summary: None,
+            key_facts: None,
+            todos: None,
+            message_count: None,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+    };
+    let file = match File::open(&safe_path) {
         Ok(f) => f,
         Err(e) => {
             warn!(
@@ -558,6 +621,98 @@ mod tests {
         assert_eq!(input_tok, 2, "user 'user msg' → 2 tokens");
         assert_eq!(output_tok, 4, "assistant 'assistant msg' → 4 tokens");
         assert_eq!(msg_count, 2, "only 2 valid JSONL entries");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // =========================================================================
+    // F8 — transcript path hardening (canonicalize + size cap)
+    // =========================================================================
+
+    /// F8-1: a non-existent path is rejected (canonicalize fails) and both
+    /// readers return their empty sentinels.
+    #[test]
+    fn f8_nonexistent_path_returns_empty() {
+        let missing = "/nonexistent/clx/f8/does-not-exist.jsonl";
+        assert!(safe_transcript_path(missing).is_none());
+        assert!(last_n_turns(missing, 5).is_empty());
+        assert_eq!(count_transcript_tokens(missing), (0, 0, 0));
+    }
+
+    /// F8-2: a transcript over `MAX_TRANSCRIPT_BYTES` is refused. We assert
+    /// the cap predicate directly against a real oversized file via a
+    /// sparse file so the test stays fast and does not write 64 MiB.
+    #[test]
+    fn f8_oversized_transcript_is_rejected() {
+        let temp_dir = std::env::temp_dir().join(format!("clx-f8-big-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("huge.jsonl");
+
+        let f = std::fs::File::create(&path).unwrap();
+        // Sparse file: set logical length past the cap without writing bytes.
+        f.set_len(MAX_TRANSCRIPT_BYTES + 1).unwrap();
+        drop(f);
+
+        assert!(
+            safe_transcript_path(path.to_str().unwrap()).is_none(),
+            "file larger than MAX_TRANSCRIPT_BYTES must be rejected"
+        );
+        assert!(last_n_turns(path.to_str().unwrap(), 5).is_empty());
+        assert_eq!(count_transcript_tokens(path.to_str().unwrap()), (0, 0, 0));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// F8-3: a file exactly at the cap is still accepted (boundary), and a
+    /// normal small transcript still parses (regression guard).
+    #[test]
+    fn f8_at_cap_and_small_transcript_still_parse() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join(format!("clx-f8-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("small.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":"hello world"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"assistant","message":"goodbye world"}}"#).unwrap();
+        drop(f);
+
+        // safe path resolves and is accepted
+        assert!(safe_transcript_path(path.to_str().unwrap()).is_some());
+        let turns = last_n_turns(path.to_str().unwrap(), 5);
+        assert_eq!(turns.len(), 2, "small transcript must still parse");
+        let (i, o, c) = count_transcript_tokens(path.to_str().unwrap());
+        assert_eq!((i, o, c), (3, 4, 2));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// F8-4: a symlink to a real transcript is canonicalized to its target
+    /// and the content is read through the resolved path.
+    #[test]
+    #[cfg(unix)]
+    fn f8_symlink_is_canonicalized_to_target() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join(format!("clx-f8-link-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("real.jsonl");
+        let link = temp_dir.join("link.jsonl");
+
+        let mut f = std::fs::File::create(&target).unwrap();
+        writeln!(f, r#"{{"type":"user","message":"via symlink"}}"#).unwrap();
+        drop(f);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = safe_transcript_path(link.to_str().unwrap())
+            .expect("symlink to a small file must resolve");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&target).unwrap(),
+            "symlink must canonicalize to its real target"
+        );
+        let turns = last_n_turns(link.to_str().unwrap(), 5);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "via symlink");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

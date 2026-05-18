@@ -132,39 +132,37 @@ async fn run_inner(input: HookInput) -> Result<()> {
         }
     };
 
-    // Optimistic-concurrency gate: re-fetch the last AutoSummary timestamp
-    // immediately before persisting. If another Stop-hook handler ran in
-    // parallel and already wrote a snapshot after this handler started,
-    // skip writing to avoid duplicate AutoSummary snapshots for the same
-    // session/window. Storage::create_snapshot is the boundary we cannot
-    // wrap in a single SQL statement; this check is the tightest possible
-    // re-read before the insert.
-    match storage.last_auto_summary_at(session_id) {
-        Ok(Some(last)) if last >= started_at => {
-            debug!(
-                "auto-summary: another handler wrote a snapshot at {} after this handler started at {}; skipping",
-                last, started_at
-            );
-            return Ok(());
-        }
-        Ok(_) => { /* no concurrent writer; proceed */ }
-        Err(e) => {
-            // Conservative on query failure: proceed rather than silently skip.
-            warn!("auto-summary: duplicate-snapshot guard query failed: {e}");
-        }
-    }
+    // Atomic duplicate-snapshot guard. The previous implementation
+    // re-read `last_auto_summary_at` and then called `create_snapshot` in
+    // two separate statements; two concurrent Stop handlers could both
+    // pass the guard and both INSERT (TOCTOU). The guarded insert below
+    // performs the freshness check and the INSERT in one IMMEDIATE
+    // transaction, so SQLite serializes parallel handlers and the loser
+    // observes the winner's row. The freshness window matches the
+    // handler's own throttle: any AutoSummary written since `started_at`
+    // means a sibling handler beat us, so we skip cleanly.
+    let within_secs = (Utc::now() - started_at).num_seconds().max(0) + 1;
 
     let mut snap = Snapshot::new(input.session_id.clone(), SnapshotTrigger::AutoSummary);
     snap.summary = Some(summary);
     snap.message_count = i32::try_from(turns_since).ok();
-    if let Err(e) = storage.create_snapshot(&snap) {
-        warn!("auto-summary: failed to persist snapshot: {e}");
-        return Ok(());
+    match storage.create_snapshot_if_no_recent_auto_summary(&snap, within_secs) {
+        Ok(true) => {
+            debug!(
+                "auto-summary: persisted snapshot for session {} (turns_since={})",
+                session_id, turns_since
+            );
+        }
+        Ok(false) => {
+            debug!(
+                "auto-summary: a concurrent handler already wrote an AutoSummary for session {}; skipping",
+                session_id
+            );
+        }
+        Err(e) => {
+            warn!("auto-summary: failed to persist snapshot: {e}");
+        }
     }
-    debug!(
-        "auto-summary: persisted snapshot for session {} (turns_since={})",
-        session_id, turns_since
-    );
     Ok(())
 }
 
