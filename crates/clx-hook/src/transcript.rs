@@ -410,10 +410,8 @@ mod tests {
     fn test_count_transcript_tokens_with_content() {
         use std::io::Write;
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("clx-transcript-test-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
 
         // Create a transcript file with known content.
         // Each entry is a JSONL line with type and message fields.
@@ -440,18 +438,14 @@ mod tests {
             "assistant tokens should be estimated from 'goodbye world'"
         );
         assert_eq!(msg_count, 2, "only valid JSONL entries should be counted");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_count_transcript_tokens_exceeds_pressure_threshold() {
         use std::io::Write;
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("clx-pressure-test-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
 
         // Create a transcript with enough content to exceed a realistic threshold.
         // We'll simulate a 200k-token window at 80% threshold = 160k tokens needed.
@@ -475,8 +469,6 @@ mod tests {
             "total_tokens ({total_tokens}) should exceed threshold ({threshold})"
         );
         assert_eq!(msg_count, 110);
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     // =========================================================================
@@ -528,9 +520,8 @@ mod tests {
             .await;
 
         // Write a small transcript file
-        let temp_dir = std::env::temp_dir().join(format!("clx-t16-success-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
         write_transcript(
             &transcript_path,
             &[
@@ -559,8 +550,6 @@ mod tests {
         let summary = result.summary.expect("summary should be Some");
         assert!(!summary.is_empty(), "summary must be non-empty");
         assert_eq!(result.message_count, Some(2));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// T16-2: `process_transcript` falls back gracefully when Ollama is unavailable.
@@ -571,10 +560,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_transcript_fallback_when_ollama_unavailable() {
         // Arrange — write a small transcript
-        let temp_dir =
-            std::env::temp_dir().join(format!("clx-t16-fallback-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
         write_transcript(
             &transcript_path,
             &[
@@ -607,8 +594,6 @@ mod tests {
             Some(2),
             "message_count must reflect the transcript lines"
         );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// T16-3: `count_transcript_tokens` with a known structure returns correct token counts.
@@ -620,9 +605,8 @@ mod tests {
     fn test_count_transcript_tokens_known_structure() {
         use std::io::Write;
 
-        let temp_dir = std::env::temp_dir().join(format!("clx-t16-tokens-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
 
         let mut f = std::fs::File::create(&transcript_path).unwrap();
         // "user msg" = 8 chars → (8+3)/4 = 2 tokens
@@ -640,8 +624,6 @@ mod tests {
         assert_eq!(input_tok, 2, "user 'user msg' → 2 tokens");
         assert_eq!(output_tok, 4, "assistant 'assistant msg' → 4 tokens");
         assert_eq!(msg_count, 2, "only 2 valid JSONL entries");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     // =========================================================================
@@ -663,9 +645,8 @@ mod tests {
     /// sparse file so the test stays fast and does not write 64 MiB.
     #[test]
     fn f8_oversized_transcript_is_rejected() {
-        let temp_dir = std::env::temp_dir().join(format!("clx-f8-big-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let path = temp_dir.join("huge.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("huge.jsonl");
 
         let f = std::fs::File::create(&path).unwrap();
         // Sparse file: set logical length past the cap without writing bytes.
@@ -678,8 +659,6 @@ mod tests {
         );
         assert!(last_n_turns(path.to_str().unwrap(), 5).is_empty());
         assert_eq!(count_transcript_tokens(path.to_str().unwrap()), (0, 0, 0));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// F8-3: a file exactly at the cap is still accepted (boundary), and a
@@ -687,9 +666,8 @@ mod tests {
     #[test]
     fn f8_at_cap_and_small_transcript_still_parse() {
         use std::io::Write;
-        let temp_dir = std::env::temp_dir().join(format!("clx-f8-ok-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let path = temp_dir.join("small.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("small.jsonl");
 
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"type":"user","message":"hello world"}}"#).unwrap();
@@ -702,8 +680,6 @@ mod tests {
         assert_eq!(turns.len(), 2, "small transcript must still parse");
         let (i, o, c) = count_transcript_tokens(path.to_str().unwrap());
         assert_eq!((i, o, c), (3, 4, 2));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// F8-4: a symlink to a real transcript is canonicalized to its target
@@ -712,10 +688,9 @@ mod tests {
     #[cfg(unix)]
     fn f8_symlink_is_canonicalized_to_target() {
         use std::io::Write;
-        let temp_dir = std::env::temp_dir().join(format!("clx-f8-link-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let target = temp_dir.join("real.jsonl");
-        let link = temp_dir.join("link.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("real.jsonl");
+        let link = tmp.path().join("link.jsonl");
 
         let mut f = std::fs::File::create(&target).unwrap();
         writeln!(f, r#"{{"type":"user","message":"via symlink"}}"#).unwrap();
@@ -732,8 +707,6 @@ mod tests {
         let turns = last_n_turns(link.to_str().unwrap(), 5);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content, "via symlink");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// F8-5: a non-regular path (FIFO / char device) is rejected by the
@@ -744,9 +717,8 @@ mod tests {
     #[cfg(unix)]
     fn f8_non_regular_path_is_rejected_no_unbounded_read() {
         use std::os::unix::fs::FileTypeExt;
-        let temp_dir = std::env::temp_dir().join(format!("clx-f8-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let fifo = temp_dir.join("pipe");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fifo = tmp.path().join("pipe");
 
         // mkfifo via libc-free path: use the `nix`-free std approach by
         // shelling out to `mkfifo` (POSIX, always present on unix CI).
@@ -769,8 +741,6 @@ mod tests {
         );
         assert!(last_n_turns(fifo.to_str().unwrap(), 5).is_empty());
         assert_eq!(count_transcript_tokens(fifo.to_str().unwrap()), (0, 0, 0));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// F8-6: a regular file reporting an honest over-cap length is rejected
@@ -778,9 +748,8 @@ mod tests {
     /// both yield their empty sentinel without consuming the file.
     #[test]
     fn f8_over_cap_regular_file_is_bounded_and_empty() {
-        let temp_dir = std::env::temp_dir().join(format!("clx-f8-cap-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let path = temp_dir.join("over.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("over.jsonl");
 
         let f = std::fs::File::create(&path).unwrap();
         f.set_len(MAX_TRANSCRIPT_BYTES + 4096).unwrap();
@@ -795,8 +764,6 @@ mod tests {
             "rejection must be effectively instant (bounded), took {:?}",
             start.elapsed()
         );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// T16-4: `build_transcript_text` does not panic on multi-byte UTF-8 content.
