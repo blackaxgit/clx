@@ -23,7 +23,10 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
+use fs4::FileExt;
+use fs4::TryLockError;
 use secrecy::ExposeSecret;
 
 use super::{CredentialError, Result};
@@ -63,13 +66,54 @@ pub trait CredentialBackend: Send + Sync {
 ///   file and the store never corrupts.
 ///
 /// Pure file IO: this NEVER prompts and is identical on every OS.
+///
+/// # Concurrency contract
+///
+/// CLX hooks run as SEPARATE OS processes (one per hook invocation). The full
+/// load -> decrypt -> mutate -> encrypt -> temp-write -> rename cycle is
+/// serialized two ways:
+///
+/// * `write_lock` (in-process [`Mutex`]) prevents thread races and reduces
+///   inter-process lock contention within one process.
+/// * An advisory exclusive `flock`/`LockFileEx` on a dedicated sidecar
+///   (`credentials.age.lock`, NOT the data file we rename over) serializes
+///   the entire RMW across processes, so two concurrent hooks can never read
+///   the same snapshot and silently drop each other's write. The lock is held
+///   by an RAII guard released on every exit path including panic, and is
+///   acquired with a bounded timeout so a stuck holder degrades the hook with
+///   a clear error instead of hanging Claude Code forever.
 pub struct AgeFileBackend {
     dir: PathBuf,
     cred_file: PathBuf,
     key_file: PathBuf,
+    lock_file: PathBuf,
     /// Serializes this process's read-modify-write cycles. Cross-process
-    /// safety is provided by atomic rename + keyfile create-new.
+    /// safety is provided by the advisory lock on `lock_file`.
     write_lock: Mutex<()>,
+}
+
+/// Max time to wait for the inter-process credential lock before giving up.
+/// A hook that cannot acquire the lock returns a clear error and degrades
+/// gracefully rather than hanging Claude Code indefinitely.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting on a contended advisory lock.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// RAII guard holding the cross-process advisory exclusive lock. The lock is
+/// released when the underlying file handle is dropped (and, as a hard
+/// guarantee, on process death: advisory `flock`/`fcntl` locks are released
+/// by the kernel when the owning process exits, so a killed holder never
+/// wedges other processes).
+struct InterProcessLockGuard {
+    file: fs::File,
+}
+
+impl Drop for InterProcessLockGuard {
+    fn drop(&mut self) {
+        // Best-effort explicit unlock; the OS also releases on fd close.
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl AgeFileBackend {
@@ -84,6 +128,7 @@ impl AgeFileBackend {
         Ok(Self {
             cred_file: dir.join("credentials.age"),
             key_file: dir.join("cred.key"),
+            lock_file: dir.join("credentials.age.lock"),
             dir,
             write_lock: Mutex::new(()),
         })
@@ -197,7 +242,22 @@ impl AgeFileBackend {
         }
     }
 
-    /// Decrypt the credentials map (empty if the file is absent).
+    /// Decrypt the credentials map.
+    ///
+    /// # Recovery contract
+    ///
+    /// * File ABSENT (fresh install) -> legitimate empty store. Zero prompts.
+    /// * File present, valid age blob -> decrypted map.
+    /// * File present, ZERO bytes -> treated as CORRUPTION, not an empty
+    ///   store. A zero-byte file is exactly what a crash mid-write (before
+    ///   temp+rename completes) or an external `truncate` produces. Returning
+    ///   an empty map here would let the next `set`/`delete` overwrite it with
+    ///   an empty-map blob and PERMANENTLY destroy every stored credential.
+    ///   We instead surface an actionable error and NEVER auto-destroy. The
+    ///   only safe recovery is the user deliberately removing the empty file
+    ///   (then `set`/`migrate` repopulates from scratch).
+    /// * File present, non-zero garbage -> already errors at the age decoder;
+    ///   that behavior is preserved.
     fn load_map(&self, identity: &age::x25519::Identity) -> Result<BTreeMap<String, String>> {
         let encrypted = match fs::read(&self.cred_file) {
             Ok(b) => b,
@@ -205,7 +265,16 @@ impl AgeFileBackend {
             Err(e) => return Err(Self::map_err("read credentials.age", e)),
         };
         if encrypted.is_empty() {
-            return Ok(BTreeMap::new());
+            return Err(CredentialError::Storage(format!(
+                "credentials store is corrupt: {} exists but is zero bytes \
+                 (a crash or external truncate during a prior write). CLX will \
+                 NOT overwrite it, to avoid destroying credentials that may \
+                 have existed. To recover, delete the empty file deliberately \
+                 (`rm {}`) and re-run `clx credentials set <key> <value>` (or \
+                 `clx credentials migrate`) to repopulate it.",
+                self.cred_file.display(),
+                self.cred_file.display(),
+            )));
         }
         let decryptor = age::Decryptor::new(&encrypted[..])
             .map_err(|e| Self::map_err("init age decryptor (corrupt credentials.age?)", e))?;
@@ -256,14 +325,69 @@ impl AgeFileBackend {
         Ok(())
     }
 
+    /// Acquire the cross-process advisory exclusive lock on the dedicated
+    /// sidecar lockfile, blocking up to [`LOCK_TIMEOUT`].
+    ///
+    /// We lock the sidecar, never `credentials.age` itself: the data file is
+    /// replaced via rename, and locking a file you rename over is racy (the
+    /// lock would be bound to an inode that gets unlinked). The sidecar is
+    /// created once and never renamed, so its inode is stable.
+    ///
+    /// On timeout we return a clear error rather than block forever, so a
+    /// stuck holder degrades the hook gracefully instead of hanging Claude
+    /// Code. The kernel releases advisory locks on fd close AND on process
+    /// death, so a killed holder never permanently wedges other processes.
+    fn acquire_interprocess_lock(&self) -> Result<InterProcessLockGuard> {
+        self.ensure_dir()?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&self.lock_file)
+            .map_err(|e| Self::map_err("open credentials lockfile", e))?;
+
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match FileExt::try_lock(&file) {
+                Ok(()) => return Ok(InterProcessLockGuard { file }),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(CredentialError::Storage(format!(
+                            "could not acquire the credential store lock within {}s \
+                             (another process is holding {}). Aborting WITHOUT \
+                             writing so no credential is lost; retry shortly.",
+                            LOCK_TIMEOUT.as_secs(),
+                            self.lock_file.display(),
+                        )));
+                    }
+                    std::thread::sleep(LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Error(e)) => {
+                    return Err(Self::map_err("lock credentials store", e));
+                }
+            }
+        }
+    }
+
     fn with_map<R>(
         &self,
         f: impl FnOnce(&mut BTreeMap<String, String>, &age::x25519::Identity) -> Result<R>,
     ) -> Result<R> {
-        let _guard = self
+        // In-process Mutex first: cheap, prevents thread races, and reduces
+        // contention on the inter-process lock.
+        let _thread_guard = self
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cross-process advisory lock around the ENTIRE read-modify-write so
+        // two hook processes can never lose each other's write. RAII: dropped
+        // (and unlocked) on every exit path including `?` early-return and
+        // panic.
+        let _proc_guard = self.acquire_interprocess_lock()?;
         let identity = self.load_identity()?;
         let mut map = self.load_map(&identity)?;
         let out = f(&mut map, &identity)?;

@@ -37,6 +37,15 @@ regex.workspace = true
 sha2 = "0.10"
 hex = "0.4"
 
+# Inter-process advisory file lock for the credential store read-modify-write
+# cycle. CLX hooks run as SEPARATE OS processes (one per hook invocation), so
+# an in-process Mutex alone cannot prevent a lost update when two hooks write
+# concurrently. `fs4` is the actively maintained (1.x, 2026) pure-Rust,
+# cross-platform successor to the abandoned `fs2`: flock on unix, LockFileEx
+# on Windows, advisory, released on fd close / process death. We lock a
+# dedicated `.lock` sidecar (NOT the data file we rename over).
+fs4 = "1"
+
 # Reranker (D2). Pinned at 5.x (ort 2.0 stable, &mut self rerank). Capture
 # exact in Cargo.lock after first build. Default features are sufficient for
 # TextRerank; we do not enable any optional GPU/CUDA features.

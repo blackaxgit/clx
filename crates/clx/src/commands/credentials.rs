@@ -17,7 +17,8 @@ use crate::types::CredentialsListOutput;
 
 #[derive(Subcommand)]
 pub enum CredentialsAction {
-    /// Store a credential in the system keychain
+    /// Store a credential in the configured credential backend (encrypted
+    /// file by default, macOS keychain only if opted in)
     Set {
         /// Credential key (e.g., `OPENAI_API_KEY`)
         key: String,
@@ -25,7 +26,8 @@ pub enum CredentialsAction {
         value: String,
     },
 
-    /// Retrieve a credential from the system keychain
+    /// Retrieve a credential from the configured credential backend
+    /// (encrypted file by default, macOS keychain only if opted in)
     Get {
         /// Credential key to retrieve
         key: String,
