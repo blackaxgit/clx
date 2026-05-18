@@ -555,8 +555,15 @@ pub(crate) fn risk_score_to_decision(
 ) -> PolicyDecision {
     match risk_score {
         1..=3 => PolicyDecision::Allow,
-        // L1 (LLM) never hard-denies — only L0 blacklist can hard-deny.
-        // LLM can be wrong, so the user always gets final say via confirmation dialog.
+        // 8-10: explicitly dangerous/irreversible. Hard-deny so the hook emits a
+        // block (PreToolUse "deny"). This restores the documented contract
+        // (see the doc comment above): 1-3 Allow, 4-7 Ask, 8-10 Deny. Without
+        // this band the deny path in the hook is unreachable from an L1 verdict.
+        8..=10 => PolicyDecision::Deny {
+            reason: format!("[{category}] {reasoning}"),
+        },
+        // 4-7 (and any out-of-range score): inconclusive. The user gets final
+        // say via the confirmation dialog. Behavior here is unchanged.
         _ => PolicyDecision::Ask {
             reason: format!("[{category}] {reasoning}"),
         },

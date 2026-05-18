@@ -27,7 +27,7 @@ pub fn cmd_version(cli: &Cli) -> Result<()> {
         println!("A command validation and context persistence layer for Claude Code.");
         println!();
         println!("  Config: {}", clx_core::paths::clx_dir().display());
-        println!("  License: MIT");
+        println!("  License: MPL-2.0");
     }
 
     Ok(())
