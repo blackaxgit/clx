@@ -400,4 +400,124 @@ mod tests {
             "unexpected exit: {exit:?}"
         );
     }
+
+    // =====================================================================
+    // Wave 1 E: in-process integration behavior for `handle_event`.
+    //
+    // These live here (not in `tests/hooks_router_e2e.rs`) because the
+    // workspace lint forbids `unsafe` `std::env::set_var`, so an external
+    // integration test cannot redirect `HOME` to build real `HookDeps`
+    // without touching the real `~/.clx`. `HookDeps::for_test()` is
+    // `#[cfg(test)]`-only (in-memory sqlite, zero real-env / network /
+    // keychain), so the safe place for the in-memory `Read`/`Write`
+    // contract is this in-crate module. Anchored to
+    // `specs/_prerelease/04-integration.md` 3.1 + the edge/failure matrix.
+    // =====================================================================
+    mod wave1_integration_behavior {
+        use super::*;
+
+        fn envelope(event: &str, extra: &serde_json::Value) -> String {
+            let mut base = serde_json::json!({
+                "session_id": "00000000-0000-0000-0000-0000000000ee",
+                "cwd": "/tmp/test-project",
+                "hook_event_name": event,
+            });
+            if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+                for (k, v) in e {
+                    b.insert(k.clone(), v.clone());
+                }
+            }
+            base.to_string()
+        }
+
+        #[tokio::test]
+        async fn oversize_writes_block_json_to_injected_writer() {
+            let big = vec![b'a'; (MAX_INPUT_SIZE as usize) + 1];
+            let mut out = Vec::<u8>::new();
+            let exit = handle_event(&big[..], &mut out, HookDeps::for_test()).await;
+            assert_eq!(exit, HookExit::InputTooLarge);
+            let v: serde_json::Value =
+                serde_json::from_str(String::from_utf8_lossy(&out).trim()).expect("block json");
+            assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+            assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "block");
+            assert_eq!(
+                v["hookSpecificOutput"]["permissionDecisionReason"],
+                "Input too large"
+            );
+        }
+
+        #[tokio::test]
+        async fn exactly_at_cap_is_input_too_large() {
+            // Documented boundary `n >= MAX_INPUT_SIZE` (router.rs read_input).
+            let at_cap = vec![b'a'; MAX_INPUT_SIZE as usize];
+            let mut out = Vec::<u8>::new();
+            let exit = handle_event(&at_cap[..], &mut out, HookDeps::for_test()).await;
+            assert_eq!(exit, HookExit::InputTooLarge);
+        }
+
+        #[tokio::test]
+        async fn malformed_json_is_parse_error() {
+            let mut out = Vec::<u8>::new();
+            let exit =
+                handle_event(b"not json at all" as &[u8], &mut out, HookDeps::for_test()).await;
+            assert_eq!(exit, HookExit::ParseError);
+        }
+
+        #[tokio::test]
+        async fn empty_stdin_is_parse_error() {
+            let mut out = Vec::<u8>::new();
+            let exit = handle_event(b"" as &[u8], &mut out, HookDeps::for_test()).await;
+            assert_eq!(exit, HookExit::ParseError);
+        }
+
+        #[tokio::test]
+        async fn missing_required_field_is_parse_error() {
+            let raw = serde_json::json!({ "hook_event_name": "PreToolUse" }).to_string();
+            let mut out = Vec::<u8>::new();
+            let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+            assert_eq!(exit, HookExit::ParseError);
+        }
+
+        #[tokio::test]
+        async fn unknown_event_is_allowed_ok() {
+            let raw = envelope("SomeFutureEvent2027", &serde_json::json!({}));
+            let mut out = Vec::<u8>::new();
+            let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+            assert_eq!(exit, HookExit::Ok);
+        }
+
+        #[tokio::test]
+        async fn all_eight_events_reach_dispatch_without_panic() {
+            // 3.2: every registered event dispatches; Stop is synthesized
+            // here (I-R2 gap) with a correct `hook_event_name:"Stop"`.
+            let cases = [
+                (
+                    "PreToolUse",
+                    serde_json::json!({"tool_name":"Read","tool_use_id":"t","tool_input":{"file_path":"/tmp/x"}}),
+                ),
+                (
+                    "PostToolUse",
+                    serde_json::json!({"tool_name":"Read","tool_use_id":"t","tool_input":{"file_path":"/tmp/x"},"tool_response":{"ok":true}}),
+                ),
+                ("PreCompact", serde_json::json!({"trigger":"auto"})),
+                ("SessionStart", serde_json::json!({"source":"startup"})),
+                ("SessionEnd", serde_json::json!({})),
+                ("SubagentStart", serde_json::json!({"tool_name":"Task"})),
+                (
+                    "UserPromptSubmit",
+                    serde_json::json!({"prompt":"long enough prompt to reach the recall gate"}),
+                ),
+                ("Stop", serde_json::json!({})),
+            ];
+            for (event, extra) in cases {
+                let raw = envelope(event, &extra);
+                let mut out = Vec::<u8>::new();
+                let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+                assert!(
+                    matches!(exit, HookExit::Ok | HookExit::HandlerError),
+                    "event {event} should reach dispatch, got {exit:?}"
+                );
+            }
+        }
+    }
 }

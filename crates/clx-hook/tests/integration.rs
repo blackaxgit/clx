@@ -7,19 +7,44 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[path = "support/mod.rs"]
+mod support;
+use support::{assert_home_size_bounded, harden_command, isolated_clx_home};
+
+/// Regression proof for the disk-leak fix: the isolated `HOME` guard is a
+/// `tempfile::TempDir` whose `Drop` removes the directory even while a
+/// panic unwinds the stack. This is what makes the leak unrecoverable
+/// without RAII (a trailing `remove_dir_all` is skipped on any panic).
+#[test]
+fn isolated_home_is_raii_removed_even_on_panic() {
+    support::assert_tempdir_removed_even_on_panic();
+}
+
+/// Sanity for the size guard itself: a hermetic-sized HOME passes.
+#[test]
+fn size_guard_accepts_small_home() {
+    let home = isolated_clx_home();
+    std::fs::create_dir_all(home.path().join(".clx/data")).unwrap();
+    std::fs::write(
+        home.path().join(".clx/config.yaml"),
+        "auto_recall:\n  enabled: true\n",
+    )
+    .unwrap();
+    assert_home_size_bounded(home.path());
+}
+
 /// Helper: spawn the clx-hook binary with isolated HOME and pipe JSON input.
 /// Returns (stdout, stderr) as strings.
 fn run_hook(input: &str) -> (String, String) {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    // Use a unique temp directory per invocation to avoid parallel test interference.
-    // Keep `_temp_dir` alive until end of function so the directory isn't cleaned up early.
-    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    // RAII isolation: unique name via mkdtemp, removed on Drop even on
+    // panic. Kept alive until end of function so it is not cleaned early.
+    let temp_dir = isolated_clx_home();
     let temp_home = temp_dir.path();
 
-    let mut child = Command::new(binary)
-        .env("HOME", temp_home)
-        .env("CLX_LOG", "error") // Suppress log noise
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -36,6 +61,7 @@ fn run_hook(input: &str) -> (String, String) {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_home_size_bounded(temp_home);
     (stdout, stderr)
 }
 
@@ -162,8 +188,8 @@ fn test_hook_trust_mode_valid_token_allows() {
     // PreToolUse should auto-allow any command without LLM validation.
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home = std::env::temp_dir().join(format!("clx-trust-valid-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Create config.yaml that enables trust_mode and disables L1
     let clx_dir = temp_home.join(".clx");
@@ -188,9 +214,8 @@ fn test_hook_trust_mode_valid_token_allows() {
         }
     });
 
-    let mut child = Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -206,6 +231,8 @@ fn test_hook_trust_mode_valid_token_allows() {
         .expect("Failed to wait for clx-hook");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
+    assert_home_size_bounded(temp_home);
+
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Failed to parse trust mode output: {e}\nOutput: {stdout}"));
 
@@ -214,8 +241,6 @@ fn test_hook_trust_mode_valid_token_allows() {
         hook_output["permissionDecision"], "allow",
         "Trust mode with valid token should auto-allow even dangerous commands"
     );
-
-    let _ = std::fs::remove_dir_all(&temp_home);
 }
 
 // =========================================================================
@@ -228,8 +253,8 @@ fn test_hook_trust_mode_expired_token_falls_through() {
     // the hook should fall through to normal validation (not auto-allow).
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home = std::env::temp_dir().join(format!("clx-trust-expired-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Create config that enables trust_mode, disables L1 (so it defaults to "ask")
     let clx_dir = temp_home.join(".clx");
@@ -268,9 +293,8 @@ fn test_hook_trust_mode_expired_token_falls_through() {
         }
     });
 
-    let mut child = Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -285,6 +309,8 @@ fn test_hook_trust_mode_expired_token_falls_through() {
         .wait_with_output()
         .expect("Failed to wait for clx-hook");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert_home_size_bounded(temp_home);
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Failed to parse expired trust output: {e}\nOutput: {stdout}"));
@@ -306,8 +332,6 @@ fn test_hook_trust_mode_expired_token_falls_through() {
         !token_path.exists(),
         "Expired trust token file should be removed after detection"
     );
-
-    let _ = std::fs::remove_dir_all(&temp_home);
 }
 
 // =========================================================================
@@ -320,8 +344,8 @@ fn test_hook_default_decision_allow_on_ollama_unavailable() {
     // to the configured default_decision. Here we set it to "allow".
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home = std::env::temp_dir().join(format!("clx-default-allow-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     let clx_dir = temp_home.join(".clx");
     std::fs::create_dir_all(&clx_dir).unwrap();
@@ -353,9 +377,8 @@ ollama:
         }
     });
 
-    let mut child = Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -371,6 +394,8 @@ ollama:
         .expect("Failed to wait for clx-hook");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
+    assert_home_size_bounded(temp_home);
+
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Failed to parse output: {e}\nOutput: {stdout}"));
 
@@ -379,8 +404,6 @@ ollama:
         hook_output["permissionDecision"], "allow",
         "default_decision=allow should result in 'allow' when Ollama is unreachable"
     );
-
-    let _ = std::fs::remove_dir_all(&temp_home);
 }
 
 // =========================================================================
@@ -393,8 +416,8 @@ fn test_hook_default_decision_deny_on_ollama_unavailable() {
     // to the configured default_decision. Here we set it to "deny".
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home = std::env::temp_dir().join(format!("clx-default-deny-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     let clx_dir = temp_home.join(".clx");
     std::fs::create_dir_all(&clx_dir).unwrap();
@@ -426,9 +449,8 @@ ollama:
         }
     });
 
-    let mut child = Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -444,6 +466,8 @@ ollama:
         .expect("Failed to wait for clx-hook");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
+    assert_home_size_bounded(temp_home);
+
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Failed to parse output: {e}\nOutput: {stdout}"));
 
@@ -452,8 +476,6 @@ ollama:
         hook_output["permissionDecision"], "deny",
         "default_decision=deny should result in 'deny' when Ollama is unreachable"
     );
-
-    let _ = std::fs::remove_dir_all(&temp_home);
 }
 
 // =========================================================================
@@ -466,8 +488,8 @@ fn test_hook_default_decision_ask_on_ollama_unavailable() {
     // to the configured default_decision. Here we set it to "ask".
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home = std::env::temp_dir().join(format!("clx-default-ask-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     let clx_dir = temp_home.join(".clx");
     std::fs::create_dir_all(&clx_dir).unwrap();
@@ -499,9 +521,8 @@ ollama:
         }
     });
 
-    let mut child = Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -517,6 +538,8 @@ ollama:
         .expect("Failed to wait for clx-hook");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
+    assert_home_size_bounded(temp_home);
+
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Failed to parse output: {e}\nOutput: {stdout}"));
 
@@ -525,8 +548,6 @@ ollama:
         hook_output["permissionDecision"], "ask",
         "default_decision=ask should result in 'ask' when Ollama is unreachable"
     );
-
-    let _ = std::fs::remove_dir_all(&temp_home);
 }
 
 // =========================================================================
@@ -622,8 +643,8 @@ fn test_post_tool_use_context_pressure_warning_emitted() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-post-pressure-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Write config enabling context pressure in "notify" mode with a low window
     // so that a modest transcript crosses the threshold.
@@ -663,9 +684,8 @@ fn test_post_tool_use_context_pressure_warning_emitted() {
         "transcript_path": transcript_path.to_str().unwrap()
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -682,7 +702,7 @@ fn test_post_tool_use_context_pressure_warning_emitted() {
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     // When context pressure fires the handler emits a JSON object with additionalContext
     assert!(
@@ -819,9 +839,8 @@ fn test_pre_compact_with_transcript_file() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-compact-transcript-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Disable Ollama to force the graceful-degradation path
     let clx_dir = temp_home.join(".clx");
@@ -850,9 +869,8 @@ fn test_pre_compact_with_transcript_file() {
         "transcript_path": transcript_path.to_str().unwrap()
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -869,7 +887,7 @@ fn test_pre_compact_with_transcript_file() {
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     // Handler should complete; no stdout unless error
     if !stdout.trim().is_empty() {
@@ -886,9 +904,8 @@ fn test_pre_compact_graceful_degradation_ollama_unavailable() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home =
-        std::env::temp_dir().join(format!("clx-compact-no-ollama-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Point Ollama at a port that is not listening to force unavailable path
     let clx_dir = temp_home.join(".clx");
@@ -915,9 +932,8 @@ fn test_pre_compact_graceful_degradation_ollama_unavailable() {
         "transcript_path": transcript_path.to_str().unwrap()
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -935,7 +951,7 @@ fn test_pre_compact_graceful_degradation_ollama_unavailable() {
     let exit_status = output.status;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     assert!(
         exit_status.success(),
@@ -999,8 +1015,8 @@ fn test_session_start_new_session_creates_and_emits_system_message() {
 fn test_session_start_resumed_session_detection() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
-    let temp_home = std::env::temp_dir().join(format!("clx-start-resume-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     let input = serde_json::json!({
         "session_id": "start-t13-2",
@@ -1012,9 +1028,8 @@ fn test_session_start_resumed_session_detection() {
 
     // Helper to run with the shared temp_home
     let run = |binary: &str, temp_home: &std::path::Path, body: &str| {
-        let mut child = std::process::Command::new(binary)
-            .env("HOME", temp_home)
-            .env("CLX_LOG", "error")
+        let mut command = std::process::Command::new(binary);
+        let mut child = harden_command(&mut command, temp_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1034,14 +1049,14 @@ fn test_session_start_resumed_session_detection() {
     };
 
     // First call — creates the session
-    let (stdout1, _) = run(binary, &temp_home, &input_str);
+    let (stdout1, _) = run(binary, temp_home, &input_str);
     assert!(
         !stdout1.trim().is_empty(),
         "First SessionStart must emit JSON"
     );
 
     // Second call — should detect existing session (resume path)
-    let (stdout2, _stderr2) = run(binary, &temp_home, &input_str);
+    let (stdout2, _stderr2) = run(binary, temp_home, &input_str);
     assert!(
         !stdout2.trim().is_empty(),
         "Resumed SessionStart must also emit JSON"
@@ -1056,7 +1071,7 @@ fn test_session_start_resumed_session_detection() {
         "SessionStart"
     );
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 }
 
 /// T13-3: Previous summary injection — if a snapshot exists for a prior session
@@ -1066,8 +1081,8 @@ fn test_session_start_previous_summary_injected() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-start-summary-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Seed the storage with a previous session + snapshot using clx-core directly
     // by first running a SessionEnd for a "prior" session (which creates the snapshot).
@@ -1105,9 +1120,8 @@ fn test_session_start_previous_summary_injected() {
     }
 
     let run_hook_isolated = |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
-        let mut child = std::process::Command::new(binary)
-            .env("HOME", temp_home)
-            .env("CLX_LOG", "error")
+        let mut command = std::process::Command::new(binary);
+        let mut child = harden_command(&mut command, temp_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1128,7 +1142,7 @@ fn test_session_start_previous_summary_injected() {
     // 1. Create prior session
     run_hook_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "prior-session-t13-3",
             "cwd": project_str,
@@ -1140,7 +1154,7 @@ fn test_session_start_previous_summary_injected() {
     // 2. Create a snapshot via PreCompact (this stores a summary)
     run_hook_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "prior-session-t13-3",
             "cwd": project_str,
@@ -1153,7 +1167,7 @@ fn test_session_start_previous_summary_injected() {
     // 3. End the prior session
     run_hook_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "prior-session-t13-3",
             "cwd": project_str,
@@ -1164,7 +1178,7 @@ fn test_session_start_previous_summary_injected() {
     // 4. Start a new session — it should load the prior session summary
     let stdout = run_hook_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "new-session-t13-3",
             "cwd": project_str,
@@ -1173,7 +1187,7 @@ fn test_session_start_previous_summary_injected() {
         }),
     );
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     assert!(
         !stdout.trim().is_empty(),
@@ -1201,8 +1215,8 @@ fn test_session_start_project_rules_injected() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-start-rules-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Create a project directory with a CLAUDE.md that has a CRITICAL section
     let project_dir = temp_home.join("rulesproject");
@@ -1220,9 +1234,8 @@ fn test_session_start_project_rules_injected() {
         "source": "startup"
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1239,7 +1252,7 @@ fn test_session_start_project_rules_injected() {
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     assert!(
         !stdout.trim().is_empty(),
@@ -1327,8 +1340,8 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
     use std::io::Write;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-end-snapshot-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Disable Ollama to avoid timeout delay in CI
     let clx_dir = temp_home.join(".clx");
@@ -1353,9 +1366,8 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
     }
 
     let run_isolated = |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
-        let mut child = std::process::Command::new(binary)
-            .env("HOME", temp_home)
-            .env("CLX_LOG", "error")
+        let mut command = std::process::Command::new(binary);
+        let mut child = harden_command(&mut command, temp_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1373,7 +1385,7 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
     // Start the session first
     run_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "end-t14-2",
             "cwd": "/tmp",
@@ -1385,7 +1397,7 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
     // End with transcript
     let output = run_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "end-t14-2",
             "cwd": "/tmp",
@@ -1397,7 +1409,7 @@ fn test_session_end_creates_final_snapshot_with_transcript() {
     let exit_status = output.status;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     assert!(
         exit_status.success(),
@@ -1437,8 +1449,8 @@ fn test_session_end_no_session_found_graceful() {
 #[test]
 fn test_session_end_token_count_reported_on_stderr() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-end-tokens-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     let input = serde_json::json!({
         "session_id": "end-t14-4",
@@ -1446,9 +1458,8 @@ fn test_session_end_token_count_reported_on_stderr() {
         "hook_event_name": "SessionEnd"
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1465,7 +1476,7 @@ fn test_session_end_token_count_reported_on_stderr() {
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     // The handler always writes "CLX: Session <id> ended (~<N> tokens)" to stderr
     assert!(
@@ -1490,8 +1501,8 @@ fn test_session_end_token_count_reported_on_stderr() {
 #[test]
 fn test_user_prompt_submit_recall_success_produces_valid_json() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-ups-recall-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Disable Ollama to force the graceful-degradation path (no embedding service
     // available in CI) — recall is skipped but orchestrator context is still injected.
@@ -1505,9 +1516,8 @@ fn test_user_prompt_submit_recall_success_produces_valid_json() {
 
     // Seed storage: start a prior session so storage is non-empty.
     let run_hook_isolated = |binary: &str, temp_home: &std::path::Path, body: serde_json::Value| {
-        let mut child = std::process::Command::new(binary)
-            .env("HOME", temp_home)
-            .env("CLX_LOG", "error")
+        let mut command = std::process::Command::new(binary);
+        let mut child = harden_command(&mut command, temp_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1526,7 +1536,7 @@ fn test_user_prompt_submit_recall_success_produces_valid_json() {
     // Create a prior session to ensure the database file exists.
     run_hook_isolated(
         binary,
-        &temp_home,
+        temp_home,
         serde_json::json!({
             "session_id": "ups-prior-t31-1",
             "cwd": "/tmp",
@@ -1543,9 +1553,8 @@ fn test_user_prompt_submit_recall_success_produces_valid_json() {
         "prompt": "Implement the authentication module for the project"
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1562,7 +1571,7 @@ fn test_user_prompt_submit_recall_success_produces_valid_json() {
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     // UserPromptSubmit ALWAYS emits JSON — recall result is optional.
     assert!(
@@ -1600,8 +1609,8 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
     use std::time::Instant;
 
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-ups-timeout-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // Point Ollama at an unreachable port with the minimum allowed timeout (100 ms).
     // The recall operation will timeout after ~100 ms and the handler returns promptly.
@@ -1622,9 +1631,8 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
 
     let start = Instant::now();
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1642,7 +1650,7 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
     let elapsed = start.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     // Handler must not block: allow 5 seconds headroom for process startup + OS scheduling.
     assert!(
@@ -1676,8 +1684,8 @@ fn test_user_prompt_submit_recall_timeout_completes_in_time() {
 #[test]
 fn test_user_prompt_submit_recall_error_swallowed_no_panic() {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_home = std::env::temp_dir().join(format!("clx-ups-error-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_home).unwrap();
+    let home_guard = isolated_clx_home();
+    let temp_home = home_guard.path();
 
     // No Ollama available; auto_recall enabled. All recall errors must be swallowed.
     let clx_dir = temp_home.join(".clx");
@@ -1695,9 +1703,8 @@ fn test_user_prompt_submit_recall_error_swallowed_no_panic() {
         "prompt": "Refactor the database layer to use the repository pattern"
     });
 
-    let mut child = std::process::Command::new(binary)
-        .env("HOME", &temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = std::process::Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1714,7 +1721,7 @@ fn test_user_prompt_submit_recall_error_swallowed_no_panic() {
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_home_size_bounded(temp_home);
 
     // Process must exit successfully — errors are swallowed.
     assert!(

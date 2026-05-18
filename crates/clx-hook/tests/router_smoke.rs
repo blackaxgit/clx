@@ -23,6 +23,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "support/mod.rs"]
+mod support;
+use support::{assert_home_size_bounded, harden_command, isolated_clx_home};
+
 use insta::assert_debug_snapshot;
 
 /// Returns the absolute path to a fixture file.
@@ -46,12 +50,11 @@ fn read_fixture(name: &str) -> String {
 /// Returns `(stdout, stderr)` as strings.
 fn run_hook(input: &str) -> (String, String) {
     let binary = env!("CARGO_BIN_EXE_clx-hook");
-    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let temp_dir = isolated_clx_home();
     let temp_home = temp_dir.path();
 
-    let mut child = Command::new(binary)
-        .env("HOME", temp_home)
-        .env("CLX_LOG", "error")
+    let mut command = Command::new(binary);
+    let mut child = harden_command(&mut command, temp_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -65,6 +68,7 @@ fn run_hook(input: &str) -> (String, String) {
     let output = child
         .wait_with_output()
         .expect("failed to wait for clx-hook");
+    assert_home_size_bounded(temp_home);
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
