@@ -193,16 +193,23 @@ mod tests {
         let home = dirs::home_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let s = if home.is_empty() {
-            s.to_string()
-        } else {
-            // After replacing the path, re-pad lines that changed so the
-            // total visible width stays at 80 columns.  The ratatui
-            // TestBackend always renders exactly 80 columns, but the
-            // <HOME> token may be shorter/longer than the real path.
+        // The Settings-tab panel title embeds the absolute config-file path,
+        // which ratatui clips to the panel width (only a prefix survives in
+        // the buffer). Redact the longest known prefix and canonicalize the
+        // volatile tail to 80 cols. Non-title lines never contain this
+        // prefix, so every other snapshot stays byte-identical.
+        let config_path = clx_core::config::Config::config_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let s = {
             let mut lines: Vec<String> = Vec::new();
             for line in s.lines() {
-                if line.contains(&home) {
+                if let Some(title) = redact_title_config_path(line, &config_path, 80) {
+                    lines.push(title);
+                } else if !home.is_empty() && line.contains(&home) {
+                    // Re-pad lines that changed so the total visible width
+                    // stays at 80 columns (the <HOME> token may differ in
+                    // length from the real path).
                     let replaced = line.replace(&home, "<HOME>");
                     let vis_len: usize = replaced.chars().count();
                     if vis_len >= 80 {
@@ -273,6 +280,38 @@ mod tests {
             i += s[i..].chars().next().unwrap().len_utf8();
         }
         out
+    }
+
+    /// If `line` contains a (possibly ratatui-truncated) prefix of the
+    /// absolute `config_path`, return the line with that path region replaced
+    /// by the stable `<CONFIG_PATH>` token and the volatile tail truncated
+    /// then space-padded to exactly `width` columns. Returns `None` when the
+    /// line does not contain the path, so callers leave non-title lines
+    /// byte-identical (zero collateral on sessions/audit/rules snapshots).
+    fn redact_title_config_path(line: &str, config_path: &str, width: usize) -> Option<String> {
+        const MIN: usize = 12;
+        if config_path.len() < MIN {
+            return None;
+        }
+        let mut end = config_path.len();
+        loop {
+            if config_path.is_char_boundary(end)
+                && let Some(pos) = line.find(&config_path[..end])
+            {
+                let mut head = String::with_capacity(width);
+                head.push_str(&line[..pos]);
+                head.push_str("<CONFIG_PATH>");
+                let mut canon: String = head.chars().take(width).collect();
+                while canon.chars().count() < width {
+                    canon.push(' ');
+                }
+                return Some(canon);
+            }
+            if end <= MIN {
+                return None;
+            }
+            end -= 1;
+        }
     }
 
     fn make_app() -> App {

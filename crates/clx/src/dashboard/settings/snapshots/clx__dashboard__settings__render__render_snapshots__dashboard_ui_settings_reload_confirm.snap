@@ -2,7 +2,7 @@
 source: crates/clx/src/dashboard/settings/render.rs
 expression: rendered
 ---
-┌ Sections ──────────┐┌ Validator - <CONFIG_PATH> ───────────────────────────────↑                  
+┌ Sections ──────────┐┌ Validator - <CONFIG_PATH>                                                   
 │> Validator         ││Field                    Value                      Default                 █
 │  Context           ││                                                                            █
 │  LLM               ││enabled                  true                       true                    █

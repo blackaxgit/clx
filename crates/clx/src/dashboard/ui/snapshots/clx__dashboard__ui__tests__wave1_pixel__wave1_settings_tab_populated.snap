@@ -5,7 +5,7 @@ expression: rendered
 ┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
 │ Sessions • Audit Log • Rules • Settings                                      │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌ Sections ──────────┐┌ Validator - <HOME>/.clx/config.yaml ───────────↑        
+┌ Sections ──────────┐┌ Validator - <CONFIG_PATH>                               
 │> Validator         ││Field                Value                Default       █
 │  Context           ││                                                        █
 │  LLM               ││enabled              true                 true          █

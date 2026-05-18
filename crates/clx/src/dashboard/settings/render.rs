@@ -557,10 +557,19 @@ mod render_snapshots {
 
         let mut out_lines: Vec<String> = Vec::new();
         for line in s.lines() {
-            let mut replaced = line.to_string();
-            if !config_path.is_empty() && replaced.contains(&config_path) {
-                replaced = replaced.replace(&config_path, "<CONFIG_PATH>");
+            // The panel title embeds the absolute config-file path, which
+            // ratatui clips to the panel width: only a *prefix* of the path
+            // survives in the buffer, so a full-string match is not portable
+            // across machines (it matched only on the original dev HOME).
+            // Redact the longest prefix of the known path present on the
+            // line and canonicalize the volatile tail to a fixed width.
+            // Non-title lines never contain this prefix, so they fall through
+            // unchanged (every other snapshot stays byte-identical).
+            if let Some(title) = redact_title_config_path(line, &config_path, COLS as usize) {
+                out_lines.push(title);
+                continue;
             }
+            let mut replaced = line.to_string();
             if !home.is_empty() && replaced.contains(&home) {
                 replaced = replaced.replace(&home, "<HOME>");
             }
@@ -588,6 +597,38 @@ mod render_snapshots {
             }
         }
         out_lines.join("\n")
+    }
+
+    /// If `line` contains a (possibly ratatui-truncated) prefix of the
+    /// absolute `config_path`, return the line with that path region replaced
+    /// by the stable `<CONFIG_PATH>` token and the volatile tail truncated
+    /// then space-padded to exactly `width` columns. Returns `None` when the
+    /// line does not contain the path, so callers leave non-title lines
+    /// byte-identical (zero collateral on sessions/audit/rules snapshots).
+    fn redact_title_config_path(line: &str, config_path: &str, width: usize) -> Option<String> {
+        const MIN: usize = 12;
+        if config_path.len() < MIN {
+            return None;
+        }
+        let mut end = config_path.len();
+        loop {
+            if config_path.is_char_boundary(end)
+                && let Some(pos) = line.find(&config_path[..end])
+            {
+                let mut head = String::with_capacity(width);
+                head.push_str(&line[..pos]);
+                head.push_str("<CONFIG_PATH>");
+                let mut canon: String = head.chars().take(width).collect();
+                while canon.chars().count() < width {
+                    canon.push(' ');
+                }
+                return Some(canon);
+            }
+            if end <= MIN {
+                return None;
+            }
+            end -= 1;
+        }
     }
 
     /// Render the Settings tab (entire `area = frame.area()`) and return the
