@@ -161,6 +161,11 @@ fn parse_stop_fixture() {
 }
 
 #[test]
+fn parse_stop_event_fixture() {
+    snapshot_parsed_fixture("parse_stop_event", "stop_event.json");
+}
+
+#[test]
 fn parse_session_start_fixture() {
     snapshot_parsed_fixture("parse_session_start", "session_start.json");
 }
@@ -198,6 +203,11 @@ fn emit_subagent_start_smoke() {
 #[test]
 fn emit_stop_smoke() {
     assert_emit_smoke("stop.json", "SessionEnd");
+}
+
+#[test]
+fn emit_stop_event_smoke() {
+    assert_emit_smoke("stop_event.json", "Stop");
 }
 
 #[test]

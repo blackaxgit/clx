@@ -44,6 +44,20 @@ impl Storage {
             )
             .unwrap_or(0);
 
+        // Refuse to operate on a database created by a newer CLX. Running
+        // an older binary's migrations (or queries) against a newer schema
+        // risks silent corruption or data loss, so fail fast with an
+        // actionable error instead of proceeding.
+        if current_version > SCHEMA_VERSION {
+            return Err(crate::Error::Storage(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                Some(format!(
+                    "database was created by a newer CLX (schema v{current_version} > \
+                     supported v{SCHEMA_VERSION}); upgrade CLX to open this database"
+                )),
+            )));
+        }
+
         if current_version < SCHEMA_VERSION {
             info!(
                 "Running migrations from version {} to {}",
@@ -442,4 +456,51 @@ fn alter_table_add_column(
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+
+    /// A database whose recorded schema version is newer than this binary's
+    /// `SCHEMA_VERSION` must be refused (no migrations, descriptive error)
+    /// rather than silently opened. Guards against downgrade corruption.
+    #[test]
+    fn run_migrations_refuses_newer_schema_version() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+
+        // Record a schema version from the future, as if this db were
+        // written by a newer CLX build.
+        let future_version = SCHEMA_VERSION + 1;
+        storage
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
+                [future_version],
+            )
+            .expect("seed future schema version");
+
+        let err = storage
+            .run_migrations()
+            .expect_err("re-running migrations on a newer schema must error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer CLX") && msg.contains("upgrade CLX"),
+            "error must be the actionable refuse-newer message, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("v{future_version}"))
+                && msg.contains(&format!("v{SCHEMA_VERSION}")),
+            "error must name both the on-disk and supported versions, got: {msg}"
+        );
+
+        // Normal upgrade path is unaffected: a fresh db migrates cleanly.
+        let fresh = Storage::open_in_memory().expect("fresh db opens and migrates");
+        assert_eq!(
+            fresh.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+    }
 }

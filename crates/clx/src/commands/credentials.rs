@@ -153,10 +153,12 @@ pub fn cmd_credentials(cli: &Cli, action: &CredentialsAction) -> Result<()> {
                     println!("{}", "No credentials stored.".dimmed());
                 } else {
                     for key in &keys {
-                        // Annotate keys of the form `<provider-name>:api-key` when
-                        // that provider name is present in the loaded config.
+                        // Annotate keys of the form `<provider-name>-api-key`
+                        // when that provider name is present in the loaded
+                        // config. The canonical credential naming uses a
+                        // hyphen separator (e.g. `azure-prod-api-key`).
                         let annotation = key
-                            .strip_suffix(":api-key")
+                            .strip_suffix("-api-key")
                             .and_then(|provider_name| providers.get(provider_name))
                             .map(|pc| {
                                 let kind = match pc {

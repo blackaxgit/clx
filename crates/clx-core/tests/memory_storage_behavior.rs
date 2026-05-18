@@ -407,41 +407,56 @@ fn v5_state_db_upgrades_to_v7_without_data_loss() {
     assert_eq!(s.count_tool_events("legacy-sess").unwrap(), 1);
 }
 
-/// RISK M-R1 (pin-accepted): there is NO newer-schema guard. A DB whose
-/// `schema_version` is GREATER than the current `SCHEMA_VERSION` (7) opens
-/// without error and WITHOUT forward migration. The synthetic golden corpus
-/// claims a "refuses downgrade" guard exists; the code path does not
-/// implement one (spec RISKS #1 + section 6). This test PINS the documented
-/// accepted behavior: opening a future DB silently succeeds. If a guard is
-/// later added this test will fail and must be revisited.
+/// RISK M-R1 (resolved): the newer-schema guard now exists. A DB whose
+/// `schema_version` is GREATER than the current `SCHEMA_VERSION` is REFUSED
+/// at open time with an actionable error, instead of being silently
+/// tolerated. Running an older binary against a newer schema risks silent
+/// corruption / data loss, so the migration entrypoint fails fast (spec
+/// RISKS #1 + section 6). This test asserts the corrected behavior:
+///   - a future-schema DB returns `Err` with the documented message;
+///   - a normal older -> current DB still migrates forward without error.
 #[test]
-fn risk_m_r1_newer_schema_db_opens_without_guard() {
+fn m_r1_newer_schema_db_is_refused() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let db = tmp.path().join("future.db");
+
+    // --- Case 1: future-schema DB must be refused ----------------------
+    let future_db = tmp.path().join("future.db");
     {
         // Real migrated DB, then bump schema_version far into the future.
-        let s = Storage::open(&db).expect("initial open");
+        let s = Storage::open(&future_db).expect("initial open");
         drop(s);
-        let conn = rusqlite::Connection::open(&db).unwrap();
+        let conn = rusqlite::Connection::open(&future_db).unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (999)",
             [],
         )
         .unwrap();
     }
-    // Documented accepted behavior: no "refuse newer schema" guard exists,
-    // so this open MUST succeed (spec RISKS #1, pin-accepted).
-    let reopened = Storage::open(&db);
+    let reopened = Storage::open(&future_db);
+    let err = reopened
+        .err()
+        .expect("RISK M-R1: opening a newer-schema DB MUST be refused");
+    let msg = err.to_string();
     assert!(
-        reopened.is_ok(),
-        "RISK M-R1: opening a newer-schema DB is silently tolerated \
-         (no guard implemented); pinning accepted behavior"
+        msg.contains("newer CLX") && msg.contains("upgrade CLX"),
+        "RISK M-R1: refusal error must carry the documented actionable \
+         message, got: {msg}"
     );
-    let s = reopened.unwrap();
-    assert_eq!(
-        s.schema_version().unwrap(),
-        999,
-        "RISK M-R1: version stays at the future value; no forward migration \
-         and no refusal (accepted residual, see spec section 6 + RISKS #1)"
+    assert!(
+        msg.contains("999"),
+        "RISK M-R1: refusal message must report the offending future \
+         schema version, got: {msg}"
+    );
+
+    // --- Case 2: a fresh (version 0) DB still migrates forward --------
+    // The guard must only reject *newer* schemas; an empty/older DB must
+    // still run the full migration chain up to the current version. (The
+    // realistic v5 -> v7 legacy upgrade is covered separately above.)
+    let normal_db = tmp.path().join("normal.db");
+    let migrated =
+        Storage::open(&normal_db).expect("RISK M-R1: a fresh/older DB must still migrate forward");
+    assert!(
+        migrated.schema_version().unwrap() >= 7,
+        "fresh DB must migrate up to the current supported schema version"
     );
 }
