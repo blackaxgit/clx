@@ -95,6 +95,12 @@ enum Commands {
         action: CredentialsAction,
     },
 
+    /// Relax the macOS Keychain ACL on CLX credential items so the keychain
+    /// stops re-prompting on every launch. Repairs items created by older
+    /// CLX versions; new items are handled automatically at store time.
+    /// macOS-only (a clean no-op on other operating systems).
+    KeychainTrust,
+
     /// Generate embeddings for existing snapshots (backfill)
     EmbedBackfill {
         /// Only show what would be done, don't generate embeddings
@@ -201,6 +207,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
         Some(Commands::Uninstall { purge }) => commands::cmd_uninstall(cli, *purge).await,
         Some(Commands::Version) => commands::cmd_version(cli),
         Some(Commands::Credentials { action }) => commands::cmd_credentials(cli, action),
+        Some(Commands::KeychainTrust) => commands::cmd_keychain_trust(cli),
         Some(Commands::EmbedBackfill { dry_run }) => {
             commands::cmd_embed_backfill(cli, *dry_run).await
         }

@@ -38,6 +38,19 @@ hex = "0.4"
 # TextRerank; we do not enable any optional GPU/CUDA features.
 fastembed = "5"
 
+# macOS keychain ACL relaxation (0.8.0): the `keyring` crate always creates
+# generic-password items with the default restrictive ACL bound to the
+# creating binary's code signature. Homebrew's adhoc-signed `clx` has an
+# unstable identity, so macOS re-prompts on every launch. We use the
+# maintained `security-framework` crate to (re)apply a permissive
+# "any application" SecAccess on the CLX credential items so reads never
+# prompt. Pinned at the 2.x line that `keyring v2` already locks (single
+# dependency tree, no duplicate Security.framework binding). macOS-gated so
+# non-macOS builds never pull these.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2.11"
+core-foundation = "0.9"
+
 [lints]
 workspace = true
 

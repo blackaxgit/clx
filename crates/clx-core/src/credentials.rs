@@ -23,11 +23,15 @@
 //! ```
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::sync::Once;
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tracing::{debug, warn};
+
+pub mod keychain_acl;
 
 /// Service name for CLX credentials in the system keychain
 const SERVICE_NAME: &str = "com.clx.credentials";
@@ -230,6 +234,14 @@ impl CredentialStore {
         entry
             .set_password(value)
             .map_err(|e| self.map_keyring_error(e, key))?;
+
+        // macOS only: the `keyring` write above created/updated the item with
+        // the default restrictive ACL bound to this (adhoc-signed) binary,
+        // which makes macOS re-prompt on every future launch. Relax the item
+        // to an "any application on this user account" SecAccess so reads
+        // never prompt again. This is a deliberate local-trust tradeoff (see
+        // `keychain_acl`); surfaced once per process via a one-line notice.
+        self.relax_keychain_acl(&prefixed_key);
 
         // Keep the session cache consistent with the new value.
         self.invalidate_cache(key, project);
@@ -576,6 +588,95 @@ impl CredentialStore {
         self.save_index_scoped(&keys, project)?;
         Ok(())
     }
+
+    /// Apply the permissive "any application" `SecAccess` to a freshly stored
+    /// keychain item so future reads (this launch or any later launch, signed
+    /// or adhoc) never prompt.
+    ///
+    /// macOS only. A no-op on every other OS and in unit tests using the fake
+    /// backend (Linux Secret Service does not have the adhoc-binary
+    /// re-prompt problem, and the test backend is in-memory). Best-effort:
+    /// failures are logged at debug and never surfaced as a store error, so a
+    /// locked keychain or an unexpected Security.framework status cannot make
+    /// `store` fail after the secret has already been written.
+    fn relax_keychain_acl(&self, prefixed_key: &str) {
+        #[cfg(test)]
+        if self.fake_backend.is_some() {
+            return;
+        }
+        keychain_acl::relax_item_access(&self.service, prefixed_key);
+        Self::emit_relaxed_acl_notice_once();
+    }
+
+    /// Print the relaxed-ACL rationale exactly once per process so the user
+    /// understands CLX deliberately widened the credential item's ACL. Goes
+    /// to stderr (not stdout) so it never corrupts JSON / piped output.
+    fn emit_relaxed_acl_notice_once() {
+        #[cfg(target_os = "macos")]
+        {
+            static NOTICE: Once = Once::new();
+            NOTICE.call_once(|| {
+                tracing::info!(
+                    "CLX relaxed the macOS Keychain ACL on its credential items to \
+                     'any application on this user account' so the keychain stops \
+                     re-prompting. Run `clx keychain-trust` to re-apply this to older \
+                     items."
+                );
+                eprintln!(
+                    "note: CLX set its keychain credential to be readable by any \
+                     application on this user account so macOS stops re-prompting. \
+                     This is a local-trust tradeoff (same as choosing \"Allow all \
+                     applications\" in Keychain Access)."
+                );
+            });
+        }
+    }
+
+    /// Re-apply the permissive "any application" `SecAccess` to every CLX
+    /// credential item under this store's service name.
+    ///
+    /// This repairs items created by pre-0.8.0 CLX (which have the default
+    /// restrictive ACL) so the macOS keychain stops re-prompting. macOS only;
+    /// on every other OS this is a no-op that returns `Ok(0)`.
+    ///
+    /// Returns the number of items whose access was successfully relaxed.
+    /// Items that cannot be found are skipped silently (nothing to repair);
+    /// a locked keychain surfaces as an [`CredentialError::AccessDenied`].
+    ///
+    /// # Security
+    ///
+    /// This deliberately widens the ACL on the CLX credential items to "any
+    /// application on this user account". It is the same trust decision as a
+    /// user manually choosing "Allow all applications" in Keychain Access,
+    /// scoped to CLX's own items only. It does not touch any other keychain
+    /// item.
+    pub fn repair_keychain_trust(&self) -> Result<KeychainTrustReport> {
+        // Candidate item names: the two index entries plus every scoped key
+        // recorded in the global and project indexes. Pre-0.8.0 CLX used the
+        // exact same key format, so the index is an accurate enumeration.
+        let mut names: Vec<String> = vec![Self::INDEX_KEY.to_string(), self.index_key(None)];
+
+        if let Ok(global_keys) = self.get_index_scoped(None) {
+            for k in &global_keys {
+                names.push(self.scoped_key(k, None));
+            }
+        }
+
+        let report = keychain_acl::repair_service_items(&self.service, &names)?;
+        Ok(report)
+    }
+}
+
+/// Outcome of [`CredentialStore::repair_keychain_trust`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeychainTrustReport {
+    /// Items whose ACL was successfully relaxed to "any application".
+    pub relaxed: usize,
+    /// Items that did not exist (nothing to repair for them).
+    pub missing: usize,
+    /// Whether this platform actually performs keychain trust repair.
+    /// `false` on every non-macOS OS (the whole operation is a no-op there).
+    pub macos: bool,
 }
 
 #[cfg(test)]

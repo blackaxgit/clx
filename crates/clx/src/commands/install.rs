@@ -865,6 +865,11 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
             println!("  1. Restart Claude Code to load the new configuration");
             println!("  2. Run 'clx dashboard' to verify installation");
             println!("  3. Run 'clx config' to view/edit configuration");
+            println!();
+            println!(
+                "  macOS keychain trust is auto-handled when CLX stores a credential; \
+                 run 'clx keychain-trust' once to repair items from older CLX versions."
+            );
         } else {
             println!("{}", "Installation Completed with Warnings".yellow().bold());
             println!("{}", "=".repeat(50));
