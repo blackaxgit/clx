@@ -8,15 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [0.8.0] - 2026-05-17
 
 The "memory and quality" release. Five user-visible outcomes plus an
-engineering coverage push. All work landed on `feat/0.8.0-memory-skills-coverage`
-across 13 atomic commits.
+engineering coverage push, hardened by a two-round comprehensive review
+and a Red/Green/Purple security pass. All work landed on
+`feat/0.8.0-memory-skills-coverage`.
 
 ### Added
 
 - **Recall accuracy pipeline (Phase 5).** `RecallEngine::query` now runs
   parallel embedding + FTS5 candidate generation, fuses via Reciprocal
   Rank Fusion (RRF) with `k = 60` (Cormack et al. 2009), reranks the top
-  candidates through `bge-reranker-v2-m3` (fastembed-rs 4.x) with a 250 ms
+  candidates through `bge-reranker-v2-m3` (fastembed-rs 5.x) with a 250 ms
   graceful timeout, then applies multiplicative time-decay (30-day default
   half-life) and a p70 percentile gate. New config keys on
   `AutoRecallConfig`: `rrf_enabled`, `rrf_k`, `time_decay_half_life_days`,

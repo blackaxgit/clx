@@ -128,8 +128,7 @@ pub async fn apply_reranker(
         .map(|h| h.summary.as_deref().unwrap_or(""))
         .collect();
 
-    let score_result =
-        tokio::time::timeout(timeout, backend.score(query, &candidates)).await;
+    let score_result = tokio::time::timeout(timeout, backend.score(query, &candidates)).await;
 
     let scores = match score_result {
         Ok(Ok(scores)) => scores,
@@ -241,11 +240,7 @@ mod tests {
 
     #[async_trait]
     impl Reranker for MockReranker {
-        async fn score(
-            &self,
-            _query: &str,
-            candidates: &[&str],
-        ) -> Result<Vec<f32>, RerankError> {
+        async fn score(&self, _query: &str, candidates: &[&str]) -> Result<Vec<f32>, RerankError> {
             *self.observed_calls.lock().unwrap() = candidates.len();
             if let Some(delay) = self.delay {
                 tokio::time::sleep(delay).await;
@@ -324,8 +319,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_returns_input_unchanged() {
         let baseline = RERANK_FALLBACK_TOTAL.load(Ordering::Relaxed);
-        let mock = MockReranker::ready_with(vec![5.0])
-            .with_delay(Duration::from_millis(200));
+        let mock = MockReranker::ready_with(vec![5.0]).with_delay(Duration::from_millis(200));
         let input = vec![hit(1, 0.7, Some("alpha"))];
         let out = apply_reranker(input.clone(), "q", &mock, Duration::from_millis(20)).await;
         assert_eq!(out.len(), 1);
@@ -352,10 +346,7 @@ mod tests {
     #[tokio::test]
     async fn marks_search_type_hybrid_on_success() {
         let mock = MockReranker::ready_with(vec![2.0, 1.0]);
-        let input = vec![
-            hit(1, 0.0, Some("a")),
-            hit(2, 0.0, Some("b")),
-        ];
+        let input = vec![hit(1, 0.0, Some("a")), hit(2, 0.0, Some("b"))];
         let out = apply_reranker(input, "q", &mock, Duration::from_millis(50)).await;
         assert_eq!(out.len(), 2);
         for h in &out {
@@ -367,7 +358,7 @@ mod tests {
     async fn handles_missing_summary_without_panic() {
         let mock = MockReranker::ready_with(vec![1.5, 0.5]);
         let input = vec![
-            hit(1, 0.0, None),         // no summary -> empty string in candidates
+            hit(1, 0.0, None), // no summary -> empty string in candidates
             hit(2, 0.0, Some("text")),
         ];
         let out = apply_reranker(input, "q", &mock, Duration::from_millis(50)).await;

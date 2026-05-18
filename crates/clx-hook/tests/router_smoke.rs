@@ -76,8 +76,7 @@ fn run_hook(input: &str) -> (String, String) {
 /// the upstream Claude Code envelope schema (new fields, renamed fields).
 fn snapshot_parsed_fixture(snapshot_name: &str, fixture: &str) {
     let raw = read_fixture(fixture);
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).expect("fixture must be valid JSON");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("fixture must be valid JSON");
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(
         r#"\"session_id\":\s*\"[^\"]+\""#,
@@ -114,9 +113,7 @@ fn assert_emit_smoke(fixture: &str, expected_event: &str) {
         return; // Acceptable: side-effect-only events may not emit anything.
     }
     let value: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
-        panic!(
-            "binary stdout for {fixture} must be valid JSON: {e}\nstdout: {stdout}"
-        )
+        panic!("binary stdout for {fixture} must be valid JSON: {e}\nstdout: {stdout}")
     });
     let event = value
         .get("hookSpecificOutput")

@@ -42,7 +42,12 @@ pub async fn cmd_maintenance(cli: &Cli, action: &MaintenanceAction) -> Result<()
     }
 }
 
-fn trim(cli: &Cli, tool_events_days: Option<u32>, audit_days: Option<u32>, dry_run: bool) -> Result<()> {
+fn trim(
+    cli: &Cli,
+    tool_events_days: Option<u32>,
+    audit_days: Option<u32>,
+    dry_run: bool,
+) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let storage = Storage::open_default()?;
 
@@ -71,10 +76,7 @@ fn trim(cli: &Cli, tool_events_days: Option<u32>, audit_days: Option<u32>, dry_r
                 })
             );
         } else {
-            println!(
-                "{} (dry-run)",
-                "clx maintenance trim".bold()
-            );
+            println!("{} (dry-run)", "clx maintenance trim".bold());
             println!("  tool_events older than {te_days}d: {te_count} row(s)");
             println!("  audit_log  older than {au_days}d: (count not estimated in dry-run)");
         }

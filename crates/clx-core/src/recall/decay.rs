@@ -56,9 +56,7 @@ pub fn apply_time_decay(hits: &mut [RecallHit], half_life_days: f64, now: DateTi
         };
 
         let created_utc: DateTime<Utc> = created.with_timezone(&Utc);
-        let age_seconds = now
-            .signed_duration_since(created_utc)
-            .num_seconds();
+        let age_seconds = now.signed_duration_since(created_utc).num_seconds();
 
         // Convert to fractional days. Clamp negative ages (clock skew) to 0
         // so we never multiply by a value greater than 1.0.
@@ -109,7 +107,12 @@ mod tests {
     use crate::recall::RecallSearchType;
     use chrono::Duration;
 
-    fn hit_with_score_and_age(snapshot_id: i64, score: f64, age_days: f64, now: DateTime<Utc>) -> RecallHit {
+    fn hit_with_score_and_age(
+        snapshot_id: i64,
+        score: f64,
+        age_days: f64,
+        now: DateTime<Utc>,
+    ) -> RecallHit {
         let created = now - Duration::seconds((age_days * 86_400.0) as i64);
         RecallHit {
             snapshot_id,
@@ -265,7 +268,11 @@ mod tests {
         let filtered = apply_percentile_gate(hits, 70);
         assert_eq!(filtered.len(), 4, "p70 of 10 hits should keep 4");
         for h in &filtered {
-            assert!(h.score >= 0.7 - 1e-9, "kept score {} below threshold", h.score);
+            assert!(
+                h.score >= 0.7 - 1e-9,
+                "kept score {} below threshold",
+                h.score
+            );
         }
     }
 

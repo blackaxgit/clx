@@ -181,10 +181,7 @@ impl CredentialStore {
     /// Primarily for tests that want cached behavior without touching
     /// production credentials.
     pub fn with_service_cached(service: impl Into<String>) -> Self {
-        Self::build(
-            service.into(),
-            Some(Arc::new(Mutex::new(HashMap::new()))),
-        )
+        Self::build(service.into(), Some(Arc::new(Mutex::new(HashMap::new()))))
     }
 
     /// Whether this store has an active process-scoped read cache.
@@ -272,7 +269,9 @@ impl CredentialStore {
         // Fast path: serve from the process-scoped cache without touching the
         // keychain. Both positive and negative (None) results are cached.
         if let Some(cache) = &self.cache {
-            let guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = guard.get(&prefixed_key) {
                 debug!("Serving credential '{}' from process cache", key);
                 return Ok(cached.as_ref().map(|s| s.expose_secret().to_string()));
@@ -290,7 +289,9 @@ impl CredentialStore {
         let value = self.read_scoped_uncached(&prefixed_key, key)?;
 
         if let Some(cache) = &self.cache {
-            let mut guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Double-check: a concurrent first reader may have populated the
             // entry while we were reading the keychain. Keep the existing
             // entry so all racers observe a single consistent value.
@@ -305,11 +306,7 @@ impl CredentialStore {
     /// Read a scoped credential directly from the keychain, bypassing any
     /// cache. The hot keychain call lives here so callers (and the cache
     /// fast path) share one place that touches `keyring`.
-    fn read_scoped_uncached(
-        &self,
-        prefixed_key: &str,
-        key: &str,
-    ) -> Result<Option<String>> {
+    fn read_scoped_uncached(&self, prefixed_key: &str, key: &str) -> Result<Option<String>> {
         #[cfg(test)]
         if let Some(fake) = &self.fake_backend {
             return Ok(fake.get(prefixed_key));
@@ -682,13 +679,19 @@ mod tests {
         backend.seed("clx:global:azure-api-key", "azure");
         backend.seed("clx:global:openai-api-key", "openai");
 
-        assert_eq!(store.get("azure-api-key").unwrap().as_deref(), Some("azure"));
+        assert_eq!(
+            store.get("azure-api-key").unwrap().as_deref(),
+            Some("azure")
+        );
         assert_eq!(
             store.get("openai-api-key").unwrap().as_deref(),
             Some("openai")
         );
         // Re-read both: still served from cache.
-        assert_eq!(store.get("azure-api-key").unwrap().as_deref(), Some("azure"));
+        assert_eq!(
+            store.get("azure-api-key").unwrap().as_deref(),
+            Some("azure")
+        );
         assert_eq!(
             store.get("openai-api-key").unwrap().as_deref(),
             Some("openai")
@@ -746,9 +749,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let s = store.clone();
-            handles.push(std::thread::spawn(move || {
-                s.get("api").unwrap()
-            }));
+            handles.push(std::thread::spawn(move || s.get("api").unwrap()));
         }
         for h in handles {
             assert_eq!(h.join().unwrap().as_deref(), Some("secret-value"));
@@ -759,10 +760,7 @@ mod tests {
         // cache converges to a single value. Bound the keychain hits well
         // below "once per call" (8) to prove caching engaged.
         let reads = backend.read_count();
-        assert!(
-            reads <= 8,
-            "expected bounded backend reads, got {reads}"
-        );
+        assert!(reads <= 8, "expected bounded backend reads, got {reads}");
         // Subsequent reads are fully cached.
         let before = backend.read_count();
         assert_eq!(store.get("api").unwrap().as_deref(), Some("secret-value"));

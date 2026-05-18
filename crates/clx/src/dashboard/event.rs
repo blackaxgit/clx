@@ -93,7 +93,8 @@ fn handle_dashboard_event(app: &mut App, ev: DashboardEvent) {
 // ---------------------------------------------------------------------------
 
 fn snapshot_state(app: &App) -> AppState {
-    let settings_field_count = super::settings::fields::fields_for_section(app.settings_section_idx).len();
+    let settings_field_count =
+        super::settings::fields::fields_for_section(app.settings_section_idx).len();
     AppState {
         current_tab: app.current_tab,
         should_quit: app.should_quit,
@@ -153,7 +154,8 @@ fn apply_state_to_app(app: &mut App, s: &AppState) {
         app.detail_events_state.select(s.detail_events_selected);
     }
     if app.detail_snapshots_state.selected() != s.detail_snapshots_selected {
-        app.detail_snapshots_state.select(s.detail_snapshots_selected);
+        app.detail_snapshots_state
+            .select(s.detail_snapshots_selected);
     }
     app.detail_scroll_offset = s.detail_scroll_offset;
     if app.settings_section_idx != s.settings_section_idx {
@@ -161,7 +163,8 @@ fn apply_state_to_app(app: &mut App, s: &AppState) {
     }
     if app.settings_field_idx != s.settings_field_idx {
         app.settings_field_idx = s.settings_field_idx;
-        app.settings_field_table_state.select(Some(s.settings_field_idx));
+        app.settings_field_table_state
+            .select(Some(s.settings_field_idx));
     }
     app.settings_is_dirty = s.settings_is_dirty;
     app.settings_edit_buffer.clone_from(&s.settings_edit_buffer);

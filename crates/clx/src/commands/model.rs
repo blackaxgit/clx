@@ -63,22 +63,16 @@ pub async fn cmd_model(cli: &Cli, action: &ModelAction) -> Result<()> {
 /// that the cache directory actually contains every required artifact,
 /// so a partial / interrupted download cannot be mistaken for a healthy
 /// install.
-const REQUIRED_MODEL_FILES: &[&str] =
-    &["tokenizer.json", "special_tokens_map.json", "config.json"];
+const REQUIRED_MODEL_FILES: &[&str] = &["tokenizer.json", "special_tokens_map.json", "config.json"];
 
 /// Fetch the bge-reranker-v2-m3 model into `~/.clx/models/`.
 async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
     let cache_dir = clx_core::paths::model_cache_dir();
-    fs::create_dir_all(&cache_dir).with_context(|| {
-        format!(
-            "failed to create model cache dir {}",
-            cache_dir.display()
-        )
-    })?;
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create model cache dir {}", cache_dir.display()))?;
 
     let model_dir = cache_dir.join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
-    let ready_path =
-        model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
+    let ready_path = model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
 
     // Early-out: already ready and not forcing. Safe to check before
     // taking the lock because (a) it's read-only, and (b) if a fetch is
@@ -146,8 +140,8 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
         // Even in dry-run we write a *real* content-pinned sentinel so
         // the reranker readiness check (F9) treats the stub as ready and
         // smoke tests exercise the same code path as production.
-        let pinned = pin_model_artifacts(&model_dir)
-            .context("failed to hash dry-run model artifacts")?;
+        let pinned =
+            pin_model_artifacts(&model_dir).context("failed to hash dry-run model artifacts")?;
         fs::write(&ready_path, render_sentinel(&pinned))?;
         if !cli.json {
             println!(
@@ -176,8 +170,7 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
             .with_cache_dir(cache_for_task)
             .with_show_download_progress(true);
 
-        TextRerank::try_new(options)
-            .map_err(|e| anyhow::anyhow!("fastembed init failed: {e}"))?;
+        TextRerank::try_new(options).map_err(|e| anyhow::anyhow!("fastembed init failed: {e}"))?;
         Ok(())
     })
     .await
@@ -239,8 +232,7 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
 fn cmd_status(cli: &Cli) -> Result<()> {
     let cache_dir = clx_core::paths::model_cache_dir();
     let model_dir = cache_dir.join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
-    let ready_path =
-        model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
+    let ready_path = model_dir.join(clx_core::recall::fastembed::READY_SENTINEL);
     let ready = ready_path.exists();
     let size_bytes = if model_dir.exists() {
         dir_size(&model_dir)
@@ -269,10 +261,7 @@ fn cmd_status(cli: &Cli) -> Result<()> {
         println!("{}", "=".repeat(50));
         println!("  Cache dir: {}", cache_dir.display());
         println!();
-        println!(
-            "  {}: bge-reranker-v2-m3",
-            "Model".bold()
-        );
+        println!("  {}: bge-reranker-v2-m3", "Model".bold());
         println!(
             "    Installed: {}",
             if model_dir.exists() {
@@ -289,10 +278,7 @@ fn cmd_status(cli: &Cli) -> Result<()> {
                 "no".yellow().to_string()
             }
         );
-        println!(
-            "    Size:      {}",
-            human_bytes(size_bytes)
-        );
+        println!("    Size:      {}", human_bytes(size_bytes));
         println!("    Path:      {}", model_dir.display());
         if !ready {
             println!();
@@ -349,10 +335,7 @@ fn cmd_list(cli: &Cli) -> Result<()> {
 /// the `.ready` sentinel and trusts that this guard has run.
 fn verify_model_dir_complete(model_dir: &Path) -> Result<()> {
     if !model_dir.is_dir() {
-        anyhow::bail!(
-            "model directory missing: {}",
-            model_dir.display()
-        );
+        anyhow::bail!("model directory missing: {}", model_dir.display());
     }
 
     // The ONNX weights may live at the model root or under `onnx/`,
@@ -372,10 +355,7 @@ fn verify_model_dir_complete(model_dir: &Path) -> Result<()> {
     for name in REQUIRED_MODEL_FILES {
         let p = model_dir.join(name);
         if !is_nonempty_file(&p) {
-            anyhow::bail!(
-                "missing or empty required file: {}",
-                p.display()
-            );
+            anyhow::bail!("missing or empty required file: {}", p.display());
         }
     }
 
@@ -387,7 +367,6 @@ fn verify_model_dir_complete(model_dir: &Path) -> Result<()> {
 fn is_nonempty_file(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
-
 
 /// Remove `*.tmp` / `*.part` partial-download files that some HTTP
 /// clients leave behind when interrupted. Best-effort: any IO error is
@@ -663,7 +642,10 @@ mod tests {
         let keeper = model_dir.join("config.json");
         cleanup_partial_downloads(&model_dir);
         assert!(!model_dir.join("blob.tmp").exists(), "tmp must be removed");
-        assert!(!model_dir.join("blob.part").exists(), "part must be removed");
+        assert!(
+            !model_dir.join("blob.part").exists(),
+            "part must be removed"
+        );
         assert!(keeper.exists(), "non-partial files must be preserved");
     }
 
@@ -702,7 +684,9 @@ mod tests {
     #[test]
     fn pin_model_artifacts_hashes_onnx_and_external_data() {
         let tmp = TempDir::new().unwrap();
-        let model_dir = tmp.path().join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
+        let model_dir = tmp
+            .path()
+            .join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(model_dir.join("model.onnx"), b"graph-bytes").unwrap();
         fs::write(model_dir.join("model.onnx.data"), b"weight-bytes-blob").unwrap();
@@ -742,7 +726,9 @@ mod tests {
         // The sentinel the fetch side writes must parse cleanly with the
         // clx-core parser the recall pipeline uses (no writer/reader drift).
         let tmp = TempDir::new().unwrap();
-        let model_dir = tmp.path().join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
+        let model_dir = tmp
+            .path()
+            .join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(model_dir.join("model.onnx"), b"abc").unwrap();
 

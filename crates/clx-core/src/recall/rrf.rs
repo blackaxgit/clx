@@ -52,11 +52,7 @@ use super::{RecallHit, RecallSearchType};
 /// Ties in fused score are broken by `snapshot_id` descending (stable,
 /// deterministic). Empty input returns an empty vec.
 #[must_use]
-pub fn rrf_fuse(
-    rankings: &[Vec<RecallHit>],
-    k: u32,
-    max_results: usize,
-) -> Vec<RecallHit> {
+pub fn rrf_fuse(rankings: &[Vec<RecallHit>], k: u32, max_results: usize) -> Vec<RecallHit> {
     // Use f64 because k can be 0 (edge case test) and we want full precision
     // when many small reciprocal contributions are summed across many rankers.
     let k_f = f64::from(k);
@@ -176,9 +172,15 @@ mod tests {
         assert_eq!(fused.len(), 3);
 
         // C wins on snapshot_id tie-break ahead of A.
-        assert_eq!(fused[0].snapshot_id, 30, "C wins the descending-id tiebreak");
+        assert_eq!(
+            fused[0].snapshot_id, 30,
+            "C wins the descending-id tiebreak"
+        );
         assert!((fused[0].score - score_c).abs() < 1e-12_f64);
-        assert_eq!(fused[1].snapshot_id, 10, "A follows the descending-id tiebreak");
+        assert_eq!(
+            fused[1].snapshot_id, 10,
+            "A follows the descending-id tiebreak"
+        );
         assert!((fused[1].score - score_a).abs() < 1e-12_f64);
         assert_eq!(fused[2].snapshot_id, 20, "B is last with the smaller score");
         assert!((fused[2].score - score_b).abs() < 1e-12_f64);

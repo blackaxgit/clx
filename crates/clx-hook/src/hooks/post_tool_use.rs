@@ -57,10 +57,7 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
     // Read-only tools (Read, Grep, etc.) are silently skipped. The aggregator
     // is failure-tolerant: any DB or derivation error is logged at warn and
     // does not affect the rest of the hook.
-    let tool_input_value = input
-        .tool_input
-        .clone()
-        .unwrap_or(serde_json::Value::Null);
+    let tool_input_value = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
     if aggregator::should_aggregate(tool_name, &tool_input_value) {
         let outcome = if input.tool_response.is_some() {
             ToolOutcome::Success

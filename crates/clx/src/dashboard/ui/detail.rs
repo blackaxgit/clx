@@ -1084,8 +1084,7 @@ mod render_snapshots {
         app.detail_tab = detail_tab;
         // Pre-select first row of each sub-table so the detail pane renders content.
         if !data.audit_entries.is_empty() {
-            app.detail_commands_state
-                .select(Some(0));
+            app.detail_commands_state.select(Some(0));
         }
         if !data.events.is_empty() {
             app.detail_events_state.select(Some(0));
@@ -1184,11 +1183,7 @@ mod render_snapshots {
 
     #[test]
     fn snapshot_detail_info_populated() {
-        let data = make_detail_data(
-            populated_audit(),
-            populated_events(),
-            populated_snapshots(),
-        );
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
         let mut app = make_detail_app(DetailTab::Info, data);
         let rendered = render_detail_to_string(&mut app);
         insta::assert_snapshot!("dashboard_ui_detail_info_populated", rendered);
@@ -1196,11 +1191,7 @@ mod render_snapshots {
 
     #[test]
     fn snapshot_detail_commands_populated() {
-        let data = make_detail_data(
-            populated_audit(),
-            populated_events(),
-            populated_snapshots(),
-        );
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
         let mut app = make_detail_app(DetailTab::Commands, data);
         let rendered = render_detail_to_string(&mut app);
         insta::assert_snapshot!("dashboard_ui_detail_commands_populated", rendered);
@@ -1208,11 +1199,7 @@ mod render_snapshots {
 
     #[test]
     fn snapshot_detail_audit_populated() {
-        let data = make_detail_data(
-            populated_audit(),
-            populated_events(),
-            populated_snapshots(),
-        );
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
         let mut app = make_detail_app(DetailTab::Audit, data);
         let rendered = render_detail_to_string(&mut app);
         insta::assert_snapshot!("dashboard_ui_detail_audit_populated", rendered);
@@ -1220,11 +1207,7 @@ mod render_snapshots {
 
     #[test]
     fn snapshot_detail_snapshots_populated() {
-        let data = make_detail_data(
-            populated_audit(),
-            populated_events(),
-            populated_snapshots(),
-        );
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
         let mut app = make_detail_app(DetailTab::Snapshots, data);
         let rendered = render_detail_to_string(&mut app);
         insta::assert_snapshot!("dashboard_ui_detail_snapshots_populated", rendered);

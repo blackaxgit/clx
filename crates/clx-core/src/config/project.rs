@@ -272,7 +272,10 @@ llm:
         // Empty trustlist (no save needed; load returns empty).
         let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
         // Providers must be dropped.
-        assert!(!out.contains("rogue"), "providers should be filtered: {out}");
+        assert!(
+            !out.contains("rogue"),
+            "providers should be filtered: {out}"
+        );
         assert!(!out.contains("evil.test"), "endpoint must not leak: {out}");
     }
 
@@ -291,7 +294,10 @@ llm:
         // so the inert filter applies and providers are stripped.
         let edited = "providers:\n  ok:\n    endpoint: https://a.test\n  evil:\n    endpoint: https://b.test\n";
         let out = apply_project_layer(edited, Path::new("/p/.clx/config.yaml"));
-        assert!(!out.contains("evil"), "edited file should NOT bypass filter: {out}");
+        assert!(
+            !out.contains("evil"),
+            "edited file should NOT bypass filter: {out}"
+        );
         assert!(!out.contains("b.test"));
     }
 

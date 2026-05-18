@@ -290,10 +290,7 @@ mod tests {
 
     #[test]
     fn classify_provenance_unverified_when_none_set() {
-        let env = [
-            ("CLAUDE_PROJECT_DIR", None),
-            ("CLAUDE_PLUGIN_ROOT", None),
-        ];
+        let env = [("CLAUDE_PROJECT_DIR", None), ("CLAUDE_PLUGIN_ROOT", None)];
         assert_eq!(classify_provenance(&env), Provenance::Unverified);
     }
 

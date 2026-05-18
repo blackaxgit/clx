@@ -478,9 +478,10 @@ impl Reranker for FastembedReranker {
         // claimed the right to load. We then drop the guard before the
         // blocking task starts so other callers can queue behind us.
         let taken_model: Option<TextRerank> = {
-            let mut guard = self.inner.lock().map_err(|e| {
-                RerankError::Backend(format!("rerank mutex poisoned: {e}"))
-            })?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| RerankError::Backend(format!("rerank mutex poisoned: {e}")))?;
             guard.take()
         };
 
@@ -577,8 +578,8 @@ impl Reranker for FastembedReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -608,11 +609,8 @@ mod tests {
             sha256_hex: hex,
             size: onnx_bytes.len() as u64,
         }];
-        std::fs::write(
-            model_dir.join(READY_SENTINEL),
-            render_sentinel(&artifacts),
-        )
-        .expect("write sentinel");
+        std::fs::write(model_dir.join(READY_SENTINEL), render_sentinel(&artifacts))
+            .expect("write sentinel");
         model_dir
     }
 
@@ -718,11 +716,8 @@ mod tests {
             sha256_hex: hex,
             size: bytes.len() as u64,
         }];
-        std::fs::write(
-            model_dir.join(READY_SENTINEL),
-            render_sentinel(&artifacts),
-        )
-        .expect("sentinel");
+        std::fs::write(model_dir.join(READY_SENTINEL), render_sentinel(&artifacts))
+            .expect("sentinel");
         assert!(
             FastembedReranker::verify_ready_uncached(tmp.path()),
             "onnx-under-subdir layout must resolve and verify"
@@ -803,10 +798,7 @@ mod tests {
     fn ready_sentinel_path_layout() {
         let tmp = TempDir::new().expect("tempdir");
         let adapter = FastembedReranker::new(tmp.path().to_path_buf());
-        let expected = tmp
-            .path()
-            .join(DEFAULT_MODEL_DIRNAME)
-            .join(READY_SENTINEL);
+        let expected = tmp.path().join(DEFAULT_MODEL_DIRNAME).join(READY_SENTINEL);
         assert_eq!(adapter.ready_sentinel_path(), expected);
     }
 
@@ -848,11 +840,7 @@ mod tests {
 
     #[async_trait]
     impl Reranker for SlowLoadBackend {
-        async fn score(
-            &self,
-            _query: &str,
-            candidates: &[&str],
-        ) -> Result<Vec<f32>, RerankError> {
+        async fn score(&self, _query: &str, candidates: &[&str]) -> Result<Vec<f32>, RerankError> {
             // Replicate fastembed.rs's structure: load + score inside a
             // single spawn_blocking, where the load is the expensive step.
             let load_delay = self.load_delay;
@@ -960,19 +948,14 @@ mod tests {
     /// counter must increment.
     #[tokio::test]
     async fn timeout_triggers_rrf_fallback() {
-        let baseline =
-            super::super::rerank::RERANK_FALLBACK_TOTAL.load(Ordering::Relaxed);
+        let baseline = super::super::rerank::RERANK_FALLBACK_TOTAL.load(Ordering::Relaxed);
         let backend = SlowLoadBackend::new(Duration::from_millis(300));
         let hits = vec![make_hit(42, "payload")];
-        let out =
-            apply_reranker(hits, "q", &backend, Duration::from_millis(20)).await;
+        let out = apply_reranker(hits, "q", &backend, Duration::from_millis(20)).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].snapshot_id, 42);
         // Score unchanged from the input default 0.0.
         assert!((out[0].score - 0.0).abs() < 1e-9);
-        assert!(
-            super::super::rerank::RERANK_FALLBACK_TOTAL.load(Ordering::Relaxed)
-                > baseline
-        );
+        assert!(super::super::rerank::RERANK_FALLBACK_TOTAL.load(Ordering::Relaxed) > baseline);
     }
 }

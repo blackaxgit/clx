@@ -123,11 +123,7 @@ impl Storage {
     }
 
     /// Return all tool events targeting `target` across sessions, newest first.
-    pub fn tool_events_by_target(
-        &self,
-        target: &str,
-        limit: i64,
-    ) -> crate::Result<Vec<ToolEvent>> {
+    pub fn tool_events_by_target(&self, target: &str, limit: i64) -> crate::Result<Vec<ToolEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, tool_name, target, summary, outcome, \
                     window_start_unix, window_end_unix, occurrence_count, created_at \
@@ -236,8 +232,20 @@ mod tests {
     fn append_extends_within_60s_window() {
         // Both events fall in the same minute bucket (1200 / 60 == 1230 / 60 == 20).
         let s = mk_storage();
-        let ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v1", 1_200);
-        let ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v2", 1_230);
+        let ev1 = mk_event(
+            "sess-A",
+            "Edit",
+            Some("src/foo.rs"),
+            "edit foo.rs v1",
+            1_200,
+        );
+        let ev2 = mk_event(
+            "sess-A",
+            "Edit",
+            Some("src/foo.rs"),
+            "edit foo.rs v2",
+            1_230,
+        );
         let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
         let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
         assert_eq!(id1, id2, "second call should extend the same row");
@@ -252,8 +260,20 @@ mod tests {
     fn append_inserts_new_row_outside_60s_window() {
         // 1_000 / 60 == 16, 1_260 / 60 == 21 — different buckets, separate rows.
         let s = mk_storage();
-        let ev1 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v1", 1_000);
-        let ev2 = mk_event("sess-A", "Edit", Some("src/foo.rs"), "edit foo.rs v2", 1_260);
+        let ev1 = mk_event(
+            "sess-A",
+            "Edit",
+            Some("src/foo.rs"),
+            "edit foo.rs v1",
+            1_000,
+        );
+        let ev2 = mk_event(
+            "sess-A",
+            "Edit",
+            Some("src/foo.rs"),
+            "edit foo.rs v2",
+            1_260,
+        );
         let id1 = s.append_or_extend_tool_event(&ev1).unwrap();
         let id2 = s.append_or_extend_tool_event(&ev2).unwrap();
         assert_ne!(id1, id2);
@@ -311,7 +331,13 @@ mod tests {
         // append_or_extend_tool_event must succeed even when no sessions row
         // exists for the given id (INSERT OR IGNORE inserts a placeholder).
         let s = mk_storage();
-        let ev = mk_event("synthetic-no-session", "Edit", Some("a.rs"), "edit a.rs", 1_000);
+        let ev = mk_event(
+            "synthetic-no-session",
+            "Edit",
+            Some("a.rs"),
+            "edit a.rs",
+            1_000,
+        );
         let id = s.append_or_extend_tool_event(&ev).unwrap();
         assert!(id >= 1);
         // Sessions placeholder exists.
@@ -373,7 +399,10 @@ mod tests {
         s.append_or_extend_tool_event(&c).unwrap();
         let rows = s.tool_events_by_target("src/foo.rs", 10).unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.target.as_deref() == Some("src/foo.rs")));
+        assert!(
+            rows.iter()
+                .all(|r| r.target.as_deref() == Some("src/foo.rs"))
+        );
     }
 
     #[test]
@@ -514,14 +543,24 @@ mod tests {
 
         // The unique index must collapse both writes to exactly one row.
         let rows = s1.recent_tool_events_for_session("sess-race", 10).unwrap();
-        assert_eq!(rows.len(), 1, "concurrent writers must produce a single row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "concurrent writers must produce a single row"
+        );
         assert_eq!(rows[0].occurrence_count, 2);
     }
 
     #[test]
     fn append_round_trip_preserves_fields() {
         let s = mk_storage();
-        let mut ev = mk_event("sess-A", "Write", Some("src/a.rs"), "write a.rs (12 bytes)", 5_000);
+        let mut ev = mk_event(
+            "sess-A",
+            "Write",
+            Some("src/a.rs"),
+            "write a.rs (12 bytes)",
+            5_000,
+        );
         ev.outcome = ToolOutcome::Success;
         s.append_or_extend_tool_event(&ev).unwrap();
 

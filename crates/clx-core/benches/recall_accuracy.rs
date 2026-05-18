@@ -64,8 +64,8 @@ struct GoldenSet {
 /// `scripts/generate_golden_set.py`. We avoid a YAML crate dependency to
 /// keep the bench's dev-dep footprint small and deterministic.
 fn load_golden_set(path: &PathBuf) -> GoldenSet {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
     let mut corpus: Vec<CorpusRow> = Vec::new();
     let mut pairs: Vec<GoldenPair> = Vec::new();
@@ -193,10 +193,7 @@ fn load_golden_set(path: &PathBuf) -> GoldenSet {
                 } else if let Some(rest) = stripped.strip_prefix("expected_snapshot_ids:") {
                     let v = rest.trim();
                     // Format: [1, 2, 3]
-                    let inner = v
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .trim();
+                    let inner = v.trim_start_matches('[').trim_end_matches(']').trim();
                     let mut set = HashSet::new();
                     for part in inner.split(',') {
                         let p = part.trim();

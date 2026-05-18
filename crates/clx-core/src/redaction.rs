@@ -116,8 +116,14 @@ pub fn redact_secrets(text: &str) -> String {
     //     the separator. Scheme tokens (`bearer`, `basic`) are skipped so
     //     the actual credential after them stays intact for downstream code.
     // -------------------------------------------------------------------------
-    let tolerant_keywords =
-        ["api_key", "api-key", "token", "password", "secret", "authorization"];
+    let tolerant_keywords = [
+        "api_key",
+        "api-key",
+        "token",
+        "password",
+        "secret",
+        "authorization",
+    ];
     let lower = redacted.to_lowercase();
     let mut tolerant_replacements: Vec<(usize, usize)> = Vec::new();
     for kw in &tolerant_keywords {
@@ -539,7 +545,10 @@ mod tests {
             }
         });
         let r = redact_json_value(&v);
-        assert_eq!(r["request"]["headers"]["authorization"], json!("***REDACTED***"));
+        assert_eq!(
+            r["request"]["headers"]["authorization"],
+            json!("***REDACTED***")
+        );
         assert_eq!(r["request"]["body"]["safe_field"], json!("ok"));
     }
 
@@ -589,10 +598,7 @@ mod tests {
             "a": {"b": {"c": {"d": {"secret": "deeplyhiddenvalue"}}}}
         });
         let r = redact_json_value(&v);
-        assert_eq!(
-            r["a"]["b"]["c"]["d"]["secret"],
-            json!("***REDACTED***")
-        );
+        assert_eq!(r["a"]["b"]["c"]["d"]["secret"], json!("***REDACTED***"));
     }
 
     #[test]

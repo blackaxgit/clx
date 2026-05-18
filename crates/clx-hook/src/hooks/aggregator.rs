@@ -132,12 +132,14 @@ pub fn derive_summary(tool: &str, input: &Value, outcome: ToolOutcome) -> String
         }
         "MultiEdit" => {
             let basename = basename_or_unknown(input.get("file_path").and_then(Value::as_str));
-            let n = input.get("edits").and_then(Value::as_array).map_or(0, Vec::len);
+            let n = input
+                .get("edits")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
             format!("multi-edit {basename} ({n} edits)")
         }
         "NotebookEdit" => {
-            let basename =
-                basename_or_unknown(input.get("notebook_path").and_then(Value::as_str));
+            let basename = basename_or_unknown(input.get("notebook_path").and_then(Value::as_str));
             let cell = input
                 .get("cell_id")
                 .and_then(Value::as_str)
@@ -278,14 +280,20 @@ mod tests {
 
     #[test]
     fn should_aggregate_bash_mutator_yes() {
-        assert!(should_aggregate("Bash", &json!({"command": "git commit -m 'x'"})));
+        assert!(should_aggregate(
+            "Bash",
+            &json!({"command": "git commit -m 'x'"})
+        ));
     }
 
     #[test]
     fn should_aggregate_bash_reads_no() {
         assert!(!should_aggregate("Bash", &json!({"command": "ls -la"})));
         assert!(!should_aggregate("Bash", &json!({"command": "git status"})));
-        assert!(!should_aggregate("Bash", &json!({"command": "grep -r foo ."})));
+        assert!(!should_aggregate(
+            "Bash",
+            &json!({"command": "grep -r foo ."})
+        ));
     }
 
     // --- is_mutator_bash ---

@@ -119,11 +119,7 @@ impl<'a> RecallEngine<'a> {
         }
 
         let mut fused = if config.rrf_enabled {
-            rrf::rrf_fuse(
-                &[semantic_hits, fts_hits],
-                config.rrf_k,
-                config.max_results,
-            )
+            rrf::rrf_fuse(&[semantic_hits, fts_hits], config.rrf_k, config.max_results)
         } else {
             hybrid_merge(semantic_hits, fts_hits, config.max_results)
         };

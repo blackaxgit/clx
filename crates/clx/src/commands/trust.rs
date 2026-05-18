@@ -368,7 +368,9 @@ fn handle_config_trust_add(cli: &Cli, path: PathBuf, yes: bool) -> Result<()> {
             "This grants the file permission to set non-inert keys (providers.*, logging.file, validator.enabled)."
                 .yellow()
         );
-        println!("Trust is per-machine, per-user, per-hash. Any edit to the file invalidates trust.");
+        println!(
+            "Trust is per-machine, per-user, per-hash. Any edit to the file invalidates trust."
+        );
         print!("Proceed? [y/N] ");
         io::stdout().flush().ok();
         let mut input = String::new();

@@ -18,8 +18,8 @@
 //! module performs at most one LLM call and writes no state.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -237,7 +237,11 @@ fn flatten_turns(turns: &[TurnSlice<'_>]) -> String {
         // attacker would place at line start; legitimate prose mentioning
         // `[user]` mid-line is unaffected, so extracted-output shape for
         // normal transcripts is unchanged.
-        s.push_str(&t.content.replace("\n[user]", "\n (user)").replace("\n[assistant]", "\n (assistant)"));
+        s.push_str(
+            &t.content
+                .replace("\n[user]", "\n (user)")
+                .replace("\n[assistant]", "\n (assistant)"),
+        );
         s.push('\n');
     }
     s
@@ -342,7 +346,10 @@ mod tests {
         let blob = "[user] Please refactor src/foo.rs and Cargo.toml\n\
                     [assistant] Done. Edits in src/foo.rs and tests/bar.rs.";
         let out = deterministic_template_summary(blob, 500);
-        assert!(out.contains("refactor"), "user request prefix missing: {out}");
+        assert!(
+            out.contains("refactor"),
+            "user request prefix missing: {out}"
+        );
         assert!(out.contains("foo.rs"), "should list foo.rs: {out}");
         assert!(out.contains("Cargo.toml"), "should list Cargo.toml: {out}");
     }
@@ -547,7 +554,11 @@ mod tests {
         let prompt = build_prompt(&turns, 500);
         // Per-turn body is capped at 600 chars; rest of prompt is < 200 chars
         // of framing, so the whole prompt must be well below 5000 chars.
-        assert!(prompt.chars().count() < 1500, "prompt too long: {}", prompt.chars().count());
+        assert!(
+            prompt.chars().count() < 1500,
+            "prompt too long: {}",
+            prompt.chars().count()
+        );
     }
 
     #[test]

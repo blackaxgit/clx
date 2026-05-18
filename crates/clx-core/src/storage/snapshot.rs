@@ -302,10 +302,7 @@ impl Storage {
     /// already written one. Re-reading this timestamp immediately before the
     /// insert lets the second handler detect the race and skip cleanly,
     /// preventing duplicate `AutoSummary` snapshots for the same session/window.
-    pub fn last_auto_summary_at(
-        &self,
-        session_id: &str,
-    ) -> crate::Result<Option<DateTime<Utc>>> {
+    pub fn last_auto_summary_at(&self, session_id: &str) -> crate::Result<Option<DateTime<Utc>>> {
         let ts: Option<String> = self
             .conn
             .query_row(
@@ -490,10 +487,7 @@ mod auto_summary_tests {
         let s = mk_storage();
         seed_session(&s, "sess-F3a");
         let inserted = s
-            .create_snapshot_if_no_recent_auto_summary(
-                &mk_auto_summary("sess-F3a", "first"),
-                60,
-            )
+            .create_snapshot_if_no_recent_auto_summary(&mk_auto_summary("sess-F3a", "first"), 60)
             .unwrap();
         assert!(inserted, "first call must insert");
         let snaps = s.get_snapshots_by_session("sess-F3a").unwrap();
@@ -570,10 +564,7 @@ mod auto_summary_tests {
             .unwrap();
 
         let inserted = s
-            .create_snapshot_if_no_recent_auto_summary(
-                &mk_auto_summary("sess-F3d", "fresh"),
-                60,
-            )
+            .create_snapshot_if_no_recent_auto_summary(&mk_auto_summary("sess-F3d", "fresh"), 60)
             .unwrap();
         assert!(inserted, "a stale prior summary must not block a new one");
         let snaps = s.get_snapshots_by_session("sess-F3d").unwrap();

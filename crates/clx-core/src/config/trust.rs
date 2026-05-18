@@ -154,9 +154,9 @@ impl TrustList {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp).with_context(|| {
-            format!("failed to open trustlist tmp file {}", tmp.display())
-        })?;
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("failed to open trustlist tmp file {}", tmp.display()))?;
         f.write_all(json.as_bytes())?;
         f.sync_all().ok();
         drop(f);
@@ -170,13 +170,8 @@ impl TrustList {
             fs::set_permissions(&tmp, perms).ok();
         }
 
-        fs::rename(&tmp, path).with_context(|| {
-            format!(
-                "failed to rename {} -> {}",
-                tmp.display(),
-                path.display()
-            )
-        })?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 
@@ -224,9 +219,7 @@ impl TrustList {
                 self.entries.remove(matches[0]);
                 Ok(true)
             }
-            n => bail!(
-                "hash prefix '{needle}' is ambiguous ({n} matches); supply more characters"
-            ),
+            n => bail!("hash prefix '{needle}' is ambiguous ({n} matches); supply more characters"),
         }
     }
 
@@ -316,7 +309,10 @@ mod tests {
         let loaded = TrustList::load_from(&path).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded.is_trusted(&hash));
-        assert_eq!(loaded.list()[0].path, PathBuf::from("/tmp/proj/.clx/config.yaml"));
+        assert_eq!(
+            loaded.list()[0].path,
+            PathBuf::from("/tmp/proj/.clx/config.yaml")
+        );
     }
 
     #[test]
@@ -397,11 +393,7 @@ mod tests {
     fn unsupported_version_returns_error() {
         let td = TempDir::new().unwrap();
         let path = tmp_path(&td);
-        fs::write(
-            &path,
-            r#"{"version": 999, "entries": []}"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{"version": 999, "entries": []}"#).unwrap();
         let err = TrustList::load_from(&path).unwrap_err();
         assert!(format!("{err}").contains("unsupported version"));
     }

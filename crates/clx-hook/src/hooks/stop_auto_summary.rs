@@ -100,9 +100,7 @@ async fn run_inner(input: HookInput) -> Result<()> {
         match storage.had_mutator_activity_since_last_auto_summary(session_id) {
             Ok(true) => { /* proceed */ }
             Ok(false) => {
-                debug!(
-                    "auto-summary: skip_when_idle=true and no tool_events since last summary"
-                );
+                debug!("auto-summary: skip_when_idle=true and no tool_events since last summary");
                 return Ok(());
             }
             Err(e) => {
