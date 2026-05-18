@@ -353,6 +353,52 @@ were pulled forward into 0.8.0 since the release had not yet shipped:
 - Existing per-project configs continue to apply only the inert-key
   allowlist until `clx config-trust add <path>` registers their hash
 
+### Known issues
+
+These are accepted for 0.8.0 with the workarounds noted. None cause data
+loss or weaken the default file-backend credential store. Further
+hardening is tracked for 0.8.1.
+
+- Audit-log retention for `clx maintenance trim` defaults to 90 days and
+  is not yet a `retention` config key. Workaround: pass an explicit
+  `--audit-days N` (or `--audit-days 0` to skip the audit sweep).
+- L1 (LLM) validation never hard-denies; a high-risk LLM verdict results
+  in an `ask`, not a block. Hard blocks require an L0 deterministic rule
+  or a learned deny rule. Configure L0/learned rules for must-block
+  commands.
+- The inconclusive-LLM fallback (`validator.default_decision`) is applied
+  on provider/client/generation failure but not on a malformed or
+  suspicious LLM response, which always results in `ask` regardless of
+  `default_decision`.
+- Audit-log secret redaction is heuristic (known key prefixes and
+  `key=`/`token=` style assignments). Secrets in novel formats may be
+  stored verbatim in the audit log. Avoid passing raw secrets as
+  command-line arguments.
+- A malformed `~/.clx/config.yaml` is silently replaced with built-in
+  defaults in the hook path with no user-visible error. Validate config
+  changes with `clx config show` after editing.
+- `providers.<name>.api_key_file` reads an unencrypted key file and the
+  0600 mode check is not atomic with the read. Prefer
+  `clx credentials set` (the default encrypted file backend) over
+  `api_key_file`.
+- `clx install` is not transactional: an interrupted install can leave a
+  partially configured state. Re-running `clx install` is safe and
+  recovers cleanly; a `~/.claude/settings.json.backup` is written before
+  settings are modified.
+- The legacy plain-text trust-mode token grants auto-allow based on file
+  mtime (under one hour) regardless of contents. Use `clx trust off` to
+  clear it and prefer the JSON trust token created by `clx trust on`.
+- Auto-recall opens the storage and embedding stores per prompt within
+  the 500 ms recall budget; under heavy disk contention recall may be
+  skipped for that prompt (the session continues normally).
+- Opening a database created by a newer CLX is not explicitly refused;
+  treat cross-version downgrades as unsupported.
+- `clx credentials list` does not annotate keys with their provider kind
+  for the canonical `<provider>-api-key` naming (cosmetic only; does not
+  affect credential resolution).
+- The cross-encoder reranker fallback frequency is not surfaced in
+  `clx stats` or the dashboard in 0.8.0.
+
 ## [0.7.2] - 2026-05-02
 
 ### Fixed
