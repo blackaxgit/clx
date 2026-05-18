@@ -167,8 +167,66 @@ and a Red/Green/Purple security pass. All work landed on
 
 ### Fixed
 
-- **Repeated macOS keychain password prompt.** The `clx-mcp` server
-  re-read `com.clx.credentials` from the OS keychain on every
+- **Repeated macOS keychain password prompt, eliminated at the root.**
+  CLX no longer uses the macOS keychain by default. A parallel
+  Codex + research investigation established definitively that no
+  macOS keychain API can serve an unsigned / adhoc-signed binary
+  prompt-free: the legacy keychain re-prompts on every read because
+  its "Always Allow" ACL binds to a code signature that an
+  adhoc-signed binary does not stably have, and the iOS-style
+  data-protection keychain outright rejects unsigned binaries with
+  `errSecMissingEntitlement (-34018)`. Therefore the keychain cannot
+  be the default secret store for a tool distributed without an Apple
+  Developer ID. CLX now follows the 2026 dev-CLI consensus
+  (`gh`, `aws`, `stripe`, `doppler`, `cargo`): a local file backend by
+  default, keychain opt-in.
+  - New `CredentialBackend` trait under `CredentialStore`; scoping,
+    validation, indexing, and the session cache are unchanged above it.
+  - New default `AgeFileBackend`: secrets stored in
+    `~/.clx/credentials.age` (mode 0600), encrypted with `age`
+    (age-encryption.org v1, X25519 + ChaCha20-Poly1305) under a random
+    identity at `~/.clx/cred.key` (mode 0600); `~/.clx` is 0700. Writes
+    are atomic (temp file + rename). Encrypted at rest specifically to
+    defeat the realistic CLX exposure path (dotfile sync, backups,
+    log/support bundles); a same-uid attacker remains out of scope, as
+    it is for the keychain.
+  - `KeyringBackend` retains the previous keychain code and is selected
+    only when the user explicitly sets `credentials.backend: keychain`
+    (or `CLX_CREDENTIALS_BACKEND=keychain`). Default is `file`.
+  - Credential resolution is now env (`api_key_env`) then the selected
+    backend then `api_key_file`; under the default backend the keychain
+    code path is never reached. Every credential-construction callsite
+    (`resolve_azure_credential`, the MCP server, the `clx credentials`
+    and `clx keychain-trust` commands) was repointed through a single
+    config-aware constructor so nothing silently falls through to the
+    keychain. A regression test asserts zero keychain calls under the
+    default backend.
+  - Fixed a latent `SecAccessCreate(NULL)` defect in the opt-in
+    keychain path: `NULL` means "trust only the calling app" (the
+    opposite of the intended permissive access); it now passes an
+    empty trusted-application list, and the misleading comments were
+    corrected. The opt-in keychain remains best-effort for adhoc
+    binaries by macOS design.
+  - New `clx credentials migrate <key>`: explicit, one-time move of a
+    secret that exists only in the legacy keychain into the file
+    backend. This is the single place a keychain prompt may still
+    occur, and only when the user runs it deliberately and the secret
+    is not already available from env / `api_key_file` / the file
+    backend. Automatic paths never read the keychain.
+  - Net result: a fresh user with default config sees zero macOS
+    keychain prompts for the entire Claude Code session, with no code
+    signing, no manual `security` command, and no temporary toggle.
+
+  Superseded earlier in this release cycle (kept for historical
+  context): an interim session-scoped credential cache
+  (`CredentialStore::new_cached`, `secrecy::SecretString`, zeroized on
+  drop, owned by `McpServer`) and a `clx keychain-trust` repair command
+  that relaxed the legacy keychain ACL with a single documented
+  `security set-generic-password-partition-list` call. Both still exist
+  and are correct for the opt-in keychain backend, but are no longer on
+  the default path. The original interim note read:
+- **(interim, now superseded by the file backend above)** The `clx-mcp`
+  server re-read `com.clx.credentials` from the OS keychain on every
   credential-bearing tool invocation (e.g. each `clx_credentials`
   call), so macOS prompted far more often than necessary.
   `CredentialStore` gained an opt-in session-scoped cache
