@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Rules ───────────────────────────────────────────────────────────────────────┐
+│Builtin Whitelist (1)                                                         │
+│                                                                              │
+│  + ls *  list directory                                                      │
+│                                                                              │
+│Builtin Blacklist (1)                                                         │
+│                                                                              │
+│  - rm -rf /  destructive                                                     │
+│                                                                              │
+│Config Whitelist (0)                                                          │
+│                                                                              │
+│  None                                                                        │
+│                                                                              │
+│Config Blacklist (0)                                                          │
+│                                                                              │
+│  None                                                                        │
+│                                                                              │
+│Learned Rules (1)                                                             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | q:quit Tab:switch /:filter

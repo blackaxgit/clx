@@ -381,4 +381,214 @@ mod tests {
         let rendered = redact_volatile(&render_to_string(&mut app));
         insta::assert_snapshot!("settings_tab_no_config", rendered);
     }
+
+    // =====================================================================
+    // Wave 1 E: dashboard TUI "pixel" snapshots + pure reducer transitions.
+    //
+    // Lives here (not in `crates/clx/tests/dashboard_pixel.rs`) because
+    // `clx` is a binary-only crate (no lib target): the dashboard render
+    // path and the pure `state::update` reducer are unreachable from a
+    // separate integration test file. Per the Wave 1 E brief, the pixel
+    // snapshots + reducer transitions are placed in this clearly-marked
+    // in-crate module instead. Anchored to
+    // `specs/_prerelease/04-integration.md` section 3.9 and the
+    // edge/failure matrix row "Dashboard with empty DB".
+    //
+    // TestBackend + insta only; no terminal, no DB, no network.
+    // =====================================================================
+    mod wave1_pixel {
+        use super::super::super::app::{DashboardTab, InputMode};
+        use super::super::super::data::{BuiltinRuleRow, LearnedRuleRow};
+        use super::super::super::state::{AppState, DashboardCmd, DashboardEvent, update};
+        use super::{audit_row, make_app, redact_volatile, render_to_string};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // ---- Pixel snapshots for states not yet covered upstream --------
+
+        /// `AuditLog` tab with several rows (multi-row table render).
+        #[test]
+        fn pixel_audit_tab_multi_row() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::AuditLog;
+            app.data.audit_entries.push(audit_row("ls -la /tmp"));
+            app.data.audit_entries.push(audit_row("cat /etc/hosts"));
+            app.data.audit_entries.push(audit_row("git status"));
+            app.data.total_commands = 3;
+            app.data.allowed_commands = 3;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("wave1_audit_tab_multi_row", rendered);
+        }
+
+        /// Rules tab populated with a learned rule and builtin lists.
+        #[test]
+        fn pixel_rules_tab_populated() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Rules;
+            app.data.learned_rules.push(LearnedRuleRow {
+                pattern: "cargo build".to_string(),
+                rule_type: "whitelist".to_string(),
+                scope: "global".to_string(),
+                confirmations: 4,
+                denials: 0,
+            });
+            app.data.builtin_whitelist.push(BuiltinRuleRow {
+                pattern: "ls *".to_string(),
+                description: Some("list directory".to_string()),
+            });
+            app.data.builtin_blacklist.push(BuiltinRuleRow {
+                pattern: "rm -rf /".to_string(),
+                description: Some("destructive".to_string()),
+            });
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("wave1_rules_tab_populated", rendered);
+        }
+
+        /// Settings tab with a populated editing config (default Config).
+        #[test]
+        fn pixel_settings_tab_populated() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            let cfg = clx_core::config::Config::default();
+            app.settings_editing_config = Some(cfg.clone());
+            app.settings_original_config = Some(cfg);
+            app.input_mode = InputMode::SettingsNav;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("wave1_settings_tab_populated", rendered);
+        }
+
+        // ---- Pure reducer transitions for every DashboardEvent ----------
+
+        fn key(code: KeyCode) -> DashboardEvent {
+            DashboardEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+        }
+
+        #[test]
+        fn reducer_quit_event_sets_should_quit_and_emits_quit() {
+            let (st, cmds) = update(AppState::new(), DashboardEvent::Quit);
+            assert!(st.should_quit);
+            assert_eq!(cmds, vec![DashboardCmd::Quit]);
+        }
+
+        #[test]
+        fn reducer_tick_is_a_no_op_pure_transition() {
+            let before = AppState::new();
+            let (after, cmds) = update(before.clone(), DashboardEvent::Tick);
+            assert_eq!(before, after, "Tick must not mutate state");
+            assert!(cmds.is_empty());
+        }
+
+        #[test]
+        fn reducer_resize_is_a_no_op_pure_transition() {
+            let before = AppState::new();
+            let (after, cmds) = update(before.clone(), DashboardEvent::Resize(120, 40));
+            assert_eq!(before, after, "Resize must not mutate state");
+            assert!(cmds.is_empty());
+        }
+
+        #[test]
+        fn reducer_q_key_quits() {
+            let (st, cmds) = update(AppState::new(), key(KeyCode::Char('q')));
+            assert!(st.should_quit);
+            assert_eq!(cmds, vec![DashboardCmd::Quit]);
+        }
+
+        #[test]
+        fn reducer_esc_key_quits_from_normal_mode() {
+            let (st, cmds) = update(AppState::new(), key(KeyCode::Esc));
+            assert!(st.should_quit);
+            assert_eq!(cmds, vec![DashboardCmd::Quit]);
+        }
+
+        #[test]
+        fn reducer_tab_cycles_forward_then_back() {
+            let s0 = AppState::new();
+            assert_eq!(s0.current_tab, DashboardTab::Sessions);
+            let (s1, _) = update(s0, key(KeyCode::Tab));
+            assert_eq!(s1.current_tab, DashboardTab::AuditLog);
+            let (s2, _) = update(s1, key(KeyCode::BackTab));
+            assert_eq!(s2.current_tab, DashboardTab::Sessions);
+        }
+
+        #[test]
+        fn reducer_number_keys_jump_tabs_and_settings_emits_enter_settings() {
+            let (s, cmds) = update(AppState::new(), key(KeyCode::Char('4')));
+            assert_eq!(s.current_tab, DashboardTab::Settings);
+            assert!(cmds.contains(&DashboardCmd::EnterSettings));
+        }
+
+        #[test]
+        fn reducer_enter_on_empty_sessions_is_a_no_op_no_panic() {
+            // Edge matrix: Enter on empty Sessions is a no-op (count guard).
+            let mut s = AppState::new();
+            s.sessions_count = 0;
+            let (st, cmds) = update(s, key(KeyCode::Enter));
+            assert!(
+                !cmds.contains(&DashboardCmd::EnterSessionDetail),
+                "no detail entry when sessions empty"
+            );
+            assert!(!st.should_quit);
+        }
+
+        #[test]
+        fn reducer_enter_on_nonempty_sessions_enters_detail() {
+            let mut s = AppState::new();
+            s.sessions_count = 3;
+            let (_st, cmds) = update(s, key(KeyCode::Enter));
+            assert!(cmds.contains(&DashboardCmd::EnterSessionDetail));
+        }
+
+        #[test]
+        fn reducer_scroll_guards_on_empty_db_never_panic() {
+            // Edge matrix: empty-DB reducer count guards prevent panic.
+            let s = AppState::new(); // all *_count == 0
+            for code in [
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+                KeyCode::Down,
+                KeyCode::Up,
+                KeyCode::PageDown,
+                KeyCode::PageUp,
+                KeyCode::Char('g'),
+                KeyCode::Char('G'),
+                KeyCode::Home,
+                KeyCode::End,
+            ] {
+                let (st, _) = update(s.clone(), key(code));
+                // Selection stays None or Some(0); no overflow/panic.
+                assert!(matches!(st.sessions_selected, None | Some(0)));
+            }
+        }
+
+        #[test]
+        fn reducer_r_key_requests_refresh() {
+            let (_s, cmds) = update(AppState::new(), key(KeyCode::Char('r')));
+            assert_eq!(cmds, vec![DashboardCmd::RefreshData]);
+        }
+
+        #[test]
+        fn reducer_slash_enters_filter_mode_and_typing_accumulates() {
+            let (s1, _) = update(AppState::new(), key(KeyCode::Char('/')));
+            assert_eq!(s1.input_mode, InputMode::Filter);
+            let (s2, _) = update(s1, key(KeyCode::Char('a')));
+            let (s3, _) = update(s2, key(KeyCode::Char('b')));
+            assert_eq!(s3.filter_text, "ab");
+            let (s4, _) = update(s3, key(KeyCode::Backspace));
+            assert_eq!(s4.filter_text, "a");
+            let (s5, _) = update(s4, key(KeyCode::Esc));
+            assert_eq!(s5.input_mode, InputMode::Normal);
+            assert!(s5.filter_text.is_empty());
+        }
+
+        #[test]
+        fn reducer_sort_column_cycle_and_direction_toggle() {
+            let mut s = AppState::new();
+            s.current_tab = DashboardTab::Sessions;
+            let start = s.sessions_sort_column;
+            let (s1, _) = update(s, key(KeyCode::Char('s')));
+            assert_ne!(s1.sessions_sort_column, start);
+            let asc = s1.sessions_sort_ascending;
+            let (s2, _) = update(s1, key(KeyCode::Char('S')));
+            assert_eq!(s2.sessions_sort_ascending, !asc);
+        }
+    }
 }

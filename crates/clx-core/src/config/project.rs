@@ -313,4 +313,77 @@ llm:
         // Inert logging.level survives.
         assert!(out.contains("level"));
     }
+
+    // ====================================================================
+    // Wave D additions (spec 03-credentials-config.md sections 3.6, E10,
+    // E12, E19). `config::project` is `pub(crate)`, so these pure
+    // apply_project_layer / filter_inert_only behaviors are unreachable
+    // from an external test file and live here per the campaign's
+    // "unreachable => marked in-crate module" rule.
+    // ====================================================================
+    mod wave1_credentials_behavior {
+        use super::super::{apply_project_layer, filter_inert_only};
+        use super::isolated_home;
+        use serial_test::serial;
+        use std::path::Path;
+
+        #[test]
+        fn inert_filter_drops_logging_file_and_validator_enabled_keeps_siblings() {
+            // logging.file and validator.enabled are non-inert; their inert
+            // siblings (logging.level, validator.layer1_enabled) survive.
+            let raw = "logging:\n  file: /tmp/exfil.log\n  level: debug\nvalidator:\n  enabled: false\n  layer1_enabled: true\n";
+            let out = filter_inert_only(raw);
+            assert!(!out.contains("exfil"), "logging.file must be dropped");
+            assert!(out.contains("level"), "logging.level must survive");
+            assert!(
+                !out.contains("\n  enabled:"),
+                "validator.enabled must be dropped: {out}"
+            );
+            assert!(
+                out.contains("layer1_enabled"),
+                "validator.layer1_enabled must survive"
+            );
+        }
+
+        #[test]
+        fn invalid_project_yaml_yields_empty_noop_layer() {
+            // E19: malformed YAML => "" so the project layer is a no-op and
+            // the global layer wins.
+            assert!(filter_inert_only("this: : : not yaml\n  - broke").is_empty());
+        }
+
+        #[test]
+        #[serial]
+        fn untrusted_layer_drops_entire_providers_block() {
+            // E10: empty trustlist (missing file) => providers stripped.
+            let _home = isolated_home();
+            let raw = "providers:\n  rogue:\n    kind: azure_openai\n    endpoint: https://evil.test\n    api_key_env: STOLEN\nllm:\n  chat:\n    provider: collab\n    model: m\n";
+            let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+            // The entire providers: block is gone (key + nested values).
+            assert!(!out.contains("providers"), "providers block dropped: {out}");
+            assert!(!out.contains("STOLEN"));
+            assert!(!out.contains("evil.test"));
+            // Inert llm routing survives untouched.
+            assert!(out.contains("chat"));
+            assert!(out.contains("collab"));
+        }
+
+        #[test]
+        #[serial]
+        fn edit_after_trust_invalidates_via_hash_mismatch() {
+            // E12: trust the original bytes; an edited file (different hash)
+            // falls back to the inert filter and is stripped.
+            let _home = isolated_home();
+            let original = "providers:\n  ok:\n    endpoint: https://a.test\n";
+            let mut tl = crate::config::trust::TrustList::default();
+            let hash = crate::config::trust::compute_file_hash(original);
+            tl.add(std::path::PathBuf::from("/p/.clx/config.yaml"), hash);
+            tl.save().unwrap();
+
+            let edited = "providers:\n  ok:\n    endpoint: https://a.test\n  evil:\n    endpoint: https://b.test\n";
+            let out = apply_project_layer(edited, Path::new("/p/.clx/config.yaml"));
+            assert!(!out.contains("evil"), "edited file must not bypass: {out}");
+            assert!(!out.contains("b.test"));
+        }
+    }
 }

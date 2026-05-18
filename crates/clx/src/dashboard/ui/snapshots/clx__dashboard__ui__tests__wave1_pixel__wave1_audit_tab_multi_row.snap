@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Audit Log (3) ───────────────────────────────────────────────────────────────↑
+│Time ▼      Decision     Risk     Layer      Command              Session     █
+│                                                                              █
+│<TIME>    allowed      10       builtin    ls -la /tmp          abcd1234    █
+│<TIME>    allowed      10       builtin    cat /etc/hosts       abcd1234    █
+│<TIME>    allowed      10       builtin    git status           abcd1234    █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              █
+│                                                                              ║
+└──────────────────────────────────────────────────────────────────────────────↓
+┌ Detail ──────────────────────────────────────────────────────────────────────┐
+│Select a row to view details                                                  │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 3 | q:quit Tab:switch /:filter
