@@ -16,6 +16,171 @@ use crate::Cli;
 /// Default docker-compose.yml embedded from scripts/docker-compose.yml
 const DOCKER_COMPOSE_YML: &str = include_str!("../../../../scripts/docker-compose.yml");
 
+/// CLX-managed Claude Code skills, embedded so a non-plugin (cargo/manual)
+/// install is self-contained. Each entry is (skill directory name, SKILL.md
+/// contents). Installed to `~/.claude/skills/<name>/SKILL.md`, the personal
+/// skills location documented at <https://code.claude.com/docs/en/skills>
+/// ("Where skills live": Personal -> `~/.claude/skills/<skill-name>/SKILL.md`).
+const CLX_SKILLS: &[(&str, &str)] = &[
+    (
+        "clx-recall",
+        include_str!("../../../../plugin/.claude-plugin/skills/clx-recall/SKILL.md"),
+    ),
+    (
+        "clx-remember",
+        include_str!("../../../../plugin/.claude-plugin/skills/clx-remember/SKILL.md"),
+    ),
+    (
+        "clx-checkpoint",
+        include_str!("../../../../plugin/.claude-plugin/skills/clx-checkpoint/SKILL.md"),
+    ),
+    (
+        "clx-rules",
+        include_str!("../../../../plugin/.claude-plugin/skills/clx-rules/SKILL.md"),
+    ),
+    (
+        "clx-resume",
+        include_str!("../../../../plugin/.claude-plugin/skills/clx-resume/SKILL.md"),
+    ),
+    (
+        "clx-doctor",
+        include_str!("../../../../plugin/.claude-plugin/skills/clx-doctor/SKILL.md"),
+    ),
+];
+
+/// Name of the version-stamp file written into `~/.clx/bin/`.
+const VERSION_STAMP_FILE: &str = ".clx-version";
+
+/// The workspace version this binary was built from.
+const CLX_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Result of comparing the running binary version to the on-disk stamp.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionStampStatus {
+    /// No stamp file present (fresh install or pre-0.8.0 layout).
+    Absent,
+    /// Stamp matches the running binary version.
+    Match,
+    /// Stamp differs from the running binary version (stale binary risk).
+    Mismatch { stamped: String, running: String },
+}
+
+/// Pure comparison of an optional on-disk stamp against the running version.
+fn version_stamp_status(stamp: Option<&str>, running: &str) -> VersionStampStatus {
+    match stamp {
+        None => VersionStampStatus::Absent,
+        Some(s) if s.trim() == running => VersionStampStatus::Match,
+        Some(s) => VersionStampStatus::Mismatch {
+            stamped: s.trim().to_string(),
+            running: running.to_string(),
+        },
+    }
+}
+
+/// Read the version stamp from `~/.clx/bin/.clx-version`, if present.
+fn read_version_stamp(bin_dir: &std::path::Path) -> Option<String> {
+    let path = bin_dir.join(VERSION_STAMP_FILE);
+    fs::read_to_string(path).ok()
+}
+
+/// Write the running version into `~/.clx/bin/.clx-version` (idempotent).
+fn write_version_stamp(bin_dir: &std::path::Path) -> Result<()> {
+    let path = bin_dir.join(VERSION_STAMP_FILE);
+    fs::write(path, format!("{CLX_VERSION}\n")).context("Failed to write version stamp")?;
+    Ok(())
+}
+
+/// Resolve the personal Claude Code skills directory for a skill name.
+/// Per <https://code.claude.com/docs/en/skills> personal skills live at
+/// `~/.claude/skills/<skill-name>/`.
+fn skill_dir(claude_dir: &std::path::Path, skill_name: &str) -> PathBuf {
+    claude_dir.join("skills").join(skill_name)
+}
+
+/// Install (or refresh) the embedded CLX skills into the personal skills
+/// location. CLX owns these files, so this overwrites `SKILL.md` on every
+/// run (idempotent, mirrors the binary-install policy).
+fn install_skills(claude_dir: &std::path::Path) -> Result<Vec<String>> {
+    let mut installed = Vec::new();
+    for (name, contents) in CLX_SKILLS {
+        let dir = skill_dir(claude_dir, name);
+        fs::create_dir_all(&dir).context(format!("Failed to create skill dir for {name}"))?;
+        let skill_md = dir.join("SKILL.md");
+        fs::write(&skill_md, contents).context(format!("Failed to write SKILL.md for {name}"))?;
+        installed.push((*name).to_string());
+    }
+    Ok(installed)
+}
+
+/// Remove CLX-installed skills. Only deletes a skill directory when it
+/// contains nothing other than the `SKILL.md` we wrote, so user-authored
+/// files in a same-named directory are never destroyed.
+fn uninstall_skills(claude_dir: &std::path::Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    for (name, _) in CLX_SKILLS {
+        let dir = skill_dir(claude_dir, name);
+        if !dir.exists() {
+            continue;
+        }
+        let skill_md = dir.join("SKILL.md");
+        if !skill_md.exists() {
+            continue;
+        }
+        // Only reclaim the directory if SKILL.md is the sole entry.
+        let only_skill_md = fs::read_dir(&dir).is_ok_and(|rd| {
+            let entries: Vec<_> = rd.flatten().collect();
+            entries.len() == 1 && entries[0].file_name().to_string_lossy() == "SKILL.md"
+        });
+        if only_skill_md {
+            if fs::remove_dir_all(&dir).is_ok() {
+                removed.push((*name).to_string());
+            }
+        } else if fs::remove_file(&skill_md).is_ok() {
+            // User added extra files; remove only our SKILL.md.
+            removed.push((*name).to_string());
+        }
+    }
+    removed
+}
+
+/// Additively merge missing top-level default keys into an existing
+/// config.yaml WITHOUT clobbering any user-set values. Returns the list of
+/// top-level keys that were added (empty if none / not a mapping).
+fn merge_missing_config_keys(
+    existing_yaml: &str,
+    default_yaml: &str,
+) -> Result<(String, Vec<String>)> {
+    let existing: serde_yml::Value =
+        serde_yml::from_str(existing_yaml).context("Existing config.yaml is not valid YAML")?;
+    let defaults: serde_yml::Value =
+        serde_yml::from_str(default_yaml).context("Default config is not valid YAML")?;
+
+    let (serde_yml::Value::Mapping(mut existing_map), serde_yml::Value::Mapping(default_map)) =
+        (existing.clone(), defaults)
+    else {
+        // Not a mapping (empty or scalar) -> leave untouched, no-op.
+        return Ok((existing_yaml.to_string(), Vec::new()));
+    };
+
+    let mut added = Vec::new();
+    for (k, v) in &default_map {
+        if !existing_map.contains_key(k) {
+            existing_map.insert(k.clone(), v.clone());
+            if let serde_yml::Value::String(name) = k {
+                added.push(name.clone());
+            }
+        }
+    }
+
+    if added.is_empty() {
+        return Ok((existing_yaml.to_string(), Vec::new()));
+    }
+
+    let merged = serde_yml::to_string(&serde_yml::Value::Mapping(existing_map))
+        .context("Failed to re-serialize merged config")?;
+    Ok((merged, added))
+}
+
 /// CLX section to inject into CLAUDE.md
 const CLX_CLAUDE_MD_SECTION: &str = r#"
 # CLX Integration [STRICT]
@@ -209,6 +374,9 @@ fn get_hooks_config() -> serde_json::Value {
         "UserPromptSubmit": [{
             "hooks": [{"type": "command", "command": "~/.clx/bin/clx-hook user-prompt-submit"}],
             "matcher": "*"
+        }],
+        "Stop": [{
+            "hooks": [{"type": "command", "command": "~/.clx/bin/clx-hook stop"}]
         }]
     })
 }
@@ -393,11 +561,29 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
 
     let mut installed_items: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     if !cli.json {
         println!("{}", "CLX Installation".cyan().bold());
         println!("{}", "=".repeat(50));
         println!();
+    }
+
+    // GAP-3: warn early if a stale binary set is shadowing the running CLX.
+    let bin_dir_check = clx_core::paths::bin_dir();
+    if let VersionStampStatus::Mismatch { stamped, running } =
+        version_stamp_status(read_version_stamp(&bin_dir_check).as_deref(), CLX_VERSION)
+    {
+        let msg = format!(
+            "Version skew: ~/.clx/bin was installed by CLX {stamped} but you are \
+             running CLX {running}. Re-running install will refresh the binaries."
+        );
+        if cli.json {
+            warnings.push(msg);
+        } else {
+            println!("  {} {}", "!".yellow(), msg);
+            println!();
+        }
     }
 
     // Step 0: Check Ollama prerequisites
@@ -556,7 +742,6 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
     }
 
     // Store warnings for JSON output
-    let mut warnings: Vec<String> = Vec::new();
     if !ollama_status.binary_installed {
         warnings.push("Ollama not installed - L1 validation disabled".to_string());
     } else if !ollama_status.server_running {
@@ -615,7 +800,53 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
 
     // Step 2: Write default config.yaml if not exists
     let config_path = clx_dir.join("config.yaml");
-    if !config_path.exists() {
+    if config_path.exists() {
+        // GAP-5: additively merge any missing top-level default keys into the
+        // existing config.yaml without clobbering user values.
+        match (
+            fs::read_to_string(&config_path),
+            serde_yml::to_string(&Config::default()),
+        ) {
+            (Ok(existing), Ok(default_yaml)) => {
+                match merge_missing_config_keys(&existing, &default_yaml) {
+                    Ok((merged, added)) if !added.is_empty() => {
+                        if fs::write(&config_path, merged).is_ok() {
+                            if !cli.json {
+                                println!(
+                                    "  {} Added missing config keys ({}) to {}",
+                                    "+".green(),
+                                    added.join(", "),
+                                    config_path.display()
+                                );
+                            }
+                            installed_items.push(format!("config.yaml keys: {}", added.join(", ")));
+                        }
+                    }
+                    Ok(_) => {
+                        if !cli.json {
+                            println!("  {} Exists  {}", "*".dimmed(), config_path.display());
+                        }
+                    }
+                    Err(e) => {
+                        warnings.push(format!("Could not merge config.yaml keys: {e}"));
+                        if !cli.json {
+                            println!(
+                                "  {} Exists  {} (key merge skipped: {})",
+                                "*".dimmed(),
+                                config_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                if !cli.json {
+                    println!("  {} Exists  {}", "*".dimmed(), config_path.display());
+                }
+            }
+        }
+    } else {
         let config = Config::default();
         let yaml = serde_yml::to_string(&config)?;
         fs::write(&config_path, yaml)?;
@@ -623,8 +854,6 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
             println!("  {} Created {}", "+".green(), config_path.display());
         }
         installed_items.push("config.yaml".to_string());
-    } else if !cli.json {
-        println!("  {} Exists  {}", "*".dimmed(), config_path.display());
     }
 
     // Step 3: Write default rules/default.yaml
@@ -710,6 +939,25 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
         }
     }
 
+    // GAP-3: stamp the installed workspace version so future runs can detect
+    // a stale binary set shadowing a newer CLX.
+    match write_version_stamp(&bin_dir) {
+        Ok(()) => {
+            if !cli.json {
+                println!(
+                    "  {} Stamped version {} ({})",
+                    "+".green(),
+                    CLX_VERSION,
+                    bin_dir.join(VERSION_STAMP_FILE).display()
+                );
+            }
+            installed_items.push(format!("version stamp: {CLX_VERSION}"));
+        }
+        Err(e) => {
+            warnings.push(format!("Could not write version stamp: {e}"));
+        }
+    }
+
     // Step 6: Initialize SQLite database
     if !cli.json {
         println!();
@@ -755,7 +1003,7 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
     settings["hooks"] = hooks_config;
     if !cli.json {
         println!(
-            "  {} Configured hooks (PreToolUse, PostToolUse, PreCompact, SessionStart, SessionEnd, SubagentStart, UserPromptSubmit)",
+            "  {} Configured hooks (PreToolUse, PostToolUse, PreCompact, SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop)",
             "+".green()
         );
     }
@@ -780,6 +1028,28 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
     write_claude_settings(&settings_path, &settings)?;
     if !cli.json {
         println!("  {} Updated {}", "+".green(), settings_path.display());
+    }
+
+    // GAP-2: install the 6 CLX skills into the personal skills location so a
+    // non-plugin (cargo/manual) install is self-contained.
+    match install_skills(&claude_dir) {
+        Ok(skill_names) => {
+            if !cli.json {
+                println!(
+                    "  {} Installed {} skills to {}",
+                    "+".green(),
+                    skill_names.len(),
+                    claude_dir.join("skills").display()
+                );
+            }
+            installed_items.push(format!("skills: {}", skill_names.join(", ")));
+        }
+        Err(e) => {
+            if !cli.json {
+                println!("  {} Failed to install skills: {}", "!".yellow(), e);
+            }
+            warnings.push(format!("Could not install skills: {e}"));
+        }
     }
 
     // Step 8: Inject CLX section into CLAUDE.md
@@ -850,9 +1120,12 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
             println!();
             println!("{}:", "Configured".cyan());
             println!(
-                "  - Hooks: PreToolUse, PostToolUse, PreCompact, SessionStart, SessionEnd, SubagentStart, UserPromptSubmit"
+                "  - Hooks: PreToolUse, PostToolUse, PreCompact, SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop"
             );
             println!("  - MCP Server: clx (clx_recall, clx_remember, etc.)");
+            println!(
+                "  - Skills: clx-recall, clx-remember, clx-checkpoint, clx-rules, clx-resume, clx-doctor"
+            );
             println!("  - CLAUDE.md: CLX tools documentation injected");
             println!();
             println!("{}:", "Paths".cyan());
@@ -972,6 +1245,33 @@ pub async fn cmd_uninstall(cli: &Cli, purge: bool) -> Result<()> {
         );
     }
 
+    // Step 1b: Remove CLX-installed skills (symmetric with install GAP-2).
+    // Never touches user-authored files: only our SKILL.md / empty dirs.
+    let removed_skills = uninstall_skills(&claude_dir);
+    if removed_skills.is_empty() {
+        if !cli.json {
+            println!("  {} No CLX skills found to remove", "*".dimmed());
+        }
+    } else {
+        if !cli.json {
+            println!(
+                "  {} Removed {} CLX skills",
+                "-".red(),
+                removed_skills.len()
+            );
+        }
+        removed_items.push(format!("skills: {}", removed_skills.join(", ")));
+    }
+
+    // Step 1c: Remove the version stamp (symmetric with install GAP-3).
+    let stamp_path = clx_core::paths::bin_dir().join(VERSION_STAMP_FILE);
+    if stamp_path.exists() && fs::remove_file(&stamp_path).is_ok() {
+        if !cli.json {
+            println!("  {} Removed version stamp", "-".red());
+        }
+        removed_items.push("version stamp".to_string());
+    }
+
     // Step 2: Optionally remove ~/.clx/ directory
     if purge {
         if !cli.json {
@@ -1059,4 +1359,171 @@ pub async fn cmd_uninstall(cli: &Cli, purge: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // GAP-1: get_hooks_config must register all 8 events including "Stop".
+    #[test]
+    fn hooks_config_includes_all_eight_events_with_stop() {
+        let cfg = get_hooks_config();
+        let obj = cfg.as_object().expect("hooks config is an object");
+        let expected = [
+            "PreToolUse",
+            "PostToolUse",
+            "PreCompact",
+            "SessionStart",
+            "SessionEnd",
+            "SubagentStart",
+            "UserPromptSubmit",
+            "Stop",
+        ];
+        for ev in expected {
+            assert!(obj.contains_key(ev), "missing hook event: {ev}");
+        }
+        assert_eq!(obj.len(), expected.len(), "unexpected extra hook events");
+    }
+
+    #[test]
+    fn stop_hook_uses_clx_hook_command() {
+        let cfg = get_hooks_config();
+        let cmd = cfg["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("Stop command is a string");
+        assert_eq!(cmd, "~/.clx/bin/clx-hook stop");
+        // Stop is a session-level event: no tool matcher, mirroring PreCompact.
+        assert!(cfg["Stop"][0].get("matcher").is_none());
+    }
+
+    // GAP-2: skill destination resolver and 6 embedded skills.
+    #[test]
+    fn skill_dir_resolves_personal_skills_path() {
+        let claude = std::path::Path::new("/home/u/.claude");
+        let p = skill_dir(claude, "clx-recall");
+        assert_eq!(p, std::path::Path::new("/home/u/.claude/skills/clx-recall"));
+    }
+
+    #[test]
+    fn six_skills_embedded_with_nonempty_content() {
+        assert_eq!(CLX_SKILLS.len(), 6);
+        let names: Vec<&str> = CLX_SKILLS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "clx-recall",
+            "clx-remember",
+            "clx-checkpoint",
+            "clx-rules",
+            "clx-resume",
+            "clx-doctor",
+        ] {
+            assert!(names.contains(&expected), "missing skill: {expected}");
+        }
+        for (name, content) in CLX_SKILLS {
+            assert!(!content.trim().is_empty(), "{name} SKILL.md is empty");
+        }
+    }
+
+    #[test]
+    fn install_then_uninstall_skills_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path();
+
+        let installed = install_skills(claude).unwrap();
+        assert_eq!(installed.len(), 6);
+        for (name, _) in CLX_SKILLS {
+            assert!(skill_dir(claude, name).join("SKILL.md").exists());
+        }
+
+        // Idempotent: re-running install does not error or duplicate.
+        let again = install_skills(claude).unwrap();
+        assert_eq!(again.len(), 6);
+
+        let removed = uninstall_skills(claude);
+        assert_eq!(removed.len(), 6);
+        for (name, _) in CLX_SKILLS {
+            assert!(!skill_dir(claude, name).exists());
+        }
+
+        // Uninstall when nothing is installed is a clean no-op.
+        assert!(uninstall_skills(claude).is_empty());
+    }
+
+    #[test]
+    fn uninstall_skills_preserves_user_authored_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path();
+        install_skills(claude).unwrap();
+
+        // User drops an extra file into a CLX skill dir.
+        let recall = skill_dir(claude, "clx-recall");
+        let user_file = recall.join("user-notes.md");
+        fs::write(&user_file, "my notes").unwrap();
+
+        uninstall_skills(claude);
+        // The user's file survives; only our SKILL.md was removed.
+        assert!(user_file.exists());
+        assert!(!recall.join("SKILL.md").exists());
+    }
+
+    // GAP-3: version-stamp comparison and file I/O.
+    #[test]
+    fn version_stamp_status_detects_states() {
+        assert_eq!(
+            version_stamp_status(None, "0.8.0"),
+            VersionStampStatus::Absent
+        );
+        assert_eq!(
+            version_stamp_status(Some("0.8.0\n"), "0.8.0"),
+            VersionStampStatus::Match
+        );
+        match version_stamp_status(Some("0.7.2"), "0.8.0") {
+            VersionStampStatus::Mismatch { stamped, running } => {
+                assert_eq!(stamped, "0.7.2");
+                assert_eq!(running, "0.8.0");
+            }
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_stamp_write_then_read_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_version_stamp(tmp.path()).is_none());
+        write_version_stamp(tmp.path()).unwrap();
+        let stamp = read_version_stamp(tmp.path()).expect("stamp present");
+        assert_eq!(
+            version_stamp_status(Some(&stamp), CLX_VERSION),
+            VersionStampStatus::Match
+        );
+    }
+
+    // GAP-5: additive config-key merge must never clobber user values.
+    #[test]
+    fn merge_adds_only_missing_keys_and_preserves_user_values() {
+        let existing = "alpha: user_value\n";
+        let defaults = "alpha: default_value\nbeta: 42\n";
+        let (merged, added) = merge_missing_config_keys(existing, defaults).unwrap();
+        assert_eq!(added, vec!["beta".to_string()]);
+        let v: serde_yml::Value = serde_yml::from_str(&merged).unwrap();
+        assert_eq!(v["alpha"].as_str(), Some("user_value"));
+        assert_eq!(v["beta"].as_i64(), Some(42));
+    }
+
+    #[test]
+    fn merge_is_noop_when_nothing_missing() {
+        let existing = "alpha: x\nbeta: y\n";
+        let defaults = "alpha: 1\nbeta: 2\n";
+        let (merged, added) = merge_missing_config_keys(existing, defaults).unwrap();
+        assert!(added.is_empty());
+        assert_eq!(merged, existing);
+    }
+
+    #[test]
+    fn merge_handles_empty_existing_config_as_noop() {
+        // serde_yml parses "" as Null (not a mapping) -> leave untouched.
+        let (merged, added) = merge_missing_config_keys("", "alpha: 1\n").unwrap();
+        assert!(added.is_empty());
+        assert_eq!(merged, "");
+    }
 }
