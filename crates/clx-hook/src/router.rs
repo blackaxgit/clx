@@ -70,6 +70,61 @@ impl HookDeps {
     }
 }
 
+/// Best-effort provenance verdict for the hook invocation (finding F7).
+///
+/// Threat model: `clx-hook` reads its JSON envelope from stdin. The
+/// documented assumption is "stdin is trusted because Claude Code spawns
+/// us". A local same-uid attacker can violate that by piping a fabricated
+/// `Stop` / `PostToolUse` envelope to poison CLX memory or audit state.
+///
+/// Claude Code 2026 does NOT hand hooks an unforgeable token. Per the
+/// official hooks docs (code.claude.com/docs/en/hooks, fetched 2026-05-17)
+/// the only spawn-time signal is the presence of Claude-Code-set
+/// environment variables (`CLAUDE_PROJECT_DIR`, and `CLAUDE_PLUGIN_ROOT`
+/// for plugin hooks). These are inherited and therefore forgeable by a
+/// same-uid attacker who knows the convention, so this check is genuinely
+/// best-effort defense-in-depth, not an authentication boundary.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Provenance {
+    /// At least one Claude-Code-set environment variable is present. The
+    /// invocation is consistent with a real Claude Code spawn.
+    Trusted,
+    /// No Claude-Code-set environment variable is present. Provenance could
+    /// not be established (spoof attempt, or a legitimate edge case such as
+    /// the contract test harness, CI, or a debugger). Caller logs a WARN
+    /// and still processes: a false positive that blocks every hook is a
+    /// worse outcome than the residual local-attacker risk already
+    /// acknowledged in the threat model (fail-safe, not fail-closed).
+    Unverified,
+}
+
+/// Environment variable names Claude Code 2026 sets on every hook spawn.
+/// `CLAUDE_PROJECT_DIR` is set for all command hooks; `CLAUDE_PLUGIN_ROOT`
+/// is additionally set for plugin hooks (CLX ships as a plugin). Source:
+/// official Claude Code hooks documentation, fetched 2026-05-17.
+pub const CLAUDE_PROVENANCE_ENV_VARS: &[&str] = &["CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT"];
+
+/// Pure provenance decision function (Domain layer: no process state).
+///
+/// Given the values of the known Claude-Code-set environment variables
+/// (as `(name, Option<value>)` pairs), decide whether the invocation looks
+/// like a real Claude Code spawn. An env var counts as "present" only when
+/// it is set AND non-empty, so an attacker cannot satisfy the check by
+/// exporting an empty placeholder (and a stray empty export does not give
+/// false confidence either). The OS read that produces these pairs lives
+/// at the `main()` infrastructure edge.
+#[must_use]
+pub fn classify_provenance(env_vars: &[(&str, Option<String>)]) -> Provenance {
+    let any_present = env_vars
+        .iter()
+        .any(|(_, value)| value.as_deref().is_some_and(|v| !v.trim().is_empty()));
+    if any_present {
+        Provenance::Trusted
+    } else {
+        Provenance::Unverified
+    }
+}
+
 /// Result of running `handle_event`. The binary maps every variant to
 /// `ExitCode::SUCCESS` (Claude Code treats non-zero exit codes as hook
 /// failure noise), but tests can match on this to assert behavior.
@@ -213,6 +268,52 @@ mod tests {
             "tool_input": { "file_path": "/tmp/test.txt" }
         })
         .to_string()
+    }
+
+    #[test]
+    fn classify_provenance_trusted_when_project_dir_set() {
+        let env = [
+            ("CLAUDE_PROJECT_DIR", Some("/home/u/proj".to_string())),
+            ("CLAUDE_PLUGIN_ROOT", None),
+        ];
+        assert_eq!(classify_provenance(&env), Provenance::Trusted);
+    }
+
+    #[test]
+    fn classify_provenance_trusted_when_plugin_root_set() {
+        let env = [
+            ("CLAUDE_PROJECT_DIR", None),
+            ("CLAUDE_PLUGIN_ROOT", Some("/home/u/.claude/p".to_string())),
+        ];
+        assert_eq!(classify_provenance(&env), Provenance::Trusted);
+    }
+
+    #[test]
+    fn classify_provenance_unverified_when_none_set() {
+        let env = [
+            ("CLAUDE_PROJECT_DIR", None),
+            ("CLAUDE_PLUGIN_ROOT", None),
+        ];
+        assert_eq!(classify_provenance(&env), Provenance::Unverified);
+    }
+
+    #[test]
+    fn classify_provenance_empty_value_does_not_satisfy_check() {
+        // An attacker exporting an empty placeholder must not pass, and a
+        // stray empty export must not give false confidence.
+        let env = [
+            ("CLAUDE_PROJECT_DIR", Some(String::new())),
+            ("CLAUDE_PLUGIN_ROOT", Some("   ".to_string())),
+        ];
+        assert_eq!(classify_provenance(&env), Provenance::Unverified);
+    }
+
+    #[test]
+    fn classify_provenance_known_env_var_list_is_nonempty() {
+        // Guard against an accidental edit that empties the source list,
+        // which would make classify_provenance always Unverified.
+        assert!(!CLAUDE_PROVENANCE_ENV_VARS.is_empty());
+        assert!(CLAUDE_PROVENANCE_ENV_VARS.contains(&"CLAUDE_PROJECT_DIR"));
     }
 
     #[test]

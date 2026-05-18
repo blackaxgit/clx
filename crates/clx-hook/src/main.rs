@@ -12,7 +12,10 @@
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
-use clx_hook::{HookDeps, handle_event};
+use clx_hook::{
+    CLAUDE_PROVENANCE_ENV_VARS, HookDeps, Provenance, classify_provenance, handle_event,
+};
+use tracing::warn;
 
 fn print_usage() {
     eprintln!("clx-hook - Claude Code hook handler for CLX");
@@ -53,6 +56,34 @@ async fn main() -> ExitCode {
     let Some(deps) = HookDeps::from_process_defaults() else {
         return ExitCode::SUCCESS;
     };
+
+    // F7: best-effort hook-envelope provenance check at the orchestration
+    // boundary (before any dispatch), NOT inside router::handle_event, so
+    // the in-memory contract tests that call handle_event directly are
+    // unaffected. We read the Claude-Code-set env vars here (the
+    // infrastructure edge) and hand pure (name, value) pairs to the Domain
+    // decision function. Claude Code 2026 provides no unforgeable token
+    // (see classify_provenance docs), so this is defense-in-depth, not an
+    // auth boundary. Decision: fail-safe, not fail-closed. When provenance
+    // cannot be established (spoof attempt, OR a legitimate edge case such
+    // as CI, a debugger, the contract-test harness, or a shell wrapper that
+    // dropped the env), we log a WARN and still process. A false positive
+    // that blocks every hook is a strictly worse outcome than the residual
+    // local same-uid attacker risk already acknowledged in the threat
+    // model. The WARN gives operators a forensic signal without a hard
+    // crash that would break legitimate use.
+    let env_pairs: Vec<(&str, Option<String>)> = CLAUDE_PROVENANCE_ENV_VARS
+        .iter()
+        .map(|name| (*name, std::env::var(name).ok()))
+        .collect();
+    if classify_provenance(&env_pairs) == Provenance::Unverified {
+        warn!(
+            "hook provenance unverified: no Claude Code env var present \
+             ({}). Processing anyway (fail-safe); if unexpected, a local \
+             process may be spoofing the hook envelope.",
+            CLAUDE_PROVENANCE_ENV_VARS.join(", ")
+        );
+    }
 
     // Delegate to the library. handle_event consumes stdin, writes any
     // fallback JSON (oversize input / parse error) to stdout, and returns a

@@ -25,4 +25,6 @@ pub(crate) mod types;
 #[cfg(test)]
 mod tests;
 
-pub use router::{HookDeps, HookExit, handle_event};
+pub use router::{
+    CLAUDE_PROVENANCE_ENV_VARS, HookDeps, HookExit, Provenance, classify_provenance, handle_event,
+};
