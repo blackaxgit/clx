@@ -120,7 +120,21 @@ similar_names = "allow"
 [workspace.lints.rust]
 unsafe_code = "deny"
 
-# Excluded from coverage: scaffolded reducer files (B2 wiring pending in
-# Wave 3-N) and shell-only main() in clx-hook binary.
+# Published instrumented coverage denominator (CLX 0.8.0 campaign, spec
+# section 1). cargo-llvm-cov excludes unreachable glue ONLY; every excluded
+# path has its logic covered elsewhere. Kept byte-identical with
+# scripts/test.sh (COV_IGNORE_REGEX) and the gap-map table in docs/testing.md.
+# Per-pattern rationale:
+#   dashboard/event\.rs      terminal run_event_loop glue (crossterm raw-mode,
+#                            real-TTY input); the pure `update` reducer in
+#                            dashboard/state.rs IS covered.
+#   main\.rs                 shell-only entrypoints: clx-hook stdin wiring +
+#                            clx clap dispatch shell; logic lives in
+#                            router::handle_event / command modules (covered).
+#   dashboard/runtime\.rs    reserved terminal runtime glue name (forward
+#                            compatible; do not drop if event.rs splits).
+#   credentials/keychain_acl\.rs  macOS CFArray SecAccess FFI: cfg(target_os
+#                            = "macos"), the crate's only unsafe, opt-in, and
+#                            exercised only by #[ignore] real-keychain tests.
 [workspace.metadata.cargo-llvm-cov]
-ignore-filename-regex = "(dashboard/event\\.rs|main\\.rs|dashboard/runtime\\.rs)"
+ignore-filename-regex = "(dashboard/event\\.rs|main\\.rs|dashboard/runtime\\.rs|credentials/keychain_acl\\.rs)"

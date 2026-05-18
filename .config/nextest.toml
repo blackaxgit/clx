@@ -1,0 +1,35 @@
+# cargo-nextest configuration for the CLX 0.8.0 coverage campaign.
+#
+# Two profiles:
+#   default  local inner loop: fail fast, one retry to mask rare flakes.
+#   ci       full signal: no retries, no fail-fast, JUnit output.
+#
+# The harness (scripts/test.sh) never passes --run-ignored, so the
+# #[ignore = "Requires keychain access"] real-keychain tests stay skipped
+# under every profile: zero real keychain, zero network, zero model download.
+
+[profile.default]
+# Surface the first failure quickly during the inner loop.
+fail-fast = true
+# One retry tolerates the occasional timing-sensitive test without hiding
+# a genuine regression (a test that only passes on retry is still reported).
+retries = 1
+# A test still running after 60s is slow; after 4 periods (240s) it is
+# terminated so a hung test never blocks the whole run.
+slow-timeout = { period = "60s", terminate-after = 4 }
+# Show output for failures only; keep the inner loop quiet otherwise.
+failure-output = "immediate-final"
+status-level = "fail"
+
+[profile.ci]
+# Full signal: never stop early, never retry. Every failure is real and
+# every failing test is reported in one pass (the campaign needs the
+# complete gap picture, not the first red).
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 4 }
+failure-output = "immediate-final"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"
