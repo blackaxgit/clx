@@ -100,15 +100,51 @@ run_fast() {
   ok "fast suite passed"
 }
 
+# --- LLVM toolchain resolution for cargo-llvm-cov ---------------------------
+# cargo-llvm-cov needs llvm-cov + llvm-profdata that match the rustc LLVM. With
+# rustup it discovers them via the active toolchain. Without rustup (Homebrew
+# rust) the operator otherwise has to export LLVM_COV/LLVM_PROFDATA by hand;
+# auto-detect the Homebrew LLVM so `cov` works out of the box.
+resolve_llvm_env() {
+  if command -v rustup >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -n "${LLVM_COV:-}" ] && [ -n "${LLVM_PROFDATA:-}" ]; then
+    return 0
+  fi
+  local candidates=()
+  if command -v brew >/dev/null 2>&1; then
+    candidates+=("$(brew --prefix llvm 2>/dev/null)/bin")
+  fi
+  candidates+=("/opt/homebrew/opt/llvm/bin" "/usr/local/opt/llvm/bin")
+  local dir
+  for dir in "${candidates[@]}"; do
+    if [ -x "${dir}/llvm-cov" ] && [ -x "${dir}/llvm-profdata" ]; then
+      export LLVM_COV="${dir}/llvm-cov"
+      export LLVM_PROFDATA="${dir}/llvm-profdata"
+      info "auto-resolved LLVM: ${dir} (no rustup; using Homebrew LLVM)"
+      return 0
+    fi
+  done
+  fail "rustup absent and no Homebrew LLVM found. Install with:"
+  printf '       brew install llvm   # provides llvm-cov + llvm-profdata\n' >&2
+  printf '       (or export LLVM_COV / LLVM_PROFDATA to a matching toolchain)\n' >&2
+  return 1
+}
+
 # --- cov: the instrumented coverage gate ------------------------------------
 run_cov() {
   if ! has_tool llvm-cov; then
     missing_hint llvm-cov
     return 0
   fi
+  resolve_llvm_env || return 1
   local runner=()
   if has_tool nextest; then
-    runner=(nextest)
+    # The `ci` profile (.config/nextest.toml) sets fail-fast=false and
+    # retries=0: a coverage measurement must run EVERY test regardless of
+    # individual failures and still emit the summary, not abort on first red.
+    runner=(nextest --profile ci)
   else
     warn "cargo-nextest absent; cargo-llvm-cov will use the built-in test runner"
   fi
