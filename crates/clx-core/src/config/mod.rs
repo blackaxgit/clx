@@ -255,6 +255,76 @@ pub struct Config {
     /// Opt-in. Default values preserve 0.7.x behavior (no auto-summary fires).
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// Credential storage backend selection.
+    ///
+    /// Default is the local age-encrypted file (`backend: file`), which
+    /// NEVER touches the macOS keychain and never prompts. Set
+    /// `backend: keychain` (or `CLX_CREDENTIALS_BACKEND=keychain`) to opt
+    /// into the system keychain.
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+}
+
+/// Credential storage backend configuration.
+///
+/// ```yaml
+/// credentials:
+///   backend: file      # default; local age-encrypted file, never prompts
+///   # backend: keychain  # opt-in; macOS Keychain (may prompt on adhoc binaries)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialsConfig {
+    /// `file` (default) or `keychain`.
+    #[serde(default)]
+    pub backend: crate::credentials::CredentialBackendKind,
+}
+
+impl Default for CredentialsConfig {
+    fn default() -> Self {
+        Self {
+            // The default MUST be the file backend so a fresh user never sees
+            // a single macOS keychain prompt.
+            backend: crate::credentials::CredentialBackendKind::File,
+        }
+    }
+}
+
+impl Config {
+    /// Resolve the effective credential backend, honoring the
+    /// `CLX_CREDENTIALS_BACKEND` env override (highest precedence) over the
+    /// `credentials.backend` config value (default `file`).
+    ///
+    /// An unknown env value is a hard error so a typo can never silently
+    /// fall back to the prompting keychain.
+    pub fn credential_backend_kind(
+        &self,
+    ) -> crate::Result<crate::credentials::CredentialBackendKind> {
+        if let Ok(v) = std::env::var("CLX_CREDENTIALS_BACKEND")
+            && !v.trim().is_empty()
+        {
+            return crate::credentials::CredentialBackendKind::parse(&v)
+                .map_err(|e| crate::Error::Config(e.to_string()));
+        }
+        Ok(self.credentials.backend)
+    }
+
+    /// Build a `CredentialStore` from this config (single config-aware
+    /// constructor). Every production callsite uses this so the user's
+    /// backend selection (default `file`) is honored uniformly.
+    pub fn credential_store(&self) -> crate::Result<crate::credentials::CredentialStore> {
+        Ok(crate::credentials::CredentialStore::from_config(
+            self.credential_backend_kind()?,
+        ))
+    }
+
+    /// Same as [`Config::credential_store`] but with the process-scoped read
+    /// cache enabled (long-lived MCP server).
+    pub fn credential_store_cached(&self) -> crate::Result<crate::credentials::CredentialStore> {
+        Ok(crate::credentials::CredentialStore::from_config_cached(
+            self.credential_backend_kind()?,
+        ))
+    }
 }
 
 /// Retention policy for storage tables.
@@ -1669,8 +1739,11 @@ impl Config {
                 Ok(crate::llm::LlmClient::Ollama(backend))
             }
             ProviderConfig::AzureOpenai(c) => {
-                let secret =
-                    resolve_azure_credential(name, c).map_err(LlmConfigError::ProviderInit)?;
+                let kind = self
+                    .credential_backend_kind()
+                    .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                let secret = resolve_azure_credential(name, c, kind)
+                    .map_err(LlmConfigError::ProviderInit)?;
                 let backend = crate::llm::AzureOpenAIBackend::new(c, secret)
                     .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
                 Ok(crate::llm::LlmClient::Azure(backend))
@@ -1700,18 +1773,20 @@ pub enum LlmConfigError {
 
 /// Resolve an Azure provider's API key.
 ///
-/// Resolution order:
-/// 1. Env var named in `cfg.api_key_env` (if set and non-empty).
-/// 2. `CredentialStore` entry keyed `"<provider_name>-api-key"`.
-///    (Hyphen, not colon, because `CredentialStore` rejects colons in user
-///    keys. Earlier 0.6.0 used a colon, which made the entry impossible to
-///    write via `clx credentials set`. See RUSTSEC-style note: contract
-///    mismatch fixed in 0.6.1.)
-/// 3. File at `cfg.api_key_file` (Unix: must be mode 0600).
-/// 4. Error.
+/// Resolution order (the critical correctness requirement):
+/// 1. Env var named in `cfg.api_key_env` (if set and non-empty) -> 0 prompts.
+/// 2. The selected `CredentialBackend` entry keyed `"<provider_name>-api-key"`.
+///    With the DEFAULT backend (`file`) this is the local age-encrypted file
+///    and NEVER touches the keychain / prompts. The keychain is consulted
+///    here ONLY if the user explicitly set `credentials.backend: keychain`.
+///    (Hyphen, not colon: `CredentialStore` rejects colons in user keys.)
+/// 3. File at `cfg.api_key_file` (Unix: must be mode 0600) -> 0 prompts.
+/// 4. Error (with an actionable, one-time message). NEVER a keychain
+///    fallback under the default backend -- that was the entire bug.
 fn resolve_azure_credential(
     provider_name: &str,
     cfg: &AzureOpenAIConfig,
+    backend_kind: crate::credentials::CredentialBackendKind,
 ) -> Result<secrecy::SecretString, String> {
     use secrecy::SecretString;
 
@@ -1723,18 +1798,21 @@ fn resolve_azure_credential(
         return Ok(SecretString::new(v.into()));
     }
 
-    // 2. CredentialStore (system keychain)
-    let store = crate::credentials::CredentialStore::new();
+    // 2. selected backend (file by default; keychain ONLY if opted in)
+    let store = crate::credentials::CredentialStore::from_config(backend_kind);
     let key = format!("{provider_name}-api-key");
     match store.get(&key) {
         Ok(Some(v)) => return Ok(SecretString::new(v.into())),
-        Ok(None) => {} // fall through
+        Ok(None) => {} // fall through to api_key_file (NOT to the keychain)
         Err(e) => {
-            // headless Linux without D-Bus, etc. Log and fall through.
+            // File backend IO error / headless keychain unavailable. Log and
+            // fall through to api_key_file. We never silently retry a
+            // different store (reintroducing prompts).
             tracing::warn!(
                 provider = %provider_name,
+                backend = %backend_kind_label(backend_kind),
                 error = %e,
-                "keychain unavailable, falling back to file credential"
+                "credential backend unavailable, falling back to api_key_file"
             );
         }
     }
@@ -1746,9 +1824,19 @@ fn resolve_azure_credential(
 
     Err(format!(
         "no credentials available for provider '{provider_name}' \
-         (checked env var, keychain key '{key}', and api_key_file). \
-         Run: clx credentials set {provider_name}-api-key '<your-key>'"
+         (checked env var, {} backend key '{key}', and api_key_file). \
+         Run: clx credentials set {provider_name}-api-key '<your-key>' \
+         (or `clx credentials migrate` if the secret is only in the old \
+         macOS keychain).",
+        backend_kind_label(backend_kind)
     ))
+}
+
+fn backend_kind_label(kind: crate::credentials::CredentialBackendKind) -> &'static str {
+    match kind {
+        crate::credentials::CredentialBackendKind::File => "file",
+        crate::credentials::CredentialBackendKind::Keychain => "keychain",
+    }
 }
 
 #[cfg(unix)]
@@ -3271,8 +3359,14 @@ ollama:
             eprintln!("skipping: keychain access hangs on GitHub Actions macOS runners");
             return;
         }
-        use crate::credentials::{CredentialError, CredentialStore};
-        let store = CredentialStore::with_service("clx-test-keyfmt");
+        use std::sync::Arc;
+
+        use crate::credentials::{AgeFileBackend, CredentialError, CredentialStore};
+        // Use the default (file) backend on a tempdir: deterministic and
+        // headless-safe, never touches the keychain.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            CredentialStore::with_backend(Arc::new(AgeFileBackend::with_dir(tmp.path()).unwrap()));
         let provider = "azure-regression-test-keyfmt";
 
         // 1. Hyphen-format key MUST NOT be rejected by the validator.

@@ -21,6 +21,10 @@ chrono.workspace = true
 reqwest.workspace = true
 keyring.workspace = true
 secrecy.workspace = true
+# Default local encrypted-file credential backend (age-encryption.org v1).
+# Never prompts, headless-safe, cross-platform identical. The macOS keychain
+# is opt-in only; see credentials/backend.rs.
+age.workspace = true
 sqlite-vec.workspace = true
 trait-variant.workspace = true
 url.workspace = true

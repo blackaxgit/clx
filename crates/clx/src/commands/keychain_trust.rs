@@ -31,7 +31,10 @@ use crate::Cli;
 /// surprising. When no CLX items exist the repair short-circuits with zero
 /// prompts.
 pub fn cmd_keychain_trust(cli: &Cli) -> Result<()> {
-    let store = CredentialStore::new();
+    // This command operates on the legacy macOS keychain by definition, so
+    // it always uses the keychain backend regardless of the default.
+    let store =
+        CredentialStore::from_config(clx_core::credentials::CredentialBackendKind::Keychain);
 
     // Up-front, one-time heads-up about the single login-keychain prompt.
     // Stdout-safe to suppress under --json so piped/automated output is not

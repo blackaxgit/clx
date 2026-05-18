@@ -1,11 +1,16 @@
-//! Credentials command: manage credentials stored in the system keychain.
+//! Credentials command: manage credentials in the configured backend.
+//!
+//! The default backend is a local age-encrypted file (`~/.clx/credentials.age`)
+//! that NEVER touches the macOS keychain and never prompts. `clx credentials
+//! migrate` is the only path that may read the legacy keychain, and only
+//! when the user explicitly runs it.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 
 use clx_core::config::{Config, ProviderConfig};
-use clx_core::credentials::CredentialStore;
+use clx_core::credentials::{CredentialBackendKind, CredentialStore};
 
 use crate::Cli;
 use crate::types::CredentialsListOutput;
@@ -29,16 +34,31 @@ pub enum CredentialsAction {
     /// List all stored credential keys
     List,
 
-    /// Delete a credential from the system keychain
+    /// Delete a credential from the configured backend
     Delete {
         /// Credential key to delete
+        key: String,
+    },
+
+    /// Migrate a credential from the legacy macOS keychain into the
+    /// configured (file) backend. Explicit/opt-in: this is the ONLY command
+    /// that may read the old keychain (a single macOS prompt may appear,
+    /// only if the secret is keychain-only).
+    Migrate {
+        /// Credential key to migrate (e.g. `azure-prod-api-key`).
         key: String,
     },
 }
 
 /// Credentials management command handler
 pub fn cmd_credentials(cli: &Cli, action: &CredentialsAction) -> Result<()> {
-    let store = CredentialStore::new();
+    // Use the configured backend (default `file`). Loading config never
+    // touches the keychain.
+    let kind = Config::load()
+        .ok()
+        .and_then(|c| c.credential_backend_kind().ok())
+        .unwrap_or(CredentialBackendKind::File);
+    let store = CredentialStore::from_config(kind);
 
     match action {
         CredentialsAction::Set { key, value } => {
@@ -152,6 +172,72 @@ pub fn cmd_credentials(cli: &Cli, action: &CredentialsAction) -> Result<()> {
                         keys.len(),
                         if keys.len() == 1 { "" } else { "s" }
                     );
+                }
+            }
+        }
+
+        CredentialsAction::Migrate { key } => {
+            // Already resolvable without the keychain? Then do NOT read it
+            // (avoids reintroducing the prompt for no reason).
+            if let Ok(Some(_)) = store.get(key) {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "action": "migrate",
+                            "key": key,
+                            "migrated": false,
+                            "reason": "already present in the configured backend"
+                        })
+                    );
+                } else {
+                    println!(
+                        "{} '{}' is already in the {} backend; nothing to migrate.",
+                        "OK:".green().bold(),
+                        key.cyan(),
+                        store.backend_label()
+                    );
+                }
+                return Ok(());
+            }
+
+            // Explicit, opt-in single keychain read. THIS is the only place
+            // a single macOS keychain prompt may appear, and only because
+            // the user ran `migrate` and the secret is keychain-only.
+            let keychain = CredentialStore::from_config(CredentialBackendKind::Keychain);
+            match keychain.get(key) {
+                Ok(Some(value)) => {
+                    store
+                        .store(key, &value)
+                        .context("Failed to write migrated credential to file backend")?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "action": "migrate",
+                                "key": key,
+                                "migrated": true
+                            })
+                        );
+                    } else {
+                        println!(
+                            "{} Migrated '{}' from the macOS keychain into the {} \
+                             backend. Future reads are local-file only (zero prompts).",
+                            "Success:".green().bold(),
+                            key.cyan(),
+                            store.backend_label()
+                        );
+                    }
+                }
+                Ok(None) => {
+                    anyhow::bail!(
+                        "no credential '{key}' found in the legacy keychain (nothing to \
+                         migrate). If you have the secret, run: clx credentials set {key} \
+                         '<your-key>'"
+                    );
+                }
+                Err(e) => {
+                    anyhow::bail!("failed to read '{key}' from the legacy keychain: {e}");
                 }
             }
         }

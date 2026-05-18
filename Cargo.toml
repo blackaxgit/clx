@@ -59,6 +59,11 @@ colored = "2"
 # Secure storage
 keyring = "2"
 secrecy = { version = "0.10", features = ["serde"] }
+# age-encryption.org v1 (X25519 + ChaCha20-Poly1305). Canonical Rust
+# implementation of the age spec, actively maintained by the age project.
+# Backs the DEFAULT local encrypted-file credential backend so CLX never
+# touches the macOS keychain unless the user explicitly opts in.
+age = "0.11"
 
 # Traits and utilities
 trait-variant = "0.1"

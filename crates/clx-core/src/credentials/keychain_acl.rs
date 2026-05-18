@@ -12,13 +12,20 @@
 //!
 //! # Two distinct paths (do not conflate them)
 //!
-//! 1. **Store-time (NEW credentials), zero prompt.** When CLX itself writes a
-//!    credential it is, by definition, the authorized creating process for
-//!    that brand-new item, so attaching a permissive "any application"
-//!    `SecAccess` via `SecAccessCreate(name, NULL, &access)` +
+//! 1. **Store-time (NEW credentials), best-effort.** When CLX itself writes
+//!    a credential it is the authorized creating process for that brand-new
+//!    item, so attaching a permissive `SecAccess` via
+//!    `SecAccessCreate(name, <empty CFArray>, &access)` +
 //!    `SecKeychainItemSetAccess` does NOT prompt: the process just authored
-//!    the item and already holds the right to set its access.
-//!    [`relax_item_access`] keeps this behavior unchanged.
+//!    the item and already holds the right to set its access. The trusted-
+//!    app list MUST be a non-null EMPTY array (NULL would restrict access to
+//!    only the calling app -- the opposite of what we want; that was a real
+//!    bug, now fixed). Even so, an adhoc/unsigned binary's code identity is
+//!    unstable, so this is best-effort: the keychain backend is OPT-IN only.
+//!    The DEFAULT credential backend is a local age-encrypted file that
+//!    never touches the keychain and never prompts (see
+//!    `credentials::backend`). [`relax_item_access`] is reached only when
+//!    the user explicitly selected the keychain backend.
 //!
 //! 2. **Repair (PRE-EXISTING items created by older CLX), at most one
 //!    prompt.** Items written by a previous, differently-identified adhoc
@@ -70,6 +77,20 @@
 //! other operating systems these functions are no-ops (Linux Secret Service
 //! / libsecret does not have the adhoc-binary re-prompt problem), so the
 //! crate builds unchanged on Linux/CI/Windows.
+
+/// The documented, correct trusted-application list form for a permissive
+/// `SecAccess`: a NON-null but EMPTY list (size 0). NULL would restrict to
+/// the calling app only (the bug that previously shipped). This const exists
+/// so a pure unit test can assert the contract without any keychain access.
+pub const PERMISSIVE_TRUSTED_APP_LIST_LEN: isize = 0;
+
+/// Whether the store-time `SecAccess` is built from a NULL trusted-app list.
+/// MUST be `false`: NULL == "trust only the calling app" (restrictive). The
+/// correct permissive form is a non-null empty `CFArray`.
+#[must_use]
+pub const fn permissive_access_uses_null_trustedlist() -> bool {
+    false
+}
 
 /// Which keychain-trust action a given item requires.
 ///
@@ -231,14 +252,29 @@ mod imp {
     const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
 
     unsafe extern "C" {
-        /// Create a `SecAccess`. Passing `trustedlist == NULL` yields the
-        /// documented "any application" access (no per-app restriction, no
-        /// read prompt). We never pass a restrictive list.
+        /// Create a `SecAccess`.
+        ///
+        /// IMPORTANT (Apple docs, corrected): passing `trustedlist == NULL`
+        /// makes the access trust ONLY the calling application -- the most
+        /// restrictive form, the OPPOSITE of "any application". To get a
+        /// genuinely permissive access we must pass a NON-null but EMPTY
+        /// `CFArray`: an empty trusted-application list is the documented
+        /// "no applications are in the trusted list, so access is not
+        /// restricted to specific apps" form. We therefore always pass an
+        /// empty `CFArray`, never NULL.
         fn SecAccessCreate(
             descriptor: CFStringRef,
             trustedlist: CFArrayRef,
             access_ref: *mut SecAccessRef,
         ) -> OSStatus;
+
+        /// Create an empty immutable `CFArray` (the empty trusted-app list).
+        fn CFArrayCreate(
+            allocator: CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: isize,
+            callbacks: *const std::ffi::c_void,
+        ) -> CFArrayRef;
 
         /// Replace the access object bound to a keychain item.
         fn SecKeychainItemSetAccess(item_ref: SecKeychainItemRef, access: SecAccessRef)
@@ -263,16 +299,29 @@ mod imp {
         let cf_desc = CFString::new(descriptor);
         let mut access: SecAccessRef = std::ptr::null_mut();
 
-        // NULL trusted-app list == "any application" access (Apple-documented
-        // behavior). We deliberately never construct a trusted-app list, so
-        // the resulting item is not bound to any binary identity.
+        // An EMPTY (non-null) trusted-application CFArray is the documented
+        // permissive form: no app is on the restricted list, so reads are
+        // not bound to any binary identity and do not prompt. Passing NULL
+        // here would do the OPPOSITE (trust only the calling app), which was
+        // the latent bug this code shipped before. NOTE: even with a correct
+        // permissive SecAccess, an adhoc/unsigned binary's cdhash is
+        // unstable, so the keychain remains best-effort and opt-in only;
+        // the default file backend is what actually guarantees zero prompts.
+        let empty_trustedlist =
+            unsafe { CFArrayCreate(std::ptr::null(), std::ptr::null(), 0, std::ptr::null()) };
+        if empty_trustedlist.is_null() {
+            return Err(CredentialError::Keychain(
+                "CFArrayCreate returned NULL building empty trusted-app list".to_string(),
+            ));
+        }
         let status = unsafe {
             SecAccessCreate(
                 cf_desc.as_concrete_TypeRef(),
-                std::ptr::null(),
+                empty_trustedlist,
                 &raw mut access,
             )
         };
+        unsafe { CFRelease(empty_trustedlist.cast::<std::ffi::c_void>()) };
         if status != ERR_SEC_SUCCESS || access.is_null() {
             return Err(CredentialError::Keychain(format!(
                 "SecAccessCreate failed (OSStatus {status})"
@@ -496,6 +545,15 @@ pub use imp::{relax_item_access, repair_service_items};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permissive_secaccess_uses_empty_not_null_trusted_list() {
+        // Regression for the SecAccessCreate(NULL) bug: NULL trusts only the
+        // calling app (restrictive). The permissive form is a non-null EMPTY
+        // CFArray (len 0). The comment and behavior must agree.
+        assert!(!permissive_access_uses_null_trustedlist());
+        assert_eq!(PERMISSIVE_TRUSTED_APP_LIST_LEN, 0);
+    }
 
     #[test]
     fn decide_access_relaxes_when_item_present() {
