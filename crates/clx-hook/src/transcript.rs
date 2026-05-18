@@ -5,7 +5,7 @@ use crate::types::{SUMMARIZE_PROMPT, SummaryResponse, TranscriptEntry, Transcrip
 use clx_core::config::{Capability, Config};
 use clx_core::types::estimate_tokens;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -36,7 +36,21 @@ const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 /// runs against the real target rather than a link.
 fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(transcript_path).ok()?;
-    let len = std::fs::metadata(&canonical).ok()?.len();
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    // Reject anything that is not a regular file. A character device
+    // (`/dev/zero`), block device, FIFO, socket, or directory reports a
+    // metadata length of 0, so the size cap below would pass while the
+    // subsequent line reader would never terminate (unbounded read ->
+    // OOM/SIGKILL). Treat all of these as "no usable transcript".
+    if !metadata.file_type().is_file() {
+        warn!(
+            "transcript '{}' is not a regular file ({:?}); refusing to read",
+            canonical.display(),
+            metadata.file_type()
+        );
+        return None;
+    }
+    let len = metadata.len();
     if len > MAX_TRANSCRIPT_BYTES {
         warn!(
             "transcript '{}' is {} bytes (> {} cap); refusing to read",
@@ -78,7 +92,10 @@ pub(crate) fn last_n_turns(transcript_path: &str, n: usize) -> Vec<OwnedTurn> {
         return Vec::new();
     };
 
-    let reader = BufReader::new(file);
+    // Defensively bound the bytes actually consumed regardless of the
+    // metadata size check above: a regular file can still grow (or be
+    // swapped via TOCTOU) after the gate, so cap the reader itself.
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
     let mut all: Vec<OwnedTurn> = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
@@ -121,7 +138,8 @@ pub(crate) fn count_transcript_tokens(transcript_path: &str) -> (i64, i64, i32) 
         return (0, 0, 0);
     };
 
-    let reader = BufReader::new(file);
+    // Bound the read even if the file grows or is swapped post-check.
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
     let mut message_count: i32 = 0;
@@ -195,7 +213,8 @@ pub(crate) async fn process_transcript(
         }
     };
 
-    let reader = BufReader::new(file);
+    // Bound the read even if the file grows or is swapped post-check.
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
     let mut entries = Vec::new();
     let mut message_count = 0;
     let mut input_tokens: i64 = 0;
@@ -713,6 +732,69 @@ mod tests {
         let turns = last_n_turns(link.to_str().unwrap(), 5);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content, "via symlink");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// F8-5: a non-regular path (FIFO / char device) is rejected by the
+    /// `is_file()` gate so the readers never enter an unbounded read. On
+    /// unix we create a real FIFO (a `read()` on it would block / never
+    /// EOF without the guard); the assertions must return immediately.
+    #[test]
+    #[cfg(unix)]
+    fn f8_non_regular_path_is_rejected_no_unbounded_read() {
+        use std::os::unix::fs::FileTypeExt;
+        let temp_dir = std::env::temp_dir().join(format!("clx-f8-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let fifo = temp_dir.join("pipe");
+
+        // mkfifo via libc-free path: use the `nix`-free std approach by
+        // shelling out to `mkfifo` (POSIX, always present on unix CI).
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo must succeed");
+
+        // Sanity: it really is a FIFO, not a regular file.
+        let ft = std::fs::symlink_metadata(&fifo).unwrap().file_type();
+        assert!(ft.is_fifo(), "test fixture must be a FIFO");
+
+        // The guard must reject it (treated as "no transcript"). These
+        // calls must return promptly; without the is_file() gate a reader
+        // opened on the FIFO would block forever.
+        assert!(
+            safe_transcript_path(fifo.to_str().unwrap()).is_none(),
+            "a FIFO must be rejected by the regular-file gate"
+        );
+        assert!(last_n_turns(fifo.to_str().unwrap(), 5).is_empty());
+        assert_eq!(count_transcript_tokens(fifo.to_str().unwrap()), (0, 0, 0));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// F8-6: a regular file reporting an honest over-cap length is rejected
+    /// by the size gate, and `last_n_turns` / `count_transcript_tokens`
+    /// both yield their empty sentinel without consuming the file.
+    #[test]
+    fn f8_over_cap_regular_file_is_bounded_and_empty() {
+        let temp_dir = std::env::temp_dir().join(format!("clx-f8-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("over.jsonl");
+
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_TRANSCRIPT_BYTES + 4096).unwrap();
+        drop(f);
+
+        let start = std::time::Instant::now();
+        assert!(safe_transcript_path(path.to_str().unwrap()).is_none());
+        assert!(last_n_turns(path.to_str().unwrap(), 5).is_empty());
+        assert_eq!(count_transcript_tokens(path.to_str().unwrap()), (0, 0, 0));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "rejection must be effectively instant (bounded), took {:?}",
+            start.elapsed()
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
