@@ -164,6 +164,29 @@ across 13 atomic commits.
   recommended and several functional optional keys. Skill versioning
   now lives exclusively in `plugin.json`.
 
+### Fixed
+
+- **Repeated macOS keychain password prompt.** The `clx-mcp` server
+  re-read `com.clx.credentials` from the OS keychain on every
+  credential-bearing tool invocation (e.g. each `clx_credentials`
+  call), so macOS prompted far more often than necessary.
+  `CredentialStore` gained an opt-in session-scoped cache
+  (`CredentialStore::new_cached`) holding values as
+  `secrecy::SecretString` (zeroized on drop, redacting `Debug`); the
+  cache is owned by the `McpServer` and lives exactly as long as the
+  server process (not a global static). The first read for a given
+  scoped key hits the keychain; subsequent reads (including negative
+  results and both legs of a fallback lookup) are served from memory.
+  Concurrent first access converges to a single keychain read.
+  Non-MCP callers (CLI, hook) keep the previous uncached semantics.
+  Note: a complete fix also requires the Homebrew binary to be signed
+  with an Apple Developer ID so the keychain "Always Allow" ACL
+  persists across launches; that lives in the Homebrew formula
+  (separate repo), not this codebase. Mid-session credential rotation
+  is reflected only after an MCP server restart (standard
+  cached-credential tradeoff); in-session `store`/`delete` invalidate
+  the affected entry.
+
 ### Security (Red/Green/Purple Team review)
 
 Three findings from the Purple Team synthesis were fixed before tag:

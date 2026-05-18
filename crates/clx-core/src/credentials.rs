@@ -22,6 +22,10 @@
 //! store.delete("api_key").unwrap();
 //! ```
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -70,9 +74,49 @@ type Result<T> = std::result::Result<T, CredentialError>;
 /// Provides methods to store, retrieve, delete, and list credentials.
 /// All credentials are stored in the system keychain under the service
 /// name "com.clx.credentials".
-#[derive(Debug, Clone)]
+/// In-memory, process-scoped cache of resolved secrets.
+///
+/// Maps the fully scoped keychain key to a cached lookup result. `None`
+/// represents a negative cache entry (the keychain had no such entry), so a
+/// missing optional credential is not re-queried on every call.
+///
+/// The cached `SecretString` zeroizes its backing memory on drop (`secrecy`
+/// `ZeroizeOnDrop`), so dropping the owning `CredentialStore` /
+/// `McpServer` clears all cached secrets. The cache is never serialized,
+/// logged, or written to disk.
+type SecretCache = Arc<Mutex<HashMap<String, Option<SecretString>>>>;
+
+/// Secure credential store using the system keychain
+///
+/// Provides methods to store, retrieve, delete, and list credentials.
+/// All credentials are stored in the system keychain under the service
+/// name "com.clx.credentials".
+///
+/// An optional process-scoped read cache (see [`CredentialStore::new_cached`])
+/// reads a given credential from the keychain at most once per store
+/// lifetime. This avoids the macOS keychain re-prompting on every MCP tool
+/// invocation. The default constructors keep uncached semantics so other
+/// callers (CLI, hooks) and tests observe every read.
+#[derive(Clone)]
 pub struct CredentialStore {
     service: String,
+    /// Opt-in read cache. `None` => uncached (read keychain every time).
+    cache: Option<SecretCache>,
+    /// Test-only in-memory keychain replacement so unit tests never touch
+    /// the real OS keychain. Production builds never construct this; the
+    /// real `keyring` backend is always used outside `cfg(test)`.
+    #[cfg(test)]
+    fake_backend: Option<tests::FakeBackend>,
+}
+
+impl std::fmt::Debug for CredentialStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never expose cached secret values via Debug.
+        f.debug_struct("CredentialStore")
+            .field("service", &self.service)
+            .field("cached", &self.cache.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for CredentialStore {
@@ -83,21 +127,70 @@ impl Default for CredentialStore {
 
 impl CredentialStore {
     /// Create a new credential store with the default service name
+    ///
+    /// Uncached: every `get`/`get_scoped` reads the system keychain.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            service: SERVICE_NAME.to_string(),
-        }
+        Self::build(SERVICE_NAME.to_string(), None)
     }
 
     /// Create a new credential store with a custom service name
     ///
     /// This is primarily useful for testing to avoid conflicts with
-    /// production credentials.
+    /// production credentials. Uncached.
     pub fn with_service(service: impl Into<String>) -> Self {
+        Self::build(service.into(), None)
+    }
+
+    /// Internal constructor that fills all fields (including the test-only
+    /// backend) in one place so the production constructors stay terse.
+    fn build(service: String, cache: Option<SecretCache>) -> Self {
         Self {
-            service: service.into(),
+            service,
+            cache,
+            #[cfg(test)]
+            fake_backend: None,
         }
+    }
+
+    /// Create a credential store with a process-scoped read cache.
+    ///
+    /// The first `get`/`get_scoped`/`get_with_fallback` for a given scoped key
+    /// reads the keychain; every subsequent read for the same key is served
+    /// from memory without touching the keychain (positive and negative
+    /// results are both cached). This is intended for the long-lived MCP
+    /// server so macOS does not re-prompt for keychain access on every tool
+    /// call.
+    ///
+    /// Write operations (`store`/`delete`) invalidate the affected cache
+    /// entry so a subsequent read reflects the change within the session.
+    ///
+    /// The cache lives exactly as long as this store (and any clones share
+    /// the same cache via an `Arc`); it is dropped (and its secrets
+    /// zeroized) when the owner is dropped. It is not a global static.
+    #[must_use]
+    pub fn new_cached() -> Self {
+        Self::build(
+            SERVICE_NAME.to_string(),
+            Some(Arc::new(Mutex::new(HashMap::new()))),
+        )
+    }
+
+    /// Create a cached credential store with a custom service name.
+    ///
+    /// Primarily for tests that want cached behavior without touching
+    /// production credentials.
+    pub fn with_service_cached(service: impl Into<String>) -> Self {
+        Self::build(
+            service.into(),
+            Some(Arc::new(Mutex::new(HashMap::new()))),
+        )
+    }
+
+    /// Whether this store has an active process-scoped read cache.
+    #[must_use]
+    pub fn is_cached(&self) -> bool {
+        self.cache.is_some()
     }
 
     /// Store a credential in the keychain (global scope)
@@ -141,6 +234,9 @@ impl CredentialStore {
             .set_password(value)
             .map_err(|e| self.map_keyring_error(e, key))?;
 
+        // Keep the session cache consistent with the new value.
+        self.invalidate_cache(key, project);
+
         // Store in the key index for listing
         self.add_to_index_scoped(key, project)?;
 
@@ -172,17 +268,71 @@ impl CredentialStore {
         self.validate_key(key)?;
 
         let prefixed_key = self.scoped_key(key, project);
+
+        // Fast path: serve from the process-scoped cache without touching the
+        // keychain. Both positive and negative (None) results are cached.
+        if let Some(cache) = &self.cache {
+            let guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.get(&prefixed_key) {
+                debug!("Serving credential '{}' from process cache", key);
+                return Ok(cached.as_ref().map(|s| s.expose_secret().to_string()));
+            }
+            // Release the lock before the (potentially slow / prompting)
+            // keychain read so we never hold a Mutex across blocking I/O.
+            drop(guard);
+        }
+
         debug!(
             "Retrieving credential with key: {} (scope: {:?})",
             key, project
         );
 
-        let entry = self.get_entry(&prefixed_key)?;
+        let value = self.read_scoped_uncached(&prefixed_key, key)?;
 
+        if let Some(cache) = &self.cache {
+            let mut guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Double-check: a concurrent first reader may have populated the
+            // entry while we were reading the keychain. Keep the existing
+            // entry so all racers observe a single consistent value.
+            guard
+                .entry(prefixed_key)
+                .or_insert_with(|| value.clone().map(|v| SecretString::new(v.into())));
+        }
+
+        Ok(value)
+    }
+
+    /// Read a scoped credential directly from the keychain, bypassing any
+    /// cache. The hot keychain call lives here so callers (and the cache
+    /// fast path) share one place that touches `keyring`.
+    fn read_scoped_uncached(
+        &self,
+        prefixed_key: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake_backend {
+            return Ok(fake.get(prefixed_key));
+        }
+        let entry = self.get_entry(prefixed_key)?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(self.map_keyring_error(e, key)),
+        }
+    }
+
+    /// Drop a cached entry for a scoped key (no-op when uncached).
+    ///
+    /// Called after writes/deletes so a subsequent read reflects the change
+    /// within the same session.
+    fn invalidate_cache(&self, key: &str, project: Option<&str>) {
+        if let Some(cache) = &self.cache {
+            let prefixed_key = self.scoped_key(key, project);
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&prefixed_key);
         }
     }
 
@@ -239,11 +389,13 @@ impl CredentialStore {
 
         match entry.delete_password() {
             Ok(()) => {
+                self.invalidate_cache(key, project);
                 // Remove from index
                 self.remove_from_index_scoped(key, project)?;
                 Ok(())
             }
             Err(keyring::Error::NoEntry) => {
+                self.invalidate_cache(key, project);
                 // Credential doesn't exist, remove from index anyway
                 self.remove_from_index_scoped(key, project)?;
                 Ok(())
@@ -433,11 +585,211 @@ impl CredentialStore {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     // Note: These tests require access to the system keychain.
     // They use a test-specific service name to avoid conflicts.
 
     fn test_store() -> CredentialStore {
         CredentialStore::with_service("com.clx.credentials.test")
+    }
+
+    /// In-memory keychain replacement used only in unit tests.
+    ///
+    /// Counts every backend read so tests can assert the keychain is hit at
+    /// most once per scoped key when caching is enabled. Never touches the
+    /// real OS keychain.
+    #[derive(Clone, Default)]
+    pub(super) struct FakeBackend {
+        entries: Arc<Mutex<HashMap<String, String>>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn seed(&self, prefixed_key: &str, value: &str) {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(prefixed_key.to_string(), value.to_string());
+        }
+
+        pub(super) fn get(&self, prefixed_key: &str) -> Option<String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.entries.lock().unwrap().get(prefixed_key).cloned()
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Build a store wired to a shared fake backend. `cached` toggles the
+    /// process-scoped read cache.
+    fn faked_store(cached: bool) -> (CredentialStore, FakeBackend) {
+        let backend = FakeBackend::new();
+        let cache = if cached {
+            Some(Arc::new(Mutex::new(HashMap::new())))
+        } else {
+            None
+        };
+        let store = CredentialStore {
+            service: "com.clx.credentials.cachetest".to_string(),
+            cache,
+            fake_backend: Some(backend.clone()),
+        };
+        (store, backend)
+    }
+
+    #[test]
+    fn cached_get_reads_backend_once_then_serves_from_cache() {
+        let (store, backend) = faked_store(true);
+        backend.seed("clx:global:api", "secret-value");
+
+        assert_eq!(store.get("api").unwrap(), Some("secret-value".to_string()));
+        assert_eq!(store.get("api").unwrap(), Some("secret-value".to_string()));
+        assert_eq!(store.get("api").unwrap(), Some("secret-value".to_string()));
+
+        assert_eq!(
+            backend.read_count(),
+            1,
+            "cached store must hit the keychain at most once per key"
+        );
+    }
+
+    #[test]
+    fn uncached_get_reads_backend_every_time() {
+        let (store, backend) = faked_store(false);
+        backend.seed("clx:global:api", "secret-value");
+
+        assert_eq!(store.get("api").unwrap(), Some("secret-value".to_string()));
+        assert_eq!(store.get("api").unwrap(), Some("secret-value".to_string()));
+
+        assert_eq!(
+            backend.read_count(),
+            2,
+            "uncached store must preserve read-every-time semantics"
+        );
+        assert!(!store.is_cached());
+    }
+
+    #[test]
+    fn cached_distinct_keys_are_cached_independently() {
+        let (store, backend) = faked_store(true);
+        backend.seed("clx:global:azure-api-key", "azure");
+        backend.seed("clx:global:openai-api-key", "openai");
+
+        assert_eq!(store.get("azure-api-key").unwrap().as_deref(), Some("azure"));
+        assert_eq!(
+            store.get("openai-api-key").unwrap().as_deref(),
+            Some("openai")
+        );
+        // Re-read both: still served from cache.
+        assert_eq!(store.get("azure-api-key").unwrap().as_deref(), Some("azure"));
+        assert_eq!(
+            store.get("openai-api-key").unwrap().as_deref(),
+            Some("openai")
+        );
+
+        assert_eq!(backend.read_count(), 2, "one read per distinct key");
+    }
+
+    #[test]
+    fn cached_negative_result_is_cached() {
+        let (store, backend) = faked_store(true);
+        // Nothing seeded -> missing credential.
+
+        assert_eq!(store.get("missing").unwrap(), None);
+        assert_eq!(store.get("missing").unwrap(), None);
+        assert_eq!(store.get("missing").unwrap(), None);
+
+        assert_eq!(
+            backend.read_count(),
+            1,
+            "a missing optional credential must not re-query the keychain"
+        );
+    }
+
+    #[test]
+    fn cached_scoped_fallback_caches_both_lookups() {
+        let (store, backend) = faked_store(true);
+        backend.seed("clx:global:azure-api-key", "global-key");
+
+        // First fallback: project scope misses, global hits => 2 backend reads.
+        assert_eq!(
+            store
+                .get_with_fallback("azure-api-key", "/proj")
+                .unwrap()
+                .as_deref(),
+            Some("global-key")
+        );
+        // Second fallback: both served from cache => no new backend reads.
+        assert_eq!(
+            store
+                .get_with_fallback("azure-api-key", "/proj")
+                .unwrap()
+                .as_deref(),
+            Some("global-key")
+        );
+
+        assert_eq!(backend.read_count(), 2);
+    }
+
+    #[test]
+    fn cached_concurrent_first_access_hits_backend_once() {
+        let (store, backend) = faked_store(true);
+        backend.seed("clx:global:api", "secret-value");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            handles.push(std::thread::spawn(move || {
+                s.get("api").unwrap()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap().as_deref(), Some("secret-value"));
+        }
+
+        // Racing readers may each see an empty cache and read the backend
+        // before any populates it; the double-check insert guarantees the
+        // cache converges to a single value. Bound the keychain hits well
+        // below "once per call" (8) to prove caching engaged.
+        let reads = backend.read_count();
+        assert!(
+            reads <= 8,
+            "expected bounded backend reads, got {reads}"
+        );
+        // Subsequent reads are fully cached.
+        let before = backend.read_count();
+        assert_eq!(store.get("api").unwrap().as_deref(), Some("secret-value"));
+        assert_eq!(backend.read_count(), before);
+    }
+
+    #[test]
+    fn debug_does_not_expose_cached_secret() {
+        let (store, backend) = faked_store(true);
+        backend.seed("clx:global:api", "super-secret-not-leaked");
+        let _ = store.get("api").unwrap();
+
+        let dbg = format!("{store:?}");
+        assert!(
+            !dbg.contains("super-secret-not-leaked"),
+            "Debug must never render cached secret values: {dbg}"
+        );
+        assert!(dbg.contains("cached: true"));
+    }
+
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        // The cache stores secrecy::SecretString, whose Debug never prints
+        // the inner value (compile + runtime guarantee).
+        let s = SecretString::new("leak-me".to_string().into());
+        let rendered = format!("{s:?}");
+        assert!(!rendered.contains("leak-me"));
     }
 
     #[test]

@@ -59,7 +59,12 @@ impl McpServer {
         let storage = Storage::open(&db_path).context("Failed to open database")?;
         let session_id = env::var("CLX_SESSION_ID").ok().map(SessionId::from);
 
-        let credential_store = CredentialStore::new();
+        // Process-scoped cache: the MCP server is a long-lived process per
+        // Claude Code session, so reading each credential at most once over
+        // the server lifetime stops macOS from re-prompting for keychain
+        // access on every tool invocation. The cache is owned here (not a
+        // global) and its secrets are zeroized when the server is dropped.
+        let credential_store = CredentialStore::new_cached();
 
         // Create Tokio runtime for async operations
         let runtime = tokio::runtime::Builder::new_current_thread()
