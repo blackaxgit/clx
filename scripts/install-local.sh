@@ -312,7 +312,9 @@ place_binaries() {
   local name
   for name in "${BINARY_NAMES[@]}"; do
     cp -- "${BUILD_DIR}/${name}" "${PREFIX}/${name}"
-    chmod 0755 -- "${PREFIX}/${name}"
+    # BSD chmod (macOS) does not accept the GNU `--` end-of-options marker;
+    # PREFIX is always an absolute path so the marker is unnecessary anyway.
+    chmod 0755 "${PREFIX}/${name}"
     success "  ${PREFIX}/${name}"
   done
 }
@@ -383,8 +385,11 @@ verify_installation() {
     all_pass=false
   fi
 
-  # 5. settings.json has clx MCP server.
-  if [[ -f "${settings_path}" ]] && grep -q '"clx-mcp"' "${settings_path}" 2>/dev/null; then
+  # 5. settings.json has clx MCP server. `clx install` registers the server
+  # under the key "clx" with a command path that ends in `clx-mcp`; the
+  # literal string `clx-mcp` therefore appears in the command path. Match
+  # that (not a `"clx-mcp"` JSON key, which never exists).
+  if [[ -f "${settings_path}" ]] && grep -q 'clx-mcp' "${settings_path}" 2>/dev/null; then
     success "~/.claude/settings.json contains clx MCP server"
   else
     warn "FAIL: clx MCP server not found in ${settings_path}"
