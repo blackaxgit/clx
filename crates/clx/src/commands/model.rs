@@ -21,6 +21,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 
+use clx_core::recall::fastembed::{pin_model_artifacts, render_sentinel};
+
 use crate::Cli;
 
 /// CLI sub-actions for `clx model`.
@@ -141,7 +143,12 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
             fs::write(model_dir.join(name), b"dryrun")?;
         }
         fs::write(model_dir.join("model.onnx"), b"dryrun")?;
-        fs::write(&ready_path, b"dryrun")?;
+        // Even in dry-run we write a *real* content-pinned sentinel so
+        // the reranker readiness check (F9) treats the stub as ready and
+        // smoke tests exercise the same code path as production.
+        let pinned = pin_model_artifacts(&model_dir)
+            .context("failed to hash dry-run model artifacts")?;
+        fs::write(&ready_path, render_sentinel(&pinned))?;
         if !cli.json {
             println!(
                 "{} dry-run sentinel written at {}",
@@ -192,7 +199,17 @@ async fn cmd_fetch(cli: &Cli, background: bool, force: bool) -> Result<()> {
         )
     })?;
 
-    fs::write(&ready_path, b"ready")
+    // F9 fix: pin a SHA-256 of every model artifact into the sentinel.
+    // This runs immediately after fastembed-rs verified the download via
+    // Hugging Face LFS checksums and after `verify_model_dir_complete`,
+    // so the digests are captured from a known-good install
+    // ("trust on first verified fetch, verify on every use"). The recall
+    // pipeline re-verifies these digests before loading the ONNX weights,
+    // defeating a same-uid pre-stage / mid-session swap of model.onnx or
+    // its external-weights blob.
+    let pinned = pin_model_artifacts(&model_dir)
+        .context("failed to compute model artifact digests for .ready sentinel")?;
+    fs::write(&ready_path, render_sentinel(&pinned))
         .with_context(|| format!("failed to write {}", ready_path.display()))?;
 
     drop(lock);
@@ -370,6 +387,7 @@ fn verify_model_dir_complete(model_dir: &Path) -> Result<()> {
 fn is_nonempty_file(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
+
 
 /// Remove `*.tmp` / `*.part` partial-download files that some HTTP
 /// clients leave behind when interrupted. Best-effort: any IO error is
@@ -675,6 +693,86 @@ mod tests {
         // Now a fresh acquire succeeds.
         let third = LockFile::acquire(tmp.path()).expect("third acquires after release");
         drop(third);
+    }
+
+    // -----------------------------------------------------------------
+    // F9: content-pinned .ready sentinel
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pin_model_artifacts_hashes_onnx_and_external_data() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = tmp.path().join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"graph-bytes").unwrap();
+        fs::write(model_dir.join("model.onnx.data"), b"weight-bytes-blob").unwrap();
+
+        let pinned = pin_model_artifacts(&model_dir).expect("pin must succeed");
+        assert_eq!(pinned.len(), 2, "graph + external data both pinned");
+
+        // The pinned sentinel must verify against the on-disk bytes via
+        // the same core verifier the recall pipeline uses.
+        let body = render_sentinel(&pinned);
+        let parsed =
+            clx_core::recall::fastembed::parse_sentinel(&body).expect("parse own sentinel");
+        assert_eq!(parsed.artifacts.len(), 2);
+        for a in &pinned {
+            assert_eq!(
+                a.size,
+                fs::metadata(model_dir.join(&a.rel_path)).unwrap().len(),
+                "recorded size matches file on disk"
+            );
+            assert_eq!(a.sha256_hex.len(), 64, "lowercase hex digest");
+        }
+        // End-to-end: writing the rendered sentinel makes the recall
+        // readiness check accept this install.
+        fs::write(
+            model_dir.join(clx_core::recall::fastembed::READY_SENTINEL),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            clx_core::recall::fastembed::FastembedReranker::verify_ready_uncached(tmp.path()),
+            "freshly pinned model must read back as ready"
+        );
+    }
+
+    #[test]
+    fn pinned_sentinel_round_trips_through_core_parser() {
+        // The sentinel the fetch side writes must parse cleanly with the
+        // clx-core parser the recall pipeline uses (no writer/reader drift).
+        let tmp = TempDir::new().unwrap();
+        let model_dir = tmp.path().join(clx_core::recall::fastembed::DEFAULT_MODEL_DIRNAME);
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"abc").unwrap();
+
+        let pinned = pin_model_artifacts(&model_dir).unwrap();
+        let body = render_sentinel(&pinned);
+        let parsed = clx_core::recall::fastembed::parse_sentinel(&body)
+            .expect("core parser must accept the fetch-written sentinel");
+        assert_eq!(parsed.artifacts.len(), 1);
+        assert_eq!(parsed.artifacts[0].rel_path, "model.onnx");
+    }
+
+    #[test]
+    fn pin_model_artifacts_errors_when_no_onnx() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = tmp.path().join("m");
+        fs::create_dir_all(&model_dir).unwrap();
+        // Only a stray data file, no model.onnx.
+        fs::write(model_dir.join("model.onnx.data"), b"x").unwrap();
+        assert!(pin_model_artifacts(&model_dir).is_err());
+    }
+
+    #[test]
+    fn pin_model_artifacts_supports_onnx_subdir_layout() {
+        let tmp = TempDir::new().unwrap();
+        let model_dir = tmp.path().join("m");
+        fs::create_dir_all(model_dir.join("onnx")).unwrap();
+        fs::write(model_dir.join("onnx").join("model.onnx"), b"sub").unwrap();
+        let pinned = pin_model_artifacts(&model_dir).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].rel_path, "onnx/model.onnx");
     }
 
     #[test]

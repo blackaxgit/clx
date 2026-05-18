@@ -30,11 +30,13 @@
 //! mutex hold for every subsequent call. ONNX inference is single-threaded
 //! per session anyway, so the mutex does not pessimise throughput.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use super::rerank::{RerankError, Reranker};
@@ -45,6 +47,282 @@ pub const READY_SENTINEL: &str = ".ready";
 
 /// Default model directory name under [`crate::paths::model_cache_dir`].
 pub const DEFAULT_MODEL_DIRNAME: &str = "bge-reranker-v2-m3";
+
+/// Magic header line that marks a content-pinned sentinel (F9 fix).
+///
+/// An OLD sentinel from a pre-F9 0.8.0 dev build is just an opaque marker
+/// (`ready` / `dryrun`) and will NOT start with this header. Such a
+/// sentinel is intentionally treated as "not ready" so the model is
+/// re-fetched cleanly and re-pinned; we never load weights that were not
+/// digest-verified.
+pub const SENTINEL_HEADER: &str = "clx-model-sentinel v1";
+
+/// One pinned artifact recorded in the readiness sentinel: a relative
+/// path under the model directory, its SHA-256 (hex, no prefix), and the
+/// byte length captured at fetch time.
+///
+/// The byte length is the cheap short-circuit signal on the recall hot
+/// path; the SHA-256 is the authoritative check, gated to run at most
+/// once per process (see [`verify_sentinel_against_disk`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedArtifact {
+    /// Path relative to the model directory (e.g. `model.onnx`).
+    pub rel_path: String,
+    /// Lowercase hex SHA-256 of the artifact's bytes at fetch time.
+    pub sha256_hex: String,
+    /// Artifact size in bytes at fetch time.
+    pub size: u64,
+}
+
+/// Parsed content-pinned sentinel. Pure value type so the parser is unit
+/// testable without touching the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSentinel {
+    pub artifacts: Vec<PinnedArtifact>,
+}
+
+/// Parse the textual body of a `.ready` sentinel.
+///
+/// Returns `None` for ANY input that is not a well-formed v1
+/// content-pinned sentinel (missing header, no artifact lines, malformed
+/// fields, non-hex digest, bad size). `None` always degrades to
+/// "not ready" -> RRF-only fallback; it never panics. This deliberately
+/// rejects the legacy opaque-marker format so a pre-F9 install is
+/// re-fetched and re-pinned rather than trusted blindly.
+///
+/// Grammar (one artifact per line after the header):
+///
+/// ```text
+/// clx-model-sentinel v1
+/// sha256:<64-hex>  size:<bytes>  path:<relative-path>
+/// ```
+#[must_use]
+pub fn parse_sentinel(body: &str) -> Option<ParsedSentinel> {
+    let mut lines = body.lines();
+    let header = lines.next()?.trim();
+    if header != SENTINEL_HEADER {
+        return None;
+    }
+
+    let mut artifacts = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut sha: Option<String> = None;
+        let mut size: Option<u64> = None;
+        let mut rel: Option<String> = None;
+
+        for field in line.split_whitespace() {
+            if let Some(h) = field.strip_prefix("sha256:") {
+                let h = h.to_ascii_lowercase();
+                if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    sha = Some(h);
+                } else {
+                    return None;
+                }
+            } else if let Some(s) = field.strip_prefix("size:") {
+                size = Some(s.parse::<u64>().ok()?);
+            } else if let Some(p) = field.strip_prefix("path:") {
+                if p.is_empty() {
+                    return None;
+                }
+                rel = Some(p.to_string());
+            }
+        }
+
+        match (sha, size, rel) {
+            (Some(sha256_hex), Some(size), Some(rel_path)) => {
+                artifacts.push(PinnedArtifact {
+                    rel_path,
+                    sha256_hex,
+                    size,
+                });
+            }
+            // A non-empty, non-comment line that does not carry all three
+            // fields is a malformed sentinel: reject the whole thing.
+            _ => return None,
+        }
+    }
+
+    if artifacts.is_empty() {
+        return None;
+    }
+    Some(ParsedSentinel { artifacts })
+}
+
+/// Render a content-pinned sentinel body from a set of artifacts. Used by
+/// the `clx model fetch` orchestrator (via the public re-export) so the
+/// writer and the parser cannot drift.
+#[must_use]
+pub fn render_sentinel(artifacts: &[PinnedArtifact]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(SENTINEL_HEADER);
+    out.push('\n');
+    for a in artifacts {
+        // Infallible: writing into a String never errors.
+        let _ = writeln!(
+            out,
+            "sha256:{}  size:{}  path:{}",
+            a.sha256_hex, a.size, a.rel_path
+        );
+    }
+    out
+}
+
+/// Compute the content-pinned artifact set that `clx model fetch` writes
+/// into the `.ready` sentinel.
+///
+/// Pins the ONNX graph (`model.onnx`) AND, when present, its external
+/// weights blob (`model.onnx.data`). On the upstream rozgo mirror the
+/// 108 kB `model.onnx` holds only the graph while the ~2.27 GB
+/// `model.onnx.data` holds the actual weights, so hashing the graph
+/// alone would leave the bulk of the model unverified and bypass the F9
+/// control. Both the root layout and the `onnx/` subdir layout are
+/// supported, mirroring the CLI's `verify_model_dir_complete`.
+///
+/// Returns `Err` if no `model.onnx` is present (callers run this only
+/// after the CLI integrity gate, so this is defence-in-depth).
+///
+/// Layering: this is the Infrastructure adapter that owns model-cache
+/// integrity. The CLI orchestrator calls it right after a verified fetch
+/// and persists the result; keeping the writer here next to the parser
+/// and the verifier guarantees they cannot drift, and confines `sha2` /
+/// `hex` to the one crate that already depends on them.
+pub fn pin_model_artifacts(model_dir: &Path) -> std::io::Result<Vec<PinnedArtifact>> {
+    let candidates: &[&str] = &[
+        "model.onnx",
+        "model.onnx.data",
+        "onnx/model.onnx",
+        "onnx/model.onnx.data",
+    ];
+
+    let mut pinned = Vec::new();
+    for rel in candidates {
+        let path = model_dir.join(rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 {
+            continue;
+        }
+        let sha256_hex = sha256_file_hex(&path)?;
+        pinned.push(PinnedArtifact {
+            rel_path: (*rel).to_string(),
+            sha256_hex,
+            size: meta.len(),
+        });
+    }
+
+    if !pinned.iter().any(|a| a.rel_path.ends_with("model.onnx")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no model.onnx found under {} while pinning artifacts (checked root and onnx/)",
+                model_dir.display()
+            ),
+        ));
+    }
+
+    Ok(pinned)
+}
+
+/// Stream a file through SHA-256 in fixed-size chunks. Avoids loading the
+/// 2.27 GB external-weights blob into memory. Returns lowercase hex.
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Resolve a sentinel-relative artifact path against the model directory,
+/// rejecting absolute paths and `..` traversal so a hostile sentinel
+/// cannot point the hash check at an unrelated file (and thus "pass" by
+/// hashing something the attacker controls outside the model dir).
+fn resolve_artifact(model_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return None;
+    }
+    for comp in rel_path.components() {
+        use std::path::Component;
+        match comp {
+            Component::Normal(_) => {}
+            // CurDir is harmless; everything else (ParentDir, RootDir,
+            // Prefix) is rejected.
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(model_dir.join(rel_path))
+}
+
+/// Full digest verification of every pinned artifact against the bytes on
+/// disk. This is the authoritative F9 check. Returns `true` only if every
+/// artifact exists, has the recorded size, AND re-hashes to the recorded
+/// SHA-256. Any deviation -> `false` (caller degrades to RRF-only).
+fn verify_sentinel_against_disk(model_dir: &Path, parsed: &ParsedSentinel) -> bool {
+    for a in &parsed.artifacts {
+        let Some(path) = resolve_artifact(model_dir, &a.rel_path) else {
+            warn!(
+                "reranker sentinel references unsafe path {:?}; treating model as not ready",
+                a.rel_path
+            );
+            return false;
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => m,
+            _ => {
+                warn!(
+                    "reranker pinned artifact missing: {}; treating model as not ready",
+                    path.display()
+                );
+                return false;
+            }
+        };
+        if meta.len() != a.size {
+            warn!(
+                "reranker artifact size mismatch for {} (sentinel {} bytes, disk {} bytes); \
+                 possible tampering, degrading to RRF-only",
+                path.display(),
+                a.size,
+                meta.len()
+            );
+            return false;
+        }
+        match sha256_file_hex(&path) {
+            Ok(actual) if actual == a.sha256_hex => {}
+            Ok(actual) => {
+                warn!(
+                    "reranker artifact SHA-256 mismatch for {} (expected {}, got {}); \
+                     refusing to load potentially poisoned model, degrading to RRF-only",
+                    path.display(),
+                    a.sha256_hex,
+                    actual
+                );
+                return false;
+            }
+            Err(e) => {
+                warn!(
+                    "reranker artifact hash failed for {}: {e}; treating model as not ready",
+                    path.display()
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// `fastembed-rs` cross-encoder adapter.
 ///
@@ -92,14 +370,64 @@ impl FastembedReranker {
             .join(READY_SENTINEL)
     }
 
-    /// Filesystem-cheap readiness check shared by the trait
-    /// implementation and the hook's prefetch gate.
+    /// Readiness check shared by the trait implementation and the hook's
+    /// prefetch gate.
+    ///
+    /// F9 hardening: a present `.ready` sentinel is no longer trusted on
+    /// its own. The sentinel pins a SHA-256 (and size) for every model
+    /// artifact, captured at fetch time right after fastembed-rs verified
+    /// the download via Hugging Face LFS checksums ("trust on first
+    /// verified fetch, verify on every use"). Here we re-verify those
+    /// digests so a same-uid attacker who pre-stages a poisoned
+    /// `model.onnx`/`model.onnx.data` while keeping a stale sentinel is
+    /// rejected and the pipeline degrades to RRF-only.
+    ///
+    /// Latency: the full re-hash of the 2.27 GB weights cannot run on
+    /// every recall. We short-circuit on the cheap size signal first and
+    /// memoize the full digest verification result per process via a
+    /// `OnceLock` (the cache dir is fixed for the process lifetime, so a
+    /// single verification is sound; a mid-session swap is still caught by
+    /// the size short-circuit, and a same-size same-hash swap is the
+    /// documented unavoidable residual of any same-uid local scheme).
     #[must_use]
     pub fn ready_at(cache_dir: &Path) -> bool {
-        cache_dir
-            .join(DEFAULT_MODEL_DIRNAME)
-            .join(READY_SENTINEL)
-            .exists()
+        static VERIFIED: OnceLock<bool> = OnceLock::new();
+        *VERIFIED.get_or_init(|| Self::verify_ready_uncached(cache_dir))
+    }
+
+    /// Uncached readiness verification. Factored out so tests can exercise
+    /// the full parse + digest path without the process-global memo (the
+    /// `OnceLock` in [`Self::ready_at`] would otherwise pin the first
+    /// tempdir's result for the whole test binary).
+    #[must_use]
+    pub fn verify_ready_uncached(cache_dir: &Path) -> bool {
+        let model_dir = cache_dir.join(DEFAULT_MODEL_DIRNAME);
+        let sentinel = model_dir.join(READY_SENTINEL);
+
+        let body = match std::fs::read_to_string(&sentinel) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                warn!(
+                    "reranker sentinel unreadable at {}: {e}; treating model as not ready",
+                    sentinel.display()
+                );
+                return false;
+            }
+        };
+
+        let Some(parsed) = parse_sentinel(&body) else {
+            // Legacy opaque marker or malformed content. Degrade to
+            // RRF-only and let `clx model fetch` re-pin it.
+            warn!(
+                "reranker sentinel at {} is not a content-pinned v1 sentinel \
+                 (legacy or malformed); treating model as not ready, run `clx model fetch`",
+                sentinel.display()
+            );
+            return false;
+        };
+
+        verify_sentinel_against_disk(&model_dir, &parsed)
     }
 
     /// Build the v5 init options. Extracted for unit-test visibility into
@@ -264,15 +592,211 @@ mod tests {
         assert!(!adapter.is_ready(), "no sentinel => not ready");
     }
 
+    /// Stage a model dir with `model.onnx` of given bytes plus a valid
+    /// content-pinned sentinel covering it. Returns the model dir.
+    fn stage_pinned_model(root: &Path, onnx_bytes: &[u8]) -> PathBuf {
+        let model_dir = root.join(DEFAULT_MODEL_DIRNAME);
+        std::fs::create_dir_all(&model_dir).expect("mkdir model dir");
+        std::fs::write(model_dir.join("model.onnx"), onnx_bytes).expect("write onnx");
+        let hex = {
+            let mut h = Sha256::new();
+            h.update(onnx_bytes);
+            hex::encode(h.finalize())
+        };
+        let artifacts = [PinnedArtifact {
+            rel_path: "model.onnx".to_string(),
+            sha256_hex: hex,
+            size: onnx_bytes.len() as u64,
+        }];
+        std::fs::write(
+            model_dir.join(READY_SENTINEL),
+            render_sentinel(&artifacts),
+        )
+        .expect("write sentinel");
+        model_dir
+    }
+
     #[test]
-    fn is_ready_true_when_sentinel_present() {
+    fn is_ready_true_when_sentinel_present_and_hash_matches() {
+        let tmp = TempDir::new().expect("tempdir");
+        stage_pinned_model(tmp.path(), b"fake-onnx-bytes");
+        let adapter = FastembedReranker::new(tmp.path().to_path_buf());
+        // Bypass the process-global OnceLock memo (other tests in this
+        // binary may have primed it with a different tempdir).
+        assert!(
+            FastembedReranker::verify_ready_uncached(&adapter.cache_dir),
+            "valid pinned sentinel => ready"
+        );
+    }
+
+    #[test]
+    fn is_ready_false_when_legacy_opaque_marker() {
+        // Pre-F9 sentinel body (`ready`) must be rejected so the model
+        // is re-fetched and re-pinned rather than trusted blindly.
         let tmp = TempDir::new().expect("tempdir");
         let model_dir = tmp.path().join(DEFAULT_MODEL_DIRNAME);
-        std::fs::create_dir_all(&model_dir).expect("mkdir model dir");
-        std::fs::write(model_dir.join(READY_SENTINEL), b"ok").expect("write sentinel");
+        std::fs::create_dir_all(&model_dir).expect("mkdir");
+        std::fs::write(model_dir.join("model.onnx"), b"x").expect("onnx");
+        std::fs::write(model_dir.join(READY_SENTINEL), b"ready").expect("legacy sentinel");
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "legacy opaque marker must NOT be considered ready"
+        );
+    }
 
-        let adapter = FastembedReranker::new(tmp.path().to_path_buf());
-        assert!(adapter.is_ready(), "sentinel => ready");
+    #[test]
+    fn is_ready_false_when_model_bytes_mutated_after_pin() {
+        // Core F9 regression: attacker swaps model.onnx for a poisoned
+        // payload but keeps the old sentinel. Must be rejected.
+        let tmp = TempDir::new().expect("tempdir");
+        let model_dir = stage_pinned_model(tmp.path(), b"genuine-weights");
+        // Poison the file in place; sentinel still records the old hash.
+        std::fs::write(model_dir.join("model.onnx"), b"POISONED-PAYLOAD!!").expect("overwrite");
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "mutated model bytes must invalidate readiness"
+        );
+    }
+
+    #[test]
+    fn is_ready_false_when_same_size_different_bytes() {
+        // Size short-circuit alone is not enough: a same-length swap must
+        // still be caught by the SHA-256 check.
+        let tmp = TempDir::new().expect("tempdir");
+        let model_dir = stage_pinned_model(tmp.path(), b"AAAAAAAA");
+        std::fs::write(model_dir.join("model.onnx"), b"BBBBBBBB").expect("same-size swap");
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "same-size different-content swap must be rejected by hash"
+        );
+    }
+
+    #[test]
+    fn is_ready_false_when_sentinel_malformed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let model_dir = tmp.path().join(DEFAULT_MODEL_DIRNAME);
+        std::fs::create_dir_all(&model_dir).expect("mkdir");
+        std::fs::write(model_dir.join("model.onnx"), b"x").expect("onnx");
+        std::fs::write(
+            model_dir.join(READY_SENTINEL),
+            b"clx-model-sentinel v1\nthis is not a valid artifact line\n",
+        )
+        .expect("malformed sentinel");
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "malformed sentinel must not panic and must be not-ready"
+        );
+    }
+
+    #[test]
+    fn is_ready_false_when_model_file_missing_but_sentinel_present() {
+        let tmp = TempDir::new().expect("tempdir");
+        let model_dir = stage_pinned_model(tmp.path(), b"weights");
+        std::fs::remove_file(model_dir.join("model.onnx")).expect("rm onnx");
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "sentinel present but pinned artifact gone => not ready"
+        );
+    }
+
+    #[test]
+    fn is_ready_true_when_onnx_under_subdir_layout() {
+        // fastembed layout variant: model.onnx under onnx/. The sentinel
+        // pins the relative path, so the resolver must follow it.
+        let tmp = TempDir::new().expect("tempdir");
+        let model_dir = tmp.path().join(DEFAULT_MODEL_DIRNAME);
+        std::fs::create_dir_all(model_dir.join("onnx")).expect("mkdir onnx");
+        let bytes = b"subdir-weights";
+        std::fs::write(model_dir.join("onnx").join("model.onnx"), bytes).expect("onnx");
+        let hex = {
+            let mut h = Sha256::new();
+            h.update(bytes);
+            hex::encode(h.finalize())
+        };
+        let artifacts = [PinnedArtifact {
+            rel_path: "onnx/model.onnx".to_string(),
+            sha256_hex: hex,
+            size: bytes.len() as u64,
+        }];
+        std::fs::write(
+            model_dir.join(READY_SENTINEL),
+            render_sentinel(&artifacts),
+        )
+        .expect("sentinel");
+        assert!(
+            FastembedReranker::verify_ready_uncached(tmp.path()),
+            "onnx-under-subdir layout must resolve and verify"
+        );
+    }
+
+    #[test]
+    fn is_ready_false_when_sentinel_path_escapes_model_dir() {
+        // A hostile sentinel that points the hash check at a file outside
+        // the model dir (path traversal) must be rejected outright.
+        let tmp = TempDir::new().expect("tempdir");
+        let model_dir = tmp.path().join(DEFAULT_MODEL_DIRNAME);
+        std::fs::create_dir_all(&model_dir).expect("mkdir");
+        std::fs::write(
+            model_dir.join(READY_SENTINEL),
+            "clx-model-sentinel v1\nsha256:".to_string()
+                + &"a".repeat(64)
+                + "  size:1  path:../../../etc/hostfile\n",
+        )
+        .expect("sentinel");
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "path traversal in sentinel must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_sentinel_round_trips_render() {
+        let arts = vec![
+            PinnedArtifact {
+                rel_path: "model.onnx".to_string(),
+                sha256_hex: "a".repeat(64),
+                size: 108,
+            },
+            PinnedArtifact {
+                rel_path: "model.onnx.data".to_string(),
+                sha256_hex: "b".repeat(64),
+                size: 2_435_000_000,
+            },
+        ];
+        let body = render_sentinel(&arts);
+        let parsed = parse_sentinel(&body).expect("round-trip parse");
+        assert_eq!(parsed.artifacts, arts);
+    }
+
+    #[test]
+    fn parse_sentinel_rejects_legacy_and_bad_inputs() {
+        assert!(parse_sentinel("ready").is_none(), "legacy marker");
+        assert!(parse_sentinel("dryrun").is_none(), "dryrun marker");
+        assert!(parse_sentinel("").is_none(), "empty");
+        assert!(
+            parse_sentinel("clx-model-sentinel v1\n").is_none(),
+            "header but no artifacts"
+        );
+        assert!(
+            parse_sentinel("clx-model-sentinel v1\nsha256:zz  size:1  path:m").is_none(),
+            "non-hex digest"
+        );
+        assert!(
+            parse_sentinel(&format!(
+                "clx-model-sentinel v1\nsha256:{}  size:notnum  path:m",
+                "a".repeat(64)
+            ))
+            .is_none(),
+            "non-numeric size"
+        );
+        assert!(
+            parse_sentinel(&format!(
+                "clx-model-sentinel v1\nsha256:{}  path:m",
+                "a".repeat(64)
+            ))
+            .is_none(),
+            "missing size field"
+        );
     }
 
     #[test]
@@ -287,13 +811,18 @@ mod tests {
     }
 
     #[test]
-    fn ready_at_helper_matches_instance_method() {
+    fn ready_at_false_for_empty_sentinel() {
+        // Empty sentinel is not a content-pinned v1 sentinel: not ready.
+        // Uses verify_ready_uncached to avoid the process-global memo.
         let tmp = TempDir::new().expect("tempdir");
-        assert!(!FastembedReranker::ready_at(tmp.path()));
+        assert!(!FastembedReranker::verify_ready_uncached(tmp.path()));
         let model_dir = tmp.path().join(DEFAULT_MODEL_DIRNAME);
         std::fs::create_dir_all(&model_dir).expect("mkdir");
         std::fs::write(model_dir.join(READY_SENTINEL), b"").expect("write");
-        assert!(FastembedReranker::ready_at(tmp.path()));
+        assert!(
+            !FastembedReranker::verify_ready_uncached(tmp.path()),
+            "empty sentinel must not be considered ready"
+        );
     }
 
     /// Test backend that simulates a configurable cold-load delay

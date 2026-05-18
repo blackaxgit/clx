@@ -186,28 +186,53 @@ Three findings from the Purple Team synthesis were fixed before tag:
   (case-insensitive `bearer ` / `basic ` scheme prefix) above a new
   section 2b (whitespace-tolerant keyword scan). Four regression tests.
 
-### Known issues deferred to 0.8.1
+### Security (remaining Purple Team findings, also fixed in 0.8.0)
 
-These were classified by the Purple Team as low-blast-radius and are
-tracked for the next minor release:
+The five findings the Purple Team had classified as 0.8.1-deferrable
+were pulled forward into 0.8.0 since the release had not yet shipped:
 
-- **F3** Stop auto-summary write race (TOCTOU between guard query and
-  `INSERT`) — optimistic concurrency only; narrow window; idempotent
-  failure mode. To fix in 0.8.1 via `INSERT ... WHERE NOT EXISTS` in
-  a single transaction.
-- **F5** Auto-summarize prompt content injection — attacker controls
-  only their own future summary; no cross-session blast radius.
-- **F7** Hook envelope spoofing — `clx-hook` stdin is trusted per the
-  documented threat model (Claude Code is the spawning process). A
-  local same-uid attacker has many easier paths (direct DB writes).
-  Future hardening: parent-PID check.
-- **F8** Transcript path unconstrained + no size cap — DoS bounded by
-  `HANDLER_TIMEOUT`; path comes from a trusted envelope. Future fix:
-  canonicalize + 64 MiB cap + allowlist to `~/.claude/projects`.
-- **F9** Sentinel-only reranker readiness — `fastembed-rs` validates
-  per-blob LFS SHA-256 during download; same-uid attacker who already
-  has cache write access can pre-stage poisoned ONNX. Future fix:
-  store and verify a manifest-pinned SHA-256 in the `.ready` sentinel.
+- **F3** Stop auto-summary write race (TOCTOU): new
+  `Storage::create_snapshot_if_no_recent_auto_summary` performs the
+  freshness guard and the `INSERT` as a single
+  `INSERT ... SELECT ... WHERE NOT EXISTS` inside a `BEGIN IMMEDIATE`
+  transaction. Concurrent Stop handlers now produce exactly one
+  AutoSummary snapshot. No schema migration required.
+- **F5** Auto-summarize prompt content injection: `build_prompt` wraps
+  the turns block in a per-call random nonce fence
+  (`BEGIN_TURNS_<nonce>` / `END_TURNS_<nonce>`) and neutralizes forged
+  role headers and fence/section literals in each turn's content. This
+  is the 2026-standard structural-delimitation + neutralization defense
+  (escaping is unreliable for LLMs). Anti-forgery nonce is std-only
+  (`SystemTime` + atomic counter, SplitMix64 avalanche), no new dep.
+- **F7** Hook envelope provenance: `clx-hook` now classifies
+  invocation provenance from the `CLAUDE_PROJECT_DIR` /
+  `CLAUDE_PLUGIN_ROOT` env vars Claude Code sets for plugin hooks
+  (verified against the 2026 official hooks docs). Operates fail-safe
+  (WARN + continue on `Unverified`, never a hard block) because a false
+  positive that disables all hooks is worse than the residual same-uid
+  risk already in the threat model. Pure decision function is unit
+  tested; the env read sits at the `main.rs` orchestration edge so the
+  contract tests (which drive `handle_event` directly) are unaffected.
+- **F8** Transcript path hardening: a new `safe_transcript_path`
+  canonicalizes the envelope-supplied path (resolving symlinks and
+  `..`) and enforces `MAX_TRANSCRIPT_BYTES = 64 MiB` before opening, on
+  all three read sites (`last_n_turns`, `count_transcript_tokens`,
+  `process_transcript`). A filesystem allowlist was deliberately not
+  added because relocated-config users and the test suite legitimately
+  point at arbitrary paths; canonicalize + size-cap bounds the read
+  scope without that fragility.
+- **F9** Reranker model integrity: `clx model fetch` now writes a
+  content-pinned sentinel (`clx-model-sentinel v1` with
+  `sha256:`/`size:`/`path:` lines) covering both `model.onnx` and the
+  large external `model.onnx.data` weights blob. `ready_at` re-verifies
+  the digest, gated to at most once per process via `OnceLock` with a
+  cheap size short-circuit so the recall hot path is not penalized.
+  Trust-on-first-verified-fetch then verify-on-every-use (SSH
+  known_hosts / pip-hash-pinning model). Legacy opaque sentinels from
+  pre-F9 dev builds are treated as not-ready so the model is re-fetched
+  and re-pinned. Residual risk (a same-uid attacker who rewrites both
+  the file and the sentinel) is inherent to any local scheme without an
+  external root of trust and is documented in code.
 - **Recall pipeline layering refactor.** The Domain layer in
   `crates/clx-core/src/recall/` no longer imports `Storage`,
   `LlmClient`, or `EmbeddingStore` directly. Two new ports live in
