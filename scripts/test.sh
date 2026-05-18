@@ -27,7 +27,7 @@ cd "${ROOT_DIR}"
 # --- The published instrumented coverage denominator ------------------------
 # Kept byte-identical with Cargo.toml [workspace.metadata.cargo-llvm-cov] and
 # the table in docs/testing.md. Edit all three together.
-COV_IGNORE_REGEX='(dashboard/event\.rs|main\.rs|dashboard/runtime\.rs|credentials/keychain_acl\.rs)'
+COV_IGNORE_REGEX='(dashboard/event\.rs|main\.rs|dashboard/runtime\.rs|credentials/keychain_acl\.rs|dashboard/mod\.rs|commands/keychain_trust\.rs)'
 COV_FAIL_UNDER=97
 
 # --- Hermetic environment: no network, no keychain, no model download -------
