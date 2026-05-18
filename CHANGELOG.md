@@ -359,6 +359,16 @@ These are accepted for 0.8.0 with the workarounds noted. None cause data
 loss or weaken the default file-backend credential store. Further
 hardening is tracked for 0.8.1.
 
+- Instrumented test coverage is 85.72% line / 89.01% function on the
+  published denominator (1693 tests, all passing). The coverage CI gate
+  is warn-only for 0.8.0 (existing policy). The remaining gap to the
+  97% goal is provider-bound core logic (recall ranking/format,
+  embedding rebuild/backfill loops, the L1 LLM timeout/cache arms) that
+  cannot be exercised without a live embedding/LLM provider; honestly
+  reaching 97% requires an injectable test-mode provider harness,
+  tracked for 0.8.1. We deliberately did not exclude this core logic
+  from the denominator to inflate the number.
+
 - Audit-log retention for `clx maintenance trim` defaults to 90 days and
   is not yet a `retention` config key. Workaround: pass an explicit
   `--audit-days N` (or `--audit-days 0` to skip the audit sweep).

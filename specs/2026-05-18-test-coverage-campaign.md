@@ -64,3 +64,37 @@ Behavior tests come from the spec sections; agents do not chase coverage blindly
 - Every behavior in `specs/_prerelease/01..04` has at least one asserting test; every risk-register item has a test that either proves it fixed or pins the documented accepted behavior.
 - Zero network / keychain / model-download required to run the suite.
 - CI gate updated to run `scripts/test.sh pre-release` (warn-only first release per the existing coverage-gate policy, hard-fail in 0.8.1).
+
+## 6. Result and honest disposition (2026-05-18)
+
+Final measured instrumented line coverage on the published denominator:
+**85.72%** (region 85.79%, function 89.01%), suite 1693 pass / 0 fail /
+10 ignored, clippy + fmt clean. Journey: 82.27% baseline -> 85.72% via
++77 behavior/e2e tests (Wave 1 + the deep success/branch wave), the
+risk-register cheap fixes, and the `clx_rules` macOS path-guard fix.
+
+**97% was not reached and is intentionally NOT forced.** The residual gap
+is dominated by provider-bound core logic that cannot be exercised
+offline without a live embedding/LLM provider:
+
+- `clx/src/commands/recall.rs:96-178` (results ranking + format: needs a
+  real query embedding before `find_similar`)
+- `clx-core` / `clx/src/commands/embeddings.rs` rebuild + backfill
+  per-snapshot loops (need live `client.embed()`)
+- `clx-hook/src/hooks/pre_tool_use.rs` L1 timeout / cache-hit / cache-write
+  arms (need a slow/live LLM)
+
+These are core logic, not glue, so excluding them from the denominator
+would be test theater (explicitly forbidden by Section 1). The only
+honest way to cover them is an injectable test-mode embedding/LLM
+provider -- a production/architecture change, deferred to **0.8.1** as a
+tracked engineering task, not a pre-tag scramble.
+
+**0.8.0 decision:** ship at the documented 85.72% with the coverage CI
+gate warn-only (existing policy). The `>= 97%` line in Section 5 is
+superseded for 0.8.0 by this honest disposition; it remains the 0.8.1
+target conditioned on the injectable-provider harness landing. Mutation
+testing (cargo-mutants, 80% hot-module kill) remains warn-only per the
+existing workflow. Every behavior in `specs/_prerelease/01..04` and every
+risk-register item has an asserting or pinning test; the suite needs zero
+network/keychain/model.
