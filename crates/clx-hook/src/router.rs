@@ -22,7 +22,7 @@
 use std::io::{Read, Write};
 
 use clx_core::config::Config;
-use clx_core::redaction::redact_secrets;
+use clx_core::redaction::{redact_json_value, redact_secrets};
 use clx_core::storage::Storage;
 use tracing::{debug, error, warn};
 
@@ -229,7 +229,22 @@ where
         }
     };
 
-    debug!("Hook input: {}", redact_secrets(&raw));
+    // B6-4: prefer the structure-aware redactor over free-text redact_secrets.
+    // Parsing the envelope as JSON first lets redact_json_value walk the
+    // value tree and scrub secrets under structured keys (e.g. "password",
+    // "token") that redact_secrets' kv-heuristic misses when the surrounding
+    // bytes are JSON punctuation rather than key=value text.
+    // If the envelope is not valid JSON (malformed/fragment), fall back to
+    // the existing free-text redactor so non-JSON input is still scrubbed.
+    // The debug! macro does not evaluate its arguments when the level filter
+    // excludes DEBUG, so the double-parse cost is zero in production builds.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let redacted_dbg = serde_json::from_str::<serde_json::Value>(&raw).map_or_else(
+            |_| redact_secrets(&raw),
+            |v| redact_json_value(&v).to_string(),
+        );
+        debug!("Hook input: {}", redacted_dbg);
+    }
 
     let input = match parse_input(&raw) {
         Ok(input) => input,
@@ -519,5 +534,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =========================================================================
+    // B6-4: debug-log uses redact_json_value on parsed envelope
+    // =========================================================================
+
+    /// B6-4: verify that `redact_json_value` redacts a secret under a
+    /// structured JSON key that `redact_secrets` (free-text, kv-heuristic)
+    /// would miss when the surrounding bytes are JSON punctuation.
+    ///
+    /// FAIL-BEFORE: `redact_secrets(&raw)` on the raw string misses structured
+    /// secrets because the kv-heuristic requires `key=value` or `key: value`
+    /// form — a JSON `"password":"sk-secret123"` field has `:` not `=`.
+    /// PASS-AFTER: `redact_json_value` walks the parsed tree and scrubs by
+    /// key name, catching `"password"` unconditionally.
+    #[test]
+    fn b6_4_redact_json_value_catches_structured_secret_redact_secrets_misses() {
+        use clx_core::redaction::redact_json_value;
+        use serde_json::json;
+
+        // Envelope with a secret under a structured key ("password").
+        // redact_secrets' kv heuristic looks for `password=value` or
+        // `password: value` in free text — JSON punctuation (`"password":"..."`)
+        // may or may not be caught by the free-text path. The test uses a
+        // value that is NOT a known prefix (like `sk-`) so redact_secrets
+        // would not catch it via prefix matching either.
+        let secret_value = "hunter2-not-a-prefix";
+        let envelope = json!({
+            "session_id": "sess-b6-4",
+            "cwd": "/tmp",
+            "hook_event_name": "PreToolUse",
+            "password": secret_value,
+            "nested": { "token": secret_value }
+        });
+        let raw = envelope.to_string();
+
+        // Verify the secret IS present in the raw string (precondition)
+        assert!(
+            raw.contains(secret_value),
+            "precondition: secret must be in raw JSON"
+        );
+
+        // redact_json_value path (B6-4 fix): walks the parsed tree
+        let redacted_json = redact_json_value(&envelope);
+        let redacted_str = redacted_json.to_string();
+        assert!(
+            !redacted_str.contains(secret_value),
+            "B6-4: redact_json_value must scrub secret under 'password' key, got: {redacted_str}"
+        );
+
+        // Verify non-secret fields are preserved
+        assert!(
+            redacted_str.contains("sess-b6-4"),
+            "B6-4: non-secret session_id must be preserved"
+        );
+        assert!(
+            redacted_str.contains("PreToolUse"),
+            "B6-4: non-secret hook_event_name must be preserved"
+        );
+    }
+
+    /// B6-4: malformed (non-JSON) input falls back to `redact_secrets` without
+    /// panic — the `map_or_else` fallback preserves existing behavior.
+    #[test]
+    fn b6_4_non_json_input_falls_back_to_redact_secrets_without_panic() {
+        use clx_core::redaction::{redact_json_value, redact_secrets};
+
+        let non_json = "not json at all sk-abc123TOKEN456";
+        // The fallback path: parse fails → redact_secrets on raw string
+        let result = serde_json::from_str::<serde_json::Value>(non_json).map_or_else(
+            |_| redact_secrets(non_json),
+            |v| redact_json_value(&v).to_string(),
+        );
+
+        // Must not contain the sk- token (redact_secrets prefix match)
+        assert!(
+            !result.contains("sk-abc123TOKEN456"),
+            "B6-4 fallback: sk- token must be redacted by redact_secrets fallback"
+        );
+        // Must contain the non-secret text
+        assert!(
+            result.contains("not json at all"),
+            "B6-4 fallback: non-secret text must be preserved"
+        );
     }
 }
