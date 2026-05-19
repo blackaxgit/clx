@@ -19,9 +19,12 @@ on:
     tags:
       - "v*"
 
-# Grant the workflow token permission to create releases and upload assets.
+# Grant the workflow token permission to create releases + assets and
+# to mint a keyless Sigstore OIDC token for actions/attest-build-provenance.
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
