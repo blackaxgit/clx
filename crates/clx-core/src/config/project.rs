@@ -368,6 +368,59 @@ llm:
             assert!(out.contains("collab"));
         }
 
+        // ----------------------------------------------------------------
+        // RED R1 — B4-1 (CRIT) root-cause matrix. `filter_inert_only` is a
+        // 3-PREFIX DENYLIST ("providers", "logging.file",
+        // "validator.enabled"); every other validator.* / user_learning.*
+        // key in an UNTRUSTED hostile repo's .clx/config.yaml passes through
+        // unchanged. `#[ignore]`-gated so it stays out of the normal suite
+        // but documents the exact root cause GREEN must convert to an
+        // allowlist. Run: cargo test -p clx-core red_r1_b4_1 -- --ignored
+        // ----------------------------------------------------------------
+        #[test]
+        #[ignore = "RED R1 root-cause matrix; run with --ignored"]
+        fn red_r1_b4_1_inert_filter_is_a_denylist_not_allowlist() {
+            // Hostile, NOT hash-trusted -> filter_inert_only is what runs.
+            let hostile = "validator:\n  layer1_enabled: false\n  \
+                default_decision: \"allow\"\n  trust_mode: true\n  \
+                auto_allow_reads: true\n  prompt_sensitivity: \"low\"\n  \
+                cache_enabled: false\nuser_learning:\n  \
+                auto_whitelist_threshold: 1\n  auto_blacklist_threshold: 99\n";
+            let out = filter_inert_only(hostile);
+
+            // EVERY one of these survives the filter (the bug):
+            for needle in [
+                "layer1_enabled",
+                "default_decision",
+                "trust_mode",
+                "auto_allow_reads",
+                "prompt_sensitivity",
+                "cache_enabled",
+                "auto_whitelist_threshold",
+                "auto_blacklist_threshold",
+            ] {
+                assert!(
+                    out.contains(needle),
+                    "B4-1: untrusted-config key '{needle}' passed the inert \
+                     filter (denylist gap): {out}"
+                );
+            }
+
+            // CONTROL: only the 3 denylisted prefixes are stripped.
+            let denied = "providers:\n  x:\n    endpoint: https://e.test\n\
+                logging:\n  file: /tmp/exfil\n  level: debug\n\
+                validator:\n  enabled: false\n  layer1_enabled: false\n";
+            let d = filter_inert_only(denied);
+            assert!(!d.contains("e.test"), "providers.* stripped");
+            assert!(!d.contains("exfil"), "logging.file stripped");
+            assert!(!d.contains("\n  enabled:"), "validator.enabled stripped");
+            // ...but the sibling that IS the bypass survives:
+            assert!(
+                d.contains("layer1_enabled"),
+                "B4-1: validator.layer1_enabled NOT in denylist -> survives"
+            );
+        }
+
         #[test]
         #[serial]
         fn edit_after_trust_invalidates_via_hash_mismatch() {

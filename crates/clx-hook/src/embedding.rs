@@ -130,6 +130,68 @@ mod tests {
     use super::*;
 
     // =========================================================================
+    // RED R1 — B1-9 TOCTOU resolve_command_paths divergence PoC
+    // (`resolve_command_paths` is pub(crate); unreachable from an integration
+    //  test, so the PoC lives in-crate per the campaign convention.)
+    //
+    // Run: cargo test -p clx-hook red_r1_b1_9 -- --ignored
+    // =========================================================================
+
+    /// B1-9 — `resolve_command_paths` splits on whitespace and REJOINS with a
+    /// single space, and only canonicalizes tokens starting with `/ ./ ../`.
+    /// The string the validator (L0 glob + L1 prompt) sees therefore diverges
+    /// from the string the shell actually executes:
+    ///
+    /// 1. Whitespace is collapsed: `rm  -rf  /x` -> `rm -rf /x`. A blacklist
+    ///    that an attacker crafted to rely on double-space evasion (B1-1) is
+    ///    *re-canonicalized* here — but conversely a benign-looking spaced
+    ///    form can be rewritten into a different token shape than the shell's.
+    /// 2. A symlinked absolute path is canonicalized BEFORE L0, so the
+    ///    validator judges the link TARGET while the audit/exec semantics and
+    ///    any later TOCTOU swap concern the link NAME (validator/exec view
+    ///    divergence — the documented best-effort gap).
+    #[test]
+    #[ignore = "RED R1 PoC: filesystem symlink in TempDir; run with --ignored"]
+    fn red_r1_b1_9_resolve_paths_view_divergence() {
+        // (1) Whitespace-collapse divergence: input has irregular spacing the
+        //     shell preserves as-is; the resolver returns a re-spaced string.
+        let shell_sees = "echo  a   b"; // 2 + 3 spaces
+        let validator_sees = resolve_command_paths(shell_sees);
+        assert_ne!(
+            shell_sees, validator_sees,
+            "B1-9: resolver mutates the command string the validator sees"
+        );
+        assert_eq!(
+            validator_sees, "echo a b",
+            "B1-9: whitespace collapsed -> validator/exec string divergence"
+        );
+
+        // (2) Symlink canonicalization divergence: a symlink whose name looks
+        //     innocuous resolves to a different absolute path pre-L0.
+        //     (CLX ships macOS/unix only — see release.yml.)
+        let td = tempfile::tempdir().unwrap();
+        let target = td.path().join("real_target_file");
+        std::fs::write(&target, b"x").unwrap();
+        let link = td.path().join("innocuous_link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let link_str = link.to_string_lossy().to_string();
+        let cmd = format!("cat {link_str}");
+        let resolved = resolve_command_paths(&cmd);
+        // The validator now sees the TARGET path, not the link the shell
+        // command names: judged string != named string.
+        assert!(
+            resolved.contains(&target.canonicalize().unwrap().to_string_lossy().to_string()),
+            "B1-9: validator sees canonicalized target, not the named link \
+             (resolved='{resolved}')"
+        );
+        assert!(
+            !resolved.contains("innocuous_link"),
+            "B1-9: the link name the audit log/operator expects is gone"
+        );
+    }
+
+    // =========================================================================
     // T19 — generate_and_store_embedding tests
     // =========================================================================
 
