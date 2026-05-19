@@ -63,6 +63,23 @@ impl McpServer {
                     }
                 };
 
+                // B3-2: a prompt-injected agent must not be able to add an
+                // overbroad allow rule (`*`, `Bash(*)`, ...) that would
+                // become a permanent L0 whitelist of every command. Reject
+                // before persisting; deny rules are unrestricted.
+                if matches!(rule_type, RuleType::Allow)
+                    && clx_core::policy::is_overbroad_allow_pattern(&pattern)
+                {
+                    return Err((
+                        INVALID_PARAMS,
+                        format!(
+                            "Refusing to add overbroad allow rule '{pattern}': \
+                             it would whitelist arbitrary commands. Use a \
+                             specific pattern (e.g. 'Bash(git status)')."
+                        ),
+                    ));
+                }
+
                 let rule =
                     LearnedRule::new(pattern.clone(), rule_type.clone(), "mcp_tool".to_string());
 

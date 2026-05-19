@@ -6,6 +6,7 @@
 
 use std::time::{Duration, Instant};
 
+use clx_core::redaction::redact_secrets;
 use colored::Colorize;
 use serde::Serialize;
 
@@ -88,7 +89,12 @@ async fn check_providers(config: &clx_core::config::Config) -> (Vec<ProviderRow>
     for (name, provider_cfg) in entries {
         let (kind, endpoint) = match provider_cfg {
             ProviderConfig::Ollama(o) => ("ollama".to_owned(), o.host.clone()),
-            ProviderConfig::AzureOpenai(a) => ("azure_openai".to_owned(), a.endpoint.clone()),
+            // B6-1: redact the Azure endpoint before storing it in the ProviderRow
+            // so that tenant hostnames do not appear verbatim in CLI output or
+            // the JSON health report.
+            ProviderConfig::AzureOpenai(a) => {
+                ("azure_openai".to_owned(), redact_secrets(&a.endpoint))
+            }
         };
 
         let (healthy, error) = match config.create_llm_client_by_name(&name) {
@@ -99,7 +105,9 @@ async fn check_providers(config: &clx_core::config::Config) -> (Vec<ProviderRow>
                     (false, Some(format!("provider '{name}' did not respond")))
                 }
             }
-            Err(e) => (false, Some(e.to_string())),
+            // B6-1: redact the error string (which may contain a bounded provider
+            // summary from LlmError::Display) before it reaches CLI / JSON output.
+            Err(e) => (false, Some(redact_secrets(&e.to_string()))),
         };
 
         rows.push(ProviderRow {

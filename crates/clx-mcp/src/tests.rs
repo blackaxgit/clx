@@ -401,31 +401,65 @@ fn test_tool_credentials_full_cycle() {
 
 #[test]
 fn test_credential_masking_long_value() {
-    let value = "sk-1234567890abcdef";
+    // B3-1 fix: mask must NOT leak head/tail plaintext or exact length.
+    let value = "sk-1234567890abcdef"; // 19 chars -> "medium" bracket
     let masked = mask_credential_value(value);
-    assert!(masked.contains("sk-"));
-    assert!(masked.contains("def"));
-    assert!(masked.contains("chars"));
-    // The full value must not appear in the masked output
+    // No head or tail plaintext leaked (pre-fix leaked "sk-" and "def").
+    assert!(
+        !masked.contains("sk-"),
+        "B3-1: head plaintext must not leak: {masked}"
+    );
+    assert!(
+        !masked.contains("def"),
+        "B3-1: tail plaintext must not leak: {masked}"
+    );
+    // No exact length leaked (pre-fix emitted "(19 chars)").
+    assert!(
+        !masked.contains("chars"),
+        "B3-1: exact char count must not leak: {masked}"
+    );
+    assert!(
+        !masked.contains("19"),
+        "B3-1: exact length digit must not leak: {masked}"
+    );
+    // Fixed-form redacted token with coarse bracket.
+    assert_eq!(masked, "[REDACTED:medium]");
+    // The full value must not appear in the masked output.
     assert!(!masked.contains("1234567890abcdef"));
 }
 
 #[test]
 fn test_credential_masking_short_value() {
-    let value = "abc";
+    // B3-1 fix: short value must not leak exact length (pre-fix: "**** (3 chars)").
+    let value = "abc"; // 3 chars -> "short" bracket
     let masked = mask_credential_value(value);
-    assert_eq!(masked, "**** (3 chars)");
+    assert_eq!(masked, "[REDACTED:short]");
     assert!(!masked.contains("abc"));
+    assert!(
+        !masked.contains('3'),
+        "B3-1: exact length must not leak for short value: {masked}"
+    );
+    assert!(
+        !masked.contains("chars"),
+        "B3-1: 'chars' suffix must not appear: {masked}"
+    );
 }
 
 #[test]
 fn test_credential_masking_multibyte_utf8() {
-    // Ensure masking does not panic on multi-byte UTF-8 characters
+    // B3-1 fix: multi-byte UTF-8 must not panic and must not leak any chars or exact count.
+    // 8 emoji, each 4 bytes but 1 char -> 8 chars total -> "short" bracket.
     let value = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}\u{1F605}\u{1F606}\u{1F607}";
     let masked = mask_credential_value(value);
-    assert!(masked.contains("chars"));
-    // Should not panic and should not contain the full value
+    // No "chars" suffix (pre-fix leaked exact count).
+    assert!(
+        !masked.contains("chars"),
+        "B3-1: exact char count must not leak: {masked}"
+    );
+    // Should not panic and should not contain the full value.
     assert!(!masked.contains("\u{1F603}\u{1F604}\u{1F605}\u{1F606}"));
+    // Fixed-form redacted token.
+    assert_eq!(masked, "[REDACTED:short]");
 }
 
 #[test]
