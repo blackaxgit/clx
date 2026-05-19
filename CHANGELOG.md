@@ -5,6 +5,55 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-05-19
+
+Security release. A red/green/purple pre-release assessment found and
+closed 1 CRITICAL and 8 HIGH findings; PURPLE issued a SHIP verdict
+(independent re-derivation of each fix). 0.8.0 users should upgrade.
+
+### Security
+
+- **B4-1 (CRITICAL).** A cloned hostile repo's `.clx/config.yaml` could
+  neutralise the command validator with zero user interaction: the
+  project-config inert filter was a 3-prefix denylist, so a non-trusted
+  repo could still set `validator.layer1_enabled`, `default_decision`,
+  `auto_allow_reads`, `prompt_sensitivity`, `trust_mode`,
+  `layer1_timeout_ms`, and `user_learning.*`. The entire `validator.*`
+  and `user_learning.*` subtrees are now stripped from untrusted project
+  configs; the hash-trusted (`clx config-trust`) path is unchanged.
+- **B6-1/B6-2.** Azure HTTP error bodies were surfaced verbatim into
+  `LlmError` and logged/printed without redaction, and `redact_secrets`
+  had no tenant/endpoint host pattern. Error summaries are now redacted
+  then length-bounded, and `*.openai.azure.com` / `.azure-api.net` /
+  `.cognitiveservices.azure.com` hosts are scrubbed at the log/CLI sinks.
+- **B1-4/B3-2.** An overbroad learned or MCP-added allow rule (`*`,
+  `Bash(*)`) became a permanent L0 whitelist. Such patterns are now
+  rejected at both the learned-rule load boundary and the `clx_rules`
+  MCP add boundary; deny rules are unaffected.
+- **B5-4/B3-1.** Security-weakening `CLX_VALIDATOR_*` env overrides now
+  emit a prominent WARN and are exposed via
+  `Config::security_env_overrides_active()`; the MCP credential mask is
+  `[REDACTED:<bracket>]` (no plaintext fragment, coarse length only).
+- **B1-10.** The mtime-only legacy plain-text trust-token fallback is
+  removed; only the signed JSON `TrustToken` grants trust mode. Existing
+  users of the legacy token must re-run `clx trust` (fail-safe: the
+  invalid token simply falls through to normal validation).
+- **B5-1/B5-2.** The release pipeline now runs `cargo audit` (RustSec)
+  and `cargo deny` (advisories/licenses/sources/bans) as blocking
+  gates, attaches a CycloneDX SBOM, and produces a keyless Sigstore
+  build-provenance attestation. `deny.toml` enumerates (not
+  blanket-ignores) the known unmaintained transitive advisories and
+  fails closed on any new one.
+
+### Known issues / tracked
+
+- Binary code-signing/notarization, a manual-approval gate on the
+  Homebrew publish job, full DNS-rebinding-safe Azure egress pinning,
+  the `serde_yml` (RUSTSEC-2025-0068, unsound) migration, and the B5-4
+  hook-side audit-DB row are tracked non-blocking follow-ons (see
+  `specs/2026-05-19-rgp-purple-signoff.md` and
+  `specs/2026-05-19-residual-status.md`).
+
 ## [0.8.0] - 2026-05-17
 
 The "memory and quality" release. Five user-visible outcomes plus an
