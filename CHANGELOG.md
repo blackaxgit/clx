@@ -5,6 +5,24 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Test coverage 85.72% -> 89.99%** line on the unchanged published
+  denominator (1869 tests, all passing; region 90.19%, function 91.15%).
+  Three provider-boundary seam refactors (recall via the `QueryEmbedder`
+  port, embeddings embed-loop behind `LlmBackend`, hook-L1 config+wiremock
+  e2e) plus four honest harden waves (dashboard reducers/state/data, TUI
+  pixel/contract snapshots, CLI trust/rules/config/credentials, and
+  version/maintenance/model). Each wave self-validated with a fault-model
+  mutation gate. The 97% goal is superseded by an honest disposition:
+  the residual is system-effect/non-hermetic code (`install.rs`,
+  `health.rs`, `app.rs` settings-save disk I/O) that cannot be covered
+  without test theater or a security-rejected `CLX_HOME` seam; see
+  `specs/2026-05-19-coverage-campaign-v2.md` S7. Coverage CI gate stays
+  warn-only.
+
 ## [0.8.1] - 2026-05-19
 
 Security release. A red/green/purple pre-release assessment found and

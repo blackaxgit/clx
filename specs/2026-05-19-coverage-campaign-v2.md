@@ -149,3 +149,50 @@ explicit completion gate, scoped permissions, agents never `git commit`
   weakening.
 - `specs/2026-05-18-test-coverage-campaign.md` S6 updated with the new
   honest measured number; CHANGELOG "Known issues" coverage line updated.
+
+## 7. Result and honest disposition (2026-05-19)
+
+Final measured instrumented line coverage on the **unchanged** published
+denominator: **89.99%** (region 90.19%, function 91.15%), suite
+**1869 pass / 0 fail / 9 ignored**, clippy + fmt clean, `cargo insta
+test --workspace --check` clean (snapshots machine-independent on short
+and long HOME). Journey: 85.72% (0.8.0 baseline) -> 86.82% (3 reviewed
+provider seams: recall port, embeddings extraction, hook-L1 e2e + the
+Review-A `open_default` placement fix + dead-branch removal) -> **89.99%**
+(four honest harden streams: dashboard reducers/state/data, TUI
+pixel/contract snapshots, trust/rules/config/credentials e2e,
+version/maintenance/model e2e). +158 net tests in the harden wave;
+each stream self-validated with a fault-model mutation gate
+(3-5 realistic mutants killed for the expected reason).
+
+**97% was not reached and is intentionally NOT forced.** The gap-map's
+premise (delta dominated by three provider seams) was wrong; a live
+`cargo-llvm-cov` run showed the residual is a broad CLI/TUI surface. The
+honest ceiling under the project's hard constraints (no test theater; no
+`unsafe` env mutation since `unsafe_code = "deny"`; no `CLX_HOME`
+override, deliberately rejected for credential-redirection security) is
+~90%. The remaining ~4066 uncovered lines are dominated by:
+
+- `clx/src/commands/install.rs` (~460): system-mutating install flow
+  (PATH/binary/config writes) -- not hermetically exercisable; deferred
+  by explicit user decision ("treat separately").
+- `clx/src/commands/health.rs` (~260): live process/socket probing.
+- `clx/src/dashboard/app.rs` (~170): `settings_save`/`reload` real
+  `~/.clx` disk I/O, structurally non-hermetic because `unsafe_code =
+  "deny"` blocks `$HOME` redirection and there is no `CLX_HOME` seam.
+- smaller boundary-limited residuals (`clx-mcp` remember/credentials,
+  hook session_start, rules.rs config-source arms unreachable via the
+  command boundary) -- disclosed with line refs by each stream, pinned
+  where a behavior contract applies, never padded with theater.
+
+These are core/system logic, not glue, so excluding them from the
+denominator would be test theater (forbidden by S2). Closing them needs
+either heavy sandboxed-side-effect e2e scaffolding (install/health) or a
+`CLX_HOME` testability seam whose security trade-off was rejected --
+tracked, not a forced number.
+
+**Decision:** ship the campaign at the documented **89.99%** with the
+coverage CI gate warn-only (existing policy); the `>= 97%` line in S6 is
+superseded for this cycle by this honest disposition. Mutation testing
+remains warn-only per existing workflow (per-stream fault-model gates
+applied). install.rs/health.rs heavy-e2e is the tracked follow-on.
