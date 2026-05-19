@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 license = "MPL-2.0"
 authors = ["CLX Contributors"]
@@ -59,6 +59,11 @@ colored = "2"
 # Secure storage
 keyring = "2"
 secrecy = { version = "0.10", features = ["serde"] }
+# age-encryption.org v1 (X25519 + ChaCha20-Poly1305). Canonical Rust
+# implementation of the age spec, actively maintained by the age project.
+# Backs the DEFAULT local encrypted-file credential backend so CLX never
+# touches the macOS keychain unless the user explicitly opts in.
+age = "0.11"
 
 # Traits and utilities
 trait-variant = "0.1"
@@ -68,6 +73,9 @@ figment = { version = "0.10", features = ["yaml", "env"] }
 
 # URL parsing
 url = "2"
+
+# Regex
+regex = "1"
 
 # Password input
 rpassword = "7"
@@ -111,3 +119,32 @@ similar_names = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# Published instrumented coverage denominator (CLX 0.8.0 campaign, spec
+# section 1). cargo-llvm-cov excludes unreachable glue ONLY; every excluded
+# path has its logic covered elsewhere. Kept byte-identical with
+# scripts/test.sh (COV_IGNORE_REGEX) and the gap-map table in docs/testing.md.
+# Per-pattern rationale:
+#   dashboard/event\.rs      terminal run_event_loop glue (crossterm raw-mode,
+#                            real-TTY input); the pure `update` reducer in
+#                            dashboard/state.rs IS covered.
+#   main\.rs                 shell-only entrypoints: clx-hook stdin wiring +
+#                            clx clap dispatch shell; logic lives in
+#                            router::handle_event / command modules (covered).
+#   dashboard/runtime\.rs    reserved terminal runtime glue name (forward
+#                            compatible; do not drop if event.rs splits).
+#   credentials/keychain_acl\.rs  macOS CFArray SecAccess FFI: cfg(target_os
+#                            = "macos"), the crate's only unsafe, opt-in, and
+#                            exercised only by #[ignore] real-keychain tests.
+#   dashboard/mod\.rs        terminal runtime glue: ratatui::init/restore,
+#                            the panic-hook terminal reset, and the
+#                            real-TTY run_event_loop call. Same unreachable
+#                            class as dashboard/event.rs; the pure App
+#                            reducer/state IS covered (dashboard/state.rs).
+#   commands/keychain_trust\.rs  macOS keychain ACL repair: reachable only
+#                            with real login-keychain access, exercised
+#                            solely by #[ignore = "Requires keychain
+#                            access"] tests the harness never runs. Same
+#                            class as credentials/keychain_acl.rs.
+[workspace.metadata.cargo-llvm-cov]
+ignore-filename-regex = "(dashboard/event\\.rs|main\\.rs|dashboard/runtime\\.rs|credentials/keychain_acl\\.rs|dashboard/mod\\.rs|commands/keychain_trust\\.rs)"

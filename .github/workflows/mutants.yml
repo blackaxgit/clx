@@ -1,0 +1,158 @@
+# Mutation testing (weekly baseline) for CLX hot modules.
+#
+# Runs cargo-mutants v27 against the five hot modules declared in
+# mutants.toml (recall/{mod,rrf,decay}, llm/fallback, storage/migration,
+# policy/mcp, redaction). Surviving mutants on main are tracked as
+# regressions and triaged into new unit/property tests per
+# specs/plans/0.8.0-E-coverage-mutation-trust.md section E2.
+#
+# Schedule: every Monday at 06:00 UTC. Mutation runs are long (each mutant
+# = one full rebuild + test invocation), so this is intentionally off the
+# PR critical path. The PR-diff job lives in mutants-pr.yml.
+#
+# Version pin: cargo-mutants 27 (current as of 2026-05). Bumping the pin
+# requires re-validating mutants.toml: cargo-mutants occasionally renames
+# config keys between majors. v26 used `examine_globs`; v27 uses
+# `examine_re` (the schema this repo follows).
+
+name: Mutation Testing (weekly baseline)
+
+on:
+  schedule:
+    # Monday 06:00 UTC. Avoids overlap with the weekly release-plz cadence.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  mutants-baseline:
+    name: cargo mutants (baseline on main)
+    runs-on: ubuntu-latest
+    # Full sweep across 5 modules can take 2-4 hours wall-clock on ubuntu
+    # runners. 360 minutes (= 6h) is the GitHub Actions ceiling for the
+    # standard runner tier and leaves headroom for cold caches.
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # cargo-mutants v27 pinned exactly. `cargo install --locked` ensures
+      # the binary's transitive deps match the version's published lockfile,
+      # which guards against unrelated supply-chain drift between runs.
+      - name: Install cargo-mutants v27
+        run: cargo install cargo-mutants --version '^27' --locked
+
+      - name: Print cargo-mutants version
+        run: cargo mutants --version
+
+      # --in-place: mutate files in the checkout (vs copying to a scratch
+      #             directory). Required to share the Swatinem cache.
+      # --no-shuffle: deterministic mutant order for reproducible diffing of
+      #             missed.txt across runs.
+      # --output target/mutants: keep artifacts inside the cached target dir
+      #             but in a distinct subtree (won't be wiped by `cargo clean`
+      #             of build outputs scoped to packages).
+      - name: Run cargo mutants (baseline)
+        id: mutants
+        # continue-on-error lets us upload the artifact + comment even when
+        # survivors are found; the issue comment is the visible signal.
+        continue-on-error: true
+        run: |
+          cargo mutants \
+            --in-place \
+            --no-shuffle \
+            --output target/mutants
+
+      - name: Summarize results
+        id: summary
+        if: always()
+        run: |
+          missed_file="target/mutants/missed.txt"
+          if [ -f "$missed_file" ]; then
+            missed_count=$(wc -l < "$missed_file" | tr -d ' ')
+          else
+            missed_count=0
+          fi
+          echo "missed=$missed_count" >> "$GITHUB_OUTPUT"
+          echo "Missed mutants: $missed_count"
+          {
+            echo "## Mutation testing baseline"
+            echo ""
+            echo "Missed mutants: **$missed_count**"
+            echo ""
+            if [ -f "$missed_file" ] && [ "$missed_count" -gt 0 ]; then
+              echo "<details><summary>missed.txt (first 50 lines)</summary>"
+              echo ""
+              echo '```'
+              head -n 50 "$missed_file"
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload missed.txt artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-missed
+          path: target/mutants/
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Comment on a tracking issue when the survivor count exceeds the
+      # acceptable threshold. The threshold matches the 80% kill-rate target
+      # documented in docs/mutation-testing.md: with ~120 generated mutants
+      # across the five hot modules, > 24 survivors means kill rate < 80%.
+      #
+      # The tracking issue must exist with the label `mutation-tracking`;
+      # create it once per release cycle. If no issue exists, this step is
+      # a no-op (the find step returns empty).
+      - name: Find tracking issue
+        id: find_issue
+        if: steps.summary.outputs.missed != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'mutation-tracking',
+              state: 'open',
+              per_page: 1,
+            });
+            if (issues.length === 0) {
+              core.info('No open mutation-tracking issue found. Skipping comment.');
+              core.setOutput('issue_number', '');
+            } else {
+              core.setOutput('issue_number', String(issues[0].number));
+            }
+
+      - name: Comment on tracking issue when survivors exceed threshold
+        if: steps.find_issue.outputs.issue_number != '' && fromJSON(steps.summary.outputs.missed) > 24
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ steps.find_issue.outputs.issue_number }}
+          body: |
+            Weekly mutation baseline (run [`${{ github.run_id }}`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})) found **${{ steps.summary.outputs.missed }} surviving mutants**, exceeding the 24-mutant threshold (= 80% kill rate over ~120 generated).
+
+            Artifact: `mutants-missed` on the workflow run.
+
+            Triage steps:
+            1. Classify each survivor: missing test, equivalent mutation, or false positive.
+            2. For missing tests, add targeted unit/property tests next to the affected module.
+            3. For equivalent mutations, add to `mutants.toml` `exclude_re` with a one-line justification.

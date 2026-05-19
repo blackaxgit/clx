@@ -17,6 +17,7 @@ pub mod policy;
 pub mod recall;
 pub mod redaction;
 pub mod storage;
+pub mod summarize;
 pub mod text;
 pub mod types;
 

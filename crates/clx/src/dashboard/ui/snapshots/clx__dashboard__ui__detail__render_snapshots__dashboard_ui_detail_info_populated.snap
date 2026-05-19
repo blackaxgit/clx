@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/ui/detail.rs
+expression: rendered
+---
+┌ Session Detail: 23456789 ────────────────────────────────────────────────────────────────────────┐
+│ Info • Commands • Audit • Snapshots                                                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Info ────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Session:  abcdef0123456789                                                                      │
+│  Project:  /home/user/project                                                                    │
+│  Status:   ended                    Started: 2023-11-14 22:13:20                                 │
+│  Source:   startup                  Ended:   2023-11-14 22:18:20                                 │
+│  Duration: 5m                                                                                    │
+│                                                                                                  │
+│  Tokens                  Commands                 Risk                                           │
+│  Input:  1.2K              Total:    3                Low (1-3):  1                              │
+│  Output: 800               Allowed:  1    (33%)    Med (4-7):  1                                 │
+│  Total:  2.0K              Blocked:  1    (33%)    High (8-10): 1                                │
+│  Cost:   $0.02              Prompted: 1    (33%)                                                 │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Commands (3) ────────────────────────────────────────────────────────────────────────────────────↑
+│  Time       Decision   Risk   Layer        Command                                               █
+│                                                                                                  █
+│→ 22:13:30   allowed    1      builtin      ls -la /tmp                                           █
+│  22:13:40   blocked    9      builtin      rm -rf /tmp/foo                                       █
+│  22:13:50   prompted   6      builtin      git push --force                                      █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  ║
+│                                                                                                  ║
+└──────────────────────────────────────────────────────────────────────────────────────────────────↓
+ Tab:switch  j/k:scroll  r:refresh  Esc:back  1-4:tab

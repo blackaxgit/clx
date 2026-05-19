@@ -1,39 +1,21 @@
 //! CLX Hook Binary
 //!
-//! This binary intercepts and validates Claude Code commands before execution.
+//! Thin entry point. Reads JSON from stdin, dispatches to the right handler,
+//! and prints the response on stdout. All real work lives in the `clx_hook`
+//! library (see `src/lib.rs` + `src/router.rs`). This binary owns only
+//! process-level concerns: argument parsing, tracing setup, sqlite-vec
+//! init, and constructing `HookDeps` for the router.
 //!
-//! Hook handlers:
-//! - `PreToolUse`: Validates commands using Layer 0 (deterministic rules) and Layer 1 (LLM)
-//! - `PostToolUse`: Logs events to database and tracks user decisions for learning
-//! - `PreCompact`: Creates snapshots before context compression
-//! - `SessionStart`: Creates session in database and loads previous session summary
-//! - `SessionEnd`: Updates session status and creates final snapshot
-//! - `SubagentStart`: Injects specialist rules into subagent context
-//! - `UserPromptSubmit`: Injects orchestrator reminder on user prompts
+//! Hook handlers (in the library): `PreToolUse`, `PostToolUse`, `PreCompact`,
+//! `SessionStart`, `SessionEnd`, `SubagentStart`, `UserPromptSubmit`, Stop.
 
-mod audit;
-mod context;
-mod embedding;
-mod hooks;
-mod learning;
-mod output;
-mod transcript;
-mod types;
+use std::io::{self, IsTerminal};
+use std::process::ExitCode;
 
-#[cfg(test)]
-mod tests;
-
-use anyhow::Result;
-use clx_core::redaction::redact_secrets;
-use std::io::{self, IsTerminal, Read};
-use tracing::{debug, error, warn};
-
-use hooks::{
-    handle_post_tool_use, handle_pre_compact, handle_pre_tool_use, handle_session_end,
-    handle_session_start, handle_subagent_start, handle_user_prompt_submit,
+use clx_hook::{
+    CLAUDE_PROVENANCE_ENV_VARS, HookDeps, Provenance, classify_provenance, handle_event,
 };
-use output::output_decision;
-use types::{HookInput, MAX_INPUT_SIZE};
+use tracing::warn;
 
 fn print_usage() {
     eprintln!("clx-hook - Claude Code hook handler for CLX");
@@ -42,34 +24,85 @@ fn print_usage() {
     eprintln!("It reads JSON input from stdin and is not intended for manual use.");
     eprintln!();
     eprintln!("Supported hook events: PreToolUse, PostToolUse, PreCompact,");
-    eprintln!("  SessionStart, SessionEnd, SubagentStart, UserPromptSubmit");
+    eprintln!("  SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop");
     eprintln!();
     eprintln!("Configuration: ~/.clx/config.yaml");
     eprintln!("Documentation: https://github.com/blackaxgit/clx");
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
-    // Handle --help or -h
+    // --help / -h short-circuits before any I/O.
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
-        return Ok(());
+        return ExitCode::SUCCESS;
     }
 
-    // If stdin is a terminal (no piped input), show usage
+    // If stdin is a terminal (no piped input), show usage and exit cleanly.
     if io::stdin().is_terminal() {
         print_usage();
-        return Ok(());
+        return ExitCode::SUCCESS;
     }
 
     clx_core::init_sqlite_vec();
+    init_tracing();
 
-    // Initialize tracing.
-    // - stderr: ERROR only (Claude Code treats hook stderr as failure noise).
-    // - file: WARN+ to the configured log file (created by hook on first write).
-    //   Ensures the user-visible "log file silently dropped" surprise is fixed.
+    // Build router deps. If the storage layer cannot be opened we still want
+    // Claude Code to see a clean exit (treating any non-zero as hook failure
+    // noise); the router itself does the safe "allow" fallback when handlers
+    // cannot do real work.
+    let Some(deps) = HookDeps::from_process_defaults() else {
+        return ExitCode::SUCCESS;
+    };
+
+    // F7: best-effort hook-envelope provenance check at the orchestration
+    // boundary (before any dispatch), NOT inside router::handle_event, so
+    // the in-memory contract tests that call handle_event directly are
+    // unaffected. We read the Claude-Code-set env vars here (the
+    // infrastructure edge) and hand pure (name, value) pairs to the Domain
+    // decision function. Claude Code 2026 provides no unforgeable token
+    // (see classify_provenance docs), so this is defense-in-depth, not an
+    // auth boundary. Decision: fail-safe, not fail-closed. When provenance
+    // cannot be established (spoof attempt, OR a legitimate edge case such
+    // as CI, a debugger, the contract-test harness, or a shell wrapper that
+    // dropped the env), we log a WARN and still process. A false positive
+    // that blocks every hook is a strictly worse outcome than the residual
+    // local same-uid attacker risk already acknowledged in the threat
+    // model. The WARN gives operators a forensic signal without a hard
+    // crash that would break legitimate use.
+    let env_pairs: Vec<(&str, Option<String>)> = CLAUDE_PROVENANCE_ENV_VARS
+        .iter()
+        .map(|name| (*name, std::env::var(name).ok()))
+        .collect();
+    if classify_provenance(&env_pairs) == Provenance::Unverified {
+        warn!(
+            "hook provenance unverified: no Claude Code env var present \
+             ({}). Processing anyway (fail-safe); if unexpected, a local \
+             process may be spoofing the hook envelope.",
+            CLAUDE_PROVENANCE_ENV_VARS.join(", ")
+        );
+    }
+
+    // Delegate to the library. handle_event consumes stdin, writes any
+    // fallback JSON (oversize input / parse error) to stdout, and returns a
+    // HookExit. Every variant maps to SUCCESS so Claude Code never sees
+    // hook stderr noise.
+    let _exit = handle_event(io::stdin(), io::stdout(), deps).await;
+    ExitCode::SUCCESS
+}
+
+/// Initialize tracing.
+///
+/// - stderr: ERROR only. Claude Code treats hook stderr as failure noise.
+/// - file: WARN+ to the configured log file. Created on first write so the
+///   user-visible "log file silently dropped" surprise stays fixed.
+fn init_tracing() {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let log_path = clx_core::config::Config::load().ok().and_then(|c| {
         let p = c.log_file_path();
         std::fs::create_dir_all(p.parent()?).ok()?;
@@ -81,6 +114,7 @@ async fn main() -> Result<()> {
             .map(std::sync::Mutex::new)
             .map(std::sync::Arc::new)
     });
+
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(
@@ -97,77 +131,10 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
             )
     });
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
     tracing_subscriber::registry()
         .with(stderr_layer)
         .with(file_layer)
         .init();
-
-    // Read JSON input from stdin (limited to 1MB to prevent DoS via memory exhaustion)
-    let mut input_str = String::new();
-    let stdin = io::stdin();
-    match stdin.take(MAX_INPUT_SIZE).read_to_string(&mut input_str) {
-        Ok(bytes_read) => {
-            if bytes_read as u64 >= MAX_INPUT_SIZE {
-                eprintln!("CLX: Input exceeds maximum size of {MAX_INPUT_SIZE} bytes");
-                let output = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "block",
-                        "permissionDecisionReason": "Input too large"
-                    }
-                });
-                println!("{output}");
-                std::process::exit(0);
-            }
-        }
-        Err(_e) => {
-            output_decision("allow", None, None, None);
-            std::process::exit(0);
-        }
-    }
-
-    debug!("Hook input: {}", redact_secrets(&input_str));
-
-    // Parse the input
-    let input: HookInput = match serde_json::from_str(&input_str) {
-        Ok(input) => input,
-        Err(e) => {
-            error!("Failed to parse hook input: {}", e);
-            output_decision(
-                "ask",
-                Some("CLX: Input parse error, manual confirmation required".to_string()),
-                None,
-                None,
-            );
-            std::process::exit(0);
-        }
-    };
-
-    // Route based on hook event name
-    let result = match input.hook_event_name.as_str() {
-        "PreToolUse" => handle_pre_tool_use(input).await,
-        "PostToolUse" => handle_post_tool_use(input).await,
-        "PreCompact" => handle_pre_compact(input).await,
-        "SessionStart" => handle_session_start(input).await,
-        "SessionEnd" => handle_session_end(input).await,
-        "SubagentStart" => handle_subagent_start(input).await,
-        "UserPromptSubmit" => handle_user_prompt_submit(input).await,
-        unknown => {
-            warn!("Unknown hook event: {}", unknown);
-            output_decision("allow", None, None, None);
-            Ok(())
-        }
-    };
-
-    if let Err(e) = result {
-        error!("Hook handler error: {}", e);
-        std::process::exit(0);
-    }
-
-    Ok(())
 }
 
 /// Adapter so `Arc<Mutex<File>>` can serve as a tracing-subscriber writer.

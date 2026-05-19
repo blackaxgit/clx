@@ -59,7 +59,16 @@ impl McpServer {
         let storage = Storage::open(&db_path).context("Failed to open database")?;
         let session_id = env::var("CLX_SESSION_ID").ok().map(SessionId::from);
 
-        let credential_store = CredentialStore::new();
+        // Load config first so the credential store uses the user's
+        // configured backend (default `file`: a local age-encrypted file
+        // that NEVER touches the macOS keychain). The process-scoped cache
+        // is still enabled for the long-lived MCP server (mostly moot for
+        // the file backend, retained for the opt-in keychain path). Secrets
+        // are zeroized when the server is dropped.
+        let cfg = Config::load().unwrap_or_default();
+        let credential_store = cfg
+            .credential_store_cached()
+            .unwrap_or_else(|_| CredentialStore::new_cached());
 
         // Create Tokio runtime for async operations
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -67,8 +76,7 @@ impl McpServer {
             .build()
             .context("Failed to create Tokio runtime")?;
 
-        // Initialize LLM client for embeddings via factory
-        let cfg = Config::load().unwrap_or_default();
+        // Embeddings model / client via factory
         let embed_model = cfg
             .capability_route(Capability::Embeddings)
             .map(|r| r.model.clone())

@@ -1,0 +1,1 @@
+{"session_id":"00000000-0000-0000-0000-000000000001","transcript_path":"/tmp/test-project/.claude/transcripts/00000000-0000-0000-0000-000000000001.jsonl","cwd":"/tmp/test-project","hook_event_name":"PreToolUse","tool_name":"Read","tool_use_id":"toolu_00000000000000000000000001","tool_input":{"file_path":"/tmp/test-project/README.md"}}

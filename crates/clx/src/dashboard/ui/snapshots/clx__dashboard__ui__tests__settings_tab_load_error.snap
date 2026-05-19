@@ -5,7 +5,7 @@ expression: rendered
 ┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
 │ Sessions • Audit Log • Rules • Settings                                      │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌ Sections ──────────┐┌ Settings - <HOME>/.clx/config.yaml ────────────────────┐
+┌ Sections ──────────┐┌ Settings - <CONFIG_PATH>                                
 │> Validator         ││Failed to load configuration                            │
 │  Context           ││                                                        │
 │  LLM               ││Cannot open config file                                 │

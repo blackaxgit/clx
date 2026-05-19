@@ -46,6 +46,7 @@
 //! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
 pub(crate) mod project;
+pub mod trust;
 
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -244,6 +245,123 @@ pub struct Config {
     /// Auto-recall configuration
     #[serde(default)]
     pub auto_recall: AutoRecallConfig,
+
+    /// Retention policy for storage tables.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+
+    /// Memory aggregation features (auto-summarize, etc.).
+    ///
+    /// Opt-in. Default values preserve 0.7.x behavior (no auto-summary fires).
+    #[serde(default)]
+    pub memory: MemoryConfig,
+
+    /// Credential storage backend selection.
+    ///
+    /// Default is the local age-encrypted file (`backend: file`), which
+    /// NEVER touches the macOS keychain and never prompts. Set
+    /// `backend: keychain` (or `CLX_CREDENTIALS_BACKEND=keychain`) to opt
+    /// into the system keychain.
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+}
+
+/// Credential storage backend configuration.
+///
+/// ```yaml
+/// credentials:
+///   backend: file      # default; local age-encrypted file, never prompts
+///   # backend: keychain  # opt-in; macOS Keychain (may prompt on adhoc binaries)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialsConfig {
+    /// `file` (default) or `keychain`.
+    #[serde(default)]
+    pub backend: crate::credentials::CredentialBackendKind,
+}
+
+impl Default for CredentialsConfig {
+    fn default() -> Self {
+        Self {
+            // The default MUST be the file backend so a fresh user never sees
+            // a single macOS keychain prompt.
+            backend: crate::credentials::CredentialBackendKind::File,
+        }
+    }
+}
+
+impl Config {
+    /// Resolve the effective credential backend, honoring the
+    /// `CLX_CREDENTIALS_BACKEND` env override (highest precedence) over the
+    /// `credentials.backend` config value (default `file`).
+    ///
+    /// An unknown env value is a hard error so a typo can never silently
+    /// fall back to the prompting keychain.
+    pub fn credential_backend_kind(
+        &self,
+    ) -> crate::Result<crate::credentials::CredentialBackendKind> {
+        if let Ok(v) = std::env::var("CLX_CREDENTIALS_BACKEND")
+            && !v.trim().is_empty()
+        {
+            return crate::credentials::CredentialBackendKind::parse(&v)
+                .map_err(|e| crate::Error::Config(e.to_string()));
+        }
+        Ok(self.credentials.backend)
+    }
+
+    /// Build a `CredentialStore` from this config (single config-aware
+    /// constructor). Every production callsite uses this so the user's
+    /// backend selection (default `file`) is honored uniformly.
+    pub fn credential_store(&self) -> crate::Result<crate::credentials::CredentialStore> {
+        Ok(crate::credentials::CredentialStore::from_config(
+            self.credential_backend_kind()?,
+        ))
+    }
+
+    /// Same as [`Config::credential_store`] but with the process-scoped read
+    /// cache enabled (long-lived MCP server).
+    pub fn credential_store_cached(&self) -> crate::Result<crate::credentials::CredentialStore> {
+        Ok(crate::credentials::CredentialStore::from_config_cached(
+            self.credential_backend_kind()?,
+        ))
+    }
+}
+
+/// Retention policy for storage tables.
+///
+/// A value of `0` for any field disables trimming for that table; positive
+/// integers set the retention window in days. The `clx maintenance trim`
+/// command uses these values to delete rows older than the window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetentionConfig {
+    /// Days of `tool_events` rows to retain. Default: 30.
+    #[serde(default = "default_retention_tool_events_days")]
+    pub tool_events_days: u32,
+
+    /// Days of `events` rows to retain. Default: 7.
+    #[serde(default = "default_retention_events_days")]
+    pub events_days: u32,
+
+    /// Days of `snapshots` rows to retain. Default: 0 (keep forever).
+    #[serde(default)]
+    pub snapshots_days: u32,
+}
+
+fn default_retention_tool_events_days() -> u32 {
+    30
+}
+fn default_retention_events_days() -> u32 {
+    7
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            tool_events_days: default_retention_tool_events_days(),
+            events_days: default_retention_events_days(),
+            snapshots_days: 0,
+        }
+    }
 }
 
 /// Auto-recall configuration for automatic context injection.
@@ -286,6 +404,44 @@ pub struct AutoRecallConfig {
     /// Minimum prompt length to trigger auto-recall
     #[serde(default = "default_auto_recall_min_prompt_len")]
     pub min_prompt_len: usize,
+
+    /// Pin recent session summaries on every `UserPromptSubmit` recall.
+    ///
+    /// Opt-in. When `pin_recent_sessions.enabled = true`, the hook prepends
+    /// the last N session summaries (newest first, excluding the current
+    /// session) regardless of whether the recall query produced semantic
+    /// or FTS5 hits.
+    #[serde(default)]
+    pub pin_recent_sessions: PinRecentSessionsConfig,
+
+    /// Use Reciprocal Rank Fusion for hybrid recall ranking.
+    #[serde(default = "default_true")]
+    pub rrf_enabled: bool,
+
+    /// RRF k parameter. The standard literature value is 60.
+    #[serde(default = "default_auto_recall_rrf_k")]
+    pub rrf_k: u32,
+
+    /// Multiplicative time-decay half-life in days. Set to 0 to disable.
+    #[serde(default = "default_auto_recall_time_decay_half_life_days")]
+    pub time_decay_half_life_days: f64,
+
+    /// Percentile gate as a fraction from 0.0 to 1.0. Set to 0 to disable.
+    #[serde(default = "default_auto_recall_percentile_gate")]
+    pub percentile_gate: f64,
+
+    /// Enable the cross-encoder rerank stage (bge-reranker-v2-m3).
+    /// When `false`, recall uses RRF only. Default `true` per the
+    /// 0.8.0 design; first-run UX downloads the model in the
+    /// background via `clx model fetch`.
+    #[serde(default = "default_true")]
+    pub reranker_enabled: bool,
+
+    /// Per-query timeout for the rerank stage in milliseconds.
+    /// On expiry the pipeline falls back to RRF-only ordering so the
+    /// recall request never errors. Default: 250 ms (per design §3.1).
+    #[serde(default = "default_reranker_timeout_ms")]
+    pub reranker_timeout_ms: u64,
 }
 
 impl Default for AutoRecallConfig {
@@ -299,8 +455,122 @@ impl Default for AutoRecallConfig {
             fallback_to_fts: default_true(),
             include_key_facts: default_true(),
             min_prompt_len: default_auto_recall_min_prompt_len(),
+            pin_recent_sessions: PinRecentSessionsConfig::default(),
+            rrf_enabled: default_true(),
+            rrf_k: default_auto_recall_rrf_k(),
+            time_decay_half_life_days: default_auto_recall_time_decay_half_life_days(),
+            percentile_gate: default_auto_recall_percentile_gate(),
+            reranker_enabled: default_true(),
+            reranker_timeout_ms: default_reranker_timeout_ms(),
         }
     }
+}
+
+/// Configuration for pinning the most recent session summaries into recall
+/// context on every `UserPromptSubmit` (independent of hit matching).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PinRecentSessionsConfig {
+    /// Enable pinned-session header. Default: `false` (preserves 0.7.x behavior).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Number of recent sessions to pin. Default: 3.
+    #[serde(default = "default_pin_recent_count")]
+    pub count: usize,
+
+    /// Maximum characters per pinned summary (chars, not bytes). Default: 300.
+    #[serde(default = "default_pin_recent_max_chars")]
+    pub max_chars_each: usize,
+}
+
+impl Default for PinRecentSessionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            count: default_pin_recent_count(),
+            max_chars_each: default_pin_recent_max_chars(),
+        }
+    }
+}
+
+fn default_pin_recent_count() -> usize {
+    3
+}
+
+fn default_pin_recent_max_chars() -> usize {
+    300
+}
+
+/// Memory aggregation features (Phase 10 / 0.8.0).
+///
+/// Container for opt-in memory features. Today this holds only
+/// `auto_summarize`; future features (e.g. rolling key-fact ledgers) plug in
+/// here without expanding the top-level `Config` surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MemoryConfig {
+    /// Configuration for rolling N-turn auto-summarization on `Stop`.
+    #[serde(default)]
+    pub auto_summarize: AutoSummarizeConfig,
+}
+
+/// Rolling N-turn auto-summarize configuration.
+///
+/// When `enabled = true`, the `Stop` hook handler counts the assistant
+/// turns since the last `AutoSummary` snapshot for the session and, when
+/// the threshold is reached, summarizes the recent transcript span into
+/// a new snapshot tagged with `SnapshotTrigger::AutoSummary`.
+///
+/// All fields have safe defaults. The `enabled` flag is the single gate
+/// keeping 0.7.x behavior intact for users who have not opted in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoSummarizeConfig {
+    /// Enable auto-summarize. Default: `false` (preserves 0.7.x behavior).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Number of assistant turns between auto-summary snapshots. Default: 5.
+    #[serde(default = "default_auto_summarize_every_n_turns")]
+    pub every_n_turns: u32,
+
+    /// Capability used to construct the summarizer LLM client. Default:
+    /// `"chat"`. Falls back to `Capability::Chat` when the string is not a
+    /// known capability name.
+    #[serde(default = "default_summarizer_capability")]
+    pub summarizer_capability: String,
+
+    /// Maximum characters (not bytes) for the produced summary. Default: 500.
+    #[serde(default = "default_max_summary_chars")]
+    pub max_summary_chars: usize,
+
+    /// Skip the auto-summary when no mutating tool events have been
+    /// recorded since the last summary (i.e. read-only session). Default:
+    /// `true`. Uses the `tool_events` table (schema v6) for the lookup.
+    #[serde(default = "default_true")]
+    pub skip_when_idle: bool,
+}
+
+impl Default for AutoSummarizeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_n_turns: default_auto_summarize_every_n_turns(),
+            summarizer_capability: default_summarizer_capability(),
+            max_summary_chars: default_max_summary_chars(),
+            skip_when_idle: true,
+        }
+    }
+}
+
+fn default_auto_summarize_every_n_turns() -> u32 {
+    5
+}
+
+fn default_summarizer_capability() -> String {
+    "chat".to_string()
+}
+
+fn default_max_summary_chars() -> usize {
+    500
 }
 
 /// Validator configuration
@@ -645,6 +915,22 @@ fn default_auto_recall_min_prompt_len() -> usize {
     10
 }
 
+fn default_auto_recall_rrf_k() -> u32 {
+    60
+}
+
+fn default_auto_recall_time_decay_half_life_days() -> f64 {
+    30.0
+}
+
+fn default_auto_recall_percentile_gate() -> f64 {
+    0.70
+}
+
+fn default_reranker_timeout_ms() -> u64 {
+    250
+}
+
 impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
@@ -740,7 +1026,7 @@ impl Default for McpToolsConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Azure OpenAI provider config (Task 7 — does NOT touch the root Config struct)
+// Azure OpenAI provider config (Task 7, does NOT touch the root Config struct)
 // ---------------------------------------------------------------------------
 
 /// Configuration for the Azure `OpenAI` backend.
@@ -815,7 +1101,7 @@ pub struct CapabilityRoute {
     /// transient error. `Box` to allow recursion (each fallback could
     /// itself have a fallback; v0.7.0 only surfaces a single level UX).
     /// The `model` field on a fallback route is honored at fallback call
-    /// time — the caller's model name is replaced because providers don't
+    /// time. The caller's model name is replaced because providers don't
     /// share model names (e.g. `gpt-5.4-mini` only exists on Azure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Box<CapabilityRoute>>,
@@ -865,7 +1151,11 @@ impl Config {
             crate::config::project::project_config_path_with_stop(home_boundary.as_deref())
             && let Ok(raw) = fs::read_to_string(&proj)
         {
-            let filtered = crate::config::project::filter_inert_only(&raw);
+            // Trust-gated filter (§3.11): if the file hash is in the user's
+            // ~/.clx/trusted_configs.json, the raw YAML is honored. Otherwise
+            // non-inert keys (providers.*, logging.file, validator.enabled)
+            // are stripped before merge.
+            let filtered = crate::config::project::apply_project_layer(&raw, &proj);
             if !filtered.is_empty() {
                 fig = fig.merge(Yaml::string(&filtered));
             }
@@ -1297,6 +1587,40 @@ impl Config {
                 &mut self.auto_recall.min_prompt_len,
             );
         }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_RRF_ENABLED") {
+            apply_bool_override(
+                &val,
+                "CLX_AUTO_RECALL_RRF_ENABLED",
+                &mut self.auto_recall.rrf_enabled,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_RRF_K") {
+            apply_u32_override(
+                &val,
+                "CLX_AUTO_RECALL_RRF_K",
+                1,
+                1000,
+                &mut self.auto_recall.rrf_k,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_TIME_DECAY_HALF_LIFE_DAYS") {
+            apply_f64_override(
+                &val,
+                "CLX_AUTO_RECALL_TIME_DECAY_HALF_LIFE_DAYS",
+                0.0,
+                3650.0,
+                &mut self.auto_recall.time_decay_half_life_days,
+            );
+        }
+        if let Ok(val) = env::var("CLX_AUTO_RECALL_PERCENTILE_GATE") {
+            apply_f64_override(
+                &val,
+                "CLX_AUTO_RECALL_PERCENTILE_GATE",
+                0.0,
+                1.0,
+                &mut self.auto_recall.percentile_gate,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1415,8 +1739,11 @@ impl Config {
                 Ok(crate::llm::LlmClient::Ollama(backend))
             }
             ProviderConfig::AzureOpenai(c) => {
-                let secret =
-                    resolve_azure_credential(name, c).map_err(LlmConfigError::ProviderInit)?;
+                let kind = self
+                    .credential_backend_kind()
+                    .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                let secret = resolve_azure_credential(name, c, kind)
+                    .map_err(LlmConfigError::ProviderInit)?;
                 let backend = crate::llm::AzureOpenAIBackend::new(c, secret)
                     .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
                 Ok(crate::llm::LlmClient::Azure(backend))
@@ -1446,18 +1773,20 @@ pub enum LlmConfigError {
 
 /// Resolve an Azure provider's API key.
 ///
-/// Resolution order:
-/// 1. Env var named in `cfg.api_key_env` (if set and non-empty).
-/// 2. `CredentialStore` entry keyed `"<provider_name>-api-key"`.
-///    (Hyphen — not colon — because `CredentialStore` rejects colons in user
-///    keys. Earlier 0.6.0 used a colon, which made the entry impossible to
-///    write via `clx credentials set`. See RUSTSEC-style note: contract
-///    mismatch fixed in 0.6.1.)
-/// 3. File at `cfg.api_key_file` (Unix: must be mode 0600).
-/// 4. Error.
+/// Resolution order (the critical correctness requirement):
+/// 1. Env var named in `cfg.api_key_env` (if set and non-empty) -> 0 prompts.
+/// 2. The selected `CredentialBackend` entry keyed `"<provider_name>-api-key"`.
+///    With the DEFAULT backend (`file`) this is the local age-encrypted file
+///    and NEVER touches the keychain / prompts. The keychain is consulted
+///    here ONLY if the user explicitly set `credentials.backend: keychain`.
+///    (Hyphen, not colon: `CredentialStore` rejects colons in user keys.)
+/// 3. File at `cfg.api_key_file` (Unix: must be mode 0600) -> 0 prompts.
+/// 4. Error (with an actionable, one-time message). NEVER a keychain
+///    fallback under the default backend -- that was the entire bug.
 fn resolve_azure_credential(
     provider_name: &str,
     cfg: &AzureOpenAIConfig,
+    backend_kind: crate::credentials::CredentialBackendKind,
 ) -> Result<secrecy::SecretString, String> {
     use secrecy::SecretString;
 
@@ -1469,18 +1798,21 @@ fn resolve_azure_credential(
         return Ok(SecretString::new(v.into()));
     }
 
-    // 2. CredentialStore (system keychain)
-    let store = crate::credentials::CredentialStore::new();
+    // 2. selected backend (file by default; keychain ONLY if opted in)
+    let store = crate::credentials::CredentialStore::from_config(backend_kind);
     let key = format!("{provider_name}-api-key");
     match store.get(&key) {
         Ok(Some(v)) => return Ok(SecretString::new(v.into())),
-        Ok(None) => {} // fall through
+        Ok(None) => {} // fall through to api_key_file (NOT to the keychain)
         Err(e) => {
-            // headless Linux without D-Bus, etc. — log and fall through.
+            // File backend IO error / headless keychain unavailable. Log and
+            // fall through to api_key_file. We never silently retry a
+            // different store (reintroducing prompts).
             tracing::warn!(
                 provider = %provider_name,
+                backend = %backend_kind_label(backend_kind),
                 error = %e,
-                "keychain unavailable, falling back to file credential"
+                "credential backend unavailable, falling back to api_key_file"
             );
         }
     }
@@ -1492,9 +1824,19 @@ fn resolve_azure_credential(
 
     Err(format!(
         "no credentials available for provider '{provider_name}' \
-         (checked env var, keychain key '{key}', and api_key_file). \
-         Run: clx credentials set {provider_name}-api-key '<your-key>'"
+         (checked env var, {} backend key '{key}', and api_key_file). \
+         Run: clx credentials set {provider_name}-api-key '<your-key>' \
+         (or `clx credentials migrate` if the secret is only in the old \
+         macOS keychain).",
+        backend_kind_label(backend_kind)
     ))
+}
+
+fn backend_kind_label(kind: crate::credentials::CredentialBackendKind) -> &'static str {
+    match kind {
+        crate::credentials::CredentialBackendKind::File => "file",
+        crate::credentials::CredentialBackendKind::Keychain => "keychain",
+    }
 }
 
 #[cfg(unix)]
@@ -2561,6 +2903,12 @@ auto_recall:
   fallback_to_fts: false
   include_key_facts: false
   min_prompt_len: 20
+  rrf_enabled: false
+  rrf_k: 42
+  time_decay_half_life_days: 14.5
+  percentile_gate: 0.6
+  reranker_enabled: false
+  reranker_timeout_ms: 125
 ";
 
         let config: Config = serde_yml::from_str(yaml).unwrap();
@@ -2572,6 +2920,12 @@ auto_recall:
         assert!(!config.auto_recall.fallback_to_fts);
         assert!(!config.auto_recall.include_key_facts);
         assert_eq!(config.auto_recall.min_prompt_len, 20);
+        assert!(!config.auto_recall.rrf_enabled);
+        assert_eq!(config.auto_recall.rrf_k, 42);
+        assert!((config.auto_recall.time_decay_half_life_days - 14.5).abs() < f64::EPSILON);
+        assert!((config.auto_recall.percentile_gate - 0.6).abs() < f64::EPSILON);
+        assert!(!config.auto_recall.reranker_enabled);
+        assert_eq!(config.auto_recall.reranker_timeout_ms, 125);
     }
 
     #[test]
@@ -2586,6 +2940,12 @@ auto_recall:
         assert!(config.auto_recall.fallback_to_fts);
         assert!(config.auto_recall.include_key_facts);
         assert_eq!(config.auto_recall.min_prompt_len, 10);
+        assert!(config.auto_recall.rrf_enabled);
+        assert_eq!(config.auto_recall.rrf_k, 60);
+        assert!((config.auto_recall.time_decay_half_life_days - 30.0).abs() < f64::EPSILON);
+        assert!((config.auto_recall.percentile_gate - 0.70).abs() < f64::EPSILON);
+        assert!(config.auto_recall.reranker_enabled);
+        assert_eq!(config.auto_recall.reranker_timeout_ms, 250);
     }
 
     #[test]
@@ -2601,6 +2961,10 @@ auto_recall:
         assert_eq!(config.auto_recall.max_results, 3);
         assert!(config.auto_recall.fallback_to_fts);
         assert!(config.auto_recall.include_key_facts);
+        assert!(config.auto_recall.rrf_enabled);
+        assert_eq!(config.auto_recall.rrf_k, 60);
+        assert!((config.auto_recall.percentile_gate - 0.70).abs() < f64::EPSILON);
+        assert!(config.auto_recall.reranker_enabled);
     }
 
     #[test]
@@ -2705,7 +3069,7 @@ validator:
 
         // Assert: file-only values preserved without env var influence.
         assert!(!config.validator.enabled);
-        // Other fields are defaults — the point is env vars play no role here.
+        // Other fields are defaults. The point is env vars play no role here.
         assert_eq!(OllamaConfig::default().host, "http://127.0.0.1:11434");
     }
 
@@ -2982,7 +3346,7 @@ ollama:
     /// uses `<provider>-api-key` (hyphen).
     ///
     /// Discriminates by error variant so headless CI (Linux without D-Bus,
-    /// sandboxed macOS keychain) still passes — those return
+    /// sandboxed macOS keychain) still passes. Those return
     /// `ServiceUnavailable`/`Keychain`, orthogonal to the validator contract.
     #[test]
     fn azure_keychain_key_passes_credential_store_validator() {
@@ -2995,8 +3359,14 @@ ollama:
             eprintln!("skipping: keychain access hangs on GitHub Actions macOS runners");
             return;
         }
-        use crate::credentials::{CredentialError, CredentialStore};
-        let store = CredentialStore::with_service("clx-test-keyfmt");
+        use std::sync::Arc;
+
+        use crate::credentials::{AgeFileBackend, CredentialError, CredentialStore};
+        // Use the default (file) backend on a tempdir: deterministic and
+        // headless-safe, never touches the keychain.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            CredentialStore::with_backend(Arc::new(AgeFileBackend::with_dir(tmp.path()).unwrap()));
         let provider = "azure-regression-test-keyfmt";
 
         // 1. Hyphen-format key MUST NOT be rejected by the validator.
@@ -3011,7 +3381,7 @@ ollama:
                 panic!("hyphen key '{key}' rejected by validator (regression): {msg}");
             }
             Err(CredentialError::ServiceUnavailable(_) | CredentialError::Keychain(_)) => {
-                // Headless CI — keychain not present. Validator contract is
+                // Headless CI, keychain not present. Validator contract is
                 // what we're testing; storage is incidental.
             }
             Err(other) => panic!("unexpected error storing hyphen key: {other:?}"),

@@ -31,7 +31,10 @@ use std::io;
 use std::process;
 use tracing_subscriber::EnvFilter;
 
-use commands::{ConfigAction, CredentialsAction, EmbeddingsAction, RulesAction, TrustAction};
+use commands::{
+    ConfigAction, ConfigTrustAction, CredentialsAction, EmbeddingsAction, MaintenanceAction,
+    ModelAction, RulesAction, TrustAction,
+};
 
 /// CLX - Claude Code Extension
 #[derive(Parser)]
@@ -92,6 +95,12 @@ enum Commands {
         action: CredentialsAction,
     },
 
+    /// Relax the macOS Keychain ACL on CLX credential items so the keychain
+    /// stops re-prompting on every launch. Repairs items created by older
+    /// CLX versions; new items are handled automatically at store time.
+    /// macOS-only (a clean no-op on other operating systems).
+    KeychainTrust,
+
     /// Generate embeddings for existing snapshots (backfill)
     EmbedBackfill {
         /// Only show what would be done, don't generate embeddings
@@ -118,6 +127,15 @@ enum Commands {
         action: TrustAction,
     },
 
+    /// Manage trusted per-project config files (`~/.clx/trusted_configs.json`).
+    /// Trusted configs are allowed to set non-inert keys (providers.*,
+    /// logging.file, validator.enabled). Trust is per-machine, per-user,
+    /// per-file-hash; any edit invalidates it.
+    ConfigTrust {
+        #[command(subcommand)]
+        action: ConfigTrustAction,
+    },
+
     /// Check CLX system health
     Health {
         /// Output as JSON
@@ -133,6 +151,18 @@ enum Commands {
         /// Refresh interval in seconds
         #[arg(long, default_value = "2")]
         refresh: u64,
+    },
+
+    /// Maintenance tasks (retention trim, etc.)
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+    },
+
+    /// Manage CLX models (rerankers, embeddings)
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
     },
 }
 
@@ -177,6 +207,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
         Some(Commands::Uninstall { purge }) => commands::cmd_uninstall(cli, *purge).await,
         Some(Commands::Version) => commands::cmd_version(cli),
         Some(Commands::Credentials { action }) => commands::cmd_credentials(cli, action),
+        Some(Commands::KeychainTrust) => commands::cmd_keychain_trust(cli),
         Some(Commands::EmbedBackfill { dry_run }) => {
             commands::cmd_embed_backfill(cli, *dry_run).await
         }
@@ -186,9 +217,12 @@ async fn run_command(cli: &Cli) -> Result<()> {
         }
         Some(Commands::Embeddings { action }) => commands::cmd_embeddings(cli, action).await,
         Some(Commands::Trust { action }) => commands::cmd_trust(cli, action.clone()).await,
+        Some(Commands::ConfigTrust { action }) => commands::cmd_config_trust(cli, action.clone()),
         Some(Commands::Health { json }) => commands::health::cmd_health(*json || cli.json).await,
         Some(Commands::Dashboard { days, refresh }) => dashboard::run_dashboard(*days, *refresh)
             .map_err(|e| anyhow::anyhow!("Dashboard error: {e}")),
+        Some(Commands::Maintenance { action }) => commands::cmd_maintenance(cli, action).await,
+        Some(Commands::Model { action }) => commands::cmd_model(cli, action).await,
         None => commands::cmd_default(cli),
     }
 }
