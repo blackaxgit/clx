@@ -1,13 +1,62 @@
 //! Recall command: search context database for past interactions.
+//!
+//! ## Seam (0.8.1, campaign v2 Stream 1)
+//!
+//! The embedding step is driven through the existing [`QueryEmbedder`] port
+//! so an offline test can substitute the I/O boundary (a wiremock-backed
+//! `LlmQueryEmbedder` via config-in-sandbox) without a `#[cfg(test)]`
+//! constructor hack. The similarity step calls `EmbeddingStore::find_similar`
+//! directly and `storage` is opened lazily only at the snapshot-hydration
+//! sites — *exactly* as the pre-refactor raw path did (it is NOT the
+//! `RecallEngine` RRF/decay/percentile pipeline that `clx-mcp` uses).
+//!
+//! [`recall_via_ports`] performs the same two operations the old raw path
+//! did — `QueryEmbedder::embed_query` (was `ollama.embed`) then
+//! `EmbeddingStore::find_similar` — so the observable CLI output (stdout for
+//! `--json` and human, exit codes, and *when* `Storage::open_default` is
+//! reached) is byte-identical to the pre-refactor behaviour. This is a seam
+//! refactor for testability, not a behaviour change.
 
 use anyhow::{Context, Result};
 use colored::Colorize;
 
 use clx_core::config::{Capability, Config};
+use clx_core::embeddings::EmbeddingStore;
+use clx_core::recall::{LlmQueryEmbedder, QueryEmbedder};
 use clx_core::storage::Storage;
 
 use crate::Cli;
 use crate::types::{RecallOutput, RecallResult, truncate_str};
+
+/// Number of nearest snapshots the recall search returns. Preserved
+/// verbatim from the pre-refactor `emb_store.find_similar(&emb, 5)`.
+const RECALL_LIMIT: usize = 5;
+
+/// Embedding + similarity core, with the embed step behind the
+/// [`QueryEmbedder`] port so an offline fake (or a wiremock-backed
+/// `LlmQueryEmbedder`) can substitute the I/O boundary without a
+/// `#[cfg(test)]` constructor hack.
+///
+/// Returns the `(snapshot_id, distance)` pairs ordered by ascending
+/// distance, identical in shape and content to the pre-refactor
+/// `ollama.embed(...)` then `emb_store.find_similar(...)` chain. An `Err`
+/// here corresponds to the pre-refactor `ollama.embed(...)` error arm
+/// (reached *before* any `Storage::open_default`, matching the old code).
+async fn recall_via_ports(
+    embedder: &dyn QueryEmbedder,
+    emb_store: &EmbeddingStore,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(i64, f32)>> {
+    let query_embedding = embedder
+        .embed_query(query)
+        .await
+        .context("embedding generation failed")?;
+    let similar = emb_store
+        .find_similar(&query_embedding, limit)
+        .context("similarity search failed")?;
+    Ok(similar)
+}
 
 /// Search context database
 pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
@@ -56,7 +105,20 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         return Ok(());
     };
 
-    // Generate embedding for the query
+    // Build the embedding port (Hexagonal boundary): production wires the
+    // `LlmQueryEmbedder` adapter over `Config::create_llm_client`; an offline
+    // test substitutes a wiremock-backed embedder via config-in-sandbox.
+    // `storage` is intentionally NOT opened here — the pre-refactor code
+    // opened it lazily only at the hydration sites, so opening it earlier
+    // would change which error surfaces when embed also fails.
+    let embed_model_opt = if embed_model.is_empty() {
+        None
+    } else {
+        Some(embed_model.as_str())
+    };
+    let embedder = LlmQueryEmbedder::new(&ollama, embed_model_opt);
+
+    // Spinner for the human path (suppressed for --json).
     let spinner = if cli.json {
         None
     } else {
@@ -66,8 +128,10 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         Some(sp)
     };
 
-    let query_embedding = match ollama.embed(query, Some(&embed_model)).await {
-        Ok(emb) => emb,
+    // Port-driven embed + similarity. An Err here is the embed-error arm,
+    // observably identical to the pre-refactor `ollama.embed` failure.
+    let similar = match recall_via_ports(&embedder, &emb_store, query, RECALL_LIMIT).await {
+        Ok(similar) => similar,
         Err(e) => {
             if let Some(sp) = &spinner {
                 sp.finish_and_clear();
@@ -92,14 +156,13 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
         }
     };
 
-    // Search for similar snapshots
-    let similar = emb_store.find_similar(&query_embedding, 5)?;
-
     if let Some(sp) = spinner {
         sp.finish_and_clear();
     }
 
     if cli.json {
+        // Open storage lazily here (pre-refactor parity: the old JSON path
+        // opened it only at this point, after a successful embed+search).
         let storage = Storage::open_default()?;
         let mut results = Vec::new();
         for (snapshot_id, distance) in &similar {
@@ -141,6 +204,9 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
                 println!("({embedding_count} embeddings in database, but none matched your query)");
             }
         } else {
+            // Open storage lazily here (pre-refactor parity: the old human
+            // path opened it only inside the non-empty branch, never on the
+            // "no matching context" path).
             let storage = Storage::open_default()?;
             for (i, (snapshot_id, distance)) in similar.iter().enumerate() {
                 // Lower distance = more similar

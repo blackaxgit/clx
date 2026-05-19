@@ -768,4 +768,257 @@ mod render_snapshots {
         let rendered = render_settings_to_string(&mut app);
         insta::assert_snapshot!("dashboard_ui_settings_exit_guard", rendered);
     }
+
+    // ── H2: previously-unrendered branches ──────────────────────────────────
+
+    use clx_core::config::{AzureOpenAIConfig, McpCommandTool, OllamaConfig, ProviderConfig};
+
+    /// `truncate_value` unit contract: the three branches (fits, max<=3
+    /// dot-fill, normal ellipsis) are pure and asserted directly so a
+    /// mutation to the off-by-one (`max_width - 3`) or the `<=` guard fails
+    /// here, not just visually.
+    #[test]
+    fn truncate_value_branches() {
+        // fits unchanged
+        assert_eq!(super::truncate_value("short", 10), "short");
+        assert_eq!(super::truncate_value("exactly10!", 10), "exactly10!");
+        // max_width <= 3 → dot fill of exactly max_width dots
+        assert_eq!(super::truncate_value("anything", 3), "...");
+        assert_eq!(super::truncate_value("anything", 1), ".");
+        assert_eq!(super::truncate_value("anything", 0), "");
+        // normal truncation: head of len max_width-3 then "..."
+        assert_eq!(super::truncate_value("abcdefghij", 8), "abcde...");
+    }
+
+    /// LLM section with two configured providers (ollama + azure) and a
+    /// populated `llm:` routing block. Exercises `append_provider_rows`
+    /// non-empty path, the azure credential row, and both routing arms.
+    #[test]
+    fn snapshot_settings_llm_populated_providers_and_routing() {
+        let mut app = make_settings_app();
+        let mut cfg = make_default_config();
+        cfg.providers.insert(
+            "local-ollama".to_string(),
+            ProviderConfig::Ollama(OllamaConfig {
+                host: "http://127.0.0.1:11434".to_string(),
+                ..OllamaConfig::default()
+            }),
+        );
+        cfg.providers.insert(
+            "azure-prod".to_string(),
+            ProviderConfig::AzureOpenai(AzureOpenAIConfig {
+                endpoint: "https://example.openai.azure.com".to_string(),
+                api_key_env: Some("CLX_TEST_AZURE_KEY_UNSET".to_string()),
+                api_key_file: None,
+                api_version: None,
+                timeout_ms: 30_000,
+                retry: clx_core::llm::RetryConfig::default(),
+            }),
+        );
+        cfg.llm = Some(clx_core::config::LlmRouting {
+            chat: clx_core::config::CapabilityRoute {
+                provider: "local-ollama".to_string(),
+                model: "qwen3:1.7b".to_string(),
+                fallback: None,
+            },
+            embeddings: clx_core::config::CapabilityRoute {
+                provider: "local-ollama".to_string(),
+                model: "qwen3-embedding:0.6b".to_string(),
+                fallback: None,
+            },
+        });
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 2;
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_llm_populated", rendered);
+    }
+
+    /// `azure_credential_source` pure contract. The crate denies
+    /// `unsafe-code`, so we cannot mutate the environment; instead we use
+    /// `PATH` (guaranteed present & non-empty in any test process) for the
+    /// "Env" arm and a name guaranteed absent for the "Keychain/file" arm.
+    #[test]
+    fn azure_credential_source_arms() {
+        let base = AzureOpenAIConfig {
+            endpoint: "https://x".to_string(),
+            api_key_env: None,
+            api_key_file: None,
+            api_version: None,
+            timeout_ms: 1,
+            retry: clx_core::llm::RetryConfig::default(),
+        };
+
+        // env var present & non-empty → "Env (PATH)"
+        assert!(std::env::var("PATH").is_ok_and(|v| !v.is_empty()));
+        let with_env = AzureOpenAIConfig {
+            api_key_env: Some("PATH".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(super::azure_credential_source(&with_env), "Env (PATH)");
+
+        // env var name configured but absent → "Keychain/file"
+        let with_absent_env = AzureOpenAIConfig {
+            api_key_env: Some("CLX_DEFINITELY_UNSET_ENV_VAR_FOR_TESTS".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            super::azure_credential_source(&with_absent_env),
+            "Keychain/file"
+        );
+
+        // empty env var name → falls to the no-env branch; file set → "File"
+        let with_file = AzureOpenAIConfig {
+            api_key_env: Some(String::new()),
+            api_key_file: Some(std::path::PathBuf::from("/tmp/k")),
+            ..base.clone()
+        };
+        assert_eq!(super::azure_credential_source(&with_file), "File");
+
+        // nothing configured → "Not configured"
+        assert_eq!(super::azure_credential_source(&base), "Not configured");
+    }
+
+    /// MCP Tools section (index 7) with a populated `command_tools` registry
+    /// → the read-only separator + pattern/`command_field` rows render.
+    #[test]
+    fn snapshot_settings_mcp_command_tools_populated() {
+        let mut app = make_settings_app();
+        let mut cfg = make_default_config();
+        cfg.mcp_tools.command_tools = vec![
+            McpCommandTool {
+                tool_pattern: "mcp__ssh__execute".to_string(),
+                command_field: "command".to_string(),
+            },
+            McpCommandTool {
+                tool_pattern: "mcp__docker__run".to_string(),
+                command_field: "cmd".to_string(),
+            },
+        ];
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 7;
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_mcp_tools_populated", rendered);
+    }
+
+    /// A field whose value differs from its default → the value cell uses
+    /// the Yellow "modified" style. Snapshot proves the modified row renders
+    /// (color is not captured by the symbol buffer, so we also assert the
+    /// changed value text is present and the default column still shows the
+    /// original).
+    #[test]
+    fn snapshot_settings_modified_value_yellow() {
+        let mut app = make_settings_app();
+        let mut cfg = make_default_config();
+        // validator.layer1_timeout_ms default is 30000 — change it.
+        cfg.validator.layer1_timeout_ms = 12345;
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 0;
+        let rendered = render_settings_to_string(&mut app);
+        assert!(
+            rendered.contains("12345"),
+            "modified value must be rendered"
+        );
+        insta::assert_snapshot!("dashboard_ui_settings_modified_value", rendered);
+    }
+
+    /// Edit-popup `range_info` for a `NumberU64` field (validator
+    /// `layer1_timeout_ms`, section 0 field 2) → "Range: 100 - 300000".
+    #[test]
+    fn snapshot_settings_edit_popup_number_u64_range() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 0;
+        app.settings_field_idx = 2; // layer1_timeout_ms : NumberU64
+        app.input_mode = InputMode::SettingsEdit;
+        app.settings_edit_buffer = "5000".to_string();
+        let rendered = render_settings_to_string(&mut app);
+        assert!(rendered.contains("Range: 100 - 300000"));
+        insta::assert_snapshot!("dashboard_ui_settings_edit_u64_range", rendered);
+    }
+
+    /// Edit-popup `range_info` for a `TextInput` field
+    /// (`context.embedding_model`, section 1 field 2) → "Non-empty string",
+    /// plus a validation error so
+    /// the red error line in the popup renders.
+    #[test]
+    fn snapshot_settings_edit_popup_text_input_with_error() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 1;
+        app.settings_field_idx = 2; // embedding_model : TextInput
+        app.input_mode = InputMode::SettingsEdit;
+        app.settings_edit_buffer = String::new();
+        app.settings_edit_error = Some("must not be empty".to_string());
+        let rendered = render_settings_to_string(&mut app);
+        assert!(rendered.contains("Non-empty string"));
+        assert!(rendered.contains("must not be empty"));
+        insta::assert_snapshot!("dashboard_ui_settings_edit_text_error", rendered);
+    }
+
+    /// Edit-popup `range_info` for a `NumberF32` field
+    /// (`ollama.retry_backoff`, section 2 field with `NumberF32`) →
+    /// "Range: <min> - <max>".
+    #[test]
+    fn snapshot_settings_edit_popup_number_f32_range() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        // section 2 (LLM/Ollama) has a NumberF32 field (retry_backoff).
+        app.settings_section_idx = 2;
+        // find the F32 field index dynamically to stay robust to reorder.
+        let fields = super::fields_for_section(2);
+        let idx = fields
+            .iter()
+            .position(|f| matches!(f.widget, super::FieldWidget::NumberF32 { .. }))
+            .expect("ollama section has a NumberF32 field");
+        app.settings_field_idx = idx;
+        app.input_mode = InputMode::SettingsEdit;
+        app.settings_edit_buffer = "2.0".to_string();
+        let rendered = render_settings_to_string(&mut app);
+        assert!(rendered.contains("Range: "));
+        insta::assert_snapshot!("dashboard_ui_settings_edit_f32_range", rendered);
+    }
+
+    /// Edit-popup for a field index that is out of range → `render_edit_popup`
+    /// returns early (no popup). The base field table still renders. This
+    /// covers the `fields.get(idx)` None early-return guard.
+    #[test]
+    fn snapshot_settings_edit_popup_field_out_of_range_noop() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 0;
+        app.settings_field_idx = 999; // out of range → early return
+        app.input_mode = InputMode::SettingsEdit;
+        let rendered = render_settings_to_string(&mut app);
+        // No " Edit: " popup title is drawn.
+        assert!(
+            !rendered.contains("Edit:"),
+            "out-of-range field must not draw an edit popup"
+        );
+        insta::assert_snapshot!("dashboard_ui_settings_edit_oob_noop", rendered);
+    }
+
+    /// Section with a config loaded but the section index out of range →
+    /// `fields_for_section` returns empty and the "No fields" row renders.
+    #[test]
+    fn snapshot_settings_section_out_of_range_no_fields() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 99; // beyond SECTIONS → empty fields
+        let rendered = render_settings_to_string(&mut app);
+        assert!(rendered.contains("No fields"));
+        insta::assert_snapshot!("dashboard_ui_settings_no_fields", rendered);
+    }
 }

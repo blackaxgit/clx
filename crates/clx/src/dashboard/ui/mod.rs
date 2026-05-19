@@ -618,6 +618,127 @@ mod tests {
             assert!(s5.filter_text.is_empty());
         }
 
+        // ---- H2: status bar + tab bar permutation snapshots -------------
+        //
+        // `render_status_bar` / `render_tab_bar` have many uncovered key-hint
+        // and style branches. These drive each one through the full `render`
+        // entry point and snapshot the redacted 80x24 buffer.
+
+        use crate::dashboard::app::ExitTarget;
+
+        /// `SettingsEdit` input mode → "Type to edit | [Enter] Confirm ..."
+        /// key hints, and the field-table placeholder still shows.
+        #[test]
+        fn pixel_status_bar_settings_edit_hints() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            app.input_mode = InputMode::SettingsEdit;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_settings_edit_hints", rendered);
+        }
+
+        /// `SettingsNav` + dirty + exit pending → "[s] Save  [x] Discard
+        /// [Esc] Stay" hints and the yellow dirty status style.
+        #[test]
+        fn pixel_status_bar_exit_pending_hints() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            app.input_mode = InputMode::SettingsNav;
+            app.settings_is_dirty = true;
+            app.settings_exit_pending = Some(ExitTarget::Quit);
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_exit_pending_hints", rendered);
+        }
+
+        /// `SettingsNav` + reload-confirm → "Reload from disk? [y] Yes ..."
+        #[test]
+        fn pixel_status_bar_reload_confirm_hints() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            app.input_mode = InputMode::SettingsNav;
+            app.settings_reload_confirm = true;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_reload_confirm_hints", rendered);
+        }
+
+        /// `SettingsNav` + confirm-reset → "Reset all changes? [y] Yes ..."
+        #[test]
+        fn pixel_status_bar_confirm_reset_hints() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            app.input_mode = InputMode::SettingsNav;
+            app.settings_confirm_reset = true;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_confirm_reset_hints", rendered);
+        }
+
+        /// `SettingsNav` + dirty (no pending dialog) → the "[s]Save [R]Reset"
+        /// save-hint suffix appears in the key-hint span.
+        #[test]
+        fn pixel_status_bar_settings_nav_dirty_save_hint() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            app.input_mode = InputMode::SettingsNav;
+            app.settings_is_dirty = true;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_settings_nav_dirty", rendered);
+        }
+
+        /// Load error → red status-bar style and " | ERROR: ..." segment.
+        #[test]
+        fn pixel_status_bar_load_error_red() {
+            let mut app = make_app();
+            app.data.load_error = Some("db locked".to_string());
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_load_error_red", rendered);
+        }
+
+        /// Settings edit error → red style + " | <error>" and the
+        /// `settings_save_result` " | <msg>" segment both render.
+        #[test]
+        fn pixel_status_bar_settings_edit_error_and_save_result() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::Settings;
+            app.settings_edit_error = Some("value out of range".to_string());
+            app.settings_save_result = Some("Saved to disk".to_string());
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_edit_error_save_result", rendered);
+        }
+
+        /// Filter active in Normal mode on a non-Settings tab → the active
+        /// tab title shows the `[filter: ...]` suffix (tab-bar branch) and
+        /// the status bar shows " | Filter: <text>".
+        #[test]
+        fn pixel_tab_bar_filter_suffix_and_status_filter() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::AuditLog;
+            app.filter_text = "rm".to_string();
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_tabbar_filter_suffix", rendered);
+        }
+
+        /// Filter input mode → status bar shows the trailing-cursor
+        /// " | Filter: <text>_" form.
+        #[test]
+        fn pixel_status_bar_filter_input_mode_cursor() {
+            let mut app = make_app();
+            app.input_mode = InputMode::Filter;
+            app.filter_text = "git".to_string();
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_status_filter_input_cursor", rendered);
+        }
+
+        /// Settings tab dirty → the tab title gets a trailing " *" marker
+        /// (the `settings_is_dirty` branch of `render_tab_bar`).
+        #[test]
+        fn pixel_tab_bar_settings_dirty_star_marker() {
+            let mut app = make_app();
+            app.current_tab = DashboardTab::AuditLog; // not on Settings tab
+            app.settings_is_dirty = true;
+            let rendered = redact_volatile(&render_to_string(&mut app));
+            insta::assert_snapshot!("h2_tabbar_settings_dirty_star", rendered);
+        }
+
         #[test]
         fn reducer_sort_column_cycle_and_direction_toggle() {
             let mut s = AppState::new();

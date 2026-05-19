@@ -597,4 +597,296 @@ mod tests {
         assert_eq!(stats.medium, 3);
         assert_eq!(stats.high, 2);
     }
+
+    // ---- SessionDetailData::fetch_from_storage ----
+
+    use clx_core::types::{
+        AuditDecision, AuditLogEntry, Event, EventType, Snapshot, SnapshotTrigger,
+    };
+
+    fn audit(session: &str, decision: AuditDecision, risk: Option<i32>) -> AuditLogEntry {
+        let mut e = AuditLogEntry::new(
+            SessionId::new(session),
+            "echo hi".to_owned(),
+            "builtin".to_owned(),
+            decision,
+        );
+        e.risk_score = risk;
+        e
+    }
+
+    #[test]
+    fn test_session_detail_missing_session_returns_none() {
+        let storage = make_storage();
+        // No session created => get_session returns None => fetch returns None.
+        let out = SessionDetailData::fetch_from_storage(&storage, "ghost-session");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_session_detail_aggregates_command_and_risk_stats() {
+        let storage = make_storage();
+        let sid = "detail-agg-01";
+        storage
+            .create_session(&make_session(sid, 100, 50, Utc::now()))
+            .expect("create session");
+        // 2 allowed, 1 blocked, 1 prompted; risk: low(2), medium(5), high(9), none.
+        storage
+            .create_audit_log(&audit(sid, AuditDecision::Allowed, Some(2)))
+            .unwrap();
+        storage
+            .create_audit_log(&audit(sid, AuditDecision::Allowed, Some(5)))
+            .unwrap();
+        storage
+            .create_audit_log(&audit(sid, AuditDecision::Blocked, Some(9)))
+            .unwrap();
+        storage
+            .create_audit_log(&audit(sid, AuditDecision::Prompted, None))
+            .unwrap();
+        storage
+            .append_event(&Event::new(SessionId::new(sid), EventType::Message))
+            .unwrap();
+        storage
+            .create_snapshot(&Snapshot::new(SessionId::new(sid), SnapshotTrigger::Manual))
+            .unwrap();
+
+        let d = SessionDetailData::fetch_from_storage(&storage, sid)
+            .expect("detail data must load for an existing session");
+
+        // Command stats: 4 total, 2 allowed, 1 blocked, 1 prompted.
+        assert_eq!(d.command_stats.total, 4);
+        assert_eq!(d.command_stats.allowed, 2);
+        assert_eq!(d.command_stats.blocked, 1);
+        assert_eq!(d.command_stats.prompted, 1);
+        // Risk buckets: <=3 low, 4..=7 medium, >=8 high; None counts nowhere.
+        assert_eq!(d.risk_stats.low, 1);
+        assert_eq!(d.risk_stats.medium, 1);
+        assert_eq!(d.risk_stats.high, 1);
+        assert_eq!(d.audit_entries.len(), 4);
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.snapshots.len(), 1);
+        assert_eq!(d.session.id.as_str(), sid);
+    }
+
+    #[test]
+    fn test_session_detail_risk_boundaries_are_inclusive() {
+        // Pin the exact boundary semantics: 3 is low, 4 and 7 are medium,
+        // 8 is high. A regression to `< 3` / `> 7` would shift these.
+        let storage = make_storage();
+        let sid = "risk-bounds";
+        storage
+            .create_session(&make_session(sid, 0, 0, Utc::now()))
+            .unwrap();
+        for r in [3, 4, 7, 8] {
+            storage
+                .create_audit_log(&audit(sid, AuditDecision::Allowed, Some(r)))
+                .unwrap();
+        }
+        let d = SessionDetailData::fetch_from_storage(&storage, sid).unwrap();
+        assert_eq!(d.risk_stats.low, 1, "risk 3 must be low");
+        assert_eq!(d.risk_stats.medium, 2, "risk 4 and 7 must be medium");
+        assert_eq!(d.risk_stats.high, 1, "risk 8 must be high");
+    }
+
+    #[test]
+    fn test_session_detail_empty_subtables_default_to_zero() {
+        let storage = make_storage();
+        let sid = "detail-empty";
+        storage
+            .create_session(&make_session(sid, 0, 0, Utc::now()))
+            .unwrap();
+        let d = SessionDetailData::fetch_from_storage(&storage, sid).unwrap();
+        assert_eq!(d.command_stats.total, 0);
+        assert_eq!(d.command_stats.allowed, 0);
+        assert_eq!(d.risk_stats.low, 0);
+        assert!(d.audit_entries.is_empty());
+        assert!(d.events.is_empty());
+        assert!(d.snapshots.is_empty());
+    }
+
+    // ---- DashboardData::fetch_from_storage: row-shaping branches ----
+
+    #[test]
+    fn test_fetch_active_session_has_dash_duration_and_negative_secs() {
+        // An active (no ended_at) session: duration "-" and duration_secs -1.
+        let storage = make_storage();
+        let mut s = make_session("active-row-01", 10, 5, Utc::now());
+        s.ended_at = None;
+        s.status = SessionStatus::Active;
+        storage.create_session(&s).unwrap();
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        let row = data
+            .sessions
+            .iter()
+            .find(|r| r.session_id == "active-row-01")
+            .expect("session row present");
+        assert_eq!(row.duration, "-");
+        assert_eq!(row.duration_secs, -1);
+        assert_eq!(row.status, "active");
+    }
+
+    #[test]
+    fn test_fetch_long_session_duration_formats_hours_and_minutes() {
+        // ended 90 minutes after start => "1h 30m"; duration_secs = 5400.
+        let storage = make_storage();
+        let start = Utc::now() - ChronoDuration::hours(3);
+        let mut s = make_session("long-row-01", 0, 0, start);
+        s.ended_at = Some(start + ChronoDuration::minutes(90));
+        storage.create_session(&s).unwrap();
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        let row = data
+            .sessions
+            .iter()
+            .find(|r| r.session_id == "long-row-01")
+            .unwrap();
+        assert_eq!(row.duration, "1h 30m");
+        assert_eq!(row.duration_secs, 5400);
+    }
+
+    #[test]
+    fn test_fetch_token_display_scales_to_k_and_m() {
+        let storage = make_storage();
+        let now = Utc::now();
+        // 1_500 total -> "1.5K"
+        storage
+            .create_session(&make_session("tok-k-row", 1_000, 500, now))
+            .unwrap();
+        // 2_500_000 total -> "2.5M"
+        storage
+            .create_session(&make_session(
+                "tok-m-row",
+                2_000_000,
+                500_000,
+                now - ChronoDuration::minutes(1),
+            ))
+            .unwrap();
+        // 42 total -> "42" (raw)
+        storage
+            .create_session(&make_session(
+                "tok-raw-row",
+                40,
+                2,
+                now - ChronoDuration::minutes(2),
+            ))
+            .unwrap();
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        let by = |id: &str| -> String {
+            data.sessions
+                .iter()
+                .find(|r| r.session_id == id)
+                .unwrap()
+                .tokens
+                .clone()
+        };
+        assert_eq!(by("tok-k-row"), "1.5K");
+        assert_eq!(by("tok-m-row"), "2.5M");
+        assert_eq!(by("tok-raw-row"), "42");
+    }
+
+    #[test]
+    fn test_fetch_populates_audit_rows_with_short_session_id() {
+        let storage = make_storage();
+        let sid = "audit-shaping-session-XYZ";
+        storage
+            .create_session(&make_session(sid, 0, 0, Utc::now()))
+            .unwrap();
+        let mut e = AuditLogEntry::new(
+            SessionId::new(sid),
+            "rm -rf /tmp/scratch".to_owned(),
+            "llm".to_owned(),
+            AuditDecision::Blocked,
+        );
+        e.risk_score = Some(9);
+        storage.create_audit_log(&e).unwrap();
+
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        let ar = data
+            .audit_entries
+            .iter()
+            .find(|a| a.command == "rm -rf /tmp/scratch")
+            .expect("audit row present");
+        assert_eq!(ar.decision, "blocked");
+        assert_eq!(ar.layer, "llm");
+        assert_eq!(ar.risk_score, Some(9));
+        // session_short_id is the last 8 chars of the full session id.
+        assert_eq!(ar.session_short_id, last_n_chars(sid, 8));
+        // command_short is the (here untruncated) display copy.
+        assert_eq!(ar.command_short, "rm -rf /tmp/scratch");
+    }
+
+    #[test]
+    fn test_fetch_populates_learned_rules_global_and_scoped() {
+        use clx_core::types::{LearnedRule, RuleType};
+        let storage = make_storage();
+        let mut global = LearnedRule::new(
+            "git status".to_owned(),
+            RuleType::Allow,
+            "user_decision".to_owned(),
+        );
+        global.confirmation_count = 5;
+        global.denial_count = 1;
+        global.project_path = None;
+        storage.add_rule(&global).unwrap();
+
+        let mut scoped = LearnedRule::new(
+            "cargo test".to_owned(),
+            RuleType::Deny,
+            "user_decision".to_owned(),
+        );
+        scoped.project_path = Some("/work/clx".to_owned());
+        storage.add_rule(&scoped).unwrap();
+
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        let g = data
+            .learned_rules
+            .iter()
+            .find(|r| r.pattern == "git status")
+            .expect("global rule");
+        assert_eq!(g.scope, "[global]");
+        assert_eq!(g.confirmations, 5);
+        assert_eq!(g.denials, 1);
+        assert_eq!(g.rule_type, "allow");
+
+        let sc = data
+            .learned_rules
+            .iter()
+            .find(|r| r.pattern == "cargo test")
+            .expect("scoped rule");
+        assert_eq!(sc.scope, "/work/clx");
+        assert_eq!(sc.rule_type, "deny");
+    }
+
+    #[test]
+    fn test_fetch_counts_audit_decisions_and_risk_distribution() {
+        let storage = make_storage();
+        let sid = "decision-counts";
+        storage
+            .create_session(&make_session(sid, 0, 0, Utc::now()))
+            .unwrap();
+        for (d, r) in [
+            (AuditDecision::Allowed, 1),
+            (AuditDecision::Allowed, 2),
+            (AuditDecision::Blocked, 9),
+            (AuditDecision::Prompted, 5),
+        ] {
+            let mut e = AuditLogEntry::new(
+                SessionId::new(sid),
+                "cmd".to_owned(),
+                "builtin".to_owned(),
+                d,
+            );
+            e.risk_score = Some(r);
+            storage.create_audit_log(&e).unwrap();
+        }
+        let data = DashboardData::fetch_from_storage(&storage, None);
+        assert_eq!(data.allowed_commands, 2);
+        assert_eq!(data.denied_commands, 1);
+        assert_eq!(data.prompted_commands, 1);
+        assert_eq!(data.total_commands, 4);
+        // Risk distribution mirrors the per-session detail bucketing.
+        assert_eq!(data.risk_low, 2);
+        assert_eq!(data.risk_medium, 1);
+        assert_eq!(data.risk_high, 1);
+        assert!(data.load_error.is_none());
+    }
 }

@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/settings/render.rs
+expression: rendered
+---
+┌ Sections ──────────┐┌ Fields - <CONFIG_PATH>                                                      
+│  Validator         ││Field                    Value                      Default                 │
+│  Context           ││                                                                            │
+│  LLM               ││No fields                                                                   │
+│  User Learning     ││                                                                            │
+│  Logging           ││                                                                            │
+│  Ctx Pressure      ││                                                                            │
+│  Sess Recovery     ││                                                                            │
+│  MCP Tools         ││                                                                            │
+│  Auto Recall       ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
