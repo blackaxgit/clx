@@ -34,7 +34,7 @@ pub use traits::PolicyEvaluator;
 pub use cache::{ValidationCache, compute_cache_key};
 pub use file_util::ensure_default_rules_file;
 pub use llm::{DEFAULT_VALIDATOR_PROMPT, load_validator_prompt};
-pub use matching::glob_match;
+pub use matching::{glob_match, is_overbroad_allow_pattern};
 pub use mcp::{McpExtraction, extract_mcp_command};
 pub use prompts::{PROMPT_HIGH, PROMPT_LOW, PROMPT_STANDARD};
 pub use read_only::is_read_only_command;

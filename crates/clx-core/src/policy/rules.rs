@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::storage::Storage;
 use crate::types::RuleType;
@@ -251,6 +251,21 @@ impl PolicyEngine {
         let rules_count = learned_rules.len();
 
         for rule in learned_rules {
+            // B1-4: defense-in-depth at the load boundary. An overbroad
+            // allow pattern (`*`, `Bash(*)`, ...) loaded into the L0
+            // whitelist would make every L0-unknown command hard-Allow and
+            // skip L1 entirely. Skip + WARN such rows; Deny rows are never
+            // restricted (a broad deny only ever fails safe).
+            if matches!(rule.rule_type, RuleType::Allow)
+                && super::matching::is_overbroad_allow_pattern(&rule.pattern)
+            {
+                warn!(
+                    pattern = %rule.pattern,
+                    "Skipping overbroad learned ALLOW rule (would whitelist \
+                     arbitrary commands); ignored at load"
+                );
+                continue;
+            }
             let pattern = convert_learned_pattern(&rule.pattern);
             let policy_rule = match rule.rule_type {
                 RuleType::Allow => PolicyRule::whitelist(pattern),
