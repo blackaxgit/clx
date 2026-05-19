@@ -486,62 +486,37 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             output_decision("deny", Some(reason), Some(RULES_REMINDER), None);
         }
         PolicyDecision::Ask { reason } => {
-            // For read-only commands: auto-allow even if L1 says "ask"
-            // (Read-only commands can't cause damage, so no need to confirm)
-            if is_read_only {
-                debug!(
-                    "L1: Ask for read-only command '{}', auto-allowing: {}",
-                    command, reason
-                );
-                log_audit_entry(
-                    &input.session_id,
-                    command,
-                    &input.cwd,
-                    "L1-READ",
-                    AuditDecision::Allowed,
-                    Some(5),
-                    Some(&format!("Read-only auto-allowed: {reason}")),
-                );
-                output_decision("allow", None, Some(RULES_REMINDER), None);
-                // Cache the read-only auto-allow as an allow decision
-                if config.validator.cache_enabled {
-                    let cache_key = compute_cache_key(command, &input.cwd);
-                    if let Ok(storage) = Storage::open_default() {
-                        let _ = storage.cache_decision(
-                            &cache_key,
-                            "allow",
-                            None,
-                            Some(1),
-                            config.validator.cache_allow_ttl_secs as i64,
-                        );
-                    }
+            // Read-only commands never reach here: `is_read_only`
+            // (= auto_allow_reads && is_read_only_command) causes the L0 Ask
+            // arm to auto-allow and `return Ok(())` before L1 is consulted,
+            // and L0 Allow/Deny return even earlier. So at this point
+            // `is_read_only` is provably always false; the former
+            // `if is_read_only { L1-READ auto-allow }` branch was dead code
+            // (unreachable for any HookInput) and has been removed.
+            debug!("L1: Ask for command '{}': {}", command, reason);
+            log_audit_entry(
+                &input.session_id,
+                command,
+                &input.cwd,
+                "L1",
+                AuditDecision::Prompted,
+                Some(5),
+                Some(&reason),
+            );
+            // Cache ask decision (before output_decision consumes reason)
+            if config.validator.cache_enabled {
+                let cache_key = compute_cache_key(command, &input.cwd);
+                if let Ok(storage) = Storage::open_default() {
+                    let _ = storage.cache_decision(
+                        &cache_key,
+                        "ask",
+                        Some(&reason),
+                        Some(5),
+                        config.validator.cache_ask_ttl_secs as i64,
+                    );
                 }
-            } else {
-                debug!("L1: Ask for command '{}': {}", command, reason);
-                log_audit_entry(
-                    &input.session_id,
-                    command,
-                    &input.cwd,
-                    "L1",
-                    AuditDecision::Prompted,
-                    Some(5),
-                    Some(&reason),
-                );
-                // Cache ask decision (before output_decision consumes reason)
-                if config.validator.cache_enabled {
-                    let cache_key = compute_cache_key(command, &input.cwd);
-                    if let Ok(storage) = Storage::open_default() {
-                        let _ = storage.cache_decision(
-                            &cache_key,
-                            "ask",
-                            Some(&reason),
-                            Some(5),
-                            config.validator.cache_ask_ttl_secs as i64,
-                        );
-                    }
-                }
-                output_decision("ask", Some(reason), Some(RULES_REMINDER), None);
             }
+            output_decision("ask", Some(reason), Some(RULES_REMINDER), None);
         }
     }
 
