@@ -136,8 +136,11 @@ jobs:
 
       - name: Generate CycloneDX SBOM
         run: |
-          cargo cyclonedx --release --target ${{ matrix.target }} \
-            -o "clx-${{ matrix.arch }}-apple-darwin.sbom.xml"
+          # cargo-cyclonedx has no --release/-o flags; it emits a
+          # per-crate <crate>.cdx.xml. Publish the binary crate's SBOM
+          # under the release artifact name.
+          cargo cyclonedx --format xml --target ${{ matrix.target }}
+          cp crates/clx/clx.cdx.xml "clx-${{ matrix.arch }}-apple-darwin.sbom.xml"
           echo "SBOM generated: clx-${{ matrix.arch }}-apple-darwin.sbom.xml"
           ls -lh "clx-${{ matrix.arch }}-apple-darwin.sbom.xml"
 
