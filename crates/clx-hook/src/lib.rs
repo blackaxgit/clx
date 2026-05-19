@@ -13,6 +13,7 @@
 //! point; everything else is internal.
 
 pub(crate) mod audit;
+pub(crate) mod audit_chain;
 pub(crate) mod context;
 pub(crate) mod embedding;
 pub(crate) mod hooks;

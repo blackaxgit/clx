@@ -182,10 +182,16 @@ fn test_hook_post_tool_use_basic() {
 // 4. Trust mode - valid token auto-allows
 // =========================================================================
 
+/// B1-10 regression guard: a legacy plain-text trust-token (non-JSON) no longer
+/// grants trust after the mtime-only fallback was removed. The hook falls through
+/// to normal validation (L0 denies the dangerous command).
+///
+/// Before B1-10 this test asserted `"allow"` (mtime-based auto-allow).
+/// After B1-10 the correct behavior is `"deny"` (L0 blocks `rm -rf`).
 #[test]
-fn test_hook_trust_mode_valid_token_allows() {
-    // When trust_mode is enabled and the token file is fresh (<1 hour),
-    // PreToolUse should auto-allow any command without LLM validation.
+fn test_hook_trust_mode_legacy_plain_text_token_falls_through() {
+    // B1-10: plain-text (non-JSON) trust token no longer grants trust.
+    // The hook must fall through to normal validation.
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
     let home_guard = isolated_clx_home();
@@ -200,15 +206,16 @@ fn test_hook_trust_mode_valid_token_allows() {
     )
     .unwrap();
 
-    // Create a fresh trust token file (mtime = now => valid)
+    // Write a fresh plain-text (non-JSON) token — was honored by the mtime
+    // fallback; must now be ignored (B1-10).
     std::fs::write(clx_dir.join(".trust_mode_token"), "trust_mode_active").unwrap();
 
     let input = serde_json::json!({
-        "session_id": "test-trust-valid-001",
+        "session_id": "test-trust-legacy-001",
         "cwd": "/tmp",
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_use_id": "tu-trust-001",
+        "tool_use_id": "tu-trust-legacy-001",
         "tool_input": {
             "command": "rm -rf /some/dangerous/path"
         }
@@ -237,9 +244,11 @@ fn test_hook_trust_mode_valid_token_allows() {
         .unwrap_or_else(|e| panic!("Failed to parse trust mode output: {e}\nOutput: {stdout}"));
 
     let hook_output = &parsed["hookSpecificOutput"];
+    // B1-10: plain-text token must NOT grant trust; falls through to L0 deny.
     assert_eq!(
-        hook_output["permissionDecision"], "allow",
-        "Trust mode with valid token should auto-allow even dangerous commands"
+        hook_output["permissionDecision"], "deny",
+        "B1-10: legacy plain-text trust token must not grant auto-allow; \
+         L0 must deny the dangerous command"
     );
 }
 
