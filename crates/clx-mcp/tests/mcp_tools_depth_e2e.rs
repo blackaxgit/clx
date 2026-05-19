@@ -414,11 +414,15 @@ fn rules_get_project_rules_extracts_category_section_from_project_claude_md() {
 /// `set` then `get` against the file backend in one process: the `set` Ok
 /// arm confirms storage, the `get` Ok(Some) arm returns the value MASKED
 /// (never the plaintext). Drives the age-file backend success path with
-/// zero keychain. The 13-char value is masked as `pre...fix (N chars)`.
+/// zero keychain.
+///
+/// B3-1 fix: the mask is now a fixed-form `[REDACTED:<bracket>]` token —
+/// no head/tail plaintext and no exact char count. "supersecret42" is 13
+/// chars which falls in the "short" bracket (1–15).
 #[test]
 fn credentials_set_then_get_masks_value_via_file_backend() {
     let home = HermeticHome::new();
-    let secret = "supersecret42"; // 13 chars -> prefix...suffix form
+    let secret = "supersecret42"; // 13 chars -> "short" bracket
     let input = format!(
         "{}\n{}\n{}\n",
         req(1, "initialize", serde_json::json!({})),
@@ -447,9 +451,15 @@ fn credentials_set_then_get_masks_value_via_file_backend() {
     let get_resp = parse(lines[2]);
     assert_envelope(&get_resp);
     let get_text = result_text(&get_resp);
+    // B3-1 fix: mask is a fixed-form token, no exact char count, no plaintext.
     assert!(
-        get_text.contains("Value (masked):") && get_text.contains("(13 chars)"),
-        "get must return the masked value with the char count: {get_text}"
+        get_text.contains("Value (masked):") && get_text.contains("[REDACTED:short]"),
+        "get must return the fixed-form redacted token (B3-1 fix): {get_text}"
+    );
+    // No exact length leaked (pre-fix: "(13 chars)").
+    assert!(
+        !get_text.contains("(13 chars)"),
+        "B3-1: exact char count must not appear in get response: {get_text}"
     );
     assert!(
         !get_text.contains(secret),
@@ -541,9 +551,11 @@ fn credentials_list_after_set_shows_key() {
     );
 }
 
-/// `set` with a short value (<= 6 chars) takes `mask_credential_value`'s
-/// fully-masked `**** (N chars)` branch when read back via `get` (the
-/// short-value masking arm, complementing the long-value arm above).
+/// `set` with a short value takes `mask_credential_value`'s fixed-form
+/// `[REDACTED:short]` token when read back via `get`.
+///
+/// B3-1 fix: the old `**** (N chars)` form leaked the exact character count.
+/// The new form uses a coarse bracket and leaks neither plaintext nor exact length.
 #[test]
 fn credentials_short_value_is_fully_masked() {
     let home = HermeticHome::new();
@@ -564,9 +576,15 @@ fn credentials_short_value_is_fully_masked() {
     let (stdout, _stderr) = home.run_mcp(&input);
     let lines: Vec<&str> = stdout.lines().collect();
     let get_text = result_text(&parse(lines[2]));
+    // B3-1 fix: fixed-form token, no exact char count.
     assert!(
-        get_text.contains("**** (3 chars)"),
-        "a short value must be fully masked: {get_text}"
+        get_text.contains("[REDACTED:short]"),
+        "a short value must produce the fixed-form redacted token (B3-1 fix): {get_text}"
+    );
+    // No exact length (pre-fix: "**** (3 chars)").
+    assert!(
+        !get_text.contains("(3 chars)"),
+        "B3-1: exact char count must not appear: {get_text}"
     );
     assert!(
         !get_text.contains("abc"),

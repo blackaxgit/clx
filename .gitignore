@@ -39,3 +39,6 @@ SPEC.md
 # Personal orchestration (not part of CLX)
 /claude/
 /.claude/
+*.cdx.xml
+clx-sbom.xml
+/*.cdx.xml

@@ -184,8 +184,9 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # audit: check dependencies for known vulnerabilities
+  # audit: check dependencies for known vulnerabilities and policy violations
   # Runs on ubuntu only — advisory database is platform-neutral.
+  # Gates: cargo-audit (RustSec advisories), cargo-deny (policy/licenses/sources)
   # ---------------------------------------------------------------------------
   audit:
     name: Audit dependencies
@@ -201,8 +202,11 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --quiet
+      - name: Install cargo-audit and cargo-deny
+        run: cargo install cargo-audit cargo-deny --quiet
 
-      - name: Run cargo audit
+      - name: Run cargo audit (RustSec advisories)
         run: cargo audit
+
+      - name: "Run cargo deny (policy, licenses, sources, bans)"
+        run: cargo deny check

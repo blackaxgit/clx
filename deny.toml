@@ -1,0 +1,50 @@
+# cargo-deny policy for CLX (supply-chain gate, B5-2).
+#
+# Posture: hard-fail the release/CI on a real vulnerability or a yanked
+# crate; surface unmaintained/unsound transitive crates as warnings, with
+# the currently-known set explicitly acknowledged below (NOT blanket-
+# ignored) so a new advisory still shows up.
+
+[advisories]
+version = 2
+# Real security signal -> block the pipeline.
+yanked = "deny"
+# Unmaintained / unsound transitive deps are an ecosystem reality with no
+# patched version available; they are warnings, but each currently-known
+# ID is enumerated so the gate stays meaningful and any *new* advisory is
+# not masked. Tracked follow-on: migrate off `serde_yml` (RUSTSEC-2025-0068)
+# to a maintained YAML parser — config parsing is security-relevant; the
+# inert-filter + hash-trust gate are the compensating controls today.
+ignore = [
+    "RUSTSEC-2024-0388", # derivative: unmaintained (transitive, no fix)
+    "RUSTSEC-2024-0384", # instant: unmaintained (transitive, no fix)
+    "RUSTSEC-2025-0119", # number_prefix: unmaintained (via indicatif)
+    "RUSTSEC-2024-0436", # paste: unmaintained (transitive, no fix)
+    "RUSTSEC-2025-0068", # serde_yml: unsound+unmaintained — tracked migration
+]
+
+[licenses]
+version = 2
+# All permissive / OSI-approved; compatible with shipping an MPL-2.0 tool.
+# NCSA (BSD/MIT-equivalent) and CDLA-Permissive-2.0 (permissive data
+# license) appear on transitive deps and are acceptable.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -9,10 +9,61 @@
 use crate::config::AzureOpenAIConfig;
 use crate::llm::retry::{RetryConfig, with_backoff};
 use crate::llm::{LlmError, LocalLlmBackend};
+use crate::redaction::redact_secrets;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use url::Url;
+
+/// Maximum number of bytes of the raw provider response body to include in the
+/// structured error summary. Keeping this small prevents unbounded bodies
+/// (which may carry tenant URLs, deployment paths, or auth context) from
+/// flowing verbatim into `LlmError` and its `Display` path.
+///
+/// The excerpt is additionally passed through `redact_secrets` before being
+/// embedded, so even within the cap any recognised secret pattern is scrubbed.
+const MAX_BODY_EXCERPT_BYTES: usize = 80;
+
+/// Build a bounded, structured, redacted error summary from a raw HTTP
+/// response body and the Azure `x-request-id` header value (B6-1 fix).
+///
+/// The returned string is safe to embed in `LlmError` variants whose `Display`
+/// reaches `tracing` warn/error sinks and the CLI health output. It contains:
+/// - The HTTP status code (already available from the caller's match arm).
+/// - A redacted excerpt of the body (≤ `MAX_BODY_EXCERPT_BYTES` bytes).
+/// - The `x-request-id` (non-sensitive correlation token).
+///
+/// The raw body is intentionally discarded after excerpt extraction to prevent
+/// accidental surfacing via `Debug` or future logging paths.
+fn build_error_summary(status: u16, body: &str, request_id: &str) -> String {
+    // Redact the full body FIRST so that host patterns spanning the truncation
+    // boundary are caught before the excerpt is taken (B6-1/B6-2).
+    let redacted_body = redact_secrets(body.trim());
+    // Then truncate the already-redacted string to the safe byte cap.
+    let excerpt = truncate_utf8(&redacted_body, MAX_BODY_EXCERPT_BYTES);
+
+    if request_id.is_empty() {
+        format!("status={status} body={excerpt:?}")
+    } else {
+        // Redact x-request-id too in case future Azure responses embed URLs there.
+        let rid = redact_secrets(request_id);
+        format!("status={status} body={excerpt:?} x-request-id={rid}")
+    }
+}
+
+/// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8
+/// multi-byte character. Returns a sub-str of the original.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from max_bytes to find a valid char boundary.
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 #[derive(Debug, Clone)]
 pub struct AzureOpenAIBackend {
@@ -194,20 +245,20 @@ async fn map_response<T: serde::de::DeserializeOwned>(
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs);
         let body = resp.text().await.unwrap_or_default();
-        let body_with_id = if request_id.is_empty() {
-            body.clone()
-        } else {
-            format!("{body} (x-request-id: {request_id})")
-        };
-        match status.as_u16() {
-            401 | 403 => Err(LlmError::Auth(body_with_id)),
-            404 => Err(LlmError::DeploymentNotFound(body_with_id)),
+        // B6-1: never embed the unbounded raw body in LlmError — build a
+        // bounded, structured, redacted summary instead. The raw `body`
+        // string is consumed here and does not propagate further.
+        let status_u16 = status.as_u16();
+        let summary = build_error_summary(status_u16, &body, &request_id);
+        match status_u16 {
+            401 | 403 => Err(LlmError::Auth(summary)),
+            404 => Err(LlmError::DeploymentNotFound(summary)),
             408 => Err(LlmError::Timeout),
             429 => Err(LlmError::RateLimit { retry_after }),
-            400 if body.contains("content_filter") => Err(LlmError::ContentFilter(body_with_id)),
+            400 if body.contains("content_filter") => Err(LlmError::ContentFilter(summary)),
             s => Err(LlmError::Server {
                 status: s,
-                body: body_with_id,
+                body: summary,
             }),
         }
     }
@@ -611,5 +662,140 @@ mod tests {
         );
         // secrecy crate prints either "Secret(...)" or "[REDACTED]" depending
         // on version. Both are acceptable; we just need the value gone.
+    }
+
+    // -------------------------------------------------------------------------
+    // B6-1 regression tests (GREEN G2)
+    //
+    // These tests FAIL on the pre-fix code (where the raw body was embedded
+    // verbatim into LlmError variants) and PASS after the fix (build_error_summary
+    // produces a bounded, redacted summary instead).
+    //
+    // Synthetic host only — the real leaked tenant URL appears nowhere here.
+    // -------------------------------------------------------------------------
+
+    /// B6-1 regression: a 401 response whose body carries a synthetic Azure tenant
+    /// URL must NOT appear verbatim in the `LlmError::Auth` Display string.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn b6_1_auth_error_display_does_not_contain_raw_body() {
+        allow_local();
+        let mock = MockServer::start().await;
+        // Synthetic body that models the leaked class: contains a tenant-like URL
+        // and a long error message that should be truncated + redacted.
+        let synth_body = r#"{"error":{"code":"401","message":"Access denied. Resource: https://synthetic-tenant.openai.azure.com/openai/deployments/gpt-deploy/chat/completions"}}"#;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(synth_body)
+                    .insert_header("x-request-id", "synth-req-id-0001"),
+            )
+            .mount(&mock)
+            .await;
+
+        let backend = AzureOpenAIBackend::new(
+            &cfg(mock.uri()),
+            SecretString::new("bad-key".to_string().into()),
+        )
+        .unwrap();
+
+        let err = backend
+            .generate("hi", Some("gpt-deploy"))
+            .await
+            .unwrap_err();
+        let display = err.to_string();
+
+        // The synthetic tenant hostname must NOT appear verbatim — this is the
+        // B6-1 security goal. Generic error phrases ("Access denied") are
+        // acceptable in a bounded excerpt; the tenant identity is the secret.
+        assert!(
+            !display.contains("synthetic-tenant.openai.azure.com"),
+            "B6-1 REGRESSION: tenant host leaked into LlmError Display: {display:?}"
+        );
+        // The summary must contain the status code for debuggability.
+        assert!(
+            display.contains("401"),
+            "LlmError Display must include status code for debuggability: {display:?}"
+        );
+        // The request-id is a non-sensitive correlation token; it should be present.
+        assert!(
+            display.contains("synth-req-id-0001"),
+            "LlmError Display should include x-request-id for correlation: {display:?}"
+        );
+    }
+
+    /// B6-1 regression: a 404 body with a synthetic deployment path must not
+    /// appear verbatim in `LlmError::DeploymentNotFound` Display.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn b6_1_deployment_not_found_display_does_not_contain_raw_body() {
+        allow_local();
+        let mock = MockServer::start().await;
+        let synth_body = r#"{"error":{"code":"404","message":"Deployment 'secret-deploy' at synthetic-tenant.openai.azure.com not found"}}"#;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(synth_body))
+            .mount(&mock)
+            .await;
+
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+
+        let err = backend
+            .generate("hi", Some("secret-deploy"))
+            .await
+            .unwrap_err();
+        let display = err.to_string();
+
+        assert!(
+            !display.contains("secret-deploy' at synthetic-tenant"),
+            "B6-1 REGRESSION: raw 404 body leaked into DeploymentNotFound Display: {display:?}"
+        );
+        assert!(
+            display.contains("404"),
+            "Display must include status code: {display:?}"
+        );
+    }
+
+    /// B6-1 regression: the `build_error_summary` helper produces a bounded
+    /// output — long bodies are truncated and Azure host patterns are redacted.
+    #[test]
+    fn b6_1_build_error_summary_truncates_and_redacts() {
+        // A long body containing a synthetic Azure host.
+        let long_body = format!("{{\"error\":{{\"message\":\"{}\"}}}}", "X".repeat(500));
+        let summary = build_error_summary(401, &long_body, "rid-0001");
+        // Must be much shorter than the raw body.
+        assert!(
+            summary.len() < long_body.len(),
+            "summary must be shorter than raw body: summary={summary:?}"
+        );
+
+        // A body carrying a synthetic Azure tenant host must have the host scrubbed.
+        let host_body =
+            "error at https://synthetic-tenant.openai.azure.com/openai/deployments/d/chat";
+        let summary2 = build_error_summary(401, host_body, "");
+        assert!(
+            !summary2.contains("synthetic-tenant.openai.azure.com"),
+            "B6-1/B6-2 REGRESSION: tenant host survived build_error_summary: {summary2:?}"
+        );
+        assert!(
+            summary2.contains("***AZURE-HOST-REDACTED***"),
+            "redacted token must be present in summary: {summary2:?}"
+        );
+    }
+
+    /// B6-1 regression: `truncate_utf8` never splits a multi-byte character.
+    #[test]
+    fn b6_1_truncate_utf8_respects_char_boundaries() {
+        // "café" is 5 bytes (c-a-f-é where é is 2 bytes).
+        let s = "café repeated many times to exceed the limit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let t = truncate_utf8(s, 5);
+        assert!(
+            s.is_char_boundary(t.len()),
+            "truncated at non-char-boundary"
+        );
+        assert!(t.len() <= 5);
     }
 }

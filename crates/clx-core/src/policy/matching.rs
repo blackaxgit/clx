@@ -41,6 +41,33 @@ pub fn convert_learned_pattern(pattern: &str) -> String {
     format!("Bash({pattern})")
 }
 
+/// Returns `true` if `raw` (a learned/added rule pattern, pre-conversion)
+/// is an **overbroad allow** — i.e. it would whitelist arbitrary commands
+/// (B1-4 / B3-2). A pattern is overbroad when, after unwrapping an
+/// optional `Tool(...)` shell and normalising `:`/whitespace, nothing but
+/// `*` wildcards remains (the empty string, `*`, `**`, `Bash(*)`,
+/// `Bash( * )`, `Bash(**)`). Scoped patterns that retain any literal (e.g.
+/// `Bash(git status)`, `git:status*`, `Bash(npm *)`) are NOT overbroad —
+/// this is deliberately conservative to avoid rejecting legitimate
+/// per-project allow rules. Only ever used to gate `Allow`/whitelist
+/// rules; `Deny` rules are never restricted.
+#[must_use]
+pub fn is_overbroad_allow_pattern(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    // Unwrap a single `Tool(...)` wrapper if present.
+    let inner = match (trimmed.find('('), trimmed.ends_with(')')) {
+        (Some(open), true) => &trimmed[open + 1..trimmed.len() - 1],
+        _ => trimmed,
+    };
+    // Normalise the command:args separator to whitespace, then strip all
+    // wildcards and whitespace. If nothing literal remains, the pattern
+    // matches everything.
+    inner
+        .replace(':', " ")
+        .chars()
+        .all(|c| c == '*' || c.is_whitespace())
+}
+
 /// Simple glob pattern matching
 ///
 /// Supports:
