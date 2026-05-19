@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
+│> Validator         ││                                                        │
+│  Context           ││                                                        │
+│  LLM               ││                                                        │
+│  User Learnin┌ Edit: enabled ─────────────────────────────────┐              │
+│  Logging     │Enable command validation                       │              │
+│  Ctx Pressure│                                                │              │
+│  Sess Recover│Value: [|]                                      │              │
+│  MCP Tools   │                                                │              │
+│  Auto Recall │Default: true                                   │              │
+│              │                                                │              │
+│              │                                                │              │
+│              │[Enter] Confirm   [Esc] Cancel                  │              │
+│              │                                                │              │
+│              │                                                │              │
+│              └────────────────────────────────────────────────┘              │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | Type to edit | [Enter] Conf

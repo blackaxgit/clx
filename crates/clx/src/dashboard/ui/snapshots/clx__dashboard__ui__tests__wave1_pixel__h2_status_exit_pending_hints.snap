@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings *                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
+│> Validator         ││                                                        │
+│  Context           ││                                                        │
+│  LLM               ││                                                        │
+│  User Learning     ││                                                        │
+│  Logging           ││                                                        │
+│  Ctx Pressure      ││                                                        │
+│  Sess Recove┌ Unsaved Changes ─────────────────────────────────┐             │
+│  MCP Tools  │You have unsaved changes.                         │             │
+│  Auto Recall│                                                  │             │
+│             │[s] Save   [x] Discard   [Esc] Stay               │             │
+│             └──────────────────────────────────────────────────┘             │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | [s] Save  [x] Discard  [Esc

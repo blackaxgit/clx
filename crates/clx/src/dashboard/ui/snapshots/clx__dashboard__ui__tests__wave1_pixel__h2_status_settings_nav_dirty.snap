@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings *                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
+│> Validator         ││                                                        │
+│  Context           ││                                                        │
+│  LLM               ││                                                        │
+│  User Learning     ││                                                        │
+│  Logging           ││                                                        │
+│  Ctx Pressure      ││                                                        │
+│  Sess Recovery     ││                                                        │
+│  MCP Tools         ││                                                        │
+│  Auto Recall       ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | h/l:section j/k:field Space
