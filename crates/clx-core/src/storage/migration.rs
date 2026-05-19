@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 5;
+pub(super) const SCHEMA_VERSION: i32 = 7;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -44,6 +44,20 @@ impl Storage {
             )
             .unwrap_or(0);
 
+        // Refuse to operate on a database created by a newer CLX. Running
+        // an older binary's migrations (or queries) against a newer schema
+        // risks silent corruption or data loss, so fail fast with an
+        // actionable error instead of proceeding.
+        if current_version > SCHEMA_VERSION {
+            return Err(crate::Error::Storage(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                Some(format!(
+                    "database was created by a newer CLX (schema v{current_version} > \
+                     supported v{SCHEMA_VERSION}); upgrade CLX to open this database"
+                )),
+            )));
+        }
+
         if current_version < SCHEMA_VERSION {
             info!(
                 "Running migrations from version {} to {}",
@@ -68,6 +82,14 @@ impl Storage {
 
             if current_version < 5 {
                 self.migrate_to_v5()?;
+            }
+
+            if current_version < 6 {
+                self.migrate_to_v6()?;
+            }
+
+            if current_version < 7 {
+                self.migrate_to_v7()?;
             }
 
             self.conn.execute(
@@ -330,6 +352,67 @@ impl Storage {
         info!("Completed migration to schema version 5 (embedding model identity)");
         Ok(())
     }
+
+    /// Migrate to schema version 6.
+    ///
+    /// Adds the `tool_events` table for aggregated mutator-tool invocations
+    /// captured by the `PostToolUse` hook. Each row represents one or more
+    /// invocations of a mutator tool inside a 60-second window for a given
+    /// `(session_id, tool_name, target)` triple.
+    pub(super) fn migrate_to_v6(&self) -> crate::Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS tool_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                target TEXT,
+                summary TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                window_start_unix INTEGER NOT NULL,
+                window_end_unix INTEGER NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS tool_events_session_idx
+                ON tool_events (session_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS tool_events_target_idx
+                ON tool_events (target);
+            ",
+        )?;
+
+        info!("Completed migration to schema version 6 (tool_events table)");
+        Ok(())
+    }
+
+    /// Migrate to schema version 7.
+    ///
+    /// Adds a UNIQUE INDEX on `tool_events` over the deduplication key
+    /// `(session_id, tool_name, IFNULL(target, ''), window_end_unix / 60)`.
+    ///
+    /// Rationale: the v6 `append_or_extend_tool_event` implementation used a
+    /// SELECT-then-UPDATE-or-INSERT pattern inside a deferred transaction with
+    /// no UNIQUE constraint. Two parallel `clx-hook` processes could both
+    /// observe "no recent row" inside the same 60s window and both INSERT,
+    /// creating duplicate rows. With this unique index in place,
+    /// `append_or_extend_tool_event` can use `SQLite`'s atomic
+    /// `INSERT ... ON CONFLICT DO UPDATE` (UPSERT) so the database itself is
+    /// the source of truth for dedup.
+    ///
+    /// `IFNULL(target, '')` inside the index expression collapses `NULL`s to
+    /// the empty string so two events with a `NULL` target merge into one row
+    /// (otherwise `SQLite` would treat `NULL`s as distinct in UNIQUE indexes).
+    pub(super) fn migrate_to_v7(&self) -> crate::Result<()> {
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS tool_events_dedup_idx \
+                ON tool_events (session_id, tool_name, IFNULL(target, ''), (window_end_unix / 60));",
+        )?;
+        info!("Completed migration to schema version 7 (tool_events dedup unique index)");
+        Ok(())
+    }
 }
 
 /// Valid table names for `ALTER TABLE` migrations.
@@ -373,4 +456,51 @@ fn alter_table_add_column(
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+
+    /// A database whose recorded schema version is newer than this binary's
+    /// `SCHEMA_VERSION` must be refused (no migrations, descriptive error)
+    /// rather than silently opened. Guards against downgrade corruption.
+    #[test]
+    fn run_migrations_refuses_newer_schema_version() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+
+        // Record a schema version from the future, as if this db were
+        // written by a newer CLX build.
+        let future_version = SCHEMA_VERSION + 1;
+        storage
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
+                [future_version],
+            )
+            .expect("seed future schema version");
+
+        let err = storage
+            .run_migrations()
+            .expect_err("re-running migrations on a newer schema must error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer CLX") && msg.contains("upgrade CLX"),
+            "error must be the actionable refuse-newer message, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("v{future_version}"))
+                && msg.contains(&format!("v{SCHEMA_VERSION}")),
+            "error must name both the on-disk and supported versions, got: {msg}"
+        );
+
+        // Normal upgrade path is unaffected: a fresh db migrates cleanly.
+        let fresh = Storage::open_in_memory().expect("fresh db opens and migrates");
+        assert_eq!(
+            fresh.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+    }
 }

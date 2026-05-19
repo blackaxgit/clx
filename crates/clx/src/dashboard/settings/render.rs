@@ -517,3 +517,255 @@ fn render_reload_confirm(frame: &mut Frame, area: Rect) {
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
 }
+
+// ── E1.W4: TestBackend + insta snapshots for the Settings tab ───────────────
+//
+// These snapshots pin the rendered output of `render_settings_tab` against
+// deterministic AppState + Config fixtures. The TestBackend dimensions are
+// 100x40 (wider than the list view to match detail.rs snapshots and to keep
+// the two-panel layout from clipping field labels).
+//
+// Volatile content (the config-file path embedded in panel titles, and the
+// user's home directory path) is replaced with `<CONFIG_PATH>` and `<HOME>`
+// tokens via a `redact_volatile` helper, mirroring the pattern used by
+// `crate::dashboard::ui::tests::redact_volatile`.
+//
+// Determinism rules: no system clock, no DB, no filesystem reads beyond
+// `Config::config_file_path()` (which is path-derivation only, no I/O).
+#[cfg(test)]
+mod render_snapshots {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::dashboard::app::{App, DashboardTab, InputMode};
+
+    const COLS: u16 = 100;
+    const ROWS: u16 = 40;
+
+    /// Redact volatile content from settings snapshots: replace the resolved
+    /// config-file path and the user's home directory with stable tokens so
+    /// the snapshot is portable across machines and CI runners. Re-pads each
+    /// modified line to exactly `COLS` characters so ratatui box-drawing
+    /// borders stay aligned.
+    fn redact_volatile(s: &str) -> String {
+        let config_path = clx_core::config::Config::config_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let home = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let mut out_lines: Vec<String> = Vec::new();
+        for line in s.lines() {
+            // The panel title embeds the absolute config-file path, which
+            // ratatui clips to the panel width: only a *prefix* of the path
+            // survives in the buffer, so a full-string match is not portable
+            // across machines (it matched only on the original dev HOME).
+            // Redact the longest prefix of the known path present on the
+            // line and canonicalize the volatile tail to a fixed width.
+            // Non-title lines never contain this prefix, so they fall through
+            // unchanged (every other snapshot stays byte-identical).
+            if let Some(title) = redact_title_config_path(line, &config_path, COLS as usize) {
+                out_lines.push(title);
+                continue;
+            }
+            let mut replaced = line.to_string();
+            if !home.is_empty() && replaced.contains(&home) {
+                replaced = replaced.replace(&home, "<HOME>");
+            }
+            let vis_len = replaced.chars().count();
+            if vis_len < COLS as usize {
+                let trimmed = replaced.trim_end();
+                if trimmed.ends_with('┐') {
+                    let base = trimmed.trim_end_matches('┐');
+                    let mut padded = base.to_string();
+                    let needed = COLS as usize - base.chars().count() - 1;
+                    for _ in 0..needed {
+                        padded.push('─');
+                    }
+                    padded.push('┐');
+                    out_lines.push(padded);
+                } else {
+                    let mut padded = replaced;
+                    for _ in 0..(COLS as usize - vis_len) {
+                        padded.push(' ');
+                    }
+                    out_lines.push(padded);
+                }
+            } else {
+                out_lines.push(replaced.chars().take(COLS as usize).collect());
+            }
+        }
+        out_lines.join("\n")
+    }
+
+    /// If `line` contains a (possibly ratatui-truncated) prefix of the
+    /// absolute `config_path`, return the line with that path region replaced
+    /// by the stable `<CONFIG_PATH>` token and the volatile tail truncated
+    /// then space-padded to exactly `width` columns. Returns `None` when the
+    /// line does not contain the path, so callers leave non-title lines
+    /// byte-identical (zero collateral on sessions/audit/rules snapshots).
+    fn redact_title_config_path(line: &str, config_path: &str, width: usize) -> Option<String> {
+        const MIN: usize = 12;
+        if config_path.len() < MIN {
+            return None;
+        }
+        let mut end = config_path.len();
+        loop {
+            if config_path.is_char_boundary(end)
+                && let Some(pos) = line.find(&config_path[..end])
+            {
+                let mut head = String::with_capacity(width);
+                head.push_str(&line[..pos]);
+                head.push_str("<CONFIG_PATH>");
+                let mut canon: String = head.chars().take(width).collect();
+                while canon.chars().count() < width {
+                    canon.push(' ');
+                }
+                return Some(canon);
+            }
+            if end <= MIN {
+                return None;
+            }
+            end -= 1;
+        }
+    }
+
+    /// Render the Settings tab (entire `area = frame.area()`) and return the
+    /// buffer as a redacted, trimmed-per-row string.
+    fn render_settings_to_string(app: &mut App) -> String {
+        let backend = TestBackend::new(COLS, ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_settings_tab(frame, app, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let raw = (0..ROWS)
+            .map(|y| {
+                let row: String = (0..COLS)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        redact_volatile(&raw)
+    }
+
+    fn make_settings_app() -> App {
+        let mut app = App::new(7, 5);
+        app.current_tab = DashboardTab::Settings;
+        app.input_mode = InputMode::Normal;
+        app
+    }
+
+    // ── Empty / error fixtures ──────────────────────────────────────────────
+
+    /// No config loaded and no error — renders the bordered " Fields "
+    /// placeholder in the right panel.
+    #[test]
+    fn snapshot_settings_no_config_no_error() {
+        let mut app = make_settings_app();
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_no_config_no_error", rendered);
+    }
+
+    /// Load error path — renders the red "Failed to load configuration"
+    /// message and the embedded error text.
+    #[test]
+    fn snapshot_settings_load_error() {
+        let mut app = make_settings_app();
+        app.settings_load_error = Some("permission denied (os error 13)".to_string());
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_load_error", rendered);
+    }
+
+    // ── Loaded-config fixtures ──────────────────────────────────────────────
+
+    fn make_default_config() -> clx_core::config::Config {
+        clx_core::config::Config::default()
+    }
+
+    /// Default config, first section selected — exercises the field table
+    /// happy path with both value and default columns populated.
+    #[test]
+    fn snapshot_settings_default_config_section_0() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 0;
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_default_section_0", rendered);
+    }
+
+    /// LLM section (index 2) — exercises `append_provider_rows` empty path
+    /// and the routing summary panel.
+    #[test]
+    fn snapshot_settings_default_config_llm_section() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 2;
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_default_llm_section", rendered);
+    }
+
+    /// Edit-mode popup overlay — exercises `render_edit_popup` with a
+    /// pre-populated edit buffer and no validation error.
+    #[test]
+    fn snapshot_settings_edit_mode_popup() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 0;
+        app.settings_field_idx = 0;
+        app.input_mode = InputMode::SettingsEdit;
+        app.settings_edit_buffer = "42".to_string();
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_edit_mode_popup", rendered);
+    }
+
+    /// Reset confirmation dialog overlay.
+    #[test]
+    fn snapshot_settings_confirm_reset_dialog() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_confirm_reset = true;
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_confirm_reset", rendered);
+    }
+
+    /// Reload-from-disk confirmation dialog overlay.
+    #[test]
+    fn snapshot_settings_reload_confirm_dialog() {
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_reload_confirm = true;
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_reload_confirm", rendered);
+    }
+
+    /// Dirty-exit guard prompt overlay.
+    #[test]
+    fn snapshot_settings_exit_guard_dialog() {
+        use crate::dashboard::app::ExitTarget;
+        let mut app = make_settings_app();
+        let cfg = make_default_config();
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_is_dirty = true;
+        app.settings_exit_pending = Some(ExitTarget::Quit);
+        let rendered = render_settings_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_settings_exit_guard", rendered);
+    }
+}

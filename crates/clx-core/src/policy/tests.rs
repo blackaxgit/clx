@@ -583,18 +583,51 @@ fn test_risk_score_to_decision_ask() {
 }
 
 #[test]
-fn test_risk_score_to_decision_high_scores_are_ask() {
-    // L1 never hard-denies — scores 8-10 should be Ask (user decides)
+fn test_risk_score_to_decision_high_scores_are_deny() {
+    // V-R2: scores 8-10 are explicitly dangerous and must hard-deny so the
+    // PreToolUse hook emits a block. This is the documented contract.
     for score in 8..=10 {
         let decision = risk_score_to_decision(score, "Dangerous", "critical");
         match decision {
-            PolicyDecision::Ask { reason } => {
+            PolicyDecision::Deny { reason } => {
                 assert!(reason.contains("critical"));
                 assert!(reason.contains("Dangerous"));
             }
-            _ => panic!("Expected Ask for score {score}"),
+            _ => panic!("Expected Deny for score {score}"),
         }
     }
+}
+
+#[test]
+fn test_risk_score_to_decision_band_boundaries() {
+    // V-R2 regression guard: allow/ask bands must NOT change; only the
+    // deny band (8-10) becomes reachable.
+    assert_eq!(
+        risk_score_to_decision(3, "edge", "safe"),
+        PolicyDecision::Allow,
+        "score 3 must stay Allow"
+    );
+    assert!(
+        matches!(
+            risk_score_to_decision(4, "edge", "caution"),
+            PolicyDecision::Ask { .. }
+        ),
+        "score 4 must stay Ask"
+    );
+    assert!(
+        matches!(
+            risk_score_to_decision(7, "edge", "caution"),
+            PolicyDecision::Ask { .. }
+        ),
+        "score 7 must stay Ask"
+    );
+    assert!(
+        matches!(
+            risk_score_to_decision(8, "edge", "dangerous"),
+            PolicyDecision::Deny { .. }
+        ),
+        "score 8 must now be Deny"
+    );
 }
 
 #[test]

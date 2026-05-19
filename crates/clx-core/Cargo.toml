@@ -21,10 +21,48 @@ chrono.workspace = true
 reqwest.workspace = true
 keyring.workspace = true
 secrecy.workspace = true
+# Default local encrypted-file credential backend (age-encryption.org v1).
+# Never prompts, headless-safe, cross-platform identical. The macOS keychain
+# is opt-in only; see credentials/backend.rs.
+age.workspace = true
 sqlite-vec.workspace = true
 trait-variant.workspace = true
 url.workspace = true
 figment.workspace = true
+async-trait = "0.1"
+regex.workspace = true
+
+# Per-project config trust (file-hash allowlist, §3.11). sha2/hex are already
+# in the transitive graph; pin direct versions so we own the API surface.
+sha2 = "0.10"
+hex = "0.4"
+
+# Inter-process advisory file lock for the credential store read-modify-write
+# cycle. CLX hooks run as SEPARATE OS processes (one per hook invocation), so
+# an in-process Mutex alone cannot prevent a lost update when two hooks write
+# concurrently. `fs4` is the actively maintained (1.x, 2026) pure-Rust,
+# cross-platform successor to the abandoned `fs2`: flock on unix, LockFileEx
+# on Windows, advisory, released on fd close / process death. We lock a
+# dedicated `.lock` sidecar (NOT the data file we rename over).
+fs4 = "1"
+
+# Reranker (D2). Pinned at 5.x (ort 2.0 stable, &mut self rerank). Capture
+# exact in Cargo.lock after first build. Default features are sufficient for
+# TextRerank; we do not enable any optional GPU/CUDA features.
+fastembed = "5"
+
+# macOS keychain ACL relaxation (0.8.0): the `keyring` crate always creates
+# generic-password items with the default restrictive ACL bound to the
+# creating binary's code signature. Homebrew's adhoc-signed `clx` has an
+# unstable identity, so macOS re-prompts on every launch. We use the
+# maintained `security-framework` crate to (re)apply a permissive
+# "any application" SecAccess on the CLX credential items so reads never
+# prompt. Pinned at the 2.x line that `keyring v2` already locks (single
+# dependency tree, no duplicate Security.framework binding). macOS-gated so
+# non-macOS builds never pull these.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2.11"
+core-foundation = "0.9"
 
 [lints]
 workspace = true
@@ -37,3 +75,11 @@ rstest = "0.26"
 insta = { version = "1", features = ["yaml", "json", "redactions"] }
 proptest = "1.5"
 tokio = { version = "1", features = ["full"] }
+# D4: RAGAS-style recall accuracy bench (`cargo bench --bench recall_accuracy`).
+# Dev-dep only; never enters the runtime crate graph. 0.8 uses
+# `std::hint::black_box`; we do not import the removed `criterion::black_box`.
+criterion = "0.8"
+
+[[bench]]
+name = "recall_accuracy"
+harness = false

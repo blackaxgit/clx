@@ -1,4 +1,6 @@
-//! `clx_credentials` tool — Securely manage credentials using the system keychain.
+//! `clx_credentials` tool - Securely manage credentials in the configured
+//! credential backend (an encrypted local file by default, the macOS keychain
+//! only when the user has explicitly opted in).
 
 use serde_json::{Value, json};
 use tracing::{debug, error, info};
@@ -41,7 +43,7 @@ impl McpServer {
                             "content": [{
                                 "type": "text",
                                 "text": format!(
-                                    "Credential '{}' exists. Value (masked): {}\n\nTo use this credential, reference it by key name in your configuration. The actual value is stored securely in the OS keychain.",
+                                    "Credential '{}' exists. Value (masked): {}\n\nTo use this credential, reference it by key name in your configuration. The actual value is stored securely in the configured credential backend (an encrypted local file by default, the macOS keychain only if opted in).",
                                     key, masked
                                 )
                             }]

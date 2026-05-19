@@ -3,11 +3,12 @@
 use anyhow::Result;
 use clx_core::config::{Config, ContextPressureMode};
 use clx_core::policy::{McpExtraction, extract_mcp_command};
-use clx_core::redaction::redact_secrets;
+use clx_core::redaction::{redact_json_value, redact_secrets};
 use clx_core::storage::Storage;
-use clx_core::types::{AuditDecision, AuditLogEntry, Event, EventType};
+use clx_core::types::{AuditDecision, AuditLogEntry, Event, EventType, ToolEvent, ToolOutcome};
 use tracing::{debug, warn};
 
+use crate::hooks::aggregator;
 use crate::learning::track_user_decision;
 use crate::types::HookInput;
 
@@ -34,18 +35,49 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
     let mut event = Event::new(input.session_id.clone(), EventType::ToolUse);
     event.tool_name.clone_from(&input.tool_name);
     event.tool_use_id = Some(tool_use_id.to_string());
+    // JSON-aware redaction: walks the Value recursively so that
+    // structured secrets like `{"api_key":"plainsecret"}` are scrubbed
+    // even when the secret does not appear as `key=value` in the
+    // stringified form (Issue 1 from the 0.8.0 Codex audit).
     event.tool_input = input
         .tool_input
         .as_ref()
-        .map(|v| redact_secrets(&v.to_string()));
+        .map(|v| redact_json_value(v).to_string());
     event.tool_output = input
         .tool_response
         .as_ref()
-        .map(|v| redact_secrets(&v.to_string()));
+        .map(|v| redact_json_value(v).to_string());
 
     // Store the event
     if let Err(e) = storage.append_event(&event) {
         warn!("Failed to append event: {}", e);
+    }
+
+    // Aggregate mutator tools into the tool_events table (60s windowed dedup).
+    // Read-only tools (Read, Grep, etc.) are silently skipped. The aggregator
+    // is failure-tolerant: any DB or derivation error is logged at warn and
+    // does not affect the rest of the hook.
+    let tool_input_value = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
+    if aggregator::should_aggregate(tool_name, &tool_input_value) {
+        let outcome = if input.tool_response.is_some() {
+            ToolOutcome::Success
+        } else {
+            ToolOutcome::Error
+        };
+        let target = aggregator::derive_target(tool_name, &tool_input_value);
+        let summary = aggregator::derive_summary(tool_name, &tool_input_value, outcome);
+        let now_unix = chrono::Utc::now().timestamp();
+        let ev = ToolEvent::new(
+            input.session_id.clone(),
+            tool_name,
+            target,
+            &summary,
+            outcome,
+            now_unix,
+        );
+        if let Err(e) = storage.append_or_extend_tool_event(&ev) {
+            warn!("Failed to append tool_event: {}", e);
+        }
     }
 
     // Increment command count for session
@@ -86,11 +118,15 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
         }
     }
 
-    // Create audit log entry for the execution
+    // Create audit log entry for the execution.
+    // SECURITY: redact secrets from the command before persistence; the
+    // `pre_tool_use` path uses `log_audit_entry` which wraps redaction,
+    // and this path must match. Raw secrets in `audit_log.command` would
+    // violate the documented redaction promise.
     if let Some(ref command) = extracted_command {
         let mut entry = AuditLogEntry::new(
             input.session_id.clone(),
-            command.clone(),
+            redact_secrets(command),
             "PostToolUse".to_string(),
             AuditDecision::Allowed,
         );

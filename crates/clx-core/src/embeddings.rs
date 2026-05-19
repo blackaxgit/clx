@@ -479,6 +479,10 @@ mod tests {
 
     #[test]
     fn test_get_dimension_custom() {
+        // Register the sqlite-vec extension for this test's process. Under
+        // `cargo nextest` each test runs in its own process, so the vec0
+        // virtual table module must be registered here (idempotent via Once).
+        crate::init_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
         let store = EmbeddingStore::with_dimension(conn, 768).unwrap();
         assert_eq!(store.embedding_dim(), 768);

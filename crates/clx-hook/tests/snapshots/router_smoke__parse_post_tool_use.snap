@@ -1,0 +1,21 @@
+---
+source: crates/clx-hook/tests/router_smoke.rs
+expression: value
+---
+Object {
+    "cwd": String("/tmp/test-project"),
+    "hook_event_name": String("PostToolUse"),
+    "session_id": String("00000000-0000-0000-0000-000000000002"),
+    "tool_input": Object {
+        "command": String("ls -la"),
+        "description": String("List files"),
+    },
+    "tool_name": String("Bash"),
+    "tool_response": Object {
+        "interrupted": Bool(false),
+        "stderr": String(""),
+        "stdout": String("total 0\n"),
+    },
+    "tool_use_id": String("toolu_00000000000000000000000002"),
+    "transcript_path": String("/tmp/test-project/.claude/transcripts/00000000-0000-0000-0000-000000000002.jsonl"),
+}

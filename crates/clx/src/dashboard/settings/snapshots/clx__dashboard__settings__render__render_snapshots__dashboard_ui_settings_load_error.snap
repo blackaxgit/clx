@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/settings/render.rs
+expression: rendered
+---
+┌ Sections ──────────┐┌ Settings - <CONFIG_PATH>                                                    
+│> Validator         ││Failed to load configuration                                                │
+│  Context           ││                                                                            │
+│  LLM               ││permission denied (os error 13)                                             │
+│  User Learning     ││                                                                            │
+│  Logging           ││Editing is disabled. Fix the config file manually or press [r] to retry.    │
+│  Ctx Pressure      ││                                                                            │
+│  Sess Recovery     ││                                                                            │
+│  MCP Tools         ││                                                                            │
+│  Auto Recall       ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+│                    ││                                                                            │
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘

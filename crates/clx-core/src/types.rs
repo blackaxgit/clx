@@ -295,6 +295,14 @@ pub enum SnapshotTrigger {
     Checkpoint,
     Resume,
     ContextPressure,
+    /// Opt-in rolling N-turn summarization (Phase 10 / 0.8.0).
+    ///
+    /// Snapshots tagged with this trigger are produced by the
+    /// `stop_auto_summary` hook handler when `memory.auto_summarize.enabled`
+    /// is true and at least `every_n_turns` assistant turns have elapsed
+    /// since the previous `AutoSummary` snapshot (or session start, when
+    /// none exist).
+    AutoSummary,
 }
 
 impl SnapshotTrigger {
@@ -306,6 +314,7 @@ impl SnapshotTrigger {
             Self::Checkpoint => "checkpoint",
             Self::Resume => "resume",
             Self::ContextPressure => "context_pressure",
+            Self::AutoSummary => "auto_summary",
         }
     }
 
@@ -325,7 +334,78 @@ impl FromStr for SnapshotTrigger {
             "checkpoint" => Ok(Self::Checkpoint),
             "resume" => Ok(Self::Resume),
             "context_pressure" => Ok(Self::ContextPressure),
+            "auto_summary" => Ok(Self::AutoSummary),
             _ => Err(format!("Unknown snapshot trigger: '{s}'")),
+        }
+    }
+}
+
+/// Outcome of a tool invocation aggregated into `tool_events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOutcome {
+    #[default]
+    Success,
+    Error,
+}
+
+impl ToolOutcome {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "error" => Self::Error,
+            _ => Self::Success,
+        }
+    }
+}
+
+/// One row of the `tool_events` table: an aggregated mutator-tool invocation
+/// inside a 60-second dedup window for a given `(session_id, tool_name, target)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolEvent {
+    pub id: Option<i64>,
+    pub session_id: SessionId,
+    pub tool_name: String,
+    pub target: Option<String>,
+    pub summary: String,
+    pub outcome: ToolOutcome,
+    pub window_start_unix: i64,
+    pub window_end_unix: i64,
+    pub occurrence_count: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ToolEvent {
+    /// Construct a fresh tool event with `occurrence_count = 1` and the window
+    /// pinned to `now_unix` on both edges. `created_at` is set to `Utc::now()`.
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        tool_name: &str,
+        target: Option<String>,
+        summary: &str,
+        outcome: ToolOutcome,
+        now_unix: i64,
+    ) -> Self {
+        Self {
+            id: None,
+            session_id,
+            tool_name: tool_name.to_string(),
+            target,
+            summary: summary.to_string(),
+            outcome,
+            window_start_unix: now_unix,
+            window_end_unix: now_unix,
+            occurrence_count: 1,
+            created_at: Utc::now(),
         }
     }
 }
@@ -381,6 +461,22 @@ impl Snapshot {
             output_tokens: None,
         }
     }
+}
+
+/// Compact representation of a session's most recent snapshot summary.
+///
+/// Produced by `Storage::recent_session_summaries` for the
+/// "pin recent sessions" recall feature. Holds only what the
+/// `UserPromptSubmit` hook needs to render a pinned-block header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// Session this summary belongs to.
+    pub session_id: SessionId,
+    /// When the session began (matches `sessions.started_at`).
+    pub started_at: DateTime<Utc>,
+    /// Latest snapshot summary for the session. Never `None` by contract
+    /// of the query that produces these rows.
+    pub summary: String,
 }
 
 /// Event type for session events
@@ -853,9 +949,22 @@ mod tests {
             SnapshotTrigger::Checkpoint,
             SnapshotTrigger::Resume,
             SnapshotTrigger::ContextPressure,
+            SnapshotTrigger::AutoSummary,
         ] {
             assert_eq!(SnapshotTrigger::parse(trigger.as_str()), trigger);
         }
+    }
+
+    #[test]
+    fn test_snapshot_trigger_auto_summary_string_repr() {
+        // The string repr is a hard contract: storage layer persists it,
+        // hook handlers filter on it. Pin it explicitly so a typo can't
+        // pass round-trip but break SQL queries.
+        assert_eq!(SnapshotTrigger::AutoSummary.as_str(), "auto_summary");
+        assert_eq!(
+            SnapshotTrigger::parse("auto_summary"),
+            SnapshotTrigger::AutoSummary,
+        );
     }
 
     #[test]

@@ -91,6 +91,49 @@ pub fn filter_inert_only(raw_yaml: &str) -> String {
     serde_yml::to_string(&filtered).unwrap_or_default()
 }
 
+/// Apply the project-layer trust gate (§3.11).
+///
+/// If the SHA-256 of `raw_yaml` is in the user's trustlist
+/// (`~/.clx/trusted_configs.json`), return the raw YAML unchanged so that
+/// non-inert keys (e.g. `providers.*`) take effect. Otherwise fall through
+/// to [`filter_inert_only`].
+///
+/// `project_path` is used only for log messages.
+///
+/// Errors loading the trustlist (e.g. malformed JSON) are logged but do
+/// not abort the config load: we fail closed by falling back to
+/// `filter_inert_only`. Missing trustlist file is the normal case and is
+/// silently treated as "no trusted entries".
+#[must_use]
+pub fn apply_project_layer(raw_yaml: &str, project_path: &std::path::Path) -> String {
+    let trustlist = match super::trust::TrustList::load() {
+        Ok(tl) => tl,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "trustlist load failed; falling back to inert-key filter"
+            );
+            return filter_inert_only(raw_yaml);
+        }
+    };
+    let hash = super::trust::compute_file_hash(raw_yaml);
+    if trustlist.is_trusted(&hash) {
+        tracing::debug!(
+            path = %project_path.display(),
+            hash = %hash,
+            "Project config trust-status: trusted (bypassing inert filter)"
+        );
+        raw_yaml.to_string()
+    } else {
+        tracing::debug!(
+            path = %project_path.display(),
+            hash = %hash,
+            "Project config trust-status: not-trusted (applying inert filter)"
+        );
+        filter_inert_only(raw_yaml)
+    }
+}
+
 fn filter_value(v: &serde_yml::Value, path: &str) -> serde_yml::Value {
     use serde_yml::Value;
     match v {
@@ -130,6 +173,22 @@ fn is_non_inert(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::path::Path;
+
+    /// Redirect `HOME` so that `~/.clx/trusted_configs.json` resolves under
+    /// a temp directory. Returns the temp dir so it stays alive for the
+    /// duration of the test. Must be paired with `#[serial]`.
+    #[allow(unsafe_code)]
+    fn isolated_home() -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded context enforced by `#[serial]` on each
+        // caller test. Mirrors `policy::file_util::tests::with_home`.
+        unsafe {
+            std::env::set_var("HOME", td.path());
+        }
+        td
+    }
 
     #[test]
     fn drops_entire_providers_block() {
@@ -184,5 +243,147 @@ llm:
         let out = filter_inert_only(raw);
         assert!(out.contains("ollama-local"));
         assert!(out.contains("fallback"));
+    }
+
+    // --- apply_project_layer (§3.11 trust gate) ---
+
+    #[test]
+    #[serial]
+    fn trusted_hash_returns_raw_config_with_providers() {
+        let _home = isolated_home();
+        let raw = "providers:\n  azure-prod:\n    endpoint: https://api.example.com\n";
+        // Pre-populate the trustlist with the hash of the raw YAML.
+        let mut tl = super::super::trust::TrustList::default();
+        let hash = super::super::trust::compute_file_hash(raw);
+        tl.add(std::path::PathBuf::from("/p/.clx/config.yaml"), hash);
+        tl.save().unwrap();
+
+        let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+        // Providers block is preserved when trusted.
+        assert!(out.contains("azure-prod"), "got: {out}");
+        assert!(out.contains("api.example.com"), "got: {out}");
+    }
+
+    #[test]
+    #[serial]
+    fn untrusted_hash_applies_inert_filter() {
+        let _home = isolated_home();
+        let raw = "providers:\n  rogue:\n    endpoint: https://evil.test\n";
+        // Empty trustlist (no save needed; load returns empty).
+        let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+        // Providers must be dropped.
+        assert!(
+            !out.contains("rogue"),
+            "providers should be filtered: {out}"
+        );
+        assert!(!out.contains("evil.test"), "endpoint must not leak: {out}");
+    }
+
+    #[test]
+    #[serial]
+    fn edit_after_trust_invalidates_match() {
+        let _home = isolated_home();
+        let original = "providers:\n  ok:\n    endpoint: https://a.test\n";
+        // Trust the ORIGINAL contents.
+        let mut tl = super::super::trust::TrustList::default();
+        let hash = super::super::trust::compute_file_hash(original);
+        tl.add(std::path::PathBuf::from("/p/.clx/config.yaml"), hash);
+        tl.save().unwrap();
+
+        // User edits the file (adds a malicious provider). Hash changes,
+        // so the inert filter applies and providers are stripped.
+        let edited = "providers:\n  ok:\n    endpoint: https://a.test\n  evil:\n    endpoint: https://b.test\n";
+        let out = apply_project_layer(edited, Path::new("/p/.clx/config.yaml"));
+        assert!(
+            !out.contains("evil"),
+            "edited file should NOT bypass filter: {out}"
+        );
+        assert!(!out.contains("b.test"));
+    }
+
+    #[test]
+    #[serial]
+    fn missing_trustlist_file_falls_back_to_filter() {
+        let _home = isolated_home();
+        // No trustlist file is created in the isolated home.
+        let raw = "providers:\n  any:\n    endpoint: https://nope.test\nlogging:\n  level: debug\n";
+        let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+        // Providers stripped (untrusted, missing file => empty trustlist).
+        assert!(!out.contains("nope.test"));
+        // Inert logging.level survives.
+        assert!(out.contains("level"));
+    }
+
+    // ====================================================================
+    // Wave D additions (spec 03-credentials-config.md sections 3.6, E10,
+    // E12, E19). `config::project` is `pub(crate)`, so these pure
+    // apply_project_layer / filter_inert_only behaviors are unreachable
+    // from an external test file and live here per the campaign's
+    // "unreachable => marked in-crate module" rule.
+    // ====================================================================
+    mod wave1_credentials_behavior {
+        use super::super::{apply_project_layer, filter_inert_only};
+        use super::isolated_home;
+        use serial_test::serial;
+        use std::path::Path;
+
+        #[test]
+        fn inert_filter_drops_logging_file_and_validator_enabled_keeps_siblings() {
+            // logging.file and validator.enabled are non-inert; their inert
+            // siblings (logging.level, validator.layer1_enabled) survive.
+            let raw = "logging:\n  file: /tmp/exfil.log\n  level: debug\nvalidator:\n  enabled: false\n  layer1_enabled: true\n";
+            let out = filter_inert_only(raw);
+            assert!(!out.contains("exfil"), "logging.file must be dropped");
+            assert!(out.contains("level"), "logging.level must survive");
+            assert!(
+                !out.contains("\n  enabled:"),
+                "validator.enabled must be dropped: {out}"
+            );
+            assert!(
+                out.contains("layer1_enabled"),
+                "validator.layer1_enabled must survive"
+            );
+        }
+
+        #[test]
+        fn invalid_project_yaml_yields_empty_noop_layer() {
+            // E19: malformed YAML => "" so the project layer is a no-op and
+            // the global layer wins.
+            assert!(filter_inert_only("this: : : not yaml\n  - broke").is_empty());
+        }
+
+        #[test]
+        #[serial]
+        fn untrusted_layer_drops_entire_providers_block() {
+            // E10: empty trustlist (missing file) => providers stripped.
+            let _home = isolated_home();
+            let raw = "providers:\n  rogue:\n    kind: azure_openai\n    endpoint: https://evil.test\n    api_key_env: STOLEN\nllm:\n  chat:\n    provider: collab\n    model: m\n";
+            let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+            // The entire providers: block is gone (key + nested values).
+            assert!(!out.contains("providers"), "providers block dropped: {out}");
+            assert!(!out.contains("STOLEN"));
+            assert!(!out.contains("evil.test"));
+            // Inert llm routing survives untouched.
+            assert!(out.contains("chat"));
+            assert!(out.contains("collab"));
+        }
+
+        #[test]
+        #[serial]
+        fn edit_after_trust_invalidates_via_hash_mismatch() {
+            // E12: trust the original bytes; an edited file (different hash)
+            // falls back to the inert filter and is stripped.
+            let _home = isolated_home();
+            let original = "providers:\n  ok:\n    endpoint: https://a.test\n";
+            let mut tl = crate::config::trust::TrustList::default();
+            let hash = crate::config::trust::compute_file_hash(original);
+            tl.add(std::path::PathBuf::from("/p/.clx/config.yaml"), hash);
+            tl.save().unwrap();
+
+            let edited = "providers:\n  ok:\n    endpoint: https://a.test\n  evil:\n    endpoint: https://b.test\n";
+            let out = apply_project_layer(edited, Path::new("/p/.clx/config.yaml"));
+            assert!(!out.contains("evil"), "edited file must not bypass: {out}");
+            assert!(!out.contains("b.test"));
+        }
     }
 }

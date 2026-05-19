@@ -1,0 +1,25 @@
+# Golden frontmatter fixture for the CLX plugin 2026 schema.
+#
+# Round-trip test target: validate.sh and any future Rust-side parser
+# must accept this block as-is, recover both keys (name, description),
+# confirm description is <= 1024 chars after newline folding, and confirm
+# name matches ^[a-z][a-z0-9-]+$ with length in [3,40].
+#
+# The 2026 SKILL.md spec defines only `description` (recommended) plus
+# optional `name`, `disable-model-invocation`, `allowed-tools`, etc.
+# Per-skill `version` is not part of the spec; plugin version lives in
+# plugin.json.
+#
+# This file intentionally mirrors plugin/.claude-plugin/skills/clx-recall/
+# SKILL.md frontmatter as the canonical example.
+---
+name: clx-recall
+description: >
+  Use when the user references earlier sessions, prior decisions, or asks
+  "what did I do" / "did we already" about past work in this repo. Invokes
+  mcp__clx__clx_recall to search the local CLX snapshot store. Examples:
+  "look up our Azure backend discussion", "find checkpoints from yesterday",
+  "what did we decide about retries". Do NOT use for current-session
+  context (already in the transcript), real-time data, or web search; do
+  not use for secrets retrieval.
+---

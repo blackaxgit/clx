@@ -1,0 +1,10 @@
+---
+source: crates/clx-hook/tests/router_smoke.rs
+expression: value
+---
+Object {
+    "cwd": String("/tmp/test-project"),
+    "hook_event_name": String("SessionEnd"),
+    "session_id": String("00000000-0000-0000-0000-000000000005"),
+    "transcript_path": String("/tmp/test-project/.claude/transcripts/00000000-0000-0000-0000-000000000005.jsonl"),
+}

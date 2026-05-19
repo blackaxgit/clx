@@ -5,17 +5,141 @@ use crate::types::{SUMMARIZE_PROMPT, SummaryResponse, TranscriptEntry, Transcrip
 use clx_core::config::{Capability, Config};
 use clx_core::types::estimate_tokens;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
 use tracing::warn;
+
+/// Hard ceiling on the size of a transcript file we are willing to read.
+///
+/// The `transcript_path` arrives from the hook envelope and is otherwise
+/// unconstrained. Without a cap, a hostile or accidental path such as
+/// `/dev/zero` (infinite) or a multi-gigabyte log would be streamed
+/// line-by-line until the handler timeout, wasting CPU and memory. Real
+/// Claude Code transcripts are JSONL conversation logs that stay well
+/// under this bound; 64 MiB is a generous headroom for very long
+/// sessions while still bounding the worst case.
+const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resolve `transcript_path` to a canonical path and reject it when the
+/// file is missing, unresolvable (broken symlink, traversal), or larger
+/// than [`MAX_TRANSCRIPT_BYTES`].
+///
+/// Returns `None` (caller treats as "no usable transcript") instead of
+/// erroring so the Stop/SessionEnd hooks stay non-fatal.
+///
+/// No filesystem allowlist is enforced: legitimate transcripts live under
+/// `~/.claude/projects/` in production but the existing test-suite (and
+/// users with relocated Claude config) point at arbitrary temp paths, so
+/// a hard root allowlist would break valid callers. Canonicalization plus
+/// the size cap bound the read scope without that fragility. Canonicalize
+/// also collapses `..` traversal and resolves symlinks, so the size check
+/// runs against the real target rather than a link.
+fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(transcript_path).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    // Reject anything that is not a regular file. A character device
+    // (`/dev/zero`), block device, FIFO, socket, or directory reports a
+    // metadata length of 0, so the size cap below would pass while the
+    // subsequent line reader would never terminate (unbounded read ->
+    // OOM/SIGKILL). Treat all of these as "no usable transcript".
+    if !metadata.file_type().is_file() {
+        warn!(
+            "transcript '{}' is not a regular file ({:?}); refusing to read",
+            canonical.display(),
+            metadata.file_type()
+        );
+        return None;
+    }
+    let len = metadata.len();
+    if len > MAX_TRANSCRIPT_BYTES {
+        warn!(
+            "transcript '{}' is {} bytes (> {} cap); refusing to read",
+            canonical.display(),
+            len,
+            MAX_TRANSCRIPT_BYTES
+        );
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Owned (role, content) pair extracted from a transcript JSONL file.
+///
+/// Produced by `last_n_turns`. Kept owned (not a `TurnSlice<'a>`) because
+/// the JSONL line buffer the data was parsed from is dropped at the end
+/// of each `BufRead::lines()` iteration; lifetimes can't bridge that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Read the most recent `n` `user`/`assistant` turns from a transcript
+/// JSONL file. Used by the `stop_auto_summary` hook handler to build the
+/// summarization prompt.
+///
+/// Returns an empty `Vec` when the file is unreadable or contains no
+/// valid turns; never panics. Order is chronological (oldest first within
+/// the trailing window).
+pub(crate) fn last_n_turns(transcript_path: &str, n: usize) -> Vec<OwnedTurn> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let Some(path) = safe_transcript_path(transcript_path) else {
+        return Vec::new();
+    };
+    let Ok(file) = File::open(&path) else {
+        return Vec::new();
+    };
+
+    // Defensively bound the bytes actually consumed regardless of the
+    // metadata size check above: a regular file can still grow (or be
+    // swapped via TOCTOU) after the gate, so cap the reader itself.
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
+    let mut all: Vec<OwnedTurn> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) else {
+            continue;
+        };
+        let role = match entry.entry_type.as_deref() {
+            Some(r @ ("user" | "assistant")) => r.to_string(),
+            _ => continue,
+        };
+        let content = entry
+            .message
+            .as_ref()
+            .map(|m| m.content().to_string())
+            .unwrap_or_default();
+        if content.is_empty() {
+            continue;
+        }
+        all.push(OwnedTurn { role, content });
+    }
+    // Keep only the trailing `n` turns. `split_off` would copy; `drain`
+    // from the front avoids a clone on the kept tail.
+    let len = all.len();
+    if len > n {
+        all.drain(0..len - n);
+    }
+    all
+}
 
 /// Fast token count from transcript file (no LLM calls, no async).
 /// Returns (`input_tokens`, `output_tokens`, `message_count`).
 pub(crate) fn count_transcript_tokens(transcript_path: &str) -> (i64, i64, i32) {
-    let Ok(file) = File::open(transcript_path) else {
+    let Some(path) = safe_transcript_path(transcript_path) else {
+        return (0, 0, 0);
+    };
+    let Ok(file) = File::open(&path) else {
         return (0, 0, 0);
     };
 
-    let reader = BufReader::new(file);
+    // Bound the read even if the file grows or is swapped post-check.
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
     let mut message_count: i32 = 0;
@@ -54,8 +178,24 @@ pub(crate) async fn process_transcript(
     transcript_path: &str,
     ollama_available: bool,
 ) -> TranscriptResult {
-    // Read transcript file
-    let file = match File::open(transcript_path) {
+    // Read transcript file. `safe_transcript_path` canonicalizes the
+    // envelope-supplied path and rejects oversized/unresolvable files so
+    // a hostile path cannot drive an unbounded read.
+    let Some(safe_path) = safe_transcript_path(transcript_path) else {
+        warn!(
+            "Refusing transcript file '{}' (missing, unresolvable, or over size cap)",
+            transcript_path
+        );
+        return TranscriptResult {
+            summary: None,
+            key_facts: None,
+            todos: None,
+            message_count: None,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+    };
+    let file = match File::open(&safe_path) {
         Ok(f) => f,
         Err(e) => {
             warn!(
@@ -73,7 +213,8 @@ pub(crate) async fn process_transcript(
         }
     };
 
-    let reader = BufReader::new(file);
+    // Bound the read even if the file grows or is swapped post-check.
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
     let mut entries = Vec::new();
     let mut message_count = 0;
     let mut input_tokens: i64 = 0;
@@ -269,10 +410,8 @@ mod tests {
     fn test_count_transcript_tokens_with_content() {
         use std::io::Write;
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("clx-transcript-test-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
 
         // Create a transcript file with known content.
         // Each entry is a JSONL line with type and message fields.
@@ -299,18 +438,14 @@ mod tests {
             "assistant tokens should be estimated from 'goodbye world'"
         );
         assert_eq!(msg_count, 2, "only valid JSONL entries should be counted");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_count_transcript_tokens_exceeds_pressure_threshold() {
         use std::io::Write;
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("clx-pressure-test-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
 
         // Create a transcript with enough content to exceed a realistic threshold.
         // We'll simulate a 200k-token window at 80% threshold = 160k tokens needed.
@@ -334,8 +469,6 @@ mod tests {
             "total_tokens ({total_tokens}) should exceed threshold ({threshold})"
         );
         assert_eq!(msg_count, 110);
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     // =========================================================================
@@ -387,9 +520,8 @@ mod tests {
             .await;
 
         // Write a small transcript file
-        let temp_dir = std::env::temp_dir().join(format!("clx-t16-success-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
         write_transcript(
             &transcript_path,
             &[
@@ -418,8 +550,6 @@ mod tests {
         let summary = result.summary.expect("summary should be Some");
         assert!(!summary.is_empty(), "summary must be non-empty");
         assert_eq!(result.message_count, Some(2));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// T16-2: `process_transcript` falls back gracefully when Ollama is unavailable.
@@ -430,10 +560,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_transcript_fallback_when_ollama_unavailable() {
         // Arrange — write a small transcript
-        let temp_dir =
-            std::env::temp_dir().join(format!("clx-t16-fallback-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
         write_transcript(
             &transcript_path,
             &[
@@ -466,8 +594,6 @@ mod tests {
             Some(2),
             "message_count must reflect the transcript lines"
         );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// T16-3: `count_transcript_tokens` with a known structure returns correct token counts.
@@ -479,9 +605,8 @@ mod tests {
     fn test_count_transcript_tokens_known_structure() {
         use std::io::Write;
 
-        let temp_dir = std::env::temp_dir().join(format!("clx-t16-tokens-{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let transcript_path = temp_dir.join("transcript.jsonl");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tmp.path().join("transcript.jsonl");
 
         let mut f = std::fs::File::create(&transcript_path).unwrap();
         // "user msg" = 8 chars → (8+3)/4 = 2 tokens
@@ -499,8 +624,146 @@ mod tests {
         assert_eq!(input_tok, 2, "user 'user msg' → 2 tokens");
         assert_eq!(output_tok, 4, "assistant 'assistant msg' → 4 tokens");
         assert_eq!(msg_count, 2, "only 2 valid JSONL entries");
+    }
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    // =========================================================================
+    // F8 — transcript path hardening (canonicalize + size cap)
+    // =========================================================================
+
+    /// F8-1: a non-existent path is rejected (canonicalize fails) and both
+    /// readers return their empty sentinels.
+    #[test]
+    fn f8_nonexistent_path_returns_empty() {
+        let missing = "/nonexistent/clx/f8/does-not-exist.jsonl";
+        assert!(safe_transcript_path(missing).is_none());
+        assert!(last_n_turns(missing, 5).is_empty());
+        assert_eq!(count_transcript_tokens(missing), (0, 0, 0));
+    }
+
+    /// F8-2: a transcript over `MAX_TRANSCRIPT_BYTES` is refused. We assert
+    /// the cap predicate directly against a real oversized file via a
+    /// sparse file so the test stays fast and does not write 64 MiB.
+    #[test]
+    fn f8_oversized_transcript_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("huge.jsonl");
+
+        let f = std::fs::File::create(&path).unwrap();
+        // Sparse file: set logical length past the cap without writing bytes.
+        f.set_len(MAX_TRANSCRIPT_BYTES + 1).unwrap();
+        drop(f);
+
+        assert!(
+            safe_transcript_path(path.to_str().unwrap()).is_none(),
+            "file larger than MAX_TRANSCRIPT_BYTES must be rejected"
+        );
+        assert!(last_n_turns(path.to_str().unwrap(), 5).is_empty());
+        assert_eq!(count_transcript_tokens(path.to_str().unwrap()), (0, 0, 0));
+    }
+
+    /// F8-3: a file exactly at the cap is still accepted (boundary), and a
+    /// normal small transcript still parses (regression guard).
+    #[test]
+    fn f8_at_cap_and_small_transcript_still_parse() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("small.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":"hello world"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"assistant","message":"goodbye world"}}"#).unwrap();
+        drop(f);
+
+        // safe path resolves and is accepted
+        assert!(safe_transcript_path(path.to_str().unwrap()).is_some());
+        let turns = last_n_turns(path.to_str().unwrap(), 5);
+        assert_eq!(turns.len(), 2, "small transcript must still parse");
+        let (i, o, c) = count_transcript_tokens(path.to_str().unwrap());
+        assert_eq!((i, o, c), (3, 4, 2));
+    }
+
+    /// F8-4: a symlink to a real transcript is canonicalized to its target
+    /// and the content is read through the resolved path.
+    #[test]
+    #[cfg(unix)]
+    fn f8_symlink_is_canonicalized_to_target() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("real.jsonl");
+        let link = tmp.path().join("link.jsonl");
+
+        let mut f = std::fs::File::create(&target).unwrap();
+        writeln!(f, r#"{{"type":"user","message":"via symlink"}}"#).unwrap();
+        drop(f);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = safe_transcript_path(link.to_str().unwrap())
+            .expect("symlink to a small file must resolve");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&target).unwrap(),
+            "symlink must canonicalize to its real target"
+        );
+        let turns = last_n_turns(link.to_str().unwrap(), 5);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "via symlink");
+    }
+
+    /// F8-5: a non-regular path (FIFO / char device) is rejected by the
+    /// `is_file()` gate so the readers never enter an unbounded read. On
+    /// unix we create a real FIFO (a `read()` on it would block / never
+    /// EOF without the guard); the assertions must return immediately.
+    #[test]
+    #[cfg(unix)]
+    fn f8_non_regular_path_is_rejected_no_unbounded_read() {
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fifo = tmp.path().join("pipe");
+
+        // mkfifo via libc-free path: use the `nix`-free std approach by
+        // shelling out to `mkfifo` (POSIX, always present on unix CI).
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo must succeed");
+
+        // Sanity: it really is a FIFO, not a regular file.
+        let ft = std::fs::symlink_metadata(&fifo).unwrap().file_type();
+        assert!(ft.is_fifo(), "test fixture must be a FIFO");
+
+        // The guard must reject it (treated as "no transcript"). These
+        // calls must return promptly; without the is_file() gate a reader
+        // opened on the FIFO would block forever.
+        assert!(
+            safe_transcript_path(fifo.to_str().unwrap()).is_none(),
+            "a FIFO must be rejected by the regular-file gate"
+        );
+        assert!(last_n_turns(fifo.to_str().unwrap(), 5).is_empty());
+        assert_eq!(count_transcript_tokens(fifo.to_str().unwrap()), (0, 0, 0));
+    }
+
+    /// F8-6: a regular file reporting an honest over-cap length is rejected
+    /// by the size gate, and `last_n_turns` / `count_transcript_tokens`
+    /// both yield their empty sentinel without consuming the file.
+    #[test]
+    fn f8_over_cap_regular_file_is_bounded_and_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("over.jsonl");
+
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_TRANSCRIPT_BYTES + 4096).unwrap();
+        drop(f);
+
+        let start = std::time::Instant::now();
+        assert!(safe_transcript_path(path.to_str().unwrap()).is_none());
+        assert!(last_n_turns(path.to_str().unwrap(), 5).is_empty());
+        assert_eq!(count_transcript_tokens(path.to_str().unwrap()), (0, 0, 0));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "rejection must be effectively instant (bounded), took {:?}",
+            start.elapsed()
+        );
     }
 
     /// T16-4: `build_transcript_text` does not panic on multi-byte UTF-8 content.

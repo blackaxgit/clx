@@ -892,3 +892,324 @@ mod tests {
         assert_eq!(decision_style("unknown").fg, Some(Color::White));
     }
 }
+
+// ── E1.W4: TestBackend + insta snapshots for the SessionDetail screen ───────
+//
+// These snapshots pin the rendered output of `detail::render` against
+// deterministic AppState + SessionDetailData fixtures. The TestBackend
+// dimensions are fixed at 100x40 (wider than the list view's 80x24 to
+// accommodate the detail-pane layout without ratatui truncating columns).
+//
+// Determinism rules for these fixtures:
+//   - No `Instant::now()`, `chrono::Utc::now()`, or system clock reads.
+//   - All timestamps are pinned via `chrono::DateTime::from_timestamp(...)`.
+//   - No filesystem or DB I/O; `SessionDetailData` is built inline.
+//
+// If a render tweak changes layout, accept the new snapshot via
+// `cargo insta review` (or `INSTA_UPDATE=always cargo test`).
+#[cfg(test)]
+mod render_snapshots {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::dashboard::app::{App, DetailTab, ScreenState};
+    use crate::dashboard::data::{CommandStats, RiskStats, SessionDetailData};
+
+    /// Fixed terminal dimensions for detail snapshots. 100 columns is wide
+    /// enough that the side-by-side metric boxes ("Tokens / Commands / Risk")
+    /// render without wrapping; 40 rows gives the detail pane breathing room.
+    const COLS: u16 = 100;
+    const ROWS: u16 = 40;
+
+    /// Render `app`'s current detail screen into a `COLS`x`ROWS` headless
+    /// terminal and return the buffer as a newline-joined string with
+    /// trailing spaces trimmed per row (for snapshot stability).
+    fn render_detail_to_string(app: &mut App) -> String {
+        let backend = TestBackend::new(COLS, ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                super::render(frame, app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..ROWS)
+            .map(|y| {
+                let row: String = (0..COLS)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Deterministic UTC timestamp: 2023-11-14T22:13:20Z (Unix `1_700_000_000`).
+    fn fixed_started_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    /// Deterministic UTC timestamp 5 minutes after start.
+    fn fixed_ended_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_300, 0).unwrap()
+    }
+
+    fn make_session() -> clx_core::types::Session {
+        clx_core::types::Session {
+            id: clx_core::types::SessionId::new("abcdef0123456789"),
+            project_path: "/home/user/project".to_string(),
+            transcript_path: None,
+            started_at: fixed_started_at(),
+            ended_at: Some(fixed_ended_at()),
+            source: clx_core::types::SessionSource::Startup,
+            message_count: 10,
+            command_count: 3,
+            input_tokens: 1200,
+            output_tokens: 800,
+            status: clx_core::types::SessionStatus::Ended,
+        }
+    }
+
+    fn make_audit_entry(
+        cmd: &str,
+        decision: clx_core::types::AuditDecision,
+        risk: Option<i32>,
+        offset_secs: i64,
+    ) -> clx_core::types::AuditLogEntry {
+        clx_core::types::AuditLogEntry {
+            id: None,
+            session_id: clx_core::types::SessionId::new("abcdef0123456789"),
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000 + offset_secs, 0).unwrap(),
+            command: cmd.to_string(),
+            decision,
+            layer: "builtin".to_string(),
+            risk_score: risk,
+            reasoning: Some("matched whitelist pattern".to_string()),
+            working_dir: Some("/home/user/project".to_string()),
+            user_decision: None,
+        }
+    }
+
+    fn make_event(
+        et: clx_core::types::EventType,
+        tool: Option<&str>,
+        input: Option<&str>,
+        offset_secs: i64,
+    ) -> clx_core::types::Event {
+        clx_core::types::Event {
+            id: None,
+            session_id: clx_core::types::SessionId::new("abcdef0123456789"),
+            event_type: et,
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000 + offset_secs, 0).unwrap(),
+            tool_name: tool.map(str::to_string),
+            tool_use_id: None,
+            tool_input: input.map(str::to_string),
+            tool_output: None,
+        }
+    }
+
+    fn make_snapshot(
+        trigger: clx_core::types::SnapshotTrigger,
+        summary: Option<&str>,
+        facts: Option<&str>,
+        todos: Option<&str>,
+        offset_secs: i64,
+    ) -> clx_core::types::Snapshot {
+        clx_core::types::Snapshot {
+            id: None,
+            session_id: clx_core::types::SessionId::new("abcdef0123456789"),
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000 + offset_secs, 0).unwrap(),
+            trigger,
+            summary: summary.map(str::to_string),
+            key_facts: facts.map(str::to_string),
+            todos: todos.map(str::to_string),
+            message_count: Some(8),
+            input_tokens: Some(1200),
+            output_tokens: Some(800),
+        }
+    }
+
+    fn make_detail_data(
+        audit: Vec<clx_core::types::AuditLogEntry>,
+        events: Vec<clx_core::types::Event>,
+        snapshots: Vec<clx_core::types::Snapshot>,
+    ) -> SessionDetailData {
+        use clx_core::types::AuditDecision;
+        let total = audit.len();
+        let allowed = audit
+            .iter()
+            .filter(|a| a.decision == AuditDecision::Allowed)
+            .count();
+        let blocked = audit
+            .iter()
+            .filter(|a| a.decision == AuditDecision::Blocked)
+            .count();
+        let prompted = audit
+            .iter()
+            .filter(|a| a.decision == AuditDecision::Prompted)
+            .count();
+        let low = audit
+            .iter()
+            .filter(|a| a.risk_score.is_some_and(|s| s <= 3))
+            .count();
+        let medium = audit
+            .iter()
+            .filter(|a| a.risk_score.is_some_and(|s| (4..=7).contains(&s)))
+            .count();
+        let high = audit
+            .iter()
+            .filter(|a| a.risk_score.is_some_and(|s| s >= 8))
+            .count();
+
+        SessionDetailData {
+            session: make_session(),
+            audit_entries: audit,
+            events,
+            snapshots,
+            command_stats: CommandStats {
+                total,
+                allowed,
+                blocked,
+                prompted,
+            },
+            risk_stats: RiskStats { low, medium, high },
+        }
+    }
+
+    /// Build an `App` already positioned in `SessionDetail` with the provided
+    /// detail data and tab. No `refresh_data` is called, so no DB access.
+    fn make_detail_app(detail_tab: DetailTab, data: SessionDetailData) -> App {
+        let mut app = App::new(7, 5);
+        app.screen_state = ScreenState::SessionDetail("abcdef0123456789".to_string());
+        app.detail_tab = detail_tab;
+        // Pre-select first row of each sub-table so the detail pane renders content.
+        if !data.audit_entries.is_empty() {
+            app.detail_commands_state.select(Some(0));
+        }
+        if !data.events.is_empty() {
+            app.detail_events_state.select(Some(0));
+        }
+        if !data.snapshots.is_empty() {
+            app.detail_snapshots_state.select(Some(0));
+        }
+        app.detail_data = Some(data);
+        app
+    }
+
+    // ── Empty-data fixtures ──────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_detail_loading_no_data() {
+        // No detail_data attached at all -> "Loading session data..." message.
+        let mut app = App::new(7, 5);
+        app.screen_state = ScreenState::SessionDetail("abcdef0123456789".to_string());
+        app.detail_tab = DetailTab::Info;
+        // detail_data stays None.
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_loading_no_data", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_info_empty() {
+        let data = make_detail_data(vec![], vec![], vec![]);
+        let mut app = make_detail_app(DetailTab::Info, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_info_empty", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_commands_empty() {
+        let data = make_detail_data(vec![], vec![], vec![]);
+        let mut app = make_detail_app(DetailTab::Commands, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_commands_empty", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_audit_empty() {
+        let data = make_detail_data(vec![], vec![], vec![]);
+        let mut app = make_detail_app(DetailTab::Audit, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_audit_empty", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_snapshots_empty() {
+        let data = make_detail_data(vec![], vec![], vec![]);
+        let mut app = make_detail_app(DetailTab::Snapshots, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_snapshots_empty", rendered);
+    }
+
+    // ── Populated fixtures ──────────────────────────────────────────────────
+
+    fn populated_audit() -> Vec<clx_core::types::AuditLogEntry> {
+        use clx_core::types::AuditDecision;
+        vec![
+            make_audit_entry("ls -la /tmp", AuditDecision::Allowed, Some(1), 10),
+            make_audit_entry("rm -rf /tmp/foo", AuditDecision::Blocked, Some(9), 20),
+            make_audit_entry("git push --force", AuditDecision::Prompted, Some(6), 30),
+        ]
+    }
+
+    fn populated_events() -> Vec<clx_core::types::Event> {
+        use clx_core::types::EventType;
+        vec![
+            make_event(EventType::ToolUse, Some("Bash"), Some("ls -la"), 10),
+            make_event(EventType::ToolResult, Some("Bash"), Some("output line"), 11),
+            make_event(EventType::Message, None, Some("prompt text"), 25),
+        ]
+    }
+
+    fn populated_snapshots() -> Vec<clx_core::types::Snapshot> {
+        use clx_core::types::SnapshotTrigger;
+        vec![
+            make_snapshot(
+                SnapshotTrigger::Auto,
+                Some("Worked on test coverage."),
+                Some("Tests added"),
+                Some("Run cargo test"),
+                100,
+            ),
+            make_snapshot(
+                SnapshotTrigger::Manual,
+                Some("Manual checkpoint."),
+                None,
+                None,
+                200,
+            ),
+        ]
+    }
+
+    #[test]
+    fn snapshot_detail_info_populated() {
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
+        let mut app = make_detail_app(DetailTab::Info, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_info_populated", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_commands_populated() {
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
+        let mut app = make_detail_app(DetailTab::Commands, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_commands_populated", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_audit_populated() {
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
+        let mut app = make_detail_app(DetailTab::Audit, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_audit_populated", rendered);
+    }
+
+    #[test]
+    fn snapshot_detail_snapshots_populated() {
+        let data = make_detail_data(populated_audit(), populated_events(), populated_snapshots());
+        let mut app = make_detail_app(DetailTab::Snapshots, data);
+        let rendered = render_detail_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_detail_snapshots_populated", rendered);
+    }
+}

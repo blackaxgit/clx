@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use super::Storage;
 use super::util::{parse_datetime, validate_session_id};
-use crate::types::{Session, SessionSource, SessionStatus};
+use crate::types::{Session, SessionId, SessionSource, SessionStatus, SessionSummary};
 
 impl Storage {
     /// Create a new session
@@ -264,6 +264,70 @@ impl Storage {
             .filter_map(std::result::Result::ok)
             .collect();
         Ok(sessions)
+    }
+
+    /// Fetch the latest snapshot summary for each of the `n` most recently
+    /// started sessions, optionally excluding one session id (the caller's
+    /// current session, to suppress self-pinning).
+    ///
+    /// Returns at most `n` rows. Sessions with no non-null snapshot summary
+    /// are filtered out. Ordering is by `sessions.started_at DESC`, then
+    /// `snapshots.created_at DESC` to break ties.
+    ///
+    /// The exclusion guard is implemented as a parameterised predicate, not
+    /// a post-filter, so `LIMIT n` is honored after the exclusion.
+    /// When `exclude_session_id` is empty (`""`) or `None` no exclusion is
+    /// applied (an empty string can never match a stored session id because
+    /// session ids are validated non-empty at insert time).
+    pub fn recent_session_summaries(
+        &self,
+        n: usize,
+        exclude_session_id: Option<&str>,
+    ) -> crate::Result<Vec<SessionSummary>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let limit = i64::try_from(n).unwrap_or(i64::MAX);
+        let exclude = exclude_session_id.unwrap_or("");
+
+        // Latest snapshot per session via correlated subquery on created_at.
+        // Group by session_id keeps one row per session; the inner MAX picks
+        // the newest snapshot timestamp; we join back to retrieve its summary
+        // by selecting the row whose created_at equals the per-session MAX.
+        let sql = "SELECT s.id, s.started_at, sn.summary, sn.created_at \
+                   FROM sessions s \
+                   JOIN snapshots sn ON sn.session_id = s.id \
+                   WHERE sn.summary IS NOT NULL \
+                     AND sn.created_at = ( \
+                         SELECT MAX(sn2.created_at) FROM snapshots sn2 \
+                         WHERE sn2.session_id = s.id AND sn2.summary IS NOT NULL \
+                     ) \
+                     AND s.id != ?1 \
+                   ORDER BY s.started_at DESC, sn.created_at DESC \
+                   LIMIT ?2";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![exclude, limit], |row| {
+                let id: String = row.get(0)?;
+                let started_str: String = row.get(1)?;
+                let summary: String = row.get(2)?;
+                Ok(SessionSummary {
+                    session_id: SessionId::new(id),
+                    started_at: parse_datetime(&started_str),
+                    summary,
+                })
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("recent_session_summaries row error (skipped): {e}");
+                    None
+                }
+            })
+            .collect();
+        Ok(rows)
     }
 
     fn row_to_session(row: &Row) -> rusqlite::Result<Session> {

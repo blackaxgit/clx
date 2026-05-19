@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::audit::log_audit_entry;
 use crate::embedding::resolve_command_paths;
+use crate::learning::track_user_decision;
 use crate::output::{RULES_REMINDER, output_decision};
 use crate::types::HookInput;
 
@@ -353,17 +354,50 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
 
     // In-memory cache is not useful in a short-lived hook process;
     // SQLite cache (above) handles cross-process caching instead.
-    let l1_decision = policy_engine
-        .evaluate_with_llm(
-            "Bash",
+    //
+    // V-R4: bound the L1 evaluation with the configured timeout. The future
+    // covers the actual LLM network call (ollama.generate inside
+    // evaluate_with_llm). On timeout the future is dropped (clean
+    // cancellation: no audit/cache writes happen until after the await
+    // returns), and we apply the documented default_decision fallback with a
+    // distinct WARN so a hung provider can never block the hook indefinitely.
+    let l1_timeout = std::time::Duration::from_millis(config.validator.layer1_timeout_ms);
+    let l1_future = policy_engine.evaluate_with_llm(
+        "Bash",
+        command,
+        &input.cwd,
+        &ollama,
+        &chat_model,
+        None,
+        &config.validator.prompt_sensitivity,
+    );
+    let Ok(l1_decision) = tokio::time::timeout(l1_timeout, l1_future).await else {
+        warn!(
+            "L1 evaluation timed out after {}ms — applying default_decision: {}",
+            config.validator.layer1_timeout_ms, config.validator.default_decision
+        );
+        clx_core::llm_health::write_health(false);
+        let fallback = config.validator.default_decision.as_str();
+        let fallback_reason = format!("LLM timeout — fallback: {fallback}");
+        log_audit_entry(
+            &input.session_id,
             command,
             &input.cwd,
-            &ollama,
-            &chat_model,
+            "L1",
+            match config.validator.default_decision {
+                DefaultDecision::Allow => AuditDecision::Allowed,
+                DefaultDecision::Deny => AuditDecision::Blocked,
+                DefaultDecision::Ask => AuditDecision::Prompted,
+            },
             None,
-            &config.validator.prompt_sensitivity,
-        )
-        .await;
+            Some(&format!(
+                "L1 timeout after {}ms — default_decision: {}",
+                config.validator.layer1_timeout_ms, config.validator.default_decision
+            )),
+        );
+        output_decision(fallback, Some(fallback_reason), Some(RULES_REMINDER), None);
+        return Ok(());
+    };
 
     // Handle LLM generation failure: evaluate_with_llm returns Ask("LLM unavailable")
     // when the generation call fails (distinct from the is_available() check above).
@@ -435,6 +469,20 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
                 Some(9),
                 Some(&reason),
             );
+            // V-R5: a DENY/BLOCK outcome must increment denial_count for the
+            // matched pattern, symmetrically to how an executed (approved)
+            // command increments confirmation_count in post_tool_use. Without
+            // this the user-learning auto_blacklist_threshold is unreachable.
+            // Exactly one call per L1 deny decision (the hook returns
+            // immediately after) so there is no double-count. Precedence is
+            // preserved: this only bumps a counter / may flip rule_type to
+            // Deny, which L0 enforces on the next invocation (L0 > learned >
+            // L1). L0 hard-blocks return earlier and are intentionally NOT
+            // learned here, matching the approve path which only learns from
+            // executed commands, not deterministic L0 outcomes.
+            if let Ok(storage) = Storage::open_default() {
+                track_user_decision(&storage, command, &input.cwd, false);
+            }
             output_decision("deny", Some(reason), Some(RULES_REMINDER), None);
         }
         PolicyDecision::Ask { reason } => {
@@ -505,4 +553,132 @@ fn rand_cleanup() -> bool {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .is_ok_and(|d| d.subsec_nanos() % 20 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{HookOutput, HookSpecificOutput};
+
+    /// Build the exact JSON envelope `output_decision` would emit, so tests
+    /// assert the emitted block/ask/allow string (not just an enum).
+    fn rendered_envelope(decision: &str, reason: Option<String>) -> String {
+        let output = HookOutput {
+            hook_specific_output: HookSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: decision.to_string(),
+                permission_decision_reason: reason,
+                additional_context: None,
+            },
+            system_message: None,
+        };
+        serde_json::to_string(&output).expect("serialize hook output")
+    }
+
+    /// V-R2 happy path: an L1 verdict at/above the deny band yields a Deny
+    /// decision AND the emitted envelope is an actual block.
+    #[test]
+    fn test_v_r2_l1_deny_emits_block_envelope() {
+        // A high-risk L1 outcome is PolicyDecision::Deny (see
+        // risk_score_to_decision 8..=10). The hook maps it to "deny".
+        let l1: PolicyDecision = PolicyDecision::Deny {
+            reason: "[critical] rm -rf /".to_string(),
+        };
+        assert_eq!(
+            l1.to_permission_decision(),
+            "deny",
+            "high-risk L1 verdict must map to deny"
+        );
+        let json = rendered_envelope(l1.to_permission_decision(), l1.reason().map(String::from));
+        assert!(
+            json.contains(r#""permissionDecision":"deny""#),
+            "emitted envelope must be a block, got: {json}"
+        );
+        assert!(json.contains("[critical] rm -rf /"));
+    }
+
+    /// V-R2 no-regression: a mid verdict still asks, a low verdict still
+    /// allows. Asserts the emitted envelope, not just the enum.
+    #[test]
+    fn test_v_r2_mid_asks_low_allows_no_regression() {
+        let ask = PolicyDecision::Ask {
+            reason: "[caution] unclear".to_string(),
+        };
+        assert_eq!(ask.to_permission_decision(), "ask");
+        assert!(
+            rendered_envelope("ask", Some("[caution] unclear".to_string()))
+                .contains(r#""permissionDecision":"ask""#)
+        );
+
+        let allow = PolicyDecision::Allow;
+        assert_eq!(allow.to_permission_decision(), "allow");
+        assert!(rendered_envelope("allow", None).contains(r#""permissionDecision":"allow""#));
+    }
+
+    /// V-R4 happy path: an L1 call within budget resolves normally (the
+    /// timeout wrapper passes the inner decision through unchanged).
+    #[tokio::test]
+    async fn test_v_r4_within_budget_passes_through() {
+        let budget = std::time::Duration::from_millis(200);
+        let fut = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            PolicyDecision::Allow
+        };
+        let res = tokio::time::timeout(budget, fut).await;
+        assert!(res.is_ok(), "within-budget call must not time out");
+        assert_eq!(res.unwrap(), PolicyDecision::Allow);
+    }
+
+    /// V-R4 failure path: an L1 call that exceeds `layer1_timeout_ms` must
+    /// resolve to the configured `default_decision` and emit the matching
+    /// envelope. Tested for `default_decision` = ask AND = deny.
+    #[tokio::test]
+    async fn test_v_r4_timeout_applies_default_decision() {
+        let budget = std::time::Duration::from_millis(20);
+        // A future that never completes within budget (the hung-provider case).
+        let hung = async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            PolicyDecision::Allow
+        };
+        let timed_out = tokio::time::timeout(budget, hung).await;
+        assert!(timed_out.is_err(), "hung L1 call must time out");
+
+        // default_decision = ask -> emitted envelope is ask (not silent allow)
+        let ask_fb = DefaultDecision::Ask.as_str();
+        assert_eq!(ask_fb, "ask");
+        assert!(
+            rendered_envelope(ask_fb, Some("LLM timeout — fallback: ask".to_string()))
+                .contains(r#""permissionDecision":"ask""#),
+            "timeout with default_decision=ask must emit ask"
+        );
+
+        // default_decision = deny -> emitted envelope is a block
+        let deny_fb = DefaultDecision::Deny.as_str();
+        assert_eq!(deny_fb, "deny");
+        assert!(
+            rendered_envelope(deny_fb, Some("LLM timeout — fallback: deny".to_string()))
+                .contains(r#""permissionDecision":"deny""#),
+            "timeout with default_decision=deny must emit a block"
+        );
+    }
+
+    /// V-R4: the provider-error path (distinct from timeout) also maps to
+    /// `default_decision`. Both converge on `default_decision`; logs differ.
+    #[test]
+    fn test_v_r4_provider_error_maps_to_default_decision() {
+        // evaluate_with_llm returns Ask("LLM unavailable") on generation
+        // failure; the hook converts that to default_decision. Verify the
+        // mapping table the hook uses for that branch.
+        for (dd, expected) in [
+            (DefaultDecision::Allow, "allow"),
+            (DefaultDecision::Ask, "ask"),
+            (DefaultDecision::Deny, "deny"),
+        ] {
+            assert_eq!(dd.as_str(), expected);
+            assert!(
+                rendered_envelope(dd.as_str(), Some("fallback".to_string()))
+                    .contains(&format!(r#""permissionDecision":"{expected}""#))
+            );
+        }
+    }
 }

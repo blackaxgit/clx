@@ -122,6 +122,7 @@ pub struct App {
     pub settings_load_error: Option<String>,
 }
 
+#[allow(dead_code)]
 impl App {
     pub fn new(days: u32, refresh_secs: u64) -> Self {
         Self {
