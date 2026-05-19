@@ -3,11 +3,12 @@
 # Trigger:  push of any tag matching v* (e.g. v0.1.0, v1.2.3-rc1)
 # Platforms:
 #   macos-latest — Apple Silicon ARM64 (M-series, default since late 2024)
-#   macos-13     — last Intel x86_64 macOS runner
+#   Apple Silicon only: Intel x86_64 macOS is unsupported from 0.8.0
+#   (no prebuilt ONNX Runtime for the bge-reranker dependency).
 #
 # Jobs:
-#   build   — compile release binaries and produce a signed tarball + SHA256 (matrix)
-#   release — download artifacts from both matrix legs and attach to a GitHub Release
+#   build   — compile release binaries and produce a signed tarball + SHA256
+#   release — download the build artifact and attach it to a GitHub Release
 #
 # Permissions: only contents:write is needed; GITHUB_TOKEN is sufficient.
 
@@ -35,7 +36,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build (${{ matrix.arch }})
-    # Both legs run on the free ARM64 runner; x86_64 is cross-compiled.
+    # Native build on the free ARM64 runner (Apple Silicon only).
     runs-on: macos-latest
 
     strategy:
@@ -43,13 +44,12 @@ jobs:
       matrix:
         include:
           # Apple Silicon — native build on ARM64 runner.
+          # x86_64-apple-darwin is intentionally not built: the bge-reranker
+          # dependency (fastembed -> ort-sys) ships no prebuilt ONNX Runtime
+          # for Intel macOS, which Apple has EOL'd (macos-13 runners retired
+          # Dec 2025). 0.8.0 ships Apple Silicon only.
           - arch: aarch64
             target: aarch64-apple-darwin
-
-          # Intel x86_64 — cross-compiled from ARM64 runner (free tier).
-          # macos-13 was retired Dec 2025; paid large runners not needed.
-          - arch: x86_64
-            target: x86_64-apple-darwin
 
     steps:
       - name: Checkout repository
@@ -77,11 +77,7 @@ jobs:
         run: |
           BINARY="target/${{ matrix.target }}/release/clx"
           file "$BINARY"
-          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-            file "$BINARY" | grep -q "x86_64" || { echo "ERROR: binary is not x86_64" >&2; exit 1; }
-          else
-            file "$BINARY" | grep -q "arm64" || { echo "ERROR: binary is not arm64" >&2; exit 1; }
-          fi
+          file "$BINARY" | grep -q "arm64" || { echo "ERROR: binary is not arm64" >&2; exit 1; }
 
       # Bundle all three binaries and the pre-built install script into one tarball.
       # The tarball layout mirrors what scripts/package.sh produces locally:
@@ -221,19 +217,17 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           TAG="${GITHUB_REF_NAME}"
 
-          # Download SHA256 checksum files from the GitHub Release.
-          for arch in aarch64 x86_64; do
-            curl -fsSL \
-              "https://github.com/blackaxgit/clx/releases/download/${TAG}/clx-${arch}-apple-darwin.tar.gz.sha256" \
-              -o "clx-${arch}.sha256"
-          done
+          # Download the SHA256 checksum from the GitHub Release.
+          # Apple Silicon only — see the build matrix comment for why
+          # x86_64-apple-darwin is not produced.
+          curl -fsSL \
+            "https://github.com/blackaxgit/clx/releases/download/${TAG}/clx-aarch64-apple-darwin.tar.gz.sha256" \
+            -o "clx-aarch64.sha256"
 
           ARM_SHA=$(awk '{print $1}' clx-aarch64.sha256)
-          X86_SHA=$(awk '{print $1}' clx-x86_64.sha256)
 
           echo "Version: ${VERSION}"
           echo "ARM SHA256: ${ARM_SHA}"
-          echo "x86 SHA256: ${X86_SHA}"
 
           # Generate the formula with correct 2-space Ruby indentation.
           # The heredoc is indented to satisfy YAML block scalar rules;
@@ -249,14 +243,12 @@ jobs:
             version "____VERSION____"
             license "MPL-2.0"
 
+            # Apple Silicon only. Intel macOS is unsupported from 0.8.0
+            # (no prebuilt ONNX Runtime for the bge-reranker dependency).
             on_macos do
               on_arm do
                 url "https://github.com/blackaxgit/clx/releases/download/____TAG____/clx-aarch64-apple-darwin.tar.gz"
                 sha256 "____ARM_SHA____"
-              end
-              on_intel do
-                url "https://github.com/blackaxgit/clx/releases/download/____TAG____/clx-x86_64-apple-darwin.tar.gz"
-                sha256 "____X86_SHA____"
               end
             end
 
@@ -276,7 +268,6 @@ jobs:
           sed -i "s|____VERSION____|${VERSION}|g" Formula/clx.rb
           sed -i "s|____TAG____|${TAG}|g" Formula/clx.rb
           sed -i "s|____ARM_SHA____|${ARM_SHA}|g" Formula/clx.rb
-          sed -i "s|____X86_SHA____|${X86_SHA}|g" Formula/clx.rb
 
       - name: Commit and push formula
         run: |
