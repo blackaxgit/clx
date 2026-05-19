@@ -844,3 +844,378 @@ fn test_normal_mode_unknown_char_noop() {
     assert_eq!(s0, s1);
     assert!(cmds.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Settings-tab list navigation arms of the shared scroll/page helpers.
+// These exercise the `DashboardTab::Settings` match arm in scroll_down/up,
+// page_down/up, scroll_to_top/bottom — previously only the Sessions/Audit/
+// Rules arms were driven.
+// ---------------------------------------------------------------------------
+
+fn settings_nav_with_fields(field_count: usize) -> AppState {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::Settings;
+    s.input_mode = InputMode::SettingsNav;
+    s.settings_field_count = field_count;
+    s
+}
+
+#[test]
+fn test_settings_nav_j_moves_field_down_within_bounds() {
+    let mut s = settings_nav_with_fields(5);
+    s.settings_field_idx = 0;
+    let (s, _) = update(s, key('j'));
+    assert_eq!(s.settings_field_idx, 1);
+}
+
+#[test]
+fn test_settings_nav_j_clamps_at_last_field() {
+    let mut s = settings_nav_with_fields(3);
+    s.settings_field_idx = 2; // max index (count-1)
+    let (s, _) = update(s, key('j'));
+    assert_eq!(s.settings_field_idx, 2);
+}
+
+#[test]
+fn test_settings_nav_k_saturates_at_zero() {
+    let mut s = settings_nav_with_fields(5);
+    s.settings_field_idx = 1;
+    let (s, _) = update(s, key('k'));
+    assert_eq!(s.settings_field_idx, 0);
+    let (s, _) = update(s, key('k'));
+    assert_eq!(s.settings_field_idx, 0);
+}
+
+#[test]
+fn test_settings_nav_page_down_walks_field_idx_to_last() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_field_idx = 0;
+    let (s, _) = update(s, keycode(KeyCode::PageDown));
+    // PAGE_SIZE (10) field-down steps, clamped at count-1 = 5.
+    assert_eq!(s.settings_field_idx, 5);
+}
+
+#[test]
+fn test_settings_nav_page_up_walks_field_idx_to_zero() {
+    let mut s = settings_nav_with_fields(20);
+    s.settings_field_idx = 4;
+    let (s, _) = update(s, keycode(KeyCode::PageUp));
+    // 10 field-up steps, saturating at 0.
+    assert_eq!(s.settings_field_idx, 0);
+}
+
+#[test]
+fn test_settings_nav_g_resets_field_idx_to_top() {
+    let mut s = settings_nav_with_fields(8);
+    s.settings_field_idx = 5;
+    let (s, _) = update(s, key('g'));
+    assert_eq!(s.settings_field_idx, 0);
+}
+
+#[test]
+fn test_settings_nav_uppercase_g_jumps_to_last_field() {
+    let mut s = settings_nav_with_fields(7);
+    s.settings_field_idx = 0;
+    let (s, _) = update(s, key('G'));
+    // scroll_to_bottom Settings arm: field_idx = field_count - 1.
+    assert_eq!(s.settings_field_idx, 6);
+}
+
+#[test]
+fn test_settings_nav_scroll_field_down_single_when_count_zero() {
+    // settings_scroll_field_down special case: max == 0 but field_idx == 0
+    // still allows one increment then clamps via .min(0) back to 0.
+    let mut s = settings_nav_with_fields(0);
+    s.settings_field_idx = 0;
+    let (s, _) = update(s, key('j'));
+    assert_eq!(s.settings_field_idx, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Settings section navigation must reset the field index (regression: a
+// section change that kept a stale field_idx would point past the new
+// section's field list).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_settings_next_section_resets_field_idx() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_field_idx = 4;
+    s.settings_section_idx = 0;
+    let (s, _) = update(s, key('l'));
+    assert_eq!(s.settings_section_idx, 1);
+    assert_eq!(s.settings_field_idx, 0);
+}
+
+#[test]
+fn test_settings_prev_section_wraps_and_resets_field_idx() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_field_idx = 3;
+    s.settings_section_idx = 0;
+    let (s, _) = update(s, key('h'));
+    let count = crate::dashboard::settings::sections::SECTIONS.len();
+    assert_eq!(s.settings_section_idx, count - 1);
+    assert_eq!(s.settings_field_idx, 0);
+}
+
+#[test]
+fn test_settings_bracket_keys_navigate_sections() {
+    let s = settings_nav_with_fields(6);
+    let (s, _) = update(s, key(']'));
+    assert_eq!(s.settings_section_idx, 1);
+    let (s, _) = update(s, key('['));
+    assert_eq!(s.settings_section_idx, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Settings-nav '4' is explicitly a no-op (already on Settings tab): no
+// EnterSettings re-emit, no exit-pending arming even when dirty.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_settings_digit_4_is_noop_already_on_settings() {
+    let s = settings_nav_with_fields(6);
+    let (s, cmds) = update(s, key('4'));
+    assert_eq!(s.current_tab, DashboardTab::Settings);
+    assert!(cmds.is_empty());
+}
+
+#[test]
+fn test_settings_digit_2_when_dirty_arms_exit_pending() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_is_dirty = true;
+    let (s, _) = update(s, key('2'));
+    assert_eq!(
+        s.settings_exit_pending,
+        Some(ExitTarget::Tab(DashboardTab::AuditLog))
+    );
+}
+
+#[test]
+fn test_settings_digit_3_when_dirty_arms_exit_pending() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_is_dirty = true;
+    let (s, _) = update(s, key('3'));
+    assert_eq!(
+        s.settings_exit_pending,
+        Some(ExitTarget::Tab(DashboardTab::Rules))
+    );
+}
+
+#[test]
+fn test_settings_digit_2_when_clean_switches_tab() {
+    let s = settings_nav_with_fields(6);
+    let (s, _) = update(s, key('2'));
+    assert_eq!(s.current_tab, DashboardTab::AuditLog);
+    assert_eq!(s.input_mode, InputMode::Normal);
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-dialog branches: an unhandled key inside an active dialog must be
+// swallowed (dialog stays open, no command) — a regression where any key
+// dismissed the dialog would silently lose the guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reload_confirm_unhandled_key_keeps_dialog_open() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_reload_confirm = true;
+    let (s, cmds) = update(s, key('z'));
+    assert!(s.settings_reload_confirm, "dialog must stay open");
+    assert!(cmds.is_empty());
+}
+
+#[test]
+fn test_reset_confirm_unhandled_key_keeps_dialog_open() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_confirm_reset = true;
+    let (s, cmds) = update(s, key('z'));
+    assert!(s.settings_confirm_reset);
+    assert!(cmds.is_empty());
+}
+
+#[test]
+fn test_exit_pending_unhandled_key_keeps_prompt_armed() {
+    let mut s = settings_nav_with_fields(6);
+    s.settings_is_dirty = true;
+    s.settings_exit_pending = Some(ExitTarget::Quit);
+    let (s, cmds) = update(s, key('z'));
+    assert_eq!(s.settings_exit_pending, Some(ExitTarget::Quit));
+    assert!(cmds.is_empty());
+}
+
+#[test]
+fn test_exit_pending_takes_priority_over_reload_confirm() {
+    // Both flags set: exit-pending guard is checked first and consumes 's'.
+    let mut s = settings_nav_with_fields(6);
+    s.settings_is_dirty = true;
+    s.settings_exit_pending = Some(ExitTarget::Quit);
+    s.settings_reload_confirm = true;
+    let (s, cmds) = update(s, key('s'));
+    assert!(cmds.contains(&DashboardCmd::SettingsSave));
+    assert_eq!(s.settings_exit_pending, None);
+    // reload-confirm flag is untouched because the exit-pending guard
+    // returned early before reaching the reload-confirm block.
+    assert!(s.settings_reload_confirm);
+}
+
+// ---------------------------------------------------------------------------
+// Audit-tab sort + scroll-to-bottom arms.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_audit_toggle_sort_direction() {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::AuditLog;
+    s.audit_sort_ascending = false;
+    let (s, _) = update(s, key('S'));
+    assert!(s.audit_sort_ascending);
+}
+
+#[test]
+fn test_audit_scroll_to_bottom_selects_last() {
+    let mut s = state_with_audit(6);
+    s.current_tab = DashboardTab::AuditLog;
+    let (s, _) = update(s, key('G'));
+    assert_eq!(s.audit_selected, Some(5));
+}
+
+#[test]
+fn test_audit_scroll_to_top_selects_first() {
+    let mut s = state_with_audit(6);
+    s.current_tab = DashboardTab::AuditLog;
+    s.audit_selected = Some(4);
+    let (s, _) = update(s, key('g'));
+    assert_eq!(s.audit_selected, Some(0));
+}
+
+#[test]
+fn test_audit_page_down_and_up_roundtrip() {
+    let mut s = state_with_audit(40);
+    s.current_tab = DashboardTab::AuditLog;
+    s.audit_selected = Some(0);
+    let (s, _) = update(s, keycode(KeyCode::PageDown));
+    assert_eq!(s.audit_selected, Some(10));
+    let (s, _) = update(s, keycode(KeyCode::PageUp));
+    assert_eq!(s.audit_selected, Some(0));
+}
+
+#[test]
+fn test_audit_scroll_to_bottom_empty_is_noop() {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::AuditLog;
+    let (s, _) = update(s, key('G'));
+    assert_eq!(s.audit_selected, None);
+}
+
+// ---------------------------------------------------------------------------
+// Rules-tab scroll-to-bottom sets the large sentinel offset.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rules_scroll_to_bottom_sets_large_offset() {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::Rules;
+    let (s, _) = update(s, key('G'));
+    assert_eq!(s.rules_scroll_offset, u16::MAX / 2);
+}
+
+#[test]
+fn test_rules_scroll_down_increments_offset() {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::Rules;
+    s.rules_scroll_offset = 2;
+    let (s, _) = update(s, key('j'));
+    assert_eq!(s.rules_scroll_offset, 3);
+}
+
+#[test]
+fn test_rules_scroll_up_saturates_offset() {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::Rules;
+    s.rules_scroll_offset = 0;
+    let (s, _) = update(s, key('k'));
+    assert_eq!(s.rules_scroll_offset, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Detail-mode keys that the reducer intentionally consumes as no-ops
+// (the runtime owns detail_data scrolling). The contract is: state is
+// unchanged and no command is emitted, but the key IS consumed (it must
+// not fall through to normal-mode handling).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_detail_scroll_keys_are_consumed_noops() {
+    for k in [
+        key('j'),
+        key('k'),
+        key('g'),
+        key('G'),
+        keycode(KeyCode::Down),
+        keycode(KeyCode::Up),
+        keycode(KeyCode::PageDown),
+        keycode(KeyCode::PageUp),
+        keycode(KeyCode::Home),
+        keycode(KeyCode::End),
+    ] {
+        let s0 = detail_state();
+        let (s1, cmds) = update(s0.clone(), k);
+        assert_eq!(s0, s1, "detail scroll key must not mutate pure state");
+        assert!(cmds.is_empty(), "detail scroll key must emit no command");
+    }
+}
+
+#[test]
+fn test_detail_digit_1_selects_info_tab() {
+    let mut s = detail_state();
+    s.detail_tab = DetailTab::Audit;
+    let (s, _) = update(s, key('1'));
+    assert_eq!(s.detail_tab, DetailTab::Info);
+}
+
+#[test]
+fn test_detail_digit_2_selects_commands_tab() {
+    let (s, _) = update(detail_state(), key('2'));
+    assert_eq!(s.detail_tab, DetailTab::Commands);
+}
+
+#[test]
+fn test_detail_digit_4_selects_snapshots_tab() {
+    let (s, _) = update(detail_state(), key('4'));
+    assert_eq!(s.detail_tab, DetailTab::Snapshots);
+}
+
+#[test]
+fn test_detail_unknown_key_is_noop() {
+    let s0 = detail_state();
+    let (s1, cmds) = update(s0.clone(), key('z'));
+    assert_eq!(s0, s1);
+    assert!(cmds.is_empty());
+}
+
+#[test]
+fn test_detail_back_tab_then_tab_returns_to_info() {
+    let (s, _) = update(detail_state(), keycode(KeyCode::BackTab));
+    assert_eq!(s.detail_tab, DetailTab::Snapshots);
+    let (s, _) = update(s, keycode(KeyCode::Tab));
+    assert_eq!(s.detail_tab, DetailTab::Info);
+}
+
+// ---------------------------------------------------------------------------
+// on_tab_switch: leaving Settings via a digit while in SettingsNav mode must
+// drop back to Normal input mode (regression: staying in SettingsNav on a
+// non-Settings tab would mis-route subsequent keys).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_leaving_settings_via_tab_resets_input_mode_to_normal() {
+    let mut s = AppState::new();
+    s.current_tab = DashboardTab::Settings;
+    s.input_mode = InputMode::SettingsNav;
+    // Not dirty => Tab navigates away; next tab after Settings is Sessions.
+    let (s, cmds) = update(s, keycode(KeyCode::Tab));
+    assert_eq!(s.current_tab, DashboardTab::Sessions);
+    assert_eq!(s.input_mode, InputMode::Normal);
+    assert!(!cmds.contains(&DashboardCmd::EnterSettings));
+}
