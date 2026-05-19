@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
+│> Validator         ││                                                        │
+│  Context           ││                                                        │
+│  LLM               ││                                                        │
+│  User Learning     ││                                                        │
+│  Logging           ││                                                        │
+│  Ctx Pressure      ││                                                        │
+│  Sess Recovery    ┌ Reset All Changes ───────────────────┐                   │
+│  MCP Tools        │Revert all changes to last saved?     │                   │
+│  Auto Recall      │                                      │                   │
+│                   │[y] Yes   [n/Esc] No                  │                   │
+│                   └──────────────────────────────────────┘                   │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | Reset all changes? [y] Yes

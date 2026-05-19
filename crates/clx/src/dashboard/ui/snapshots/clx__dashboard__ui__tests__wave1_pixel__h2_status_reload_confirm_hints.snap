@@ -1,0 +1,28 @@
+---
+source: crates/clx/src/dashboard/ui/mod.rs
+expression: rendered
+---
+┌ CLX Dashboard ───────────────────────────────────────────────────────────────┐
+│ Sessions • Audit Log • Rules • Settings                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Sections ──────────┐┌ Fields ────────────────────────────────────────────────┐
+│> Validator         ││                                                        │
+│  Context           ││                                                        │
+│  LLM               ││                                                        │
+│  User Learning     ││                                                        │
+│  Logging           ││                                                        │
+│  Ctx Pressure      ││                                                        │
+│  Sess Recovery┌ Reload from Disk ────────────────────────────┐               │
+│  MCP Tools    │Unsaved changes will be lost. Reload?         │               │
+│  Auto Recall  │                                              │               │
+│               │[y] Yes   [n/Esc] No                          │               │
+│               └──────────────────────────────────────────────┘               │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+│                    ││                                                        │
+└────────────────────┘└────────────────────────────────────────────────────────┘
+ <TIME> | Refresh <N>s | Sessions: 0 | Commands: 0 | Reload from disk? [y] Yes

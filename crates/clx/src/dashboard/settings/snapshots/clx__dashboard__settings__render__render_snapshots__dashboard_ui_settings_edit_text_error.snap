@@ -1,0 +1,44 @@
+---
+source: crates/clx/src/dashboard/settings/render.rs
+expression: rendered
+---
+┌ Sections ──────────┐┌ Context - <CONFIG_PATH>                                                     
+│  Validator         ││Field                    Value                      Default                 █
+│> Context           ││                                                                            █
+│  LLM               ││enabled                  true                       true                    █
+│  User Learning     ││auto_snapshot            true                       true                    █
+│  Logging           ││embedding_model          qwen3-embedding:0.6b       qwen3-embedding:0.6b    █
+│  Ctx Pressure      ││                                                                            █
+│  Sess Recovery     ││                                                                            █
+│  MCP Tools         ││                                                                            █
+│  Auto Recall       ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││  ┌ Edit: embedding_model ─────────────────────────┐                        █
+│                    ││  │Embedding model name                            │                        █
+│                    ││  │                                                │                        █
+│                    ││  │Value: [|]                                      │                        █
+│                    ││  │                                                │                        █
+│                    ││  │Non-empty string                                │                        █
+│                    ││  │Default: qwen3-embedding:0.6b                   │                        █
+│                    ││  │                                                │                        █
+│                    ││  │must not be empty                               │                        █
+│                    ││  │[Enter] Confirm   [Esc] Cancel                  │                        █
+│                    ││  │                                                │                        █
+│                    ││  └────────────────────────────────────────────────┘                        █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            █
+│                    ││                                                                            ║
+│                    ││                                                                            ║
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────↓

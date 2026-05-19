@@ -1116,3 +1116,490 @@ mod tests {
         assert_eq!(app.rules_scroll_offset, 0);
     }
 }
+
+/// Behavior tests for the App runtime container's state-transition methods that
+/// the pure `state::update` reducer delegates to the runtime (detail-view
+/// navigation, settings field/section navigation, config load/save lifecycle,
+/// pending-exit execution). These exercise the real `App` methods directly
+/// (no terminal, no event loop). Storage-touching paths use an in-memory
+/// `Storage`; config-touching paths redirect `$HOME` into a `TempDir` so they
+/// are hermetic (nextest runs every test in its own process).
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use clx_core::storage::Storage;
+    use clx_core::types::{
+        AuditDecision, AuditLogEntry, Event, EventType, Session, SessionId, SessionStatus,
+        Snapshot, SnapshotTrigger,
+    };
+
+    fn make_app() -> App {
+        App::new(7, 5)
+    }
+
+    fn seeded_session(id: &str) -> Session {
+        Session {
+            id: SessionId::new(id),
+            project_path: "/proj".to_owned(),
+            transcript_path: None,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            source: clx_core::types::SessionSource::Startup,
+            message_count: 3,
+            command_count: 2,
+            input_tokens: 10,
+            output_tokens: 5,
+            status: SessionStatus::Active,
+        }
+    }
+
+    /// Build an in-memory `Storage` seeded with one session carrying `n_audit`
+    /// audit rows, `n_evt` events and `n_snap` snapshots, then point a fresh
+    /// `App`'s `detail_data` at it.
+    fn app_in_detail(id: &str, n_audit: usize, n_evt: usize, n_snap: usize) -> App {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let s = seeded_session(id);
+        storage.create_session(&s).expect("create session");
+        for i in 0..n_audit {
+            let mut e = AuditLogEntry::new(
+                SessionId::new(id),
+                format!("cmd-{i}"),
+                "builtin".to_owned(),
+                AuditDecision::Allowed,
+            );
+            e.risk_score = Some(2);
+            storage.create_audit_log(&e).expect("audit");
+        }
+        for _ in 0..n_evt {
+            let ev = Event::new(SessionId::new(id), EventType::Message);
+            storage.append_event(&ev).expect("event");
+        }
+        for _ in 0..n_snap {
+            let snap = Snapshot::new(SessionId::new(id), SnapshotTrigger::Manual);
+            storage.create_snapshot(&snap).expect("snapshot");
+        }
+        let mut app = make_app();
+        app.detail_data = super::super::data::SessionDetailData::fetch_from_storage(&storage, id);
+        assert!(app.detail_data.is_some(), "detail data must load");
+        app.screen_state = ScreenState::SessionDetail(id.to_owned());
+        app
+    }
+
+    // NOTE: `App::on_enter_settings_tab`, `settings_reload`, and `settings_save`
+    // resolve their target path via `Config::config_dir()` -> `paths::clx_dir()`
+    // -> `dirs::home_dir()`. There is no env override for that path, and the
+    // workspace forbids `unsafe_code` (Cargo.toml: `unsafe_code = "deny"`), so
+    // `std::env::set_var("HOME", ...)` cannot be used to redirect it. Those
+    // disk-I/O branches are therefore not hermetically reachable from an
+    // in-crate test without mutating the developer's real `~/.clx`, which the
+    // hermeticity rule forbids. They are recorded as a residual gap rather
+    // than covered with a non-hermetic test.
+
+    // ---- enter / leave session detail ----
+
+    #[test]
+    fn test_enter_session_detail_noop_when_no_row_selected() {
+        // No sessions in data => get(selected) is None => screen stays List.
+        let mut app = make_app();
+        app.enter_session_detail();
+        assert_eq!(app.screen_state, ScreenState::List);
+        assert!(app.detail_data.is_none());
+    }
+
+    #[test]
+    fn test_leave_session_detail_clears_detail_data() {
+        let mut app = app_in_detail("leave-sess-01", 1, 0, 0);
+        assert!(app.detail_data.is_some());
+        app.leave_session_detail();
+        assert_eq!(app.screen_state, ScreenState::List);
+        assert!(app.detail_data.is_none());
+    }
+
+    // ---- detail tab cycling ----
+
+    #[test]
+    fn test_detail_next_tab_cycles_forward_and_wraps() {
+        let mut app = make_app();
+        app.detail_tab = DetailTab::Info;
+        app.detail_next_tab();
+        assert_eq!(app.detail_tab, DetailTab::Commands);
+        app.detail_tab = DetailTab::Snapshots;
+        app.detail_next_tab();
+        assert_eq!(app.detail_tab, DetailTab::Info);
+    }
+
+    #[test]
+    fn test_detail_prev_tab_wraps_to_last() {
+        let mut app = make_app();
+        app.detail_tab = DetailTab::Info;
+        app.detail_prev_tab();
+        assert_eq!(app.detail_tab, DetailTab::Snapshots);
+    }
+
+    // ---- detail scrolling: Commands tab (audit_entries) ----
+
+    #[test]
+    fn test_detail_scroll_down_commands_advances_and_clamps() {
+        let mut app = app_in_detail("d-cmd-01", 3, 0, 0);
+        app.detail_tab = DetailTab::Commands;
+        app.detail_commands_state.select(Some(0));
+        app.detail_scroll_down(); // 0 -> 1
+        assert_eq!(app.detail_commands_state.selected(), Some(1));
+        app.detail_scroll_down(); // 1 -> 2 (max, len 3)
+        app.detail_scroll_down(); // clamps at 2
+        assert_eq!(app.detail_commands_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn test_detail_scroll_up_commands_saturates_at_zero() {
+        let mut app = app_in_detail("d-cmd-02", 3, 0, 0);
+        app.detail_tab = DetailTab::Commands;
+        app.detail_commands_state.select(Some(1));
+        app.detail_scroll_up(); // 1 -> 0
+        app.detail_scroll_up(); // saturates
+        assert_eq!(app.detail_commands_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_detail_scroll_down_info_tab_scrolls_command_table() {
+        // Info tab scrolls the embedded command (audit) table.
+        let mut app = app_in_detail("d-info-01", 2, 0, 0);
+        app.detail_tab = DetailTab::Info;
+        app.detail_commands_state.select(Some(0));
+        app.detail_scroll_down();
+        assert_eq!(app.detail_commands_state.selected(), Some(1));
+    }
+
+    // ---- detail scrolling: Audit tab (events) ----
+
+    #[test]
+    fn test_detail_scroll_down_audit_uses_events_len() {
+        let mut app = app_in_detail("d-evt-01", 0, 4, 0);
+        app.detail_tab = DetailTab::Audit;
+        app.detail_events_state.select(Some(0));
+        app.detail_scroll_down();
+        app.detail_scroll_down();
+        assert_eq!(app.detail_events_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn test_detail_scroll_up_audit_decrements() {
+        let mut app = app_in_detail("d-evt-02", 0, 4, 0);
+        app.detail_tab = DetailTab::Audit;
+        app.detail_events_state.select(Some(3));
+        app.detail_scroll_up();
+        assert_eq!(app.detail_events_state.selected(), Some(2));
+    }
+
+    // ---- detail scrolling: Snapshots tab ----
+
+    #[test]
+    fn test_detail_scroll_down_snapshots_clamps_to_len() {
+        let mut app = app_in_detail("d-snap-01", 0, 0, 2);
+        app.detail_tab = DetailTab::Snapshots;
+        app.detail_snapshots_state.select(Some(0));
+        app.detail_scroll_down();
+        app.detail_scroll_down(); // clamps at len-1 = 1
+        assert_eq!(app.detail_snapshots_state.selected(), Some(1));
+    }
+
+    // ---- detail scroll to top / bottom ----
+
+    #[test]
+    fn test_detail_scroll_to_top_info_resets_offset() {
+        let mut app = app_in_detail("d-top-01", 1, 0, 0);
+        app.detail_tab = DetailTab::Info;
+        app.detail_scroll_offset = 42;
+        app.detail_scroll_to_top();
+        assert_eq!(app.detail_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_detail_scroll_to_bottom_commands_selects_last() {
+        let mut app = app_in_detail("d-bot-01", 5, 0, 0);
+        app.detail_tab = DetailTab::Commands;
+        app.detail_scroll_to_bottom();
+        assert_eq!(app.detail_commands_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn test_detail_scroll_to_bottom_audit_selects_last_event() {
+        let mut app = app_in_detail("d-bot-02", 0, 3, 0);
+        app.detail_tab = DetailTab::Audit;
+        app.detail_scroll_to_bottom();
+        assert_eq!(app.detail_events_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn test_detail_scroll_to_bottom_snapshots_selects_last() {
+        let mut app = app_in_detail("d-bot-03", 0, 0, 4);
+        app.detail_tab = DetailTab::Snapshots;
+        app.detail_scroll_to_bottom();
+        assert_eq!(app.detail_snapshots_state.selected(), Some(3));
+    }
+
+    #[test]
+    fn test_detail_scroll_to_bottom_info_sets_large_offset() {
+        let mut app = app_in_detail("d-bot-04", 1, 0, 0);
+        app.detail_tab = DetailTab::Info;
+        app.detail_scroll_to_bottom();
+        assert_eq!(app.detail_scroll_offset, u16::MAX / 2);
+    }
+
+    #[test]
+    fn test_detail_page_down_advances_ten_then_clamps() {
+        let mut app = app_in_detail("d-pg-01", 30, 0, 0);
+        app.detail_tab = DetailTab::Commands;
+        app.detail_commands_state.select(Some(0));
+        app.detail_page_down();
+        assert_eq!(app.detail_commands_state.selected(), Some(10));
+    }
+
+    #[test]
+    fn test_detail_page_up_saturates_at_zero() {
+        let mut app = app_in_detail("d-pg-02", 30, 0, 0);
+        app.detail_tab = DetailTab::Commands;
+        app.detail_commands_state.select(Some(5));
+        app.detail_page_up(); // 5 - 10 saturates to 0
+        assert_eq!(app.detail_commands_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_detail_scroll_noop_when_detail_data_absent() {
+        // Without detail_data, scroll methods must not panic and leave state.
+        let mut app = make_app();
+        app.detail_tab = DetailTab::Commands;
+        app.detail_scroll_down();
+        app.detail_scroll_to_bottom();
+        // Commands tab scroll_up does not guard on detail_data; it still moves
+        // selection from the implicit 0 via saturating_sub -> stays 0.
+        app.detail_scroll_up();
+        assert_eq!(app.detail_commands_state.selected(), Some(0));
+    }
+
+    // ---- settings field navigation (real App, real SECTIONS/fields) ----
+
+    #[test]
+    fn test_settings_scroll_field_down_moves_within_section() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_section_idx = 0; // validator: 6 fields
+        app.settings_field_idx = 0;
+        app.scroll_down();
+        assert_eq!(app.settings_field_idx, 1);
+        assert_eq!(app.settings_field_table_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn test_settings_scroll_field_down_clamps_at_last_field() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_section_idx = 0;
+        let count = super::super::settings::fields::fields_for_section(0).len();
+        for _ in 0..(count + 5) {
+            app.scroll_down();
+        }
+        assert_eq!(app.settings_field_idx, count - 1);
+    }
+
+    #[test]
+    fn test_settings_scroll_field_up_saturates_at_zero() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_field_idx = 2;
+        app.scroll_up();
+        assert_eq!(app.settings_field_idx, 1);
+        app.scroll_up();
+        app.scroll_up();
+        assert_eq!(app.settings_field_idx, 0);
+    }
+
+    #[test]
+    fn test_settings_next_section_wraps_and_resets_field() {
+        let mut app = make_app();
+        let count = super::super::settings::sections::SECTIONS.len();
+        app.settings_section_idx = count - 1;
+        app.settings_field_idx = 3;
+        app.settings_next_section();
+        assert_eq!(app.settings_section_idx, 0);
+        assert_eq!(app.settings_field_idx, 0);
+        assert_eq!(app.settings_field_table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_settings_prev_section_wraps_to_last() {
+        let mut app = make_app();
+        let count = super::super::settings::sections::SECTIONS.len();
+        app.settings_section_idx = 0;
+        app.settings_prev_section();
+        assert_eq!(app.settings_section_idx, count - 1);
+        assert_eq!(app.settings_field_idx, 0);
+    }
+
+    #[test]
+    fn test_settings_scroll_to_bottom_selects_last_field() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_section_idx = 0;
+        app.scroll_to_bottom();
+        let count = super::super::settings::fields::fields_for_section(0).len();
+        assert_eq!(app.settings_field_idx, count - 1);
+        assert_eq!(app.settings_field_table_state.selected(), Some(count - 1));
+    }
+
+    #[test]
+    fn test_settings_scroll_to_top_selects_first_field() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_field_idx = 4;
+        app.scroll_to_top();
+        assert_eq!(app.settings_field_idx, 0);
+        assert_eq!(app.settings_field_table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_settings_page_down_moves_field_selection() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_section_idx = 2; // llm: 8 fields
+        app.settings_field_idx = 0;
+        app.page_down();
+        let count = super::super::settings::fields::fields_for_section(2).len();
+        assert_eq!(app.settings_field_idx, count - 1);
+    }
+
+    #[test]
+    fn test_settings_page_up_returns_to_first_field() {
+        let mut app = make_app();
+        app.current_tab = DashboardTab::Settings;
+        app.settings_section_idx = 2;
+        app.settings_field_idx = 5;
+        app.page_up();
+        assert_eq!(app.settings_field_idx, 0);
+    }
+
+    // ---- execute_exit_target ----
+
+    #[test]
+    fn test_execute_exit_target_quit_sets_should_quit() {
+        let mut app = make_app();
+        app.input_mode = InputMode::SettingsNav;
+        app.execute_exit_target(ExitTarget::Quit);
+        assert!(app.should_quit);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn test_execute_exit_target_tab_to_settings_keeps_settings_nav() {
+        let mut app = make_app();
+        app.execute_exit_target(ExitTarget::Tab(DashboardTab::Settings));
+        assert_eq!(app.current_tab, DashboardTab::Settings);
+        assert_eq!(app.input_mode, InputMode::SettingsNav);
+    }
+
+    #[test]
+    fn test_execute_exit_target_tab_to_other_resets_to_normal() {
+        let mut app = make_app();
+        app.input_mode = InputMode::SettingsNav;
+        app.execute_exit_target(ExitTarget::Tab(DashboardTab::AuditLog));
+        assert_eq!(app.current_tab, DashboardTab::AuditLog);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    // ---- settings_discard_changes ----
+
+    #[test]
+    fn test_settings_discard_reverts_editing_to_original() {
+        let mut app = make_app();
+        let orig = Config::default();
+        let mut edited = Config::default();
+        edited.validator.layer1_timeout_ms = 999;
+        app.settings_original_config = Some(orig.clone());
+        app.settings_editing_config = Some(edited);
+        app.settings_is_dirty = true;
+        app.settings_discard_changes();
+        assert!(!app.settings_is_dirty);
+        assert_eq!(
+            app.settings_editing_config
+                .as_ref()
+                .unwrap()
+                .validator
+                .layer1_timeout_ms,
+            orig.validator.layer1_timeout_ms
+        );
+    }
+
+    #[test]
+    fn test_settings_discard_without_original_only_clears_dirty() {
+        let mut app = make_app();
+        app.settings_is_dirty = true;
+        app.settings_original_config = None;
+        app.settings_discard_changes();
+        assert!(!app.settings_is_dirty);
+    }
+
+    // ---- settings_clear_timed_messages ----
+
+    #[test]
+    fn test_clear_timed_messages_clears_stale_save_result() {
+        let mut app = make_app();
+        app.settings_save_result = Some("Saved".to_owned());
+        app.settings_save_result_time =
+            Some(Instant::now().checked_sub(Duration::from_secs(4)).unwrap());
+        app.settings_clear_timed_messages();
+        assert!(app.settings_save_result.is_none());
+        assert!(app.settings_save_result_time.is_none());
+    }
+
+    #[test]
+    fn test_clear_timed_messages_keeps_fresh_save_result() {
+        let mut app = make_app();
+        app.settings_save_result = Some("Saved".to_owned());
+        app.settings_save_result_time = Some(Instant::now());
+        app.settings_clear_timed_messages();
+        assert!(app.settings_save_result.is_some());
+    }
+
+    #[test]
+    fn test_clear_timed_messages_clears_stale_edit_error() {
+        let mut app = make_app();
+        app.settings_edit_error = Some("bad".to_owned());
+        app.settings_edit_error_time =
+            Some(Instant::now().checked_sub(Duration::from_secs(6)).unwrap());
+        app.settings_clear_timed_messages();
+        assert!(app.settings_edit_error.is_none());
+        assert!(app.settings_edit_error_time.is_none());
+    }
+
+    // ---- settings_save: hermetically reachable guard branches only ----
+    //
+    // The success path of `settings_save` (serialize + temp-write + rename)
+    // and `on_enter_settings_tab` / `settings_reload` resolve their path via
+    // the real home dir with no env override and the workspace forbids
+    // `unsafe_code`, so the disk-write branches are a recorded residual gap.
+    // The two pure early-return guards are still reachable and asserted here.
+
+    #[test]
+    fn test_settings_save_noop_when_not_dirty() {
+        let mut app = make_app();
+        app.settings_editing_config = Some(Config::default());
+        app.settings_is_dirty = false;
+        app.settings_save();
+        // Early return on the `!is_dirty` guard: no result message, and the
+        // dirty flag stays false (no disk path is entered).
+        assert!(app.settings_save_result.is_none());
+        assert!(!app.settings_is_dirty);
+    }
+
+    #[test]
+    fn test_settings_save_noop_when_no_editing_config() {
+        let mut app = make_app();
+        app.settings_editing_config = None;
+        app.settings_is_dirty = true;
+        app.settings_save();
+        // Early return on the `editing.is_none()` guard: dirty flag is left
+        // set (save did not proceed) and no result message is produced.
+        assert!(app.settings_save_result.is_none());
+        assert!(app.settings_is_dirty);
+    }
+}

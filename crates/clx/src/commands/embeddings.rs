@@ -6,6 +6,8 @@ use colored::Colorize;
 use std::io::{self, Write};
 
 use clx_core::config::{Capability, Config, OllamaConfig};
+use clx_core::embeddings::EmbeddingStore;
+use clx_core::llm::{LlmBackend, LlmClient, LlmError};
 use clx_core::storage::Storage;
 
 use crate::Cli;
@@ -17,6 +19,170 @@ use crate::Cli;
 /// Format the `model_ident` tag written into every embedding row.
 fn make_model_ident(provider: &str, model: &str) -> String {
     format!("{provider}:{model}")
+}
+
+// ---------------------------------------------------------------------------
+// Embed-client seam
+// ---------------------------------------------------------------------------
+
+/// Thin adapter closing the existing [`LlmBackend`] trait over the concrete
+/// [`LlmClient`] enum (which exposes the same surface via inherent methods but
+/// does not itself implement the trait). This keeps the extracted loop bodies
+/// generic over `LlmBackend` so an offline fake can be substituted in tests
+/// without changing the trait's public signature or the production type.
+struct LlmClientAdapter<'a>(&'a LlmClient);
+
+impl LlmBackend for LlmClientAdapter<'_> {
+    async fn generate(&self, prompt: &str, model: Option<&str>) -> Result<String, LlmError> {
+        self.0.generate(prompt, model).await
+    }
+    async fn embed(&self, text: &str, model: Option<&str>) -> Result<Vec<f32>, LlmError> {
+        self.0.embed(text, model).await
+    }
+    async fn is_available(&self) -> bool {
+        self.0.is_available().await
+    }
+}
+
+/// Outcome counts from the rebuild embed loop. Pure data so callers (and
+/// tests) assert observable behavior, not implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RebuildCounts {
+    pub processed: usize,
+    pub skipped: usize,
+    pub errors: usize,
+}
+
+/// Outcome counts from the backfill embed loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BackfillCounts {
+    pub processed: usize,
+    pub skipped: usize,
+    pub errors: usize,
+}
+
+/// Pure per-snapshot rebuild embed loop, generic over the embed-client trait
+/// surface. Mirrors the prior inline loop exactly: empty text is skipped,
+/// `embed` errors and `store_with_model` errors both count as errors, and
+/// progress is printed only in non-JSON mode.
+pub(crate) async fn rebuild_embeddings<E: LlmBackend>(
+    emb_store: &EmbeddingStore,
+    snapshots: &[(i64, String)],
+    client: &E,
+    embed_model: &str,
+    model_ident: &str,
+    json: bool,
+) -> Result<RebuildCounts> {
+    let total = snapshots.len();
+    let mut counts = RebuildCounts::default();
+
+    for (i, (snapshot_id, text)) in snapshots.iter().enumerate() {
+        if text.trim().is_empty() {
+            counts.skipped += 1;
+            continue;
+        }
+
+        if !json {
+            print!(
+                "\r  Processing [{}/{}] snapshot {}... ",
+                i + 1,
+                total,
+                snapshot_id
+            );
+            io::stdout().flush()?;
+        }
+
+        match client.embed(text, Some(embed_model)).await {
+            Ok(embedding) => {
+                if let Err(e) = emb_store.store_with_model(*snapshot_id, embedding, model_ident) {
+                    if !json {
+                        println!("{}", format!("Error: {e}").red());
+                    }
+                    counts.errors += 1;
+                } else {
+                    counts.processed += 1;
+                }
+            }
+            Err(e) => {
+                if !json {
+                    println!("{}", format!("Error: {e}").red());
+                }
+                counts.errors += 1;
+            }
+        }
+    }
+
+    Ok(counts)
+}
+
+/// Pure per-snapshot backfill embed loop, generic over the embed-client trait
+/// surface. Mirrors the prior inline loop exactly: already-embedded snapshots
+/// and empty text are skipped, the dry-run branch only counts and prints, and
+/// `embed`/`store_with_model` errors count as errors.
+pub(crate) async fn backfill_embeddings<E: LlmBackend>(
+    emb_store: &EmbeddingStore,
+    snapshots: &[(i64, String)],
+    client: &E,
+    embed_model: &str,
+    model_ident: &str,
+    json: bool,
+    dry_run: bool,
+) -> Result<BackfillCounts> {
+    let mut counts = BackfillCounts::default();
+
+    for (snapshot_id, text) in snapshots {
+        // Skip snapshots that already have an embedding.
+        if emb_store.has_embedding(*snapshot_id)? {
+            counts.skipped += 1;
+            continue;
+        }
+
+        if text.trim().is_empty() {
+            counts.skipped += 1;
+            continue;
+        }
+
+        if !json && !dry_run {
+            print!("  Processing snapshot {snapshot_id}... ");
+            io::stdout().flush()?;
+        }
+
+        if dry_run {
+            if !json {
+                println!(
+                    "  Would process snapshot {} ({} chars)",
+                    snapshot_id,
+                    text.len()
+                );
+            }
+            counts.processed += 1;
+        } else {
+            match client.embed(text, Some(embed_model)).await {
+                Ok(embedding) => {
+                    if let Err(e) = emb_store.store_with_model(*snapshot_id, embedding, model_ident)
+                    {
+                        if !json {
+                            println!("{}", format!("Error: {e}").red());
+                        }
+                        counts.errors += 1;
+                    } else {
+                        if !json {
+                            println!("{}", "OK".green());
+                        }
+                        counts.processed += 1;
+                    }
+                }
+                Err(e) => {
+                    if !json {
+                        println!("{}", format!("Error: {e}").red());
+                    }
+                    counts.errors += 1;
+                }
+            }
+        }
+    }
+
+    Ok(counts)
 }
 
 #[derive(Debug, Subcommand)]
@@ -239,47 +405,19 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 .context("Failed to read snapshots after table rebuild")?;
 
             let total = snapshots.len();
-            let mut processed = 0usize;
-            let mut skipped = 0usize;
-            let mut errors = 0usize;
-
-            for (i, (snapshot_id, text)) in snapshots.iter().enumerate() {
-                if text.trim().is_empty() {
-                    skipped += 1;
-                    continue;
-                }
-
-                if !cli.json {
-                    print!(
-                        "\r  Processing [{}/{}] snapshot {}... ",
-                        i + 1,
-                        total,
-                        snapshot_id
-                    );
-                    io::stdout().flush()?;
-                }
-
-                match client.embed(text, Some(&embed_model)).await {
-                    Ok(embedding) => {
-                        if let Err(e) =
-                            emb_store.store_with_model(*snapshot_id, embedding, &model_ident)
-                        {
-                            if !cli.json {
-                                println!("{}", format!("Error: {e}").red());
-                            }
-                            errors += 1;
-                        } else {
-                            processed += 1;
-                        }
-                    }
-                    Err(e) => {
-                        if !cli.json {
-                            println!("{}", format!("Error: {e}").red());
-                        }
-                        errors += 1;
-                    }
-                }
-            }
+            let RebuildCounts {
+                processed,
+                skipped,
+                errors,
+            } = rebuild_embeddings(
+                &emb_store,
+                &snapshots,
+                &LlmClientAdapter(&client),
+                &embed_model,
+                &model_ident,
+                cli.json,
+            )
+            .await?;
 
             if cli.json {
                 println!(
@@ -387,62 +525,20 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
         println!("Found {} snapshots", all_snapshots.len());
     }
 
-    let mut processed = 0usize;
-    let mut skipped = 0usize;
-    let mut errors = 0usize;
-
-    for (snapshot_id, text) in &all_snapshots {
-        // Skip snapshots that already have an embedding.
-        if emb_store.has_embedding(*snapshot_id)? {
-            skipped += 1;
-            continue;
-        }
-
-        if text.trim().is_empty() {
-            skipped += 1;
-            continue;
-        }
-
-        if !cli.json && !dry_run {
-            print!("  Processing snapshot {snapshot_id}... ");
-            io::stdout().flush()?;
-        }
-
-        if dry_run {
-            if !cli.json {
-                println!(
-                    "  Would process snapshot {} ({} chars)",
-                    snapshot_id,
-                    text.len()
-                );
-            }
-            processed += 1;
-        } else {
-            match client.embed(text, Some(&embed_model)).await {
-                Ok(embedding) => {
-                    if let Err(e) =
-                        emb_store.store_with_model(*snapshot_id, embedding, &model_ident)
-                    {
-                        if !cli.json {
-                            println!("{}", format!("Error: {e}").red());
-                        }
-                        errors += 1;
-                    } else {
-                        if !cli.json {
-                            println!("{}", "OK".green());
-                        }
-                        processed += 1;
-                    }
-                }
-                Err(e) => {
-                    if !cli.json {
-                        println!("{}", format!("Error: {e}").red());
-                    }
-                    errors += 1;
-                }
-            }
-        }
-    }
+    let BackfillCounts {
+        processed,
+        skipped,
+        errors,
+    } = backfill_embeddings(
+        &emb_store,
+        &all_snapshots,
+        &LlmClientAdapter(&client),
+        &embed_model,
+        &model_ident,
+        cli.json,
+        dry_run,
+    )
+    .await?;
 
     if cli.json {
         println!(

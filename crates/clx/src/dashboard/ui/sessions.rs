@@ -142,3 +142,194 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .end_symbol(Some("\u{2193}"));
     frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
+
+// ── H2: TestBackend + insta snapshots for the Sessions tab table ────────────
+//
+// Pins `sessions::render_table` (driven through `sessions::render`) for the
+// previously-unrendered branches: every sort column / direction, the
+// case-insensitive filter closure, the status-color match arms
+// (active/ended/abandoned/other), and the filtered title with `[filter: ]`.
+//
+// Hermetic: TestBackend only. The session table embeds the per-row
+// `project` path supplied by the fixture (a fixed `/work/...` literal, not
+// the real HOME), so no redaction is required.
+#[cfg(test)]
+mod render_snapshots {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::dashboard::app::{App, DashboardTab};
+    use crate::dashboard::data::SessionRow;
+
+    const COLS: u16 = 100;
+    const ROWS: u16 = 30;
+
+    fn render_sessions_to_string(app: &mut App) -> String {
+        let backend = TestBackend::new(COLS, ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render(frame, app, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..ROWS)
+            .map(|y| {
+                let row: String = (0..COLS)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn srow(
+        short: &str,
+        project: &str,
+        started: &str,
+        status: &str,
+        msgs: i64,
+        cmds: i64,
+        tokens: &str,
+        dur_secs: i64,
+        tokens_raw: i64,
+    ) -> SessionRow {
+        SessionRow {
+            session_id: format!("full-{short}"),
+            short_id: short.to_string(),
+            project: project.to_string(),
+            started: started.to_string(),
+            duration: format!("{}m", dur_secs / 60),
+            messages: msgs,
+            commands: cmds,
+            tokens: tokens.to_string(),
+            status: status.to_string(),
+            duration_secs: dur_secs,
+            tokens_raw,
+        }
+    }
+
+    fn app_with_mixed_sessions() -> App {
+        let mut app = App::new(7, 5);
+        app.current_tab = DashboardTab::Sessions;
+        // One of each status to hit every status-color arm (including the
+        // catch-all via "queued"); unsorted to make the comparator visible.
+        app.data.sessions = vec![
+            srow(
+                "zzz1",
+                "/work/beta",
+                "03-13 09:02",
+                "active",
+                4,
+                1,
+                "900",
+                120,
+                900,
+            ),
+            srow(
+                "aaa2",
+                "/work/alpha",
+                "03-13 09:01",
+                "ended",
+                20,
+                6,
+                "3.1K",
+                600,
+                3100,
+            ),
+            srow(
+                "mmm3",
+                "/work/gamma",
+                "03-13 09:03",
+                "abandoned",
+                2,
+                0,
+                "100",
+                30,
+                100,
+            ),
+            srow(
+                "kkk4",
+                "/work/delta",
+                "03-13 09:00",
+                "queued",
+                9,
+                3,
+                "1.2K",
+                300,
+                1200,
+            ),
+        ];
+        app.data.total_sessions = 4;
+        app
+    }
+
+    /// Default sort (column 0 = Status, ascending). Exercises the status
+    /// comparator and every status-color arm in the rendered rows.
+    #[test]
+    fn snapshot_sessions_status_asc_all_statuses() {
+        let mut app = app_with_mixed_sessions();
+        let rendered = render_sessions_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_sessions_status_asc", rendered);
+    }
+
+    /// Sort by Duration (col 3) descending: longest first. Covers the
+    /// numeric duration comparator + descending reverse + header arrow ▼.
+    #[test]
+    fn snapshot_sessions_duration_desc() {
+        let mut app = app_with_mixed_sessions();
+        app.sessions_sort_column = 3;
+        app.sessions_sort_ascending = false;
+        let rendered = render_sessions_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_sessions_duration_desc", rendered);
+    }
+
+    /// Sort by Tokens (col 6) ascending: numeric token comparator.
+    #[test]
+    fn snapshot_sessions_tokens_asc() {
+        let mut app = app_with_mixed_sessions();
+        app.sessions_sort_column = 6;
+        let rendered = render_sessions_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_sessions_tokens_asc", rendered);
+    }
+
+    /// Remaining comparator columns: ID(1), Started(2), Msgs(4), Cmds(5),
+    /// Project(7) — one snapshot per column proves each match arm executes.
+    #[test]
+    fn snapshot_sessions_remaining_sort_columns() {
+        for (col, name) in [
+            (1usize, "id"),
+            (2, "started"),
+            (4, "msgs"),
+            (5, "cmds"),
+            (7, "project"),
+        ] {
+            let mut app = app_with_mixed_sessions();
+            app.sessions_sort_column = col;
+            let rendered = render_sessions_to_string(&mut app);
+            insta::assert_snapshot!(format!("dashboard_ui_sessions_sort_{name}_asc"), rendered);
+        }
+    }
+
+    /// Case-insensitive filter on the project path. Only the matching row
+    /// survives; title shows `[filter: ...]` and the filtered count.
+    #[test]
+    fn snapshot_sessions_filtered_by_project() {
+        let mut app = app_with_mixed_sessions();
+        app.filter_text = "ALPHA".to_string(); // uppercase proves to_lowercase()
+        let rendered = render_sessions_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_sessions_filtered_alpha", rendered);
+    }
+
+    /// Filter matching nothing → empty placeholder row, title count (0).
+    #[test]
+    fn snapshot_sessions_filter_no_match() {
+        let mut app = app_with_mixed_sessions();
+        app.filter_text = "zzz-no-match".to_string();
+        let rendered = render_sessions_to_string(&mut app);
+        insta::assert_snapshot!("dashboard_ui_sessions_filter_no_match", rendered);
+    }
+}

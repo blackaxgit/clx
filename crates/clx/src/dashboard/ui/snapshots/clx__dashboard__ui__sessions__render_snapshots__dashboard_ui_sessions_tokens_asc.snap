@@ -1,0 +1,34 @@
+---
+source: crates/clx/src/dashboard/ui/sessions.rs
+expression: rendered
+---
+Sessions: 4 (0 active)  │  Tokens: 0 in/0 out  │  Cost: $0.00  │  Cmds: 0
+░░░░░░░░░░ 0% allow  ░░░░░░░░░░ 0% deny  ░░░░░░░░░░ 0% prompt  │  Risk L:0 M:0 H:0
+┌ Sessions (4) ────────────────────────────────────────────────────────────────────────────────────↑
+│Status     ID         Started        Duration     Msgs    Cmds    Tokens ▼   Project              █
+│                                                                                                  █
+│ended      aaa2       03-13 09:01    10m          20      6       3.1K       /work/alpha          █
+│queued     kkk4       03-13 09:00    5m           9       3       1.2K       /work/delta          █
+│active     zzz1       03-13 09:02    2m           4       1       900        /work/beta           █
+│abandoned  mmm3       03-13 09:03    0m           2       0       100        /work/gamma          █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  █
+│                                                                                                  ║
+│                                                                                                  ║
+│                                                                                                  ║
+└──────────────────────────────────────────────────────────────────────────────────────────────────↓
