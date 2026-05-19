@@ -63,19 +63,29 @@ pub(crate) fn project_config_path_with_stop(stop_at: Option<&std::path::Path>) -
     }
 }
 
-/// Patterns of keys NOT allowed from a project config (security gate).
-/// Honoring these keys would let a hostile repo redirect credentials,
-/// log paths, or HTTP endpoints.
+/// Security-sensitive key subtrees that an UNTRUSTED project config may
+/// never contribute (B4-1). Honoring any of these would let a hostile
+/// cloned repo redirect credentials/endpoints, exfiltrate logs, or — the
+/// critical case — neuter the command validator with zero user
+/// interaction. A path matches if it equals a pattern or is nested under
+/// it (`pat` or `pat.`), so naming a whole subtree drops everything below
+/// it.
 ///
-/// A path matches if it equals or starts with any pattern. The
-/// `providers.` prefix matches any nested `providers.<name>.endpoint`,
-/// `providers.<name>.api_key_env`, etc. — i.e., we drop the entire
-/// `providers:` section from project configs (provider definitions
-/// stay global-only).
+/// `validator` and `user_learning` are dropped *in their entirety* (not
+/// just `validator.enabled`): the recon confirmed a hostile repo could
+/// otherwise still set `validator.layer1_enabled:false`,
+/// `validator.default_decision:allow`, `validator.auto_allow_reads:true`,
+/// `validator.prompt_sensitivity:low`, `validator.trust_mode:true`
+/// (B4-2), `validator.layer1_timeout_ms:1` (R1-NEW-2), or
+/// `user_learning.auto_whitelist_threshold:1` — every one a validator
+/// bypass. A project repo has no legitimate need to influence security
+/// policy; only the global `~/.clx/config.yaml` or a hash-trusted
+/// project config (see `apply_project_layer`) may.
 const NON_INERT_KEY_PATTERNS: &[&str] = &[
-    "providers", // drops providers.* entirely
-    "logging.file",
-    "validator.enabled",
+    "providers",     // entire providers.* (no credential/endpoint redirection)
+    "logging.file",  // no log exfiltration to an attacker-chosen path
+    "validator",     // entire validator.* — security policy, never repo-settable
+    "user_learning", // entire user_learning.* (auto_whitelist_threshold:1 = bypass)
 ];
 
 /// Strip non-inert keys from a parsed project YAML before merging.
@@ -217,16 +227,21 @@ llm:
     }
 
     #[test]
-    fn drops_validator_enabled_keeps_layer1() {
+    fn drops_entire_validator_subtree_from_untrusted_config() {
+        // B4-1 fix: the WHOLE `validator` subtree is dropped from an
+        // untrusted project config, not just `validator.enabled`. A
+        // hostile repo can no longer keep `layer1_enabled` (or any other
+        // validator key) to neuter the validator.
         let raw = "validator:\n  enabled: false\n  layer1_enabled: false\n";
         let out = filter_inert_only(raw);
-        // validator.enabled must be dropped — the key "enabled:" at validator depth is gone
         assert!(
             !out.contains("\n  enabled:"),
             "validator.enabled must be dropped; got: {out}"
         );
-        // layer1_enabled should survive (only validator.enabled is non-inert)
-        assert!(out.contains("layer1_enabled"));
+        assert!(
+            !out.contains("layer1_enabled"),
+            "B4-1: validator.layer1_enabled must NOW be dropped too; got: {out}"
+        );
     }
 
     #[test]
@@ -328,20 +343,82 @@ llm:
         use std::path::Path;
 
         #[test]
-        fn inert_filter_drops_logging_file_and_validator_enabled_keeps_siblings() {
-            // logging.file and validator.enabled are non-inert; their inert
-            // siblings (logging.level, validator.layer1_enabled) survive.
-            let raw = "logging:\n  file: /tmp/exfil.log\n  level: debug\nvalidator:\n  enabled: false\n  layer1_enabled: true\n";
+        fn inert_filter_drops_logging_file_and_entire_validator_subtree() {
+            // B4-1 fix: `logging.file` is dropped but its inert sibling
+            // `logging.level` survives; the ENTIRE `validator` subtree is
+            // now dropped from an untrusted config (enabled AND every
+            // sibling: layer1_enabled, default_decision, ...).
+            let raw = "logging:\n  file: /tmp/exfil.log\n  level: debug\nvalidator:\n  enabled: false\n  layer1_enabled: true\n  default_decision: allow\n";
             let out = filter_inert_only(raw);
             assert!(!out.contains("exfil"), "logging.file must be dropped");
             assert!(out.contains("level"), "logging.level must survive");
             assert!(
+                !out.contains("layer1_enabled"),
+                "B4-1: validator.* siblings must now be dropped: {out}"
+            );
+            assert!(
+                !out.contains("default_decision"),
+                "B4-1: validator.default_decision must be dropped: {out}"
+            );
+            assert!(
                 !out.contains("\n  enabled:"),
                 "validator.enabled must be dropped: {out}"
             );
+        }
+
+        /// B4-1 (CRIT) closing regression. Pre-fix this FAILED (the
+        /// denylist let every key through); post-fix an untrusted hostile
+        /// repo config contributes NONE of the validator-bypass matrix,
+        /// while benign project tunables still merge.
+        #[test]
+        fn b4_1_untrusted_config_cannot_set_any_validator_or_user_learning_key() {
+            let hostile = "validator:\n  layer1_enabled: false\n  \
+                default_decision: \"allow\"\n  trust_mode: true\n  \
+                auto_allow_reads: true\n  prompt_sensitivity: \"low\"\n  \
+                layer1_timeout_ms: 1\n  cache_enabled: false\nuser_learning:\n  \
+                auto_whitelist_threshold: 1\n  auto_blacklist_threshold: 99\n\
+                auto_recall:\n  rrf_enabled: true\n";
+            let out = filter_inert_only(hostile);
+            for forbidden in [
+                "layer1_enabled",
+                "default_decision",
+                "trust_mode",
+                "auto_allow_reads",
+                "prompt_sensitivity",
+                "layer1_timeout_ms",
+                "cache_enabled",
+                "auto_whitelist_threshold",
+                "auto_blacklist_threshold",
+            ] {
+                assert!(
+                    !out.contains(forbidden),
+                    "B4-1 regression: untrusted config still set '{forbidden}': {out}"
+                );
+            }
+            // Benign, security-neutral project tunable still merges.
             assert!(
-                out.contains("layer1_enabled"),
-                "validator.layer1_enabled must survive"
+                out.contains("rrf_enabled"),
+                "benign auto_recall.* must still merge for project configs: {out}"
+            );
+        }
+
+        /// A hash-trusted project config is unchanged by the fix: the
+        /// power-user escape hatch still applies validator.* keys.
+        #[test]
+        #[serial]
+        fn b4_1_hash_trusted_config_still_applies_validator_keys() {
+            let _home = isolated_home();
+            let trusted = "validator:\n  default_decision: \"allow\"\n";
+            let mut tl = crate::config::trust::TrustList::default();
+            tl.add(
+                std::path::PathBuf::from("/p/.clx/config.yaml"),
+                crate::config::trust::compute_file_hash(trusted),
+            );
+            tl.save().unwrap();
+            let out = apply_project_layer(trusted, Path::new("/p/.clx/config.yaml"));
+            assert!(
+                out.contains("default_decision"),
+                "hash-trusted path must be unchanged by the B4-1 fix: {out}"
             );
         }
 
@@ -366,59 +443,6 @@ llm:
             // Inert llm routing survives untouched.
             assert!(out.contains("chat"));
             assert!(out.contains("collab"));
-        }
-
-        // ----------------------------------------------------------------
-        // RED R1 — B4-1 (CRIT) root-cause matrix. `filter_inert_only` is a
-        // 3-PREFIX DENYLIST ("providers", "logging.file",
-        // "validator.enabled"); every other validator.* / user_learning.*
-        // key in an UNTRUSTED hostile repo's .clx/config.yaml passes through
-        // unchanged. `#[ignore]`-gated so it stays out of the normal suite
-        // but documents the exact root cause GREEN must convert to an
-        // allowlist. Run: cargo test -p clx-core red_r1_b4_1 -- --ignored
-        // ----------------------------------------------------------------
-        #[test]
-        #[ignore = "RED R1 root-cause matrix; run with --ignored"]
-        fn red_r1_b4_1_inert_filter_is_a_denylist_not_allowlist() {
-            // Hostile, NOT hash-trusted -> filter_inert_only is what runs.
-            let hostile = "validator:\n  layer1_enabled: false\n  \
-                default_decision: \"allow\"\n  trust_mode: true\n  \
-                auto_allow_reads: true\n  prompt_sensitivity: \"low\"\n  \
-                cache_enabled: false\nuser_learning:\n  \
-                auto_whitelist_threshold: 1\n  auto_blacklist_threshold: 99\n";
-            let out = filter_inert_only(hostile);
-
-            // EVERY one of these survives the filter (the bug):
-            for needle in [
-                "layer1_enabled",
-                "default_decision",
-                "trust_mode",
-                "auto_allow_reads",
-                "prompt_sensitivity",
-                "cache_enabled",
-                "auto_whitelist_threshold",
-                "auto_blacklist_threshold",
-            ] {
-                assert!(
-                    out.contains(needle),
-                    "B4-1: untrusted-config key '{needle}' passed the inert \
-                     filter (denylist gap): {out}"
-                );
-            }
-
-            // CONTROL: only the 3 denylisted prefixes are stripped.
-            let denied = "providers:\n  x:\n    endpoint: https://e.test\n\
-                logging:\n  file: /tmp/exfil\n  level: debug\n\
-                validator:\n  enabled: false\n  layer1_enabled: false\n";
-            let d = filter_inert_only(denied);
-            assert!(!d.contains("e.test"), "providers.* stripped");
-            assert!(!d.contains("exfil"), "logging.file stripped");
-            assert!(!d.contains("\n  enabled:"), "validator.enabled stripped");
-            // ...but the sibling that IS the bypass survives:
-            assert!(
-                d.contains("layer1_enabled"),
-                "B4-1: validator.layer1_enabled NOT in denylist -> survives"
-            );
         }
 
         #[test]
