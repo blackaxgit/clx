@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 
 use crate::config::PromptSensitivity;
 use crate::llm::LlmClient;
+use crate::redaction::redact_secrets;
 
 use super::PolicyEngine;
 use super::cache::{ValidationCache, compute_cache_key};
@@ -159,7 +160,10 @@ impl PolicyEngine {
                 }
             }
             Err(e) => {
-                warn!("L1 LLM unavailable: {}", e);
+                // B6-1: pass the error Display through redact_secrets so that
+                // any provider-body fragments (tenant host, deployment path)
+                // are scrubbed before reaching the tracing sink.
+                warn!("L1 LLM unavailable: {}", redact_secrets(&e.to_string()));
                 PolicyDecision::Ask {
                     reason: "LLM unavailable".to_string(),
                 }

@@ -11,13 +11,158 @@
 
 use serde_json::Value;
 
+/// Host-suffix patterns for Azure/OpenAI tenant endpoints that must be scrubbed
+/// from logs and error messages (B6-2). These are provider infrastructure
+/// hostnames — not secrets themselves, but are in the same disclosure class as
+/// the previously-leaked tenant URL.
+///
+/// Matched as case-insensitive suffix of the `authority` (host[:port]) component
+/// of any URL-like token in the text.
+const AZURE_HOST_SUFFIXES: &[&str] = &[
+    ".openai.azure.com",
+    ".azure-api.net",
+    ".cognitiveservices.azure.com",
+];
+
+/// Replacement token used when an Azure/OpenAI tenant host is scrubbed.
+const AZURE_HOST_REDACTED: &str = "***AZURE-HOST-REDACTED***";
+
+/// Scrub Azure/OpenAI tenant hostnames from `text`.
+///
+/// Finds URL-like tokens (`https?://`) and replaces the authority component
+/// (host[:port]) when it ends with any of the [`AZURE_HOST_SUFFIXES`].
+/// Non-matching authorities are left unchanged so that unrelated HTTPS URLs
+/// (documentation links, etc.) are not over-redacted.
+///
+/// Also replaces bare hostname tokens (no scheme) that end with the same
+/// suffixes, since Azure error bodies sometimes embed them without a scheme.
+#[must_use]
+fn redact_azure_hosts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let lower = text.to_lowercase();
+    let mut cursor = 0usize;
+
+    // Pass 1: URL-bearing tokens (`https?://authority/...`).
+    // We scan for `https://` or `http://` and then extract the authority.
+    while cursor < text.len() {
+        // Look for a scheme start.
+        let scheme_pos = {
+            let mut found = None;
+            let search_from = cursor;
+            for scheme in &["https://", "http://"] {
+                if let Some(idx) = lower[search_from..].find(scheme) {
+                    let abs = search_from + idx;
+                    found = match found {
+                        None => Some((abs, scheme.len())),
+                        Some((prev, _)) if abs < prev => Some((abs, scheme.len())),
+                        other => other,
+                    };
+                }
+            }
+            found
+        };
+
+        let Some((scheme_start, scheme_len)) = scheme_pos else {
+            // No more URLs — append the rest and stop.
+            out.push_str(&text[cursor..]);
+            break;
+        };
+
+        // Append everything before the scheme.
+        out.push_str(&text[cursor..scheme_start]);
+
+        let authority_start = scheme_start + scheme_len;
+        // Authority ends at the first `/`, `?`, `#`, space, `"`, `'`, or end.
+        let authority_end = text[authority_start..]
+            .find(['/', '?', '#', ' ', '"', '\'', '\n', '\r'])
+            .map_or(text.len(), |i| authority_start + i);
+
+        let authority = &text[authority_start..authority_end];
+        let authority_lower = authority.to_lowercase();
+
+        let is_azure = AZURE_HOST_SUFFIXES
+            .iter()
+            .any(|suf| authority_lower.ends_with(suf));
+
+        if is_azure {
+            // Replace just the authority; keep scheme visible so context is clear.
+            out.push_str(&text[scheme_start..authority_start]);
+            out.push_str(AZURE_HOST_REDACTED);
+        } else {
+            // Not an Azure host — keep scheme + authority verbatim.
+            out.push_str(&text[scheme_start..authority_end]);
+        }
+
+        cursor = authority_end;
+    }
+
+    // Pass 2: bare hostname tokens (no scheme prefix) that end with an Azure suffix.
+    // Many Azure error bodies embed hostnames like `synthetic-tenant.openai.azure.com`
+    // without a leading `https://`.
+    let mut result = String::with_capacity(out.len());
+    let mut pos = 0usize;
+    let out_bytes = out.as_bytes();
+    while pos < out.len() {
+        // A word boundary: find the next non-space, non-quote, non-special run.
+        // We tokenise on whitespace and a small set of punctuation.
+        let token_start = pos;
+        let token_end = out[pos..]
+            .find([
+                ' ', '\t', '\n', '\r', '"', '\'', ',', '}', '{', '[', ']', '(', ')',
+            ])
+            .map_or(out.len(), |i| pos + i);
+
+        if token_start == token_end {
+            // Delimiter — emit and advance.
+            result.push(out_bytes[pos] as char);
+            pos += 1;
+            continue;
+        }
+
+        let token = &out[token_start..token_end];
+        // Skip tokens that already contain the redaction marker (from pass 1).
+        if !token.contains("***AZURE-HOST-REDACTED***") {
+            let token_lower = token.to_lowercase();
+            // Strip a trailing path component if present — check authority portion.
+            let authority_part = token_lower.split('/').next().unwrap_or("");
+            let is_azure = AZURE_HOST_SUFFIXES
+                .iter()
+                .any(|suf| authority_part.ends_with(suf));
+            if is_azure {
+                result.push_str(AZURE_HOST_REDACTED);
+                pos = token_end;
+                continue;
+            }
+        }
+
+        result.push_str(token);
+        pos = token_end;
+    }
+
+    result
+}
+
 /// Redact known secret patterns from text before logging.
 ///
 /// Uses simple prefix-based matching (no regex dependency). Catches common API key
 /// prefixes, keyword=value patterns for tokens/passwords/secrets, Bearer tokens,
-/// and shell `export VAR=value` patterns where VAR contains a sensitive keyword.
+/// shell `export VAR=value` patterns where VAR contains a sensitive keyword, and
+/// Azure/OpenAI tenant/endpoint hostnames (B6-2).
 #[must_use]
 pub fn redact_secrets(text: &str) -> String {
+    // Apply Azure host redaction first so that subsequent passes do not
+    // accidentally match partial tokens whose URL context has been stripped.
+    let text_owned;
+    let text: &str = if text.contains("://")
+        || AZURE_HOST_SUFFIXES
+            .iter()
+            .any(|suf| text.to_lowercase().contains(*suf))
+    {
+        text_owned = redact_azure_hosts(text);
+        &text_owned
+    } else {
+        text
+    };
     let mut redacted = text.to_string();
 
     // -------------------------------------------------------------------------
@@ -691,6 +836,123 @@ mod tests {
         assert!(
             !result.contains("dXNlcjpwd2Q12345"),
             "Basic auth credential leaked: {result}"
+        );
+    }
+
+    // =========================================================================
+    // B6-2 regression tests (GREEN G2) — Azure/OpenAI tenant host scrubbing
+    //
+    // These tests FAIL on pre-fix code (no host pattern in redact_secrets) and
+    // PASS after the fix (redact_azure_hosts integrated into redact_secrets).
+    //
+    // ALL hosts used here are SYNTHETIC — the real leaked tenant URL appears
+    // nowhere in this file.
+    // =========================================================================
+
+    /// B6-2 regression: `redact_secrets` must scrub a `*.openai.azure.com`
+    /// tenant host that appears inside an HTTPS URL in the text.
+    #[test]
+    fn b6_2_redact_secrets_scrubs_openai_azure_com_host_in_url() {
+        let text = r#"{"error":{"message":"Access denied at https://synthetic-tenant.openai.azure.com/openai/deployments/d/chat"}}"#;
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "B6-2 REGRESSION: *.openai.azure.com host leaked through redact_secrets: {result}"
+        );
+        assert!(
+            result.contains("***AZURE-HOST-REDACTED***"),
+            "redacted token must appear in output: {result}"
+        );
+    }
+
+    /// B6-2 regression: `redact_secrets` must scrub a `*.azure-api.net` host.
+    #[test]
+    fn b6_2_redact_secrets_scrubs_azure_api_net_host_in_url() {
+        let text = "endpoint=https://synthetic-tenant.azure-api.net/v1/chat";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.azure-api.net"),
+            "B6-2 REGRESSION: *.azure-api.net host leaked through redact_secrets: {result}"
+        );
+    }
+
+    /// B6-2 regression: `redact_secrets` must scrub a `*.cognitiveservices.azure.com` host.
+    #[test]
+    fn b6_2_redact_secrets_scrubs_cognitiveservices_host_in_url() {
+        let text = "resource at https://synthetic-tenant.cognitiveservices.azure.com/openai";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.cognitiveservices.azure.com"),
+            "B6-2 REGRESSION: *.cognitiveservices.azure.com host leaked: {result}"
+        );
+    }
+
+    /// B6-2 regression: `redact_secrets` must scrub a bare hostname (no scheme)
+    /// that ends with a known Azure suffix, as Azure error bodies sometimes embed
+    /// the host without an `https://` prefix.
+    #[test]
+    fn b6_2_redact_secrets_scrubs_bare_azure_hostname() {
+        let text = "host synthetic-tenant.openai.azure.com returned 401";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "B6-2 REGRESSION: bare Azure hostname leaked through redact_secrets: {result}"
+        );
+    }
+
+    /// B6-2 non-regression: `redact_secrets` must NOT over-redact unrelated HTTPS
+    /// URLs (e.g. documentation links, Ollama localhost, non-Azure endpoints).
+    #[test]
+    fn b6_2_redact_secrets_does_not_over_redact_unrelated_urls() {
+        let safe_texts = [
+            "see https://docs.example.com/guide for more info",
+            "ollama at http://127.0.0.1:11434/api/tags",
+            "endpoint https://api.openai.com/v1/chat/completions",
+        ];
+        for text in &safe_texts {
+            let result = redact_secrets(text);
+            assert_eq!(
+                result, *text,
+                "B6-2: safe URL was over-redacted by redact_secrets: input={text:?} output={result:?}"
+            );
+        }
+    }
+
+    /// B6-2 regression: `redact_json_value` must also scrub Azure tenant hosts
+    /// embedded in string values (via the `redact_secrets` path it delegates to).
+    #[test]
+    fn b6_2_redact_json_value_scrubs_azure_host_in_string_leaf() {
+        let v = serde_json::json!({
+            "log": "error at https://synthetic-tenant.openai.azure.com/openai/deployments/d",
+            "safe": "normal text"
+        });
+        let r = redact_json_value(&v);
+        let log_str = r["log"].as_str().unwrap();
+        assert!(
+            !log_str.contains("synthetic-tenant.openai.azure.com"),
+            "B6-2 REGRESSION: Azure host leaked through redact_json_value string leaf: {log_str}"
+        );
+        assert_eq!(r["safe"], serde_json::json!("normal text"));
+    }
+
+    /// B6-2 regression: the `redact_azure_hosts` internal function handles the
+    /// exact synthetic body shape used in the RED R2 `PoC` (`b6_2_redact_secrets_leaves_tenant_url_intact`).
+    #[test]
+    fn b6_2_redact_azure_hosts_handles_poc_body_shape() {
+        // Same shape as SYNTH_AZURE_BODY in red_r2_poc.rs — synthetic host only.
+        let poc_body = r#"{"error":{"code":"401","message":"Access denied due to invalid subscription key. Make sure to provide a valid key for the resource at https://synthetic-tenant.example-openai.invalid/openai/deployments/synthetic-deploy/chat/completions"}}"#;
+        // Note: example-openai.invalid does NOT end with our Azure suffixes, so it
+        // is intentionally NOT scrubbed — the PoC uses a non-`.openai.azure.com`
+        // domain on purpose (rules of engagement: no real tenant). The B6-2 fix
+        // targets the real suffix class; over-redacting `.invalid` TLDs would be
+        // wrong. This test documents that contract explicitly.
+        let result = redact_secrets(poc_body);
+        // The `.invalid` synthetic host is not in our suffix list — that's correct.
+        // What matters is that REAL Azure suffixes ARE scrubbed (tested above).
+        // This test pins the "no over-redaction of .invalid" contract.
+        assert!(
+            result.contains("example-openai.invalid"),
+            "synthetic .invalid host should NOT be scrubbed (not in Azure suffix list): {result}"
         );
     }
 }
