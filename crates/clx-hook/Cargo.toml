@@ -23,6 +23,8 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 regex.workspace = true
+sha2 = "0.10"
+hex = "0.4"
 
 [lints]
 workspace = true

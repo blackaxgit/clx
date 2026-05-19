@@ -331,21 +331,28 @@ fn decision_cache_hit_short_circuits_to_l1_cache() {
 }
 
 // =========================================================================
-// 3.9 trust mode: valid legacy token auto-allows + TRUST audit row.
+// 3.9 trust mode: B1-10 — legacy plain-text token no longer grants trust.
 // =========================================================================
 
+/// B1-10 regression guard: a fresh legacy plain-text trust token is now
+/// treated as invalid (mtime-only fallback removed). The hook falls through
+/// to normal validation — L0 denies the dangerous command.
+///
+/// Before B1-10 this test expected `"allow"` (mtime-based auto-allow).
+/// After B1-10 the correct behavior is `"deny"` (falls through to L0).
 #[test]
-fn trust_mode_valid_legacy_token_auto_allows_with_trust_audit() {
+fn trust_mode_legacy_plain_text_token_falls_through_after_b1_10() {
     let cfg = "validator:\n  enabled: true\n  trust_mode: true\n  layer1_enabled: false\n";
     let binary = env!("CARGO_BIN_EXE_clx-hook");
     let temp = isolated_clx_home();
     let clx_dir = temp.path().join(".clx");
     std::fs::create_dir_all(&clx_dir).unwrap();
     std::fs::write(clx_dir.join("config.yaml"), cfg).unwrap();
-    // Fresh legacy plain-text token (mtime = now -> valid < 3600s).
+    // Fresh legacy plain-text token — B1-10: mtime-only fallback removed;
+    // this token must NOT grant trust.
     std::fs::write(clx_dir.join(".trust_mode_token"), "trust_mode_active").unwrap();
 
-    let env = pre_tool_use("e2e-trust", "rm -rf /tmp/whatever");
+    let env = pre_tool_use("e2e-trust-b110", "rm -rf /tmp/whatever");
     let mut command = Command::new(binary);
     let mut child = harden_command(&mut command, temp.path())
         .stdin(Stdio::piped())
@@ -363,15 +370,21 @@ fn trust_mode_valid_legacy_token_auto_allows_with_trust_audit() {
     assert_home_size_bounded(temp.path());
     let parsed: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("json");
+    // B1-10: plain-text token must NOT grant auto-allow; L0 must deny.
     assert_eq!(
         decision(&parsed),
-        "allow",
-        "trust mode must auto-allow even a normally-L0-denied command"
+        "deny",
+        "B1-10: legacy plain-text trust token must not grant trust; \
+         L0 must deny the dangerous command"
     );
-    let rows = audit_rows(temp.path(), "e2e-trust");
-    assert_eq!(rows.len(), 1, "trust-allowed commands are still audited");
-    assert_eq!(rows[0].layer, "TRUST");
-    assert_eq!(rows[0].decision.as_str(), "allowed");
+    // No TRUST audit row should exist (the command was denied by L0, not trusted).
+    let rows = audit_rows(temp.path(), "e2e-trust-b110");
+    let trust_rows: Vec<_> = rows.iter().filter(|r| r.layer == "TRUST").collect();
+    assert_eq!(
+        trust_rows.len(),
+        0,
+        "B1-10: no TRUST audit row must be written for a rejected legacy token"
+    );
 }
 
 /// V-R9 (pinned): an EXPIRED legacy token (mtime > 3600s) is rejected; the

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **B1-10 (trust-token hardening):** The legacy mtime-only trust-token fallback
+  has been removed. Previously, any file at `~/.clx/.trust_mode_token` whose
+  modification time was less than 1 hour old granted global auto-allow for all
+  commands (mtime is not authentication). Now only a signed JSON `TrustToken`
+  (with expiry and optional session binding) grants trust. **Migration:** if you
+  use trust mode, run `clx trust` once to write a proper JSON token. The failure
+  mode is fail-safe: a legacy plain-text token file now falls through to normal
+  validation (more prompting, never more allowing).
+
 ### Changed
 
 - **Test coverage 85.72% -> 89.99%** line on the unchanged published
