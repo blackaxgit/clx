@@ -81,6 +81,52 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         }
     }
 
+    // B5-4-extended (config-driven audit chain): emit a SECURITY-CFG audit-chain
+    // fingerprint whenever layer0_enabled or layer1_enabled is false in the
+    // *effective* config (not just when driven by env var). This closes the gap
+    // where a user sets validator.layer0_enabled: false in ~/.clx/config.yaml
+    // without any env var — the env-only path above would not fire, but this
+    // config-driven path will. Fires once per hook process invocation, mirroring
+    // the env-override per-event semantics. Trigger key strings are intentionally
+    // human-readable config paths so log aggregators can distinguish env vs config
+    // source without a second lookup.
+    {
+        let mut cfg_triggers: Vec<&'static str> = Vec::new();
+        if !config.validator.layer0_enabled {
+            cfg_triggers.push("validator.layer0_enabled=false");
+        }
+        if !config.validator.layer1_enabled {
+            cfg_triggers.push("validator.layer1_enabled=false");
+        }
+        if !cfg_triggers.is_empty() {
+            let trigger_keys = cfg_triggers.join(", ");
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let record = build_record(1, &timestamp, &trigger_keys, GENESIS_HASH);
+
+            warn!(
+                event_fingerprint = %record.entry_hash,
+                trigger_keys = %trigger_keys,
+                "SECURITY-CFG: config-driven layer-disable active; \
+                 per-event integrity fingerprint anchored in external sink"
+            );
+
+            let reasoning = format!(
+                "config-driven layer-disable: {trigger_keys}; \
+                 event_fingerprint={}",
+                record.entry_hash
+            );
+            log_audit_entry(
+                &input.session_id,
+                "<cfg-layer-disable>",
+                &input.cwd,
+                "SECURITY-CFG",
+                AuditDecision::Prompted,
+                None,
+                Some(&reasoning),
+            );
+        }
+    }
+
     // Route by tool type to extract the command to validate.
     // MCP command tools are evaluated through the same PolicyEngine as Bash.
     let command_raw = if tool_name == "Bash" {
@@ -223,60 +269,99 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         warn!("Failed to load learned rules: {}", e);
     }
 
-    // Layer 0: Deterministic rules evaluation
+    // Layer 0: Deterministic rules evaluation (if enabled)
     // Always evaluate as "Bash" so all Bash(...) rules apply universally
     // (MCP command tools have their commands extracted and validated identically)
-    let l0_decision = policy_engine.evaluate("Bash", command);
+    if config.validator.layer0_enabled {
+        let l0_decision = policy_engine.evaluate("Bash", command);
 
-    match l0_decision {
-        PolicyDecision::Allow => {
-            debug!("L0: Allowed command '{}'", command);
-            log_audit_entry(
-                &input.session_id,
-                command,
-                &input.cwd,
-                "L0",
-                AuditDecision::Allowed,
-                None,
-                None,
-            );
-            output_decision("allow", None, Some(RULES_REMINDER), None);
-            return Ok(());
-        }
-        PolicyDecision::Deny { reason } => {
-            debug!("L0: Denied command '{}': {}", command, reason);
-            log_audit_entry(
-                &input.session_id,
-                command,
-                &input.cwd,
-                "L0",
-                AuditDecision::Blocked,
-                None,
-                Some(&reason),
-            );
-            output_decision("deny", Some(reason), Some(RULES_REMINDER), None);
-            return Ok(());
-        }
-        PolicyDecision::Ask { .. } => {
-            // For read-only commands: auto-allow without confirmation dialog
-            // (L0 didn't explicitly block it, so it's safe)
-            if is_read_only {
-                debug!("L0: Unknown read-only command '{}', auto-allowing", command);
+        match l0_decision {
+            PolicyDecision::Allow => {
+                debug!("L0: Allowed command '{}'", command);
                 log_audit_entry(
                     &input.session_id,
                     command,
                     &input.cwd,
-                    "L0-READ",
+                    "L0",
                     AuditDecision::Allowed,
                     None,
-                    Some("Read-only command auto-allowed"),
+                    None,
                 );
                 output_decision("allow", None, Some(RULES_REMINDER), None);
                 return Ok(());
             }
-            debug!("L0: Unknown command '{}', checking L1", command);
-            // Continue to Layer 1
+            PolicyDecision::Deny { reason } => {
+                debug!("L0: Denied command '{}': {}", command, reason);
+                log_audit_entry(
+                    &input.session_id,
+                    command,
+                    &input.cwd,
+                    "L0",
+                    AuditDecision::Blocked,
+                    None,
+                    Some(&reason),
+                );
+                output_decision("deny", Some(reason), Some(RULES_REMINDER), None);
+                return Ok(());
+            }
+            PolicyDecision::Ask { .. } => {
+                // For read-only commands: auto-allow without confirmation dialog
+                // (L0 didn't explicitly block it, so it's safe)
+                if is_read_only {
+                    debug!("L0: Unknown read-only command '{}', auto-allowing", command);
+                    log_audit_entry(
+                        &input.session_id,
+                        command,
+                        &input.cwd,
+                        "L0-READ",
+                        AuditDecision::Allowed,
+                        None,
+                        Some("Read-only command auto-allowed"),
+                    );
+                    output_decision("allow", None, Some(RULES_REMINDER), None);
+                    return Ok(());
+                }
+                debug!("L0: Unknown command '{}', checking L1", command);
+                // Continue to Layer 1
+            }
         }
+    } else {
+        // L0 disabled: skip deterministic ruleset entirely. Audit the skip so
+        // operators can see the weakening at the per-command row level.
+        debug!(
+            "L0 disabled, skipping deterministic ruleset for '{}'",
+            command
+        );
+        log_audit_entry(
+            &input.session_id,
+            command,
+            &input.cwd,
+            "L0",
+            AuditDecision::Prompted,
+            None,
+            Some("L0-DISABLED"),
+        );
+        // Honor auto_allow_reads even when L0 is off — preserves read-only
+        // ergonomics without requiring an L1 round-trip for read commands.
+        if is_read_only {
+            debug!(
+                "L0 disabled: read-only command '{}' auto-allowed via auto_allow_reads",
+                command
+            );
+            log_audit_entry(
+                &input.session_id,
+                command,
+                &input.cwd,
+                "L0-READ",
+                AuditDecision::Allowed,
+                None,
+                Some("Read-only command auto-allowed (L0 disabled)"),
+            );
+            output_decision("allow", None, Some(RULES_REMINDER), None);
+            return Ok(());
+        }
+        // else: fall through to cache lookup + L1 (which may itself be off,
+        // in which case the L1-disabled branch below handles forced-ask).
     }
 
     // Check SQLite decision cache before calling Ollama
@@ -320,7 +405,7 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             "L0",
             AuditDecision::Prompted,
             None,
-            Some("L1 disabled"),
+            Some("L1-DISABLED"),
         );
         output_decision(
             "ask",

@@ -74,8 +74,22 @@ fn pre_tool_use(session: &str, command: &str) -> serde_json::Value {
     })
 }
 
-/// Re-open the temp-home audit DB and return rows for a session.
+/// Re-open the temp-home audit DB and return DECISION rows for a session.
+/// Filters out the per-process `SECURITY-CFG` / `SECURITY-ENV` audit-chain
+/// signals (introduced in v0.9.0 for config/env-driven layer disable);
+/// existing decision-row tests should be unaffected by that new signal.
+/// Use [`audit_rows_all`] when a test explicitly inspects the signal.
 fn audit_rows(home: &Path, session: &str) -> Vec<clx_core::types::AuditLogEntry> {
+    audit_rows_all(home, session)
+        .into_iter()
+        .filter(|r| !matches!(r.layer.as_str(), "SECURITY-CFG" | "SECURITY-ENV"))
+        .collect()
+}
+
+/// Re-open the temp-home audit DB and return ALL rows for a session,
+/// including SECURITY-CFG / SECURITY-ENV signal rows.
+#[allow(dead_code)]
+fn audit_rows_all(home: &Path, session: &str) -> Vec<clx_core::types::AuditLogEntry> {
     let db = home.join(".clx/data/clx.db");
     if !db.exists() {
         return Vec::new();
@@ -208,7 +222,9 @@ fn l1_disabled_unknown_command_asks_and_not_cached() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].layer, "L0");
     assert_eq!(rows[0].decision.as_str(), "prompted");
-    assert_eq!(rows[0].reasoning.as_deref(), Some("L1 disabled"));
+    // v0.9.0: audit reasoning string normalized "L1 disabled" -> "L1-DISABLED"
+    // to mirror the new "L0-DISABLED" reason; documented in CHANGELOG.
+    assert_eq!(rows[0].reasoning.as_deref(), Some("L1-DISABLED"));
 
     // The L1-disabled branch must NOT write a decision-cache row.
     let db = home.path().join(".clx/data/clx.db");
