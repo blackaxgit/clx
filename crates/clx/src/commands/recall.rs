@@ -23,6 +23,7 @@ use colored::Colorize;
 use clx_core::config::{Capability, Config};
 use clx_core::embeddings::EmbeddingStore;
 use clx_core::recall::{LlmQueryEmbedder, QueryEmbedder};
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 
 use crate::Cli;
@@ -150,7 +151,8 @@ pub async fn cmd_recall(cli: &Cli, query: &str) -> Result<()> {
                 println!();
                 println!("{}", "Could not generate embedding for query.".yellow());
                 println!("Make sure Ollama is running: ollama serve");
-                println!("Error: {e}");
+                // Sink wrap (B6-1): redact LlmError Display before printing to stdout.
+                println!("Error: {}", redact_secrets(&e.to_string()));
             }
             return Ok(());
         }

@@ -214,6 +214,19 @@ impl PolicyEngine {
         let blacklist_count = config.blacklist.len();
 
         for pattern in config.whitelist {
+            // B1-4 / B3-2: apply the same overbroad gate that guards the
+            // learned-rule load path.  A file-supplied `whitelist: ["Bash(*)"]`
+            // must not become a permanent L0 wildcard allow.  WARN and skip;
+            // do NOT abort the load (other valid rules in the file are kept).
+            // Deny rules are never restricted — a broad deny only fails safe.
+            if super::matching::is_overbroad_allow_pattern(&pattern) {
+                warn!(
+                    %pattern,
+                    "Skipping overbroad file-loaded ALLOW rule (would whitelist \
+                     arbitrary commands); ignored at load"
+                );
+                continue;
+            }
             self.whitelist
                 .push(PolicyRule::whitelist(pattern).with_source(RuleSource::Config));
         }

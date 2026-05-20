@@ -3,6 +3,7 @@
 use crate::embedding::truncate_to_char_boundary;
 use crate::types::{SUMMARIZE_PROMPT, SummaryResponse, TranscriptEntry, TranscriptResult};
 use clx_core::config::{Capability, Config};
+use clx_core::redaction::redact_secrets;
 use clx_core::types::estimate_tokens;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -282,7 +283,12 @@ pub(crate) async fn process_transcript(
     }) {
         Ok(pair) => pair,
         Err(e) => {
-            warn!("Failed to create LLM client for summarization: {}", e);
+            // Sink wrap (B6-1): redact LlmError Display string before logging
+            // to prevent tenant URLs or key fragments from reaching tracing sinks.
+            warn!(
+                "Failed to create LLM client for summarization: {}",
+                redact_secrets(&e.to_string())
+            );
             return TranscriptResult {
                 summary: Some(format!(
                     "Session with {message_count} messages (LLM unavailable)"
@@ -336,7 +342,11 @@ pub(crate) async fn process_transcript(
             }
         }
         Err(e) => {
-            warn!("Failed to generate summary: {}", e);
+            // Sink wrap (B6-1): redact LlmError Display string before logging.
+            warn!(
+                "Failed to generate summary: {}",
+                redact_secrets(&e.to_string())
+            );
             TranscriptResult {
                 summary: Some(format!("Session with {message_count} messages")),
                 key_facts: None,
