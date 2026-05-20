@@ -5,6 +5,56 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`validator.layer0_enabled: bool`** (default `true`). Mirrors the
+  existing `validator.layer1_enabled` toggle at the L0 (deterministic-
+  policy) layer. Disabling skips `PolicyEngine::evaluate` and treats
+  the L0 verdict as `Ask`, so the command falls through to L1 (or to
+  the forced-`ask` posture when L1 is also disabled). Backwards
+  compatible: omitted from config or set to `true` -> existing
+  behaviour unchanged.
+- **`CLX_VALIDATOR_LAYER0_ENABLED` env override** (highest precedence;
+  any of `false`/`0`/`off`/`no` disables). Mirrors
+  `CLX_VALIDATOR_LAYER1_ENABLED`. When set to a security-weakening
+  value, emits a startup WARN and is reported by
+  `Config::security_env_overrides_active()` (now 5 variables).
+- **Dashboard Settings -> Validator** has a new `layer0_enabled` row
+  immediately below `enabled` and above `layer1_enabled` (logical
+  L0 -> L1 ordering); editable in-place like other bool fields.
+
+### Security
+
+- **Layer-disable audit-chain signal extended to config-driven
+  disable.** Previously the per-event SHA-256 audit-chain fingerprint
+  (B5-4 in v0.8.1) fired only when an env variable disabled a layer.
+  v0.9.0 ALSO emits a `SECURITY-CFG` audit row + chained fingerprint
+  when `validator.layer0_enabled` or `validator.layer1_enabled` is
+  `false` in `~/.clx/config.yaml`. An external log aggregator
+  capturing the `tracing::warn!` anchor can independently re-verify
+  any specific disable event. Closes the documented config-side gap
+  in B5-4-extended.
+- **Both-off semantics: fail-to-defined-policy.** If
+  `validator.enabled: true` but both `layer0_enabled: false` and
+  `layer1_enabled: false`, every command now resolves to
+  `output_decision("ask", "Command requires review")` regardless of
+  `validator.default_decision`. The audit row reads `L0-DISABLED` ->
+  `L1-DISABLED`. To get the "no validation at all" path, set
+  top-level `validator.enabled: false`.
+- **Hostile project config remains powerless.** v0.8.1's B4-1 inert
+  filter already drops the entire `validator.*` subtree from
+  untrusted project configs, so a cloned hostile repo cannot set
+  `layer0_enabled`. No new gate added; no theatre.
+
+### Changed
+
+- Audit-log `reasoning` for the L1-disabled branch normalised from
+  `"L1 disabled"` to `"L1-DISABLED"` so it parallels the new
+  `"L0-DISABLED"` reason text. Downstream log parsers that pattern-
+  match the legacy string need updating.
+
 ## [0.8.2] - 2026-05-20
 
 Security follow-up release. An independent Codex audit of v0.8.1 returned

@@ -175,9 +175,15 @@ Edit `~/.clx/config.yaml`:
 ```yaml
 validator:
   enabled: true
+  layer0_enabled: true        # deterministic policy (rule-based)
   layer1_enabled: true        # LLM validation
   layer1_timeout_ms: 30000
   default_decision: "ask"     # allow, deny, ask
+  # If both layer0_enabled and layer1_enabled are false (with enabled: true),
+  # every command resolves to "ask"; to disable validation entirely set
+  # enabled: false. Both layer toggles are also overridable via
+  # CLX_VALIDATOR_LAYER0_ENABLED / CLX_VALIDATOR_LAYER1_ENABLED env vars;
+  # disabling a layer emits a tamper-evident audit-chain fingerprint.
 
 context:
   enabled: true

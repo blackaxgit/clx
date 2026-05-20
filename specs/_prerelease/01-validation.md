@@ -60,7 +60,8 @@ Env override parsing at `config/mod.rs:1240-1320`.
 | Capability | Config key | Env var | Default | Defining file:line |
 |---|---|---|---|---|
 | Master enable/bypass | `validator.enabled` | `CLX_VALIDATOR_ENABLED` | `true` | `config/mod.rs:580-581`, `:779`; bypass `pre_tool_use.rs:66-69` |
-| L1 LLM enable | `validator.layer1_enabled` | `CLX_VALIDATOR_LAYER1_ENABLED` | `true` | `config/mod.rs:584-585`; gate `pre_tool_use.rs:254-272` |
+| L0 deterministic enable | `validator.layer0_enabled` | `CLX_VALIDATOR_LAYER0_ENABLED` | `true` | `config/mod.rs:583-589`; gate around the L0 evaluate in `pre_tool_use.rs`. Disabling skips `PolicyEngine::evaluate` and treats the L0 verdict as `Ask` (falls through to L1, or the forced-`ask` posture if L1 is also off). Security-weakening override: WARN + audit-chain fingerprint emitted at hook start. |
+| L1 LLM enable | `validator.layer1_enabled` | `CLX_VALIDATOR_LAYER1_ENABLED` | `true` | `config/mod.rs:591-593`; gate `pre_tool_use.rs:254-272` |
 | L1 timeout (ms) | `validator.layer1_timeout_ms` | `CLX_VALIDATOR_LAYER1_TIMEOUT_MS` | `30000` | `config/mod.rs:588-589`, `:783-785` |
 | Inconclusive fallback | `validator.default_decision` | `CLX_VALIDATOR_DEFAULT_DECISION` | `DefaultDecision::default()` | `config/mod.rs:592-593`; use `pre_tool_use.rs:286,332,375` |
 | Trust mode (auto-allow all) | `validator.trust_mode` | none (config-file only) | `false` | `config/mod.rs:598-599`, `:941`; logic `pre_tool_use.rs:72-147`; env explicitly unsupported `config/mod.rs:1266` |
