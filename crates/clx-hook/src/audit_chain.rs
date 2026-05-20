@@ -306,7 +306,10 @@ mod tests {
         // Vector 2: tamper timestamp
         let mut t = r1.clone();
         t.timestamp = "1970-01-01T00:00:00Z".to_string();
-        assert!(verify_fingerprint_sequence(&[t]).is_err(), "tampered timestamp must fail");
+        assert!(
+            verify_fingerprint_sequence(&[t]).is_err(),
+            "tampered timestamp must fail"
+        );
 
         // Vector 3: tamper event_type (not possible via build_record but simulate)
         // We can't change the static str through build_record, so verify directly
@@ -320,7 +323,10 @@ mod tests {
         // Vector 4: tamper seq
         let mut t = r1.clone();
         t.seq = 99;
-        assert!(verify_fingerprint_sequence(&[t]).is_err(), "tampered seq must fail");
+        assert!(
+            verify_fingerprint_sequence(&[t]).is_err(),
+            "tampered seq must fail"
+        );
     }
 
     /// Genesis sentinel: `prev_hash` of first record must equal `GENESIS_HASH`.
@@ -381,16 +387,35 @@ mod tests {
     #[test]
     fn separate_process_invocations_are_not_linked() {
         // Simulate process invocation 1: hook fires, sees CLX_VALIDATOR_ENABLED
-        let proc1_rec = build_record(1, "2026-05-19T10:00:00Z", "CLX_VALIDATOR_ENABLED", GENESIS_HASH);
+        let proc1_rec = build_record(
+            1,
+            "2026-05-19T10:00:00Z",
+            "CLX_VALIDATOR_ENABLED",
+            GENESIS_HASH,
+        );
 
         // Simulate process invocation 2 (later): hook fires again, same key
-        let proc2_rec = build_record(1, "2026-05-19T10:01:00Z", "CLX_VALIDATOR_ENABLED", GENESIS_HASH);
+        let proc2_rec = build_record(
+            1,
+            "2026-05-19T10:01:00Z",
+            "CLX_VALIDATOR_ENABLED",
+            GENESIS_HASH,
+        );
 
         // Both records start from GENESIS_HASH; they are not linked.
-        assert_eq!(proc1_rec.prev_hash, GENESIS_HASH, "proc1 starts from genesis");
-        assert_eq!(proc2_rec.prev_hash, GENESIS_HASH, "proc2 also starts from genesis");
+        assert_eq!(
+            proc1_rec.prev_hash, GENESIS_HASH,
+            "proc1 starts from genesis"
+        );
+        assert_eq!(
+            proc2_rec.prev_hash, GENESIS_HASH,
+            "proc2 also starts from genesis"
+        );
         assert_eq!(proc1_rec.seq, 1, "proc1 seq is 1");
-        assert_eq!(proc2_rec.seq, 1, "proc2 seq is also 1; no cross-process ordering");
+        assert_eq!(
+            proc2_rec.seq, 1,
+            "proc2 seq is also 1; no cross-process ordering"
+        );
 
         // Each record is individually verifiable in isolation.
         verify_fingerprint_sequence(std::slice::from_ref(&proc1_rec))
@@ -416,7 +441,10 @@ mod tests {
     fn fingerprint_is_deterministic_for_same_inputs() {
         let h1 = build_record(1, ts(), "CLX_VALIDATOR_ENABLED", GENESIS_HASH).entry_hash;
         let h2 = build_record(1, ts(), "CLX_VALIDATOR_ENABLED", GENESIS_HASH).entry_hash;
-        assert_eq!(h1, h2, "fingerprint must be deterministic for identical inputs");
+        assert_eq!(
+            h1, h2,
+            "fingerprint must be deterministic for identical inputs"
+        );
     }
 
     /// Option-A regression: different env-var names produce different fingerprints.
@@ -424,10 +452,26 @@ mod tests {
     #[test]
     fn different_trigger_keys_produce_different_fingerprints() {
         let h_enabled = build_record(1, ts(), "CLX_VALIDATOR_ENABLED", GENESIS_HASH).entry_hash;
-        let h_layer1 = build_record(1, ts(), "CLX_VALIDATOR_LAYER1_ENABLED", GENESIS_HASH).entry_hash;
-        let h_both = build_record(1, ts(), "CLX_VALIDATOR_ENABLED, CLX_VALIDATOR_LAYER1_ENABLED", GENESIS_HASH).entry_hash;
-        assert_ne!(h_enabled, h_layer1, "different keys must produce different fingerprints");
-        assert_ne!(h_enabled, h_both, "different key sets must produce different fingerprints");
-        assert_ne!(h_layer1, h_both, "different key sets must produce different fingerprints");
+        let h_layer1 =
+            build_record(1, ts(), "CLX_VALIDATOR_LAYER1_ENABLED", GENESIS_HASH).entry_hash;
+        let h_both = build_record(
+            1,
+            ts(),
+            "CLX_VALIDATOR_ENABLED, CLX_VALIDATOR_LAYER1_ENABLED",
+            GENESIS_HASH,
+        )
+        .entry_hash;
+        assert_ne!(
+            h_enabled, h_layer1,
+            "different keys must produce different fingerprints"
+        );
+        assert_ne!(
+            h_enabled, h_both,
+            "different key sets must produce different fingerprints"
+        );
+        assert_ne!(
+            h_layer1, h_both,
+            "different key sets must produce different fingerprints"
+        );
     }
 }
