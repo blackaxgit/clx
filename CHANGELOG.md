@@ -5,7 +5,14 @@ All notable changes to CLX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.2] - 2026-05-20
+
+Security follow-up release. An independent Codex audit of v0.8.1 returned
+a NO-SHIP verdict with 8 VULN-CONFIRMED + 1 NEW. This release closes 3 of
+the 4 HIGH findings (F1 redaction comprehensive, F2 rule pattern strict +
+file-rule gate, F3 audit-chain honest reclassify). The 4th HIGH (F4
+`serde_yml`/`libyml` migration) and the MEDIUM follow-ons (F5/F6/F7) are
+tracked under "Known issues" below for the next release.
 
 ### Security
 
