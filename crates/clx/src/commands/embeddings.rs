@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use clx_core::config::{Capability, Config, OllamaConfig};
 use clx_core::embeddings::EmbeddingStore;
 use clx_core::llm::{LlmBackend, LlmClient, LlmError};
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 
 use crate::Cli;
@@ -96,7 +97,12 @@ pub(crate) async fn rebuild_embeddings<E: LlmBackend>(
             Ok(embedding) => {
                 if let Err(e) = emb_store.store_with_model(*snapshot_id, embedding, model_ident) {
                     if !json {
-                        println!("{}", format!("Error: {e}").red());
+                        // Sink wrap (B6-1): storage errors are not LlmErrors but may
+                        // echo path/connection strings; redact defensively.
+                        println!(
+                            "{}",
+                            format!("Error: {}", redact_secrets(&e.to_string())).red()
+                        );
                     }
                     counts.errors += 1;
                 } else {
@@ -105,7 +111,11 @@ pub(crate) async fn rebuild_embeddings<E: LlmBackend>(
             }
             Err(e) => {
                 if !json {
-                    println!("{}", format!("Error: {e}").red());
+                    // Sink wrap (B6-1): LlmError Display may contain tenant URLs.
+                    println!(
+                        "{}",
+                        format!("Error: {}", redact_secrets(&e.to_string())).red()
+                    );
                 }
                 counts.errors += 1;
             }
@@ -162,7 +172,11 @@ pub(crate) async fn backfill_embeddings<E: LlmBackend>(
                     if let Err(e) = emb_store.store_with_model(*snapshot_id, embedding, model_ident)
                     {
                         if !json {
-                            println!("{}", format!("Error: {e}").red());
+                            // Sink wrap (B6-1): redact before printing to stdout.
+                            println!(
+                                "{}",
+                                format!("Error: {}", redact_secrets(&e.to_string())).red()
+                            );
                         }
                         counts.errors += 1;
                     } else {
@@ -174,7 +188,11 @@ pub(crate) async fn backfill_embeddings<E: LlmBackend>(
                 }
                 Err(e) => {
                     if !json {
-                        println!("{}", format!("Error: {e}").red());
+                        // Sink wrap (B6-1): LlmError Display may contain tenant URLs.
+                        println!(
+                            "{}",
+                            format!("Error: {}", redact_secrets(&e.to_string())).red()
+                        );
                     }
                     counts.errors += 1;
                 }
@@ -353,11 +371,14 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
             let client = match config.create_llm_client(Capability::Embeddings) {
                 Ok(c) => c,
                 Err(e) => {
+                    // Sink wrap (B6-1): LlmError Display may contain tenant URLs or
+                    // connection strings; redact before printing or embedding in JSON.
+                    let safe_err = redact_secrets(&e.to_string());
                     if cli.json {
                         println!(
                             "{}",
                             serde_json::json!({
-                                "error": format!("Failed to create LLM client: {e}"),
+                                "error": format!("Failed to create LLM client: {safe_err}"),
                                 "provider": provider_name,
                                 "table_rebuilt": true,
                                 "embeddings_generated": 0
@@ -367,8 +388,10 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                         println!();
                         println!(
                             "{}",
-                            format!("Failed to create LLM client for '{provider_name}': {e}")
-                                .yellow()
+                            format!(
+                                "Failed to create LLM client for '{provider_name}': {safe_err}"
+                            )
+                            .yellow()
                         );
                         println!("Table was rebuilt but embeddings could not be regenerated.");
                     }
@@ -477,16 +500,21 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
     let client = match config.create_llm_client(Capability::Embeddings) {
         Ok(c) => c,
         Err(e) => {
+            // Sink wrap (B6-1): redact LlmError Display before printing or JSON.
+            let safe_err = redact_secrets(&e.to_string());
             if cli.json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "error": format!("Failed to create LLM client: {e}"),
+                        "error": format!("Failed to create LLM client: {safe_err}"),
                         "hint": "Check LLM configuration"
                     })
                 );
             } else {
-                println!("{}", format!("Failed to create LLM client: {e}").red());
+                println!(
+                    "{}",
+                    format!("Failed to create LLM client: {safe_err}").red()
+                );
             }
             return Ok(());
         }

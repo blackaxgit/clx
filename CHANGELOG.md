@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **R-B6 / T2 / T4 / T6 (F1, redaction comprehensive).** An independent
+  Codex audit confirmed the Azure / LLM error redaction was incomplete
+  in v0.8.1: raw `reqwest::Error::to_string()` was embedded in
+  `LlmError::Connection` at the source, several CLI/log sinks rendered
+  the resulting error without going through `redact_secrets`, the
+  stop-hook snapshot summary was persisted verbatim with no redaction,
+  and the `redact_azure_hosts` boundary set missed `:`, `;`, `<`, `>`,
+  `=`, `&`, `?`, `\` (so `tenant.openai.azure.com:443`,
+  `host=tenant...&port=443`, and a few other realistic forms survived).
+  All eleven identified sinks (`llm/azure.rs`, `llm/mod.rs` Display,
+  `redaction.rs` boundary set, `clx-hook/transcript.rs`,
+  `stop_auto_summary.rs`, `recall/mod.rs::sanitize_recall_text`, six
+  `commands/embeddings.rs` + `commands/recall.rs` print sites) are now
+  wrapped; Azure errors are redacted at construction. Defense-in-depth
+  on snapshot persistence + recall formatting closes the prior-leak
+  tenant-URL class for stored data as well as live errors.
+- **R-B1-4 / B3-2 / T3 / new `Bash(*)x` (F2, rule pattern strict + file
+  gate).** `parse_pattern` used `rfind(')')` and silently accepted
+  trailing junk: `parse_pattern("Bash(*)x")` returned `Some(("Bash","*"))`
+  and the engine evaluated `Bash(*)x` as a universal Allow. It now
+  requires the closing `)` to be the last non-whitespace character.
+  Separately, the prior round's overbroad-allow gate (PR #27 G3) only
+  ran on the *learned-rule load* path; file-loaded
+  `whitelist: ["Bash(*)"]` patterns at `policy/rules.rs:216-219` were
+  pushed straight into the L0 whitelist with no gate. The
+  `is_overbroad_allow_pattern` filter now applies to file-loaded
+  whitelist patterns too (WARN + skip, load continues). Deny rules
+  remain unfiltered.
+- **B5-4 (honest reclassify, F3):** The `audit_chain` module introduced in
+  0.8.1 was documented and described in the CHANGELOG/PR as a "SHA-256
+  hash-chained validator_disabled audit." This claim was inaccurate.
+  `clx-hook` is a short-lived process spawned once per hook event; every
+  invocation called `build_record(seq=1, ..., GENESIS_HASH)` with no
+  persisted head hash, so records from different invocations were never
+  cryptographically linked to each other. The actual property delivered —
+  which is genuine and useful — is **per-event SHA-256 fingerprinting**: each
+  bypass event record carries a deterministic, verifiable integrity fingerprint
+  of its own fields. An external log aggregator or syslog that captures the
+  `tracing::warn!` output can independently re-verify any specific event by
+  recomputing `build_record(seq, timestamp, trigger_keys, prev_hash).entry_hash`
+  and comparing to the captured value. Any field alteration changes the hash,
+  making tampering detectable. The module, struct, function names, doc comments,
+  WARN log field (`event_fingerprint`, was `head_hash`), and audit reasoning
+  string have been updated to remove all "chain" implications and state the
+  per-event scope honestly. `verify_chain` is renamed to
+  `verify_fingerprint_sequence`. Four new regression tests prove: (1) a single
+  record is verifiable in isolation; (2) records from simulated separate process
+  invocations are NOT linked (the cross-process non-linkage is the expected,
+  documented behavior); (3) fingerprints are deterministic for identical inputs;
+  (4) different trigger-key sets produce different fingerprints.
+
 - **B1-10 (trust-token hardening):** The legacy mtime-only trust-token fallback
   has been removed. Previously, any file at `~/.clx/.trust_mode_token` whose
   modification time was less than 1 hour old granted global auto-allow for all
@@ -17,6 +68,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   use trust mode, run `clx trust` once to write a proper JSON token. The failure
   mode is fail-safe: a legacy plain-text token file now falls through to normal
   validation (more prompting, never more allowing).
+
+### Known issues / tracked (NOT yet closed in `[Unreleased]`)
+
+- **F4 (HIGH) `serde_yml` (RUSTSEC-2025-0068) + `libyml` (RUSTSEC-2025-0067)
+  unsoundness.** Codex confirmed both crates remain on the path that
+  parses untrusted project `.clx/config.yaml`, BEFORE the inert filter
+  runs, so the inert filter is not a parse-time compensating control.
+  Migration to `serde_yaml_ng` 0.10.x is in scope and was attempted in
+  this wave; the cross-crate change set (workspace `Cargo.toml`, every
+  `serde_yml::` call site, `deny.toml` ignore-list update, fail-closed
+  contract preservation) is non-trivial and warrants its own focused
+  PR with full verification rather than a tail-end rush. Tracked as
+  the v0.8.3 release blocker. Until landed, `deny.toml`'s
+  `RUSTSEC-2025-0068` ignore remains honest enumeration (not blanket).
+- **F5/F6/F7 (MEDIUM) deferred from this wave**: explicit per-job
+  permissions on CI workflows + manual-approval `environment:` gate
+  on Homebrew publish (F5); resolved-IP private/link-local reblock for
+  Azure post-DNS rebind protection (F6); global `default_decision=allow`
+  privileged-mode gating to harden fail-open arms (F7). Tracked.
 
 ### Changed
 
