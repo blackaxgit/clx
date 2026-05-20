@@ -925,7 +925,7 @@ mod render_snapshots {
     }
 
     /// Edit-popup `range_info` for a `NumberU64` field (validator
-    /// `layer1_timeout_ms`, section 0 field 2) → "Range: 100 - 300000".
+    /// `layer1_timeout_ms`, section 0 field 3) → "Range: 100 - 300000".
     #[test]
     fn snapshot_settings_edit_popup_number_u64_range() {
         let mut app = make_settings_app();
@@ -933,7 +933,7 @@ mod render_snapshots {
         app.settings_editing_config = Some(cfg.clone());
         app.settings_original_config = Some(cfg);
         app.settings_section_idx = 0;
-        app.settings_field_idx = 2; // layer1_timeout_ms : NumberU64
+        app.settings_field_idx = 3; // layer1_timeout_ms : NumberU64 (was 2; layer0_enabled inserted at 1)
         app.input_mode = InputMode::SettingsEdit;
         app.settings_edit_buffer = "5000".to_string();
         let rendered = render_settings_to_string(&mut app);

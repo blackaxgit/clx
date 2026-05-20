@@ -41,6 +41,11 @@ pub const VALIDATOR_FIELDS: &[FieldDef] = &[
         widget: FieldWidget::Toggle,
     },
     FieldDef {
+        label: "layer0_enabled",
+        description: "Enable layer 0 (deterministic policy) validation",
+        widget: FieldWidget::Toggle,
+    },
+    FieldDef {
         label: "layer1_enabled",
         description: "Enable layer 1 (fast) validation",
         widget: FieldWidget::Toggle,
