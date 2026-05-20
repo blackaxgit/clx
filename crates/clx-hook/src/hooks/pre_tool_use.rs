@@ -46,21 +46,27 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             // acceptable (the hook is spawned per-event, not a daemon).
             let record = build_record(1, &timestamp, &trigger_keys, GENESIS_HASH);
 
-            // Emit head hash as WARN to an external anchor sink.
+            // Emit the per-event integrity fingerprint as WARN to an external
+            // anchor sink (log aggregator, syslog). An external observer can
+            // re-verify this specific event by recomputing:
+            //   build_record(1, timestamp, trigger_keys, GENESIS_HASH).entry_hash
+            // and comparing to the captured fingerprint. This is a per-event
+            // integrity guarantee, not a cross-invocation chain (each new
+            // hook process starts from seq=1 and GENESIS_HASH).
             warn!(
-                head_hash = %record.entry_hash,
+                event_fingerprint = %record.entry_hash,
                 trigger_keys = %trigger_keys,
                 "SECURITY-ENV: security-weakening env override(s) active; \
-                 audit chain head hash anchored"
+                 per-event integrity fingerprint anchored in external sink"
             );
 
             // Persist a structured audit row (SECURITY-ENV layer).
-            // The reasoning field carries the env-var names (not values).
-            // redact_secrets in log_audit_entry (B6-3) is a no-op over bare
-            // env-var names, which contain no secret-shaped patterns.
+            // The reasoning field carries the env-var names (not values) and
+            // the per-event fingerprint. redact_secrets in log_audit_entry
+            // (B6-3) is a no-op over bare env-var names and hex hashes.
             let reasoning = format!(
                 "security-weakening env override(s) active: {trigger_keys}; \
-                 chain_seq=1; head_hash={}",
+                 event_fingerprint={}",
                 record.entry_hash
             );
             log_audit_entry(
