@@ -98,7 +98,15 @@ fn redact_azure_hosts(text: &str) -> String {
 
     // Pass 2: bare hostname tokens (no scheme prefix) that end with an Azure suffix.
     // Many Azure error bodies embed hostnames like `synthetic-tenant.openai.azure.com`
-    // without a leading `https://`.
+    // without a leading `https://`. The boundary set must cover all characters that
+    // reqwest and the url crate emit in their error strings:
+    //   `:` — port separator: `tenant.openai.azure.com:443`
+    //   `;` — field terminator: `tenant.openai.azure.com;`
+    //   `<` / `>` — XML/HTML: `<tenant.openai.azure.com>`
+    //   `=` / `&` / `?` — URL query: `host=tenant.openai.azure.com&port=443`
+    //   `\` — Windows path separators in error text
+    // T6/B6-2 fix: extend the delimiter set so post-fix punctuation does not
+    // prevent the hostname token from being recognised and scrubbed.
     let mut result = String::with_capacity(out.len());
     let mut pos = 0usize;
     let out_bytes = out.as_bytes();
@@ -109,6 +117,8 @@ fn redact_azure_hosts(text: &str) -> String {
         let token_end = out[pos..]
             .find([
                 ' ', '\t', '\n', '\r', '"', '\'', ',', '}', '{', '[', ']', '(', ')',
+                // T6: additional boundaries for reqwest/url error output forms
+                ':', ';', '<', '>', '=', '&', '?', '\\',
             ])
             .map_or(out.len(), |i| pos + i);
 
@@ -953,6 +963,104 @@ mod tests {
         assert!(
             result.contains("example-openai.invalid"),
             "synthetic .invalid host should NOT be scrubbed (not in Azure suffix list): {result}"
+        );
+    }
+
+    // =========================================================================
+    // T6 regression tests — extended boundary set for bare hostname pass
+    //
+    // These tests FAIL on pre-fix code (boundary set at redaction.rs:110-112
+    // missing `:`, `;`, `<`, `>`, `=`, `&`, `?`, `\`) and PASS after the fix.
+    //
+    // Counterexamples from the Codex audit:
+    //   - `tenant.openai.azure.com:443`    (colon/port suffix)
+    //   - `tenant.openai.azure.com;`       (semicolon terminator)
+    //   - `host=tenant.openai.azure.com&port=443`  (query-param form)
+    //
+    // ALL hosts used here are SYNTHETIC.
+    // =========================================================================
+
+    /// T6 regression: bare hostname with a `:port` suffix must be redacted.
+    ///
+    /// reqwest errors from connection failures embed the target as
+    /// `tcp connect error: Connection refused (os error 61), url: <URL>` which
+    /// after URL parsing can surface as `host:port`. The `:` was previously
+    /// not in the Pass-2 boundary set, so `synthetic-tenant.openai.azure.com:443`
+    /// was not split and the authority did not match any Azure suffix.
+    #[test]
+    fn t6_regression_bare_hostname_with_port_is_redacted() {
+        let text = "connect error at synthetic-tenant.openai.azure.com:443 failed";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "T6 REGRESSION: bare Azure hostname with :port leaked: {result}"
+        );
+        assert!(
+            result.contains("***AZURE-HOST-REDACTED***"),
+            "redacted token must appear in output: {result}"
+        );
+    }
+
+    /// T6 regression: bare hostname with a `;` terminator must be redacted.
+    ///
+    /// Some HTTP/1.1 error strings and log formats use semicolons as field
+    /// separators: `host: synthetic-tenant.openai.azure.com; status: 401`.
+    #[test]
+    fn t6_regression_bare_hostname_semicolon_terminated_is_redacted() {
+        let text = "host: synthetic-tenant.openai.azure.com; status: 401";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "T6 REGRESSION: semicolon-terminated Azure hostname leaked: {result}"
+        );
+    }
+
+    /// T6 regression: hostname in a query-param form `host=<host>&port=443`
+    /// must be redacted. The `=` preceding the hostname and `&` following it
+    /// were both missing from the old boundary set.
+    #[test]
+    fn t6_regression_hostname_in_query_param_form_is_redacted() {
+        let text = "error: host=synthetic-tenant.openai.azure.com&port=443";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "T6 REGRESSION: hostname in query-param form leaked: {result}"
+        );
+    }
+
+    /// T6 regression: `?` query separator following hostname must split correctly.
+    #[test]
+    fn t6_regression_hostname_followed_by_query_separator_is_redacted() {
+        let text = "url: synthetic-tenant.openai.azure.com?api-version=2024-10-21";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "T6 REGRESSION: hostname before ? query separator leaked: {result}"
+        );
+    }
+
+    /// T6 regression: `<host>` XML/HTML-embedded form must be redacted.
+    #[test]
+    fn t6_regression_hostname_in_xml_angle_brackets_is_redacted() {
+        let text = "resource=<synthetic-tenant.openai.azure.com>";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("synthetic-tenant.openai.azure.com"),
+            "T6 REGRESSION: hostname in XML angle brackets leaked: {result}"
+        );
+    }
+
+    /// T6 non-regression: the extended boundary set must not over-redact
+    /// safe tokens that happen to contain boundary characters adjacent to
+    /// non-Azure hostnames.
+    #[test]
+    fn t6_does_not_over_redact_safe_hosts_with_ports() {
+        // api.openai.com is NOT an Azure suffix — must not be scrubbed.
+        let text = "api.openai.com:443 is fine";
+        let result = redact_secrets(text);
+        assert_eq!(
+            result, text,
+            "T6: safe non-Azure host with port was over-redacted: {result}"
         );
     }
 }
