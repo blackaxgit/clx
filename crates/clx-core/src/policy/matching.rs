@@ -6,16 +6,33 @@
 /// Parse a pattern in the format `ToolName(command_pattern)`
 ///
 /// Returns (`tool_name`, `command_pattern`) or None if parsing fails.
+///
+/// # Security invariant (R-B1-4 / B3-2)
+///
+/// The closing `)` **must** be the last non-whitespace character of the
+/// string.  Patterns with trailing non-whitespace (e.g. `Bash(*)x`) are
+/// rejected rather than silently trimmed.  Without this check, `rfind(')')`
+/// would find the inner `)` and return `Some(("Bash", "*"))` for the pattern
+/// `Bash(*)x`, causing the `PolicyEngine` to evaluate it as a wildcard allow
+/// rule that matches every Bash command.
 #[must_use]
 pub fn parse_pattern(pattern: &str) -> Option<(String, String)> {
     // Find the opening parenthesis
     let paren_start = pattern.find('(')?;
 
-    // Find the closing parenthesis
+    // Find the closing parenthesis using rfind so nested parens in the
+    // command body (e.g. fork-bomb patterns) still parse correctly.
     let paren_end = pattern.rfind(')')?;
 
-    // Ensure valid structure
+    // Ensure valid structure: opening must precede closing.
     if paren_end <= paren_start {
+        return None;
+    }
+
+    // Security: reject patterns where non-whitespace characters follow the
+    // closing `)`.  Trailing whitespace is harmless; trailing text is not.
+    let after_paren = &pattern[paren_end + 1..];
+    if !after_paren.trim().is_empty() {
         return None;
     }
 
