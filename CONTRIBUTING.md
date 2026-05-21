@@ -49,7 +49,7 @@ CLX is a Cargo workspace with four crates. Understanding the boundaries helps yo
 |-------|------|--------------|
 | `clx` | CLI entry point and dashboard | `commands/`, `dashboard/` |
 | `clx-core` | Core library shared by all crates | `config`, `policy/`, `storage/`, `ollama`, `embeddings`, `credentials`, `paths`, `types`, `error` |
-| `clx-hook` | Hook handler binary (PreToolUse / PostToolUse / PreCompact / SessionStart / SessionEnd) | `hooks/`, `audit`, `learning`, `transcript`, `context`, `embedding` |
+| `clx-hook` | Hook handler binary (PreToolUse / PostToolUse / PreCompact / SessionStart / SessionEnd / SubagentStart / UserPromptSubmit / Stop) | `hooks/`, `audit`, `learning`, `transcript`, `context`, `embedding` |
 | `clx-mcp` | MCP server exposing CLX tools to Claude Code | `server`, `protocol/`, `tools/` (7 tools), `validation` |
 
 **Guiding principles:**
@@ -76,7 +76,7 @@ cargo build -p clx-hook
 cargo build -p clx-mcp
 ```
 
-Install binaries locally (mirrors the `install.sh` script):
+Install binaries locally:
 
 ```sh
 cargo install --path crates/clx

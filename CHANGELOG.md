@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `validator.default_decision`. The audit row reads `L0-DISABLED` ->
   `L1-DISABLED`. To get the "no validation at all" path, set
   top-level `validator.enabled: false`.
+- **`clx health` both-off observability.** When `validator.enabled: true`
+  but both `layer0_enabled` and `layer1_enabled` are `false`, `clx health`
+  now surfaces a prominent `WARN` stating that every command resolves to
+  `ask` and no actual validation is running. Mirrors the existing
+  `CLX_VALIDATOR_*` env-override WARN style so a forensic operator can
+  see the both-off posture at a glance.
 - **Hostile project config remains powerless.** v0.8.1's B4-1 inert
   filter already drops the entire `validator.*` subtree from
   untrusted project configs, so a cloned hostile repo cannot set
