@@ -80,6 +80,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   literal is removed in v0.10.0; update parsers to match
   `"L1-DISABLED"` before upgrading.
 
+### Documentation
+
+- Corrected an inaccurate "Known issues" note carried in the 0.8.0 and
+  0.8.2 changelog sections, which stated that L1 (LLM) validation never
+  hard-denies. L1 has always hard-denied: a risk score of 8-10 maps to
+  a `deny` block envelope (`risk_score_to_decision` in
+  `crates/clx-core/src/policy/llm.rs`; regression test
+  `test_v_r2_l1_deny_emits_block_envelope`). Scores 4-7 resolve to
+  `ask`, 1-3 to `allow`. The earlier note was inaccurate when written
+  and does not reflect shipped behaviour.
+
 ## [0.8.2] - 2026-05-20
 
 Security follow-up release. An independent Codex audit of v0.8.1 returned
