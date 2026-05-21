@@ -74,8 +74,22 @@ fn pre_tool_use(session: &str, command: &str) -> serde_json::Value {
     })
 }
 
-/// Re-open the temp-home audit DB and return rows for a session.
+/// Re-open the temp-home audit DB and return DECISION rows for a session.
+/// Filters out the per-process `SECURITY-CFG` / `SECURITY-ENV` audit-chain
+/// signals (introduced in v0.9.0 for config/env-driven layer disable);
+/// existing decision-row tests should be unaffected by that new signal.
+/// Use [`audit_rows_all`] when a test explicitly inspects the signal.
 fn audit_rows(home: &Path, session: &str) -> Vec<clx_core::types::AuditLogEntry> {
+    audit_rows_all(home, session)
+        .into_iter()
+        .filter(|r| !matches!(r.layer.as_str(), "SECURITY-CFG" | "SECURITY-ENV"))
+        .collect()
+}
+
+/// Re-open the temp-home audit DB and return ALL rows for a session,
+/// including SECURITY-CFG / SECURITY-ENV signal rows.
+#[allow(dead_code)]
+fn audit_rows_all(home: &Path, session: &str) -> Vec<clx_core::types::AuditLogEntry> {
     let db = home.join(".clx/data/clx.db");
     if !db.exists() {
         return Vec::new();
@@ -208,7 +222,22 @@ fn l1_disabled_unknown_command_asks_and_not_cached() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].layer, "L0");
     assert_eq!(rows[0].decision.as_str(), "prompted");
-    assert_eq!(rows[0].reasoning.as_deref(), Some("L1 disabled"));
+    // v0.9.0: audit reasoning string normalized "L1 disabled" -> "L1-DISABLED"
+    // with a parallel-change one-version dual-emit window — the row carries
+    // both the canonical "L1-DISABLED" and the legacy "L1 disabled" alias as
+    // substrings so v0.8.x log parsers keep working through v0.9.0. v0.10.0
+    // plan: drop the legacy alias. See `specs/2026-05-20-v090-red-findings.md`
+    // (T9.5 / L1-rename deprecation hygiene).
+    let reasoning = rows[0].reasoning.as_deref().unwrap_or("");
+    assert!(
+        reasoning.contains("L1-DISABLED"),
+        "L1-disabled reasoning must contain canonical 'L1-DISABLED'; got {reasoning:?}"
+    );
+    assert!(
+        reasoning.contains("L1 disabled"),
+        "L1-disabled reasoning must contain legacy 'L1 disabled' alias \
+         (v0.9.0 dual-emit window); got {reasoning:?}"
+    );
 
     // The L1-disabled branch must NOT write a decision-cache row.
     let db = home.path().join(".clx/data/clx.db");
@@ -248,15 +277,44 @@ fn l1_provider_down_default_decision_deny_emits_block() {
     assert_eq!(rows[0].decision.as_str(), "blocked");
 }
 
+/// v0.9.0 BREAKING CONTRACT FLIP (closes release-blocker #1 silent-allow
+/// class — see `specs/2026-05-20-v090-red-findings.md`).
+///
+/// Pre-v0.9.0: `default_decision=allow` + Ollama unreachable → silent
+/// `"allow"` for L0-unknown commands (the F7-deferred fail-open class).
+/// v0.9.0: the hook forces `effective_decision="ask"` so the user makes the
+/// decision when the command falls through to L1 and L1 is unreachable.
+/// `deny` and `ask` defaults pass through unchanged (verified in the two
+/// adjacent tests). To restore the prior posture explicitly, set
+/// `default_decision=allow` AND `layer1_enabled=false` — the L1-DISABLED
+/// ask is then the loud gate.
 #[test]
-fn l1_provider_down_default_decision_allow_emits_allow() {
+fn l1_provider_down_default_decision_allow_forces_ask_v090() {
     let env = pre_tool_use("e2e-dallow", "frobnicate --x");
     let (out, home) = run_with_config(&ollama_down_cfg("allow"), &env);
-    assert_eq!(decision(&out), "allow");
+    assert_eq!(
+        decision(&out),
+        "ask",
+        "v0.9.0: default_decision=allow with L1 unreachable and command \
+         falling through to L1 must force ask (F7 posture)"
+    );
     let rows = audit_rows(home.path(), "e2e-dallow");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].layer, "L1");
-    assert_eq!(rows[0].decision.as_str(), "allowed");
+    assert_eq!(
+        rows[0].decision.as_str(),
+        "prompted",
+        "v0.9.0: forced-ask must audit as prompted"
+    );
+    let reasoning = rows[0].reasoning.as_deref().unwrap_or("");
+    assert!(
+        reasoning.contains("effective_decision: ask"),
+        "v0.9.0: reasoning must record effective_decision=ask; got {reasoning:?}"
+    );
+    assert!(
+        reasoning.contains("configured: allow"),
+        "v0.9.0: reasoning must record configured value; got {reasoning:?}"
+    );
 }
 
 #[test]

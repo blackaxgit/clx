@@ -15,7 +15,7 @@ pub const SECTIONS: &[SectionDef] = &[
     SectionDef {
         key: "validator",
         title: "Validator",
-        field_count: 6,
+        field_count: 7,
     },
     SectionDef {
         key: "context",
@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn test_total_field_count() {
         let total: usize = SECTIONS.iter().map(|s| s.field_count).sum();
-        // 6+3+8+3+4+3+2+3+8 = 40 scalar fields (+ display-only items)
-        assert_eq!(total, 40);
+        // 7+3+8+3+4+3+2+3+8 = 41 scalar fields (+ display-only items)
+        assert_eq!(total, 41);
     }
 }

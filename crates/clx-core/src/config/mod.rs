@@ -580,6 +580,14 @@ pub struct ValidatorConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Enable layer 0 (deterministic-policy / rule-based) validation.
+    /// When `false`, the static L0 allow/deny ruleset is skipped and every
+    /// command falls through to L1 (and `default_decision` if L1 is also off).
+    /// Disabling weakens security posture; treated as a weakening override
+    /// (WARN at startup, audit-chain fingerprint per hook invocation).
+    #[serde(default = "default_true")]
+    pub layer0_enabled: bool,
+
     /// Enable layer 1 (fast) validation
     #[serde(default = "default_true")]
     pub layer1_enabled: bool,
@@ -935,6 +943,7 @@ impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            layer0_enabled: default_true(),
             layer1_enabled: default_true(),
             layer1_timeout_ms: default_layer1_timeout(),
             default_decision: DefaultDecision::Ask,
@@ -1217,6 +1226,7 @@ impl Config {
     ///
     /// A weakening override is defined as any of:
     /// - `CLX_VALIDATOR_ENABLED=false`  — entire validator disabled
+    /// - `CLX_VALIDATOR_LAYER0_ENABLED=false`  — deterministic L0 ruleset disabled
     /// - `CLX_VALIDATOR_LAYER1_ENABLED=false`  — LLM review stage disabled
     /// - `CLX_VALIDATOR_DEFAULT_DECISION=allow`  — fail-open on inconclusive
     /// - `CLX_VALIDATOR_AUTO_ALLOW_READS=true`  — reads auto-approved without LLM
@@ -1233,6 +1243,11 @@ impl Config {
             && matches!(val.to_lowercase().as_str(), "false" | "0" | "no" | "off")
         {
             active.push(("CLX_VALIDATOR_ENABLED", val));
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_LAYER0_ENABLED")
+            && matches!(val.to_lowercase().as_str(), "false" | "0" | "no" | "off")
+        {
+            active.push(("CLX_VALIDATOR_LAYER0_ENABLED", val));
         }
         if let Ok(val) = env::var("CLX_VALIDATOR_LAYER1_ENABLED")
             && matches!(val.to_lowercase().as_str(), "false" | "0" | "no" | "off")
@@ -1292,6 +1307,27 @@ impl Config {
                      command validator via environment variable; all tool calls will be \
                      permitted without review. This override is intentional only for \
                      trusted CI/ops contexts. Audit trail: env var weakens security posture."
+                );
+            }
+        }
+        if let Ok(val) = env::var("CLX_VALIDATOR_LAYER0_ENABLED") {
+            apply_bool_override(
+                &val,
+                "CLX_VALIDATOR_LAYER0_ENABLED",
+                &mut self.validator.layer0_enabled,
+            );
+            // SECURITY AUDIT: disabling L0 (deterministic ruleset) via env is a
+            // security-weakening override.
+            if !self.validator.layer0_enabled {
+                tracing::warn!(
+                    env_var = "CLX_VALIDATOR_LAYER0_ENABLED",
+                    value = %val,
+                    "SECURITY WARNING: CLX_VALIDATOR_LAYER0_ENABLED=false disables the \
+                     deterministic Layer-0 ruleset; allow/deny patterns (rm -rf /, \
+                     curl|bash, etc.) are no longer enforced. Commands fall through to \
+                     L1 (LLM) or default_decision. This override is intentional only \
+                     for trusted CI/ops contexts. Audit trail: env var weakens \
+                     security posture."
                 );
             }
         }
@@ -2205,6 +2241,7 @@ mod tests {
 
         // Validator defaults
         assert!(config.validator.enabled);
+        assert!(config.validator.layer0_enabled);
         assert!(config.validator.layer1_enabled);
         assert_eq!(config.validator.layer1_timeout_ms, 30000);
         assert_eq!(config.validator.default_decision, DefaultDecision::Ask);
@@ -2588,6 +2625,29 @@ validator:
         );
     }
 
+    /// GREEN regression for B5-4: when `CLX_VALIDATOR_LAYER0_ENABLED=false` is set,
+    /// `security_env_overrides_active()` must report it.
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn b5_4_security_env_overrides_active_detects_layer0_disabled() {
+        let _guard = EnvGuard::new(&["CLX_VALIDATOR_LAYER0_ENABLED"]);
+
+        unsafe {
+            env::set_var("CLX_VALIDATOR_LAYER0_ENABLED", "false");
+        }
+
+        let config = Config::default();
+        let overrides = config.security_env_overrides_active();
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, _)| *k == "CLX_VALIDATOR_LAYER0_ENABLED"),
+            "B5-4: CLX_VALIDATOR_LAYER0_ENABLED=false must appear in security_env_overrides_active(); \
+             got: {overrides:?}"
+        );
+    }
+
     /// GREEN regression for B5-4: when `CLX_VALIDATOR_LAYER1_ENABLED=false` is set,
     /// `security_env_overrides_active()` must report it.
     #[test]
@@ -2657,14 +2717,15 @@ validator:
         );
     }
 
-    /// Full B5-4 scenario: all four weakening vars set simultaneously —
-    /// all four must appear in `security_env_overrides_active()`.
+    /// Full B5-4 scenario: all five weakening vars set simultaneously —
+    /// all five must appear in `security_env_overrides_active()`.
     #[test]
     #[serial_test::serial]
     #[allow(unsafe_code)]
     fn b5_4_all_four_weakening_vars_all_reported() {
         let _guard = EnvGuard::new(&[
             "CLX_VALIDATOR_ENABLED",
+            "CLX_VALIDATOR_LAYER0_ENABLED",
             "CLX_VALIDATOR_LAYER1_ENABLED",
             "CLX_VALIDATOR_DEFAULT_DECISION",
             "CLX_VALIDATOR_AUTO_ALLOW_READS",
@@ -2672,6 +2733,7 @@ validator:
 
         unsafe {
             env::set_var("CLX_VALIDATOR_ENABLED", "false");
+            env::set_var("CLX_VALIDATOR_LAYER0_ENABLED", "false");
             env::set_var("CLX_VALIDATOR_LAYER1_ENABLED", "false");
             env::set_var("CLX_VALIDATOR_DEFAULT_DECISION", "allow");
             env::set_var("CLX_VALIDATOR_AUTO_ALLOW_READS", "true");
@@ -2682,6 +2744,7 @@ validator:
 
         // The config values are actually weakened.
         assert!(!config.validator.enabled, "validator must be disabled");
+        assert!(!config.validator.layer0_enabled, "L0 must be disabled");
         assert!(!config.validator.layer1_enabled, "L1 must be disabled");
         assert_eq!(
             config.validator.default_decision,
@@ -2689,12 +2752,16 @@ validator:
             "default_decision must be allow"
         );
 
-        // All four weakening vars are reported.
+        // All five weakening vars are reported.
         let overrides = config.security_env_overrides_active();
         let keys: Vec<&str> = overrides.iter().map(|(k, _)| *k).collect();
         assert!(
             keys.contains(&"CLX_VALIDATOR_ENABLED"),
             "missing ENABLED: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"CLX_VALIDATOR_LAYER0_ENABLED"),
+            "missing LAYER0_ENABLED: {keys:?}"
         );
         assert!(
             keys.contains(&"CLX_VALIDATOR_LAYER1_ENABLED"),
@@ -2710,8 +2777,8 @@ validator:
         );
         assert_eq!(
             overrides.len(),
-            4,
-            "expected exactly 4 weakening overrides; got: {keys:?}"
+            5,
+            "expected exactly 5 weakening overrides; got: {keys:?}"
         );
     }
 
@@ -2722,6 +2789,7 @@ validator:
     fn b5_4_no_weakening_vars_returns_empty() {
         let _guard = EnvGuard::new(&[
             "CLX_VALIDATOR_ENABLED",
+            "CLX_VALIDATOR_LAYER0_ENABLED",
             "CLX_VALIDATOR_LAYER1_ENABLED",
             "CLX_VALIDATOR_DEFAULT_DECISION",
             "CLX_VALIDATOR_AUTO_ALLOW_READS",
@@ -2729,6 +2797,7 @@ validator:
 
         unsafe {
             env::remove_var("CLX_VALIDATOR_ENABLED");
+            env::remove_var("CLX_VALIDATOR_LAYER0_ENABLED");
             env::remove_var("CLX_VALIDATOR_LAYER1_ENABLED");
             env::remove_var("CLX_VALIDATOR_DEFAULT_DECISION");
             env::remove_var("CLX_VALIDATOR_AUTO_ALLOW_READS");

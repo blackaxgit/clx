@@ -6,12 +6,12 @@ expression: rendered
 │> Validator         ││Field                    Value                      Default                 █
 │  Context           ││                                                                            █
 │  LLM               ││enabled                  true                       true                    █
-│  User Learning     ││layer1_enabled           true                       true                    █
-│  Logging           ││layer1_timeout_ms        30000                      30000                   █
-│  Ctx Pressure      ││default_decision         ask                        ask                     █
-│  Sess Recovery     ││trust_mode               false                      false                   █
-│  MCP Tools         ││auto_allow_reads         true                       true                    █
-│  Auto Recall       ││                                                                            █
+│  User Learning     ││layer0_enabled           true                       true                    █
+│  Logging           ││layer1_enabled           true                       true                    █
+│  Ctx Pressure      ││layer1_timeout_ms        30000                      30000                   █
+│  Sess Recovery     ││default_decision         ask                        ask                     █
+│  MCP Tools         ││trust_mode               false                      false                   █
+│  Auto Recall       ││auto_allow_reads         true                       true                    █
 │                    ││                                                                            █
 │                    ││                                                                            █
 │                    ││                                                                            █
@@ -36,7 +36,7 @@ expression: rendered
 │                    ││                                                                            █
 │                    ││                                                                            █
 │                    ││                                                                            █
-│                    ││                                                                            █
+│                    ││                                                                            ║
 │                    ││                                                                            ║
 │                    ││                                                                            ║
 │                    ││                                                                            ║

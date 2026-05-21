@@ -44,6 +44,29 @@
 //!
 //! Privacy guarantee: only the env-var NAME is recorded. Values, argv, cwd,
 //! and any PII are never stored.
+//!
+//! ## T3 disposition (env+config double-audit is intentional dual-signal)
+//!
+//! When the SAME logical layer is disabled by BOTH an env override AND a
+//! config flag (e.g. `CLX_VALIDATOR_LAYER0_ENABLED=false` while
+//! `validator.layer0_enabled: false` is also in the YAML), the v0.9.0 hook
+//! emits TWO audit-chain records on the SECURITY-CFG emit path of
+//! `pre_tool_use.rs`: one tagged `SECURITY-ENV` (with the env-var name(s) as
+//! `trigger_keys`) and one tagged `SECURITY-CFG` (with the config-path
+//! string(s) as `trigger_keys`). The two records carry DIFFERENT
+//! `trigger_keys` and therefore DIFFERENT `entry_hash` fingerprints — they
+//! are NOT duplicates and a log aggregator must NOT deduplicate them by
+//! fingerprint.
+//!
+//! This dual-emit is INTENTIONAL (not a deduplication bug). The SECURITY-ENV
+//! row attributes the disable to operator-injected env state (process-launch
+//! ambient), which can change between hook invocations without a config
+//! edit. The SECURITY-CFG row attributes the disable to operator-edited
+//! config state (persistent on-disk), which survives across hook
+//! invocations. A forensic operator needs both attributions to distinguish
+//! "transient ambient bypass" from "persistent on-disk bypass"; collapsing
+//! the two would lose that signal. See
+//! `specs/2026-05-20-v090-red-findings.md` (T3) for the disposition rationale.
 
 use sha2::{Digest, Sha256};
 

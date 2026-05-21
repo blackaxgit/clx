@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **macOS** (ARM64/Apple Silicon recommended)
+- **macOS** (Apple Silicon / ARM64 only)
 - **Rust** toolchain (edition 2024, rustc 1.85+) — install via [rustup](https://rustup.rs/):
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -22,13 +22,7 @@ Paste this prompt into Claude Code:
 Install CLX for me: clone https://github.com/blackaxgit/clx, build with cargo build --release, then run ./target/release/clx install. After that, pull the required Ollama models: ollama pull qwen3:1.7b && ollama pull qwen3-embedding:0.6b. Finally, tell me to restart Claude Code.
 ```
 
-### Option 2: One-Line Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/blackaxgit/clx/main/install.sh | bash
-```
-
-### Option 3: Build from Source
+### Option 2: Build from Source
 
 ```bash
 git clone https://github.com/blackaxgit/clx.git
@@ -66,12 +60,13 @@ The install command sets up everything CLX needs to work with Claude Code:
 2. **Copies binaries** (`clx`, `clx-hook`, `clx-mcp`) to `~/.clx/bin/`
 3. **Initializes SQLite database** for session storage and context persistence
 4. **Configures Claude Code hooks** in `~/.claude/settings.json`:
-   - `PreToolUse` — validates commands before execution
-   - `PostToolUse` — logs command results
-   - `PreCompact` — snapshots context before compression
-   - `SessionStart` / `SessionEnd` — tracks session lifecycle
-   - `SubagentStart` — monitors subagent activity
-   - `UserPromptSubmit` — injects context on user prompts
+   - `PreToolUse` - validates commands before execution
+   - `PostToolUse` - logs command results
+   - `PreCompact` - snapshots context before compression
+   - `SessionStart` / `SessionEnd` - tracks session lifecycle
+   - `SubagentStart` - monitors subagent activity
+   - `UserPromptSubmit` - injects context on user prompts
+   - `Stop` - opt-in auto-summarize at end of turn
 5. **Registers MCP server** (`clx-mcp`) so Claude can use CLX tools
 6. **Injects CLX section** into `~/.claude/CLAUDE.md` with tool documentation
 

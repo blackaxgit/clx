@@ -106,7 +106,7 @@ pub fn set_field_value(
 ) -> Result<(), String> {
     match (section, field) {
         // Section 0: Validator
-        (0, 2) => {
+        (0, 3) => {
             config.validator.layer1_timeout_ms = validate_u64(raw, 100, 300_000)?;
         }
 
@@ -238,11 +238,12 @@ pub fn reset_field_to_default(config: &mut Config, section: usize, field: usize)
     match (section, field) {
         // Section 0: Validator
         (0, 0) => config.validator.enabled = defaults.validator.enabled,
-        (0, 1) => config.validator.layer1_enabled = defaults.validator.layer1_enabled,
-        (0, 2) => config.validator.layer1_timeout_ms = defaults.validator.layer1_timeout_ms,
-        (0, 3) => config.validator.default_decision = defaults.validator.default_decision,
-        (0, 4) => config.validator.trust_mode = defaults.validator.trust_mode,
-        (0, 5) => config.validator.auto_allow_reads = defaults.validator.auto_allow_reads,
+        (0, 1) => config.validator.layer0_enabled = defaults.validator.layer0_enabled,
+        (0, 2) => config.validator.layer1_enabled = defaults.validator.layer1_enabled,
+        (0, 3) => config.validator.layer1_timeout_ms = defaults.validator.layer1_timeout_ms,
+        (0, 4) => config.validator.default_decision = defaults.validator.default_decision,
+        (0, 5) => config.validator.trust_mode = defaults.validator.trust_mode,
+        (0, 6) => config.validator.auto_allow_reads = defaults.validator.auto_allow_reads,
 
         // Section 1: Context
         (1, 0) => config.context.enabled = defaults.context.enabled,
@@ -358,11 +359,12 @@ pub fn get_field_value(config: &Config, section: usize, field: usize) -> String 
     match (section, field) {
         // Section 0: Validator
         (0, 0) => config.validator.enabled.to_string(),
-        (0, 1) => config.validator.layer1_enabled.to_string(),
-        (0, 2) => config.validator.layer1_timeout_ms.to_string(),
-        (0, 3) => config.validator.default_decision.to_string(),
-        (0, 4) => config.validator.trust_mode.to_string(),
-        (0, 5) => config.validator.auto_allow_reads.to_string(),
+        (0, 1) => config.validator.layer0_enabled.to_string(),
+        (0, 2) => config.validator.layer1_enabled.to_string(),
+        (0, 3) => config.validator.layer1_timeout_ms.to_string(),
+        (0, 4) => config.validator.default_decision.to_string(),
+        (0, 5) => config.validator.trust_mode.to_string(),
+        (0, 6) => config.validator.auto_allow_reads.to_string(),
 
         // Section 1: Context
         (1, 0) => config.context.enabled.to_string(),
@@ -470,9 +472,10 @@ pub fn toggle_field(config: &mut Config, section: usize, field: usize) {
     match (section, field) {
         // Section 0: Validator
         (0, 0) => config.validator.enabled = !config.validator.enabled,
-        (0, 1) => config.validator.layer1_enabled = !config.validator.layer1_enabled,
-        (0, 4) => config.validator.trust_mode = !config.validator.trust_mode,
-        (0, 5) => config.validator.auto_allow_reads = !config.validator.auto_allow_reads,
+        (0, 1) => config.validator.layer0_enabled = !config.validator.layer0_enabled,
+        (0, 2) => config.validator.layer1_enabled = !config.validator.layer1_enabled,
+        (0, 5) => config.validator.trust_mode = !config.validator.trust_mode,
+        (0, 6) => config.validator.auto_allow_reads = !config.validator.auto_allow_reads,
 
         // Section 1: Context
         (1, 0) => config.context.enabled = !config.context.enabled,
@@ -503,7 +506,7 @@ pub fn toggle_field(config: &mut Config, section: usize, field: usize) {
 pub fn cycle_field(config: &mut Config, section: usize, field: usize) {
     match (section, field) {
         // Section 0: Validator — default_decision (ask → allow → deny → ask)
-        (0, 3) => {
+        (0, 4) => {
             config.validator.default_decision = match config.validator.default_decision {
                 DefaultDecision::Ask => DefaultDecision::Allow,
                 DefaultDecision::Allow => DefaultDecision::Deny,
@@ -557,7 +560,7 @@ pub fn recompute_dirty(app: &mut App) {
 /// Call this *before* toggling to detect the dangerous transition.
 #[must_use]
 pub fn is_trust_mode_enabling(config: &Config, section: usize, field: usize) -> bool {
-    section == 0 && field == 4 && !config.validator.trust_mode
+    section == 0 && field == 5 && !config.validator.trust_mode
 }
 
 #[cfg(test)]
@@ -615,9 +618,10 @@ mod tests {
         let config = Config::default();
         // Validator
         assert_eq!(get_field_value(&config, 0, 0), "true");
-        assert_eq!(get_field_value(&config, 0, 2), "30000");
-        assert_eq!(get_field_value(&config, 0, 3), "ask");
-        assert_eq!(get_field_value(&config, 0, 4), "false");
+        assert_eq!(get_field_value(&config, 0, 1), "true"); // layer0_enabled default true
+        assert_eq!(get_field_value(&config, 0, 3), "30000");
+        assert_eq!(get_field_value(&config, 0, 4), "ask");
+        assert_eq!(get_field_value(&config, 0, 5), "false");
 
         // Ollama
         assert_eq!(get_field_value(&config, 2, 0), "http://127.0.0.1:11434");
@@ -655,9 +659,10 @@ mod tests {
         // Each (section, field, getter) tuple for all bool fields
         let bool_fields: &[(usize, usize)] = &[
             (0, 0), // validator.enabled
-            (0, 1), // validator.layer1_enabled
-            (0, 4), // validator.trust_mode
-            (0, 5), // validator.auto_allow_reads
+            (0, 1), // validator.layer0_enabled
+            (0, 2), // validator.layer1_enabled
+            (0, 5), // validator.trust_mode
+            (0, 6), // validator.auto_allow_reads
             (1, 0), // context.enabled
             (1, 1), // context.auto_snapshot
             (3, 0), // user_learning.enabled
@@ -687,9 +692,9 @@ mod tests {
     #[test]
     fn test_toggle_nontoggle_field_is_noop() {
         let mut config = Config::default();
-        let before = get_field_value(&config, 0, 2); // layer1_timeout_ms (NumberU64)
-        toggle_field(&mut config, 0, 2);
-        assert_eq!(get_field_value(&config, 0, 2), before);
+        let before = get_field_value(&config, 0, 3); // layer1_timeout_ms (NumberU64)
+        toggle_field(&mut config, 0, 3);
+        assert_eq!(get_field_value(&config, 0, 3), before);
     }
 
     // --- cycle_field tests ---
@@ -697,13 +702,13 @@ mod tests {
     #[test]
     fn test_cycle_default_decision_validator() {
         let mut config = Config::default();
-        assert_eq!(get_field_value(&config, 0, 3), "ask");
-        cycle_field(&mut config, 0, 3);
-        assert_eq!(get_field_value(&config, 0, 3), "allow");
-        cycle_field(&mut config, 0, 3);
-        assert_eq!(get_field_value(&config, 0, 3), "deny");
-        cycle_field(&mut config, 0, 3);
-        assert_eq!(get_field_value(&config, 0, 3), "ask");
+        assert_eq!(get_field_value(&config, 0, 4), "ask");
+        cycle_field(&mut config, 0, 4);
+        assert_eq!(get_field_value(&config, 0, 4), "allow");
+        cycle_field(&mut config, 0, 4);
+        assert_eq!(get_field_value(&config, 0, 4), "deny");
+        cycle_field(&mut config, 0, 4);
+        assert_eq!(get_field_value(&config, 0, 4), "ask");
     }
 
     #[test]
@@ -797,21 +802,21 @@ mod tests {
     #[test]
     fn test_is_trust_mode_enabling_when_off() {
         let config = Config::default();
-        assert!(is_trust_mode_enabling(&config, 0, 4));
+        assert!(is_trust_mode_enabling(&config, 0, 5));
     }
 
     #[test]
     fn test_is_trust_mode_enabling_when_already_on() {
         let mut config = Config::default();
         config.validator.trust_mode = true;
-        assert!(!is_trust_mode_enabling(&config, 0, 4));
+        assert!(!is_trust_mode_enabling(&config, 0, 5));
     }
 
     #[test]
     fn test_is_trust_mode_enabling_wrong_field() {
         let config = Config::default();
         assert!(!is_trust_mode_enabling(&config, 0, 0));
-        assert!(!is_trust_mode_enabling(&config, 1, 4));
+        assert!(!is_trust_mode_enabling(&config, 1, 5));
     }
 
     // --- Phase 3: validator tests ---
@@ -925,15 +930,15 @@ mod tests {
     #[test]
     fn test_set_field_value_u64_roundtrip() {
         let mut config = Config::default();
-        set_field_value(&mut config, 0, 2, "5000").unwrap();
+        set_field_value(&mut config, 0, 3, "5000").unwrap();
         assert_eq!(config.validator.layer1_timeout_ms, 5000);
-        assert_eq!(get_field_value(&config, 0, 2), "5000");
+        assert_eq!(get_field_value(&config, 0, 3), "5000");
     }
 
     #[test]
     fn test_set_field_value_u64_rejects_out_of_range() {
         let mut config = Config::default();
-        assert!(set_field_value(&mut config, 0, 2, "50").is_err());
+        assert!(set_field_value(&mut config, 0, 3, "50").is_err());
         // Verify value unchanged
         assert_eq!(config.validator.layer1_timeout_ms, 30000);
     }
@@ -1004,7 +1009,7 @@ mod tests {
         // Verify every number field can be set with its default value (round-trip)
         let defaults = Config::default();
         let number_fields: &[(usize, usize)] = &[
-            (0, 2), // layer1_timeout_ms
+            (0, 3), // layer1_timeout_ms
             (2, 3), // embedding_dim
             (2, 4), // timeout_ms
             (2, 5), // max_retries
@@ -1042,7 +1047,7 @@ mod tests {
     fn test_reset_field_to_default_number() {
         let mut config = Config::default();
         config.validator.layer1_timeout_ms = 999;
-        reset_field_to_default(&mut config, 0, 2);
+        reset_field_to_default(&mut config, 0, 3);
         assert_eq!(config.validator.layer1_timeout_ms, 30000);
     }
 
@@ -1082,7 +1087,7 @@ mod tests {
         config.context_pressure.threshold = 0.5;
 
         // Reset them
-        reset_field_to_default(&mut config, 0, 2);
+        reset_field_to_default(&mut config, 0, 3);
         reset_field_to_default(&mut config, 2, 0);
         reset_field_to_default(&mut config, 5, 2);
 

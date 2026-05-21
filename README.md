@@ -4,7 +4,7 @@
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
 [![Claude Code Ready](https://img.shields.io/badge/Claude_Code-Auto_Install_Ready-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDE2IDE2Ij48dGV4dCB4PSIwIiB5PSIxMyIgZm9udC1zaXplPSIxNCI+8J+UpTwvdGV4dD48L3N2Zz4=)](#install-with-claude-code)
 
-> **Note:** Currently supports macOS (ARM64 and Intel) only.
+> **Note:** Currently supports macOS (Apple Silicon / ARM64) only.
 
 Intelligent command validation and context persistence for Claude Code.
 
@@ -34,6 +34,9 @@ Intelligent command validation and context persistence for Claude Code.
   - `clx_remember` - Explicitly save information
   - `clx_checkpoint` - Create manual snapshots
   - `clx_rules` - Manage validation rules
+  - `clx_session_info` - Get current session details
+  - `clx_credentials` - Manage stored provider credentials
+  - `clx_stats` - Report usage and storage statistics
 
 ## Quick Install
 
@@ -74,12 +77,6 @@ Install CLX from https://github.com/blackaxgit/clx:
 **3.** Restart Claude Code.
 
 **Done.** Hooks are validating commands, context is being persisted, and MCP tools are available.
-
-### One-line install (alternative)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/blackaxgit/clx/main/install.sh | bash
-```
 
 ---
 
@@ -175,9 +172,18 @@ Edit `~/.clx/config.yaml`:
 ```yaml
 validator:
   enabled: true
+  layer0_enabled: true        # deterministic policy (rule-based)
   layer1_enabled: true        # LLM validation
   layer1_timeout_ms: 30000
   default_decision: "ask"     # allow, deny, ask
+  # If both layer0_enabled and layer1_enabled are false (with enabled: true),
+  # every command resolves to "ask"; to disable validation entirely set
+  # enabled: false. Both layer toggles are also overridable via
+  # CLX_VALIDATOR_LAYER0_ENABLED / CLX_VALIDATOR_LAYER1_ENABLED env vars;
+  # disabling a layer emits a per-event SHA-256 fingerprint to
+  # tracing::warn!; tamper-evident only when an external append-only sink
+  # captures the anchor (SQLite alone is not tamper-evident because a
+  # same-uid attacker can rewrite the database file).
 
 context:
   enabled: true
@@ -290,7 +296,6 @@ clx/
 │   ├── clx-mcp/        # MCP server binary
 │   └── clx/            # CLI binary + dashboard
 ├── scripts/            # Docker compose, service management, packaging
-├── install.sh          # Build-from-source installer
 ├── INSTALL.md          # Installation guide
 └── CONTRIBUTING.md     # Contribution guide
 ```
