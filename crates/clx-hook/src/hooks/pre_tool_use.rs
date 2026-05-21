@@ -262,8 +262,15 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     // Initialize policy engine
     let mut policy_engine = PolicyEngine::new().with_project_path(&input.cwd);
 
-    // Load learned rules from database if available
-    if let Ok(storage) = Storage::open_default()
+    // T2: Load learned rules ONLY when L1 is enabled. When `layer1_enabled=false`
+    // the L0→Ask path falls through to the "L1-DISABLED → ask" branch
+    // unconditionally; loading learned rules in that path is a maintenance
+    // hazard — a single overbroad learned-allow row (B1-4 carry-over) would
+    // silently suppress the L1-DISABLED ask prompt. Gating the load behind
+    // `layer1_enabled` honors the "L1 disabled = engine doesn't consult learned
+    // whitelist" property and removes a pre-gate I/O side effect (recon T2).
+    if config.validator.layer1_enabled
+        && let Ok(storage) = Storage::open_default()
         && let Err(e) = policy_engine.load_learned_rules(&storage)
     {
         warn!("Failed to load learned rules: {}", e);
@@ -364,8 +371,19 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         // in which case the L1-disabled branch below handles forced-ask).
     }
 
-    // Check SQLite decision cache before calling Ollama
-    if config.validator.cache_enabled {
+    // T9.1 (cache-bypass): consult the SQLite decision cache ONLY when BOTH
+    // `layer0_enabled` and `layer1_enabled` are true. The cache is populated
+    // EXCLUSIVELY by L1 verdicts (see `cache_decision` calls in the L1 match
+    // arms below). Consulting it when L1 is disabled silently replays a stale
+    // L1-allow as if L0 had cleared the command; consulting it when L0 was
+    // bypassed lets a poisoned/legacy allow row override the deterministic
+    // deny-list class the operator opted out of. Either way the cache becomes
+    // an L0/L1 bypass surface. Skip the lookup entirely so the next gate
+    // (L1-disabled forced-ask, or L1 evaluation) runs.
+    if config.validator.cache_enabled
+        && config.validator.layer0_enabled
+        && config.validator.layer1_enabled
+    {
         let cache_key = compute_cache_key(command, &input.cwd);
         if let Ok(storage) = Storage::open_default() {
             // Best-effort cleanup of expired entries (1 in 20 chance)
@@ -398,6 +416,12 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
     // Layer 1: LLM-based validation (if enabled)
     if !config.validator.layer1_enabled {
         debug!("L1 disabled, defaulting to ask");
+        // T9.5 / L1-rename dual-emit: emit BOTH the canonical "L1-DISABLED"
+        // (v0.9.0 normalized) AND the legacy "L1 disabled" (v0.8.x literal)
+        // as substrings of a single reasoning string so a v0.8.x consumer
+        // that regex-matches the legacy literal still finds this row during
+        // the parallel-change deprecation window. v0.10.0 plan: drop the
+        // legacy alias and keep only "L1-DISABLED".
         log_audit_entry(
             &input.session_id,
             command,
@@ -405,7 +429,7 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             "L0",
             AuditDecision::Prompted,
             None,
-            Some("L1-DISABLED"),
+            Some("L1-DISABLED (alias: L1 disabled)"),
         );
         output_decision(
             "ask",
@@ -428,25 +452,44 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
                 "Failed to create LLM client: {}, defaulting to {}",
                 e, config.validator.default_decision
             );
-            let fallback = config.validator.default_decision.as_str();
-            let reason = format!("LLM unavailable — fallback: {fallback}");
+            // T9.2 / F7-deferred posture: a command reaching this fallback has
+            // either (a) bypassed L0 (`layer0_enabled=false`) or (b) been
+            // escalated by L0→Ask (L0 didn't clear it). In either case the
+            // command received ZERO L1 scrutiny. Honoring
+            // `default_decision=allow` here silently passes the command — the
+            // exact silent-allow class v0.8.2 deferred as F7 and v0.9.0's L0
+            // toggle re-enables. Force `effective_decision="ask"` so the user
+            // makes the decision. `deny` and `ask` pass through unchanged
+            // (both are already fail-closed / safe).
+            let configured = config.validator.default_decision;
+            let effective_decision = if configured == DefaultDecision::Allow {
+                warn!(
+                    "LLM client error with default_decision=allow — \
+                     forcing ask (F7 posture: silent allow refused when an \
+                     L0-unknown command falls through to an unreachable L1)"
+                );
+                "ask"
+            } else {
+                configured.as_str()
+            };
+            let reason = format!("LLM unavailable — fallback: {effective_decision}");
             log_audit_entry(
                 &input.session_id,
                 command,
                 &input.cwd,
                 "L1",
-                match config.validator.default_decision {
-                    DefaultDecision::Allow => AuditDecision::Allowed,
-                    DefaultDecision::Deny => AuditDecision::Blocked,
-                    DefaultDecision::Ask => AuditDecision::Prompted,
+                match effective_decision {
+                    "allow" => AuditDecision::Allowed,
+                    "deny" => AuditDecision::Blocked,
+                    _ => AuditDecision::Prompted,
                 },
                 None,
                 Some(&format!(
-                    "Ollama client error: {e} — default_decision: {}",
-                    config.validator.default_decision
+                    "Ollama client error: {e} — effective_decision: \
+                     {effective_decision} (configured: {configured})"
                 )),
             );
-            output_decision(fallback, Some(reason), Some(RULES_REMINDER), None);
+            output_decision(effective_decision, Some(reason), Some(RULES_REMINDER), None);
             return Ok(());
         }
     };
@@ -474,25 +517,42 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             "Ollama not available, defaulting to {}",
             config.validator.default_decision
         );
-        let fallback = config.validator.default_decision.as_str();
-        let reason = format!("LLM unavailable — fallback: {fallback}");
+        // T9.2 / F7-deferred posture (Ollama-unavailable arm): same shape as
+        // the LLM-client-construction error above. The command bypassed L0
+        // (layer0_enabled=false) or escalated L0→Ask, and now L1 is
+        // unreachable. `default_decision=allow` here silently passes an
+        // unreviewed command (identical blast radius to `layer1_enabled=false`
+        // with allow as default — but without the loud L1-DISABLED ask gate).
+        // Force `effective_decision="ask"` so the user makes the decision.
+        let configured = config.validator.default_decision;
+        let effective_decision = if configured == DefaultDecision::Allow {
+            warn!(
+                "Ollama unavailable with default_decision=allow — \
+                 forcing ask (F7 posture: silent allow refused when an \
+                 L0-unknown command falls through to an unreachable L1)"
+            );
+            "ask"
+        } else {
+            configured.as_str()
+        };
+        let reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             &input.session_id,
             command,
             &input.cwd,
             "L1",
-            match config.validator.default_decision {
-                DefaultDecision::Allow => AuditDecision::Allowed,
-                DefaultDecision::Deny => AuditDecision::Blocked,
-                DefaultDecision::Ask => AuditDecision::Prompted,
+            match effective_decision {
+                "allow" => AuditDecision::Allowed,
+                "deny" => AuditDecision::Blocked,
+                _ => AuditDecision::Prompted,
             },
             None,
             Some(&format!(
-                "Ollama unavailable — default_decision: {}",
-                config.validator.default_decision
+                "Ollama unavailable — effective_decision: {effective_decision} \
+                 (configured: {configured})"
             )),
         );
-        output_decision(fallback, Some(reason), Some(RULES_REMINDER), None);
+        output_decision(effective_decision, Some(reason), Some(RULES_REMINDER), None);
         return Ok(());
     }
 
@@ -521,25 +581,45 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
             config.validator.layer1_timeout_ms, config.validator.default_decision
         );
         clx_core::llm_health::write_health(false);
-        let fallback = config.validator.default_decision.as_str();
-        let fallback_reason = format!("LLM timeout — fallback: {fallback}");
+        // T9.3 / F7-deferred posture (timeout arm): a hung provider must
+        // never become an automatic pass. On timeout with
+        // `default_decision=allow` the command received zero L1 scrutiny;
+        // force `effective_decision="ask"` so the user makes the decision.
+        // `deny` and `ask` already fail-closed and pass through.
+        let configured = config.validator.default_decision;
+        let effective_decision = if configured == DefaultDecision::Allow {
+            warn!(
+                "L1 timeout with default_decision=allow — \
+                 forcing ask (F7 posture: silent allow refused on a hung L1)"
+            );
+            "ask"
+        } else {
+            configured.as_str()
+        };
+        let fallback_reason = format!("LLM timeout — fallback: {effective_decision}");
         log_audit_entry(
             &input.session_id,
             command,
             &input.cwd,
             "L1",
-            match config.validator.default_decision {
-                DefaultDecision::Allow => AuditDecision::Allowed,
-                DefaultDecision::Deny => AuditDecision::Blocked,
-                DefaultDecision::Ask => AuditDecision::Prompted,
+            match effective_decision {
+                "allow" => AuditDecision::Allowed,
+                "deny" => AuditDecision::Blocked,
+                _ => AuditDecision::Prompted,
             },
             None,
             Some(&format!(
-                "L1 timeout after {}ms — default_decision: {}",
-                config.validator.layer1_timeout_ms, config.validator.default_decision
+                "L1 timeout after {}ms — effective_decision: \
+                 {effective_decision} (configured: {configured})",
+                config.validator.layer1_timeout_ms
             )),
         );
-        output_decision(fallback, Some(fallback_reason), Some(RULES_REMINDER), None);
+        output_decision(
+            effective_decision,
+            Some(fallback_reason),
+            Some(RULES_REMINDER),
+            None,
+        );
         return Ok(());
     };
 
@@ -550,25 +630,44 @@ pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
         && reason == "LLM unavailable"
     {
         clx_core::llm_health::write_health(false);
-        let fallback = config.validator.default_decision.as_str();
-        let fallback_reason = format!("LLM unavailable — fallback: {fallback}");
+        // T9.4 / F7-deferred posture (gen-failed arm): identical shape to
+        // T9.2 and T9.3 — the command received no L1 verdict (the provider
+        // accepted the request but generation failed). Silent allow here
+        // is the same silent-allow class; force ask when
+        // `default_decision=allow`.
+        let configured = config.validator.default_decision;
+        let effective_decision = if configured == DefaultDecision::Allow {
+            warn!(
+                "LLM generation failed with default_decision=allow — \
+                 forcing ask (F7 posture: silent allow refused on gen failure)"
+            );
+            "ask"
+        } else {
+            configured.as_str()
+        };
+        let fallback_reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             &input.session_id,
             command,
             &input.cwd,
             "L1",
-            match config.validator.default_decision {
-                DefaultDecision::Allow => AuditDecision::Allowed,
-                DefaultDecision::Deny => AuditDecision::Blocked,
-                DefaultDecision::Ask => AuditDecision::Prompted,
+            match effective_decision {
+                "allow" => AuditDecision::Allowed,
+                "deny" => AuditDecision::Blocked,
+                _ => AuditDecision::Prompted,
             },
             None,
             Some(&format!(
-                "LLM generation failed — default_decision: {}",
-                config.validator.default_decision
+                "LLM generation failed — effective_decision: \
+                 {effective_decision} (configured: {configured})"
             )),
         );
-        output_decision(fallback, Some(fallback_reason), Some(RULES_REMINDER), None);
+        output_decision(
+            effective_decision,
+            Some(fallback_reason),
+            Some(RULES_REMINDER),
+            None,
+        );
         return Ok(());
     }
 

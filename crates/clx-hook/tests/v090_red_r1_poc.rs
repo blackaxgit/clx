@@ -14,6 +14,20 @@
 //!     not the future fix.  These tests REPRODUCE the gap; they intentionally
 //!     do not assert a not-yet-implemented invariant.
 
+// Adversarial PoCs prioritise reproducible attack shape over style hygiene.
+#![allow(
+    clippy::pedantic,
+    clippy::restriction,
+    clippy::nursery,
+    clippy::doc_markdown,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::redundant_closure_for_method_calls,
+    clippy::duration_subsec,
+    clippy::ignore_without_reason,
+    clippy::single_char_pattern
+)]
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -545,7 +559,10 @@ fn walk_rs(root: &Path, visit: &mut dyn FnMut(&Path, &str)) {
                 Err(_) => continue,
             };
             if ft.is_dir() {
-                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 if name == "target" || name == ".git" || name == ".claude" {
                     continue;
                 }
@@ -553,7 +570,9 @@ fn walk_rs(root: &Path, visit: &mut dyn FnMut(&Path, &str)) {
                 continue;
             }
             if ft.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {
-                let Ok(body) = std::fs::read_to_string(&p) else { continue; };
+                let Ok(body) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
                 visit(&p, &body);
             }
         }
@@ -710,9 +729,10 @@ async fn f3_carryover_security_cfg_uses_per_event_fingerprint_seq1_genesis() {
     let (_out, home) = run(cfg, &env);
 
     let rows = audit_rows(home.path(), "f3-carryover");
-    let sec_cfg = rows.iter().find(|r| r.layer == "SECURITY-CFG").expect(
-        "must have a SECURITY-CFG row (config-driven layer-disable was active)",
-    );
+    let sec_cfg = rows
+        .iter()
+        .find(|r| r.layer == "SECURITY-CFG")
+        .expect("must have a SECURITY-CFG row (config-driven layer-disable was active)");
     let reasoning = sec_cfg.reasoning.as_deref().unwrap_or("");
 
     // The trigger key string is exactly "validator.layer0_enabled=false".
@@ -768,10 +788,7 @@ fn t8_doc_honesty_tamper_evident_overclaims_present() {
 
     // The honest text exists in v0.8.2 reclassify but is not echoed in
     // [Unreleased].  Pin the missing qualifier.
-    let unreleased_section = changelog
-        .split("## [0.8.2]")
-        .next()
-        .unwrap_or("");
+    let unreleased_section = changelog.split("## [0.8.2]").next().unwrap_or("");
     assert!(
         !unreleased_section.contains("tamper-evident only when an external"),
         "T8: [Unreleased] must currently lack the honest qualifier \

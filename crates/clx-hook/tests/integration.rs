@@ -349,8 +349,21 @@ fn test_hook_trust_mode_expired_token_falls_through() {
 
 #[test]
 fn test_hook_default_decision_allow_on_ollama_unavailable() {
-    // When L1 is enabled but Ollama is unreachable, the hook should fall back
-    // to the configured default_decision. Here we set it to "allow".
+    // v0.9.0 BREAKING CONTRACT FLIP — closes release-blocker #1 (silent-allow
+    // class) in `specs/2026-05-20-v090-red-findings.md`.
+    //
+    // Pre-v0.9.0 behavior: with `default_decision=allow` and Ollama
+    // unreachable, the hook silently emitted `allow` — even for an L0-unknown
+    // command that received zero LLM scrutiny. That is the F7-deferred
+    // silent-allow class re-enabled by the new `layer0_enabled` toggle.
+    //
+    // v0.9.0 behavior: when an L0-unknown command falls through to L1 and L1
+    // is unreachable / times out / errors, `default_decision=allow` is
+    // refused and `effective_decision="ask"` is emitted instead. The user
+    // makes the decision. `deny` and `ask` pass through unchanged.
+    //
+    // To restore the prior posture explicitly, set `default_decision=allow`
+    // AND `layer1_enabled=false`; the L1-DISABLED ask is then the loud gate.
     let binary = env!("CARGO_BIN_EXE_clx-hook");
 
     let home_guard = isolated_clx_home();
@@ -410,8 +423,9 @@ ollama:
 
     let hook_output = &parsed["hookSpecificOutput"];
     assert_eq!(
-        hook_output["permissionDecision"], "allow",
-        "default_decision=allow should result in 'allow' when Ollama is unreachable"
+        hook_output["permissionDecision"], "ask",
+        "default_decision=allow with L1 unreachable and command falling through to L1 \
+         must force ask (F7 posture v0.9.0)"
     );
 }
 

@@ -293,10 +293,15 @@ async fn l0_and_l1_disabled_forces_ask() {
             .any(|r| r.layer == "L0" && r.reasoning.as_deref() == Some("L0-DISABLED")),
         "must have L0/L0-DISABLED row; cmd_rows: {cmd_rows:?}"
     );
+    // v0.9.0 dual-emit window: the L1-DISABLED reasoning carries BOTH the
+    // canonical "L1-DISABLED" and the legacy "L1 disabled" alias as
+    // substrings so v0.8.x log parsers keep working through v0.9.0. v0.10.0
+    // plan: drop the legacy alias. See `specs/2026-05-20-v090-red-findings.md`
+    // (T9.5 / L1-rename deprecation hygiene).
     assert!(
-        cmd_rows
-            .iter()
-            .any(|r| r.layer == "L0" && r.reasoning.as_deref() == Some("L1-DISABLED")),
+        cmd_rows.iter().any(
+            |r| r.layer == "L0" && r.reasoning.as_deref().unwrap_or("").contains("L1-DISABLED")
+        ),
         "must have L0/L1-DISABLED row (forced ask audit); cmd_rows: {cmd_rows:?}"
     );
 }

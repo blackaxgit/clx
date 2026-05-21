@@ -17,7 +17,20 @@
 //!
 //! Synthetic secrets only. Hermetic via wiremock loopback + `CLX_MODEL_FETCH_DRYRUN=1`.
 
-#![allow(dead_code)]
+// Adversarial PoCs prioritise reproducible attack shape over style hygiene.
+#![allow(
+    dead_code,
+    clippy::pedantic,
+    clippy::restriction,
+    clippy::nursery,
+    clippy::doc_markdown,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::redundant_closure_for_method_calls,
+    clippy::duration_subsec,
+    clippy::ignore_without_reason,
+    clippy::single_char_pattern
+)]
 
 use std::io::Write;
 use std::path::Path;
@@ -257,11 +270,7 @@ async fn red_t3_env_plus_config_double_audit() {
         "  layer0_enabled: false\n  layer1_enabled: true\n",
     );
     let env = pre_tool_use("red-r2-t3", ASK_CMD);
-    let (_out, home) = run_with_extra_env(
-        &cfg,
-        &env,
-        &[("CLX_VALIDATOR_LAYER0_ENABLED", "false")],
-    );
+    let (_out, home) = run_with_extra_env(&cfg, &env, &[("CLX_VALIDATOR_LAYER0_ENABLED", "false")]);
 
     let rows = audit_rows(home.path(), "red-r2-t3");
     let env_rows = rows.iter().filter(|r| r.layer == "SECURITY-ENV").count();
@@ -820,4 +829,3 @@ async fn red_t_race_security_cfg_writes_before_l0_evaluation() {
         l0_row.timestamp
     );
 }
-
