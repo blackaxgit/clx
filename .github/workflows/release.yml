@@ -92,11 +92,10 @@ jobs:
           file "$BINARY"
           file "$BINARY" | grep -q "arm64" || { echo "ERROR: binary is not arm64" >&2; exit 1; }
 
-      # Bundle all three binaries and the pre-built install script into one tarball.
-      # The tarball layout mirrors what scripts/package.sh produces locally:
+      # Bundle all three binaries into one tarball. To install from the
+      # tarball, extract it and run `./bin/clx install`.
       #
       #   clx-{arch}-apple-darwin/
-      #     install.sh          ← drop-in installer (no Rust required)
       #     bin/
       #       clx
       #       clx-hook
@@ -113,10 +112,6 @@ jobs:
           cp "${BIN_DIR}/clx"          "${STAGE_DIR}/bin/"
           cp "${BIN_DIR}/clx-hook"     "${STAGE_DIR}/bin/"
           cp "${BIN_DIR}/clx-mcp"      "${STAGE_DIR}/bin/"
-
-          # Copy the installer script from the repository root.
-          cp install.sh "${STAGE_DIR}/install.sh"
-          chmod +x "${STAGE_DIR}/install.sh"
 
           # Reset timestamps to avoid "Can't restore time: Operation not permitted"
           # errors when Homebrew extracts on macOS with SIP enabled.
