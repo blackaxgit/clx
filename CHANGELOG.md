@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-20
+
 ### Added
 
 - **`validator.layer0_enabled: bool`** (default `true`). Mirrors the
