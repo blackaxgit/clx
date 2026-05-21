@@ -147,8 +147,9 @@ missed (`pre_tool_use.rs:217-366`). Implementation
 `crates/clx-core/src/policy/llm.rs:74-176`.
 
 - **Given** `layer1_enabled = false`. **When** L0 Ask. **Then** audit layer
-  `L0`, decision `prompted`, reasoning "L1 disabled"; output `ask` with
-  reason "Command requires review" (`pre_tool_use.rs:254-272`). Note the
+  `L0`, decision `prompted`, reasoning `"L1-DISABLED (with v0.9.0
+  dual-emit alias 'L1 disabled' retained for one minor version)"`;
+  output `ask` with reason "Command requires review" (`pre_tool_use.rs:254-272`). Note the
   ask is NOT cached in this branch.
 - **Given** LLM client construction fails. **Then** `default_decision`
   fallback; audit layer `L1`, decision mapped from `default_decision`
@@ -419,7 +420,9 @@ validator: { layer1_enabled: false }
 ```
 Action: run an unknown non-read-only command e.g. `mycustomtool --apply`.
 Expected: `ask` "Command requires review", audit layer `L0`,
-decision `prompted`, reasoning "L1 disabled". Confirm NO cache row written.
+decision `prompted`, reasoning `"L1-DISABLED (with v0.9.0 dual-emit
+alias 'L1 disabled' retained for one minor version)"`. Confirm NO cache
+row written.
 
 ### 5.5 L1 provider down -> default_decision
 

@@ -183,7 +183,10 @@ validator:
   # every command resolves to "ask"; to disable validation entirely set
   # enabled: false. Both layer toggles are also overridable via
   # CLX_VALIDATOR_LAYER0_ENABLED / CLX_VALIDATOR_LAYER1_ENABLED env vars;
-  # disabling a layer emits a tamper-evident audit-chain fingerprint.
+  # disabling a layer emits a per-event SHA-256 fingerprint to
+  # tracing::warn!; tamper-evident only when an external append-only sink
+  # captures the anchor (SQLite alone is not tamper-evident because a
+  # same-uid attacker can rewrite the database file).
 
 context:
   enabled: true

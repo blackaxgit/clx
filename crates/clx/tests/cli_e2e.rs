@@ -342,6 +342,117 @@ fn unknown_subcommand_exits_nonzero() {
     clx(&t).arg("totally-unknown-subcmd").assert().failure();
 }
 
+// ===========================================================================
+// T7 both-off observability: `clx health` WARN when validator.enabled=true
+// AND both layer0_enabled=false AND layer1_enabled=false.
+// Closes the T7 release-blocker carry-over in
+// specs/2026-05-20-v090-red-findings.md.
+// ===========================================================================
+
+/// Write a config with `validator.enabled=true` and BOTH layer toggles off
+/// into the isolated `~/.clx/config.yaml`. Returns the path written.
+fn write_both_off_config(t: &TempDir) -> std::path::PathBuf {
+    let clx_dir = home_path(t, ".clx");
+    std::fs::create_dir_all(&clx_dir).expect("mkdir .clx");
+    let cfg_path = clx_dir.join("config.yaml");
+    // Minimal YAML: only the validator block matters; everything else
+    // falls back to serde defaults via the `#[serde(default)]` impls.
+    let yaml = "\
+validator:
+  enabled: true
+  layer0_enabled: false
+  layer1_enabled: false
+";
+    std::fs::write(&cfg_path, yaml).expect("write config.yaml");
+    cfg_path
+}
+
+#[test]
+fn health_warns_when_validator_enabled_and_both_layers_off_human() {
+    // T7 closing test (table / human path). The WARN row must surface
+    // both the cause and the mitigation.
+    let t = tmp();
+    let _cfg_path = write_both_off_config(&t);
+
+    // `clx health` may exit non-zero because Ollama/binaries aren't
+    // installed in the test env. We only need the WARN text on stdout.
+    let assert = clx(&t).arg("health").assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+
+    assert!(
+        stdout.contains("validator.enabled=true"),
+        "WARN must cite the enabled=true posture; full stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("layer0_enabled") && stdout.contains("layer1_enabled"),
+        "WARN must name BOTH toggles; full stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("no actual validation is running"),
+        "WARN must spell out the consequence; full stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("enabled=false"),
+        "WARN must point at the explicit-bypass remediation; full stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn health_json_warns_when_validator_enabled_and_both_layers_off() {
+    // T7 closing test (JSON path). The `warnings` array must contain
+    // the both-off message verbatim.
+    let t = tmp();
+    let _cfg_path = write_both_off_config(&t);
+
+    let assert = clx(&t).args(["health", "--json"]).assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("health --json must emit valid JSON; got:\n{stdout}\nerr: {e}"));
+    let warnings = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("health --json must include `warnings`; got: {v}"));
+    assert!(
+        !warnings.is_empty(),
+        "warnings array must be non-empty under both-off + enabled=true; got: {v}"
+    );
+    let any_match = warnings.iter().any(|w| {
+        w.as_str().is_some_and(|s| {
+            s.contains("validator.enabled=true") && s.contains("no actual validation is running")
+        })
+    });
+    assert!(
+        any_match,
+        "warnings array must contain the T7 WARN text; got: {warnings:?}"
+    );
+}
+
+#[test]
+fn health_does_not_warn_under_default_config() {
+    // Negative control: a fresh install (default config) must NOT emit
+    // the T7 WARN. We assert by inspecting `warnings` in --json: it
+    // must either be absent (skip_serializing_if) or contain no
+    // both-off entry.
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+
+    let assert = clx(&t).args(["health", "--json"]).assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("health --json must emit valid JSON; got:\n{stdout}\nerr: {e}"));
+
+    if let Some(arr) = v.get("warnings").and_then(serde_json::Value::as_array) {
+        let leaked = arr.iter().any(|w| {
+            w.as_str()
+                .is_some_and(|s| s.contains("no actual validation is running"))
+        });
+        assert!(
+            !leaked,
+            "T7 WARN must NOT fire under default config; got: {arr:?}"
+        );
+    }
+}
+
 #[test]
 fn maintenance_trim_real_run_on_fresh_db_is_ok() {
     // A real (non-dry-run) trim on a freshly installed empty DB must

@@ -27,15 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
-- **Layer-disable audit-chain signal extended to config-driven
-  disable.** Previously the per-event SHA-256 audit-chain fingerprint
-  (B5-4 in v0.8.1) fired only when an env variable disabled a layer.
-  v0.9.0 ALSO emits a `SECURITY-CFG` audit row + chained fingerprint
-  when `validator.layer0_enabled` or `validator.layer1_enabled` is
-  `false` in `~/.clx/config.yaml`. An external log aggregator
-  capturing the `tracing::warn!` anchor can independently re-verify
-  any specific disable event. Closes the documented config-side gap
-  in B5-4-extended.
+- **Layer-disable per-event fingerprint extended to config-driven
+  disable.** Previously the per-event SHA-256 fingerprint emitted to
+  `tracing::warn!` (B5-4 in v0.8.1) fired only when an env variable
+  disabled a layer. v0.9.0 also emits a `SECURITY-CFG` audit row +
+  per-event fingerprint when `validator.layer0_enabled` or
+  `validator.layer1_enabled` is `false` in `~/.clx/config.yaml`. The
+  fingerprint is tamper-evident only when an external append-only sink
+  captures the anchor (SQLite alone is not tamper-evident because a
+  same-uid attacker can rewrite the database file). CLX ships no
+  aggregator wiring; the operator must configure one (syslog, journald,
+  etc.). Closes the documented config-side gap in B5-4-extended.
 - **Both-off semantics: fail-to-defined-policy.** If
   `validator.enabled: true` but both `layer0_enabled: false` and
   `layer1_enabled: false`, every command now resolves to
@@ -48,12 +50,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   untrusted project configs, so a cloned hostile repo cannot set
   `layer0_enabled`. No new gate added; no theatre.
 
+### Changed (BREAKING)
+
+- Hook now refuses `default_decision=allow` as silent fallback when an
+  L0-unknown command falls through to L1 and L1 is unreachable / times
+  out / errors. The decision is forced to `ask` so the user makes the
+  call. Closes the F7-deferred silent-allow class (see
+  `specs/2026-05-20-v090-red-findings.md` release-blocker #1). Affects
+  users who configured `default_decision=allow` with the prior
+  fail-open behaviour. To restore the prior behaviour explicitly, set
+  `default_decision=allow` AND ensure `layer1_enabled=false`; the
+  `L1-DISABLED` ask is then the loud gate.
+
 ### Changed
 
 - Audit-log `reasoning` for the L1-disabled branch normalised from
   `"L1 disabled"` to `"L1-DISABLED"` so it parallels the new
-  `"L0-DISABLED"` reason text. Downstream log parsers that pattern-
-  match the legacy string need updating.
+  `"L0-DISABLED"` reason text. For one-version compatibility, v0.9.0
+  emits both the legacy `"L1 disabled"` string and the new
+  `"L1-DISABLED"` string in the same reasoning field (dual-emit
+  deprecation window, parallel-change pattern). Downstream log parsers
+  matching either string continue to work. The legacy `"L1 disabled"`
+  literal is removed in v0.10.0; update parsers to match
+  `"L1-DISABLED"` before upgrading.
 
 ## [0.8.2] - 2026-05-20
 

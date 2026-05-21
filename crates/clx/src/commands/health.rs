@@ -42,6 +42,8 @@ struct HealthReport {
     summary: Summary,
     providers: Vec<ProviderRow>,
     routing: RoutingSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +139,33 @@ async fn check_providers(config: &clx_core::config::Config) -> (Vec<ProviderRow>
     (rows, routing)
 }
 
+/// T7 both-off observability: when `validator.enabled = true` AND both
+/// `layer0_enabled = false` AND `layer1_enabled = false`, every command
+/// resolves to `ask`; no actual validation is running. The audit DB still
+/// shows `L0-DISABLED` + `L1-DISABLED` rows that can read like active
+/// validation to a forensic operator, so `clx health` surfaces a WARN.
+///
+/// Mirror of the existing `CLX_VALIDATOR_*` env-override WARN style: a
+/// startup-time security-weakening posture is surfaced loudly in the
+/// human report and as a `warnings[]` entry in the JSON report.
+///
+/// Returns the WARN message when the both-off condition holds, or `None`
+/// when the config is fine or unavailable.
+fn check_validator_both_layers_off(config: Option<&clx_core::config::Config>) -> Option<String> {
+    let cfg = config?;
+    let v = &cfg.validator;
+    if v.enabled && !v.layer0_enabled && !v.layer1_enabled {
+        Some(
+            "validator.enabled=true but both layer0_enabled and layer1_enabled are false \
+             - every command will resolve to ask; no actual validation is running. \
+             To disable validation entirely, set enabled=false."
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Run the health check command.
 ///
 /// Executes all 9 validators concurrently, then probes each configured LLM
@@ -177,11 +206,20 @@ pub async fn cmd_health(json: bool) -> anyhow::Result<()> {
         )
     };
 
+    // T7 both-off observability: global warnings not tied to a single
+    // check row. Surfaced after the providers section in human output
+    // and as a top-level `warnings` array in the JSON report.
+    let mut global_warnings: Vec<String> = Vec::new();
+    if let Some(w) = check_validator_both_layers_off(config.as_ref()) {
+        global_warnings.push(w);
+    }
+
     if json {
-        print_json(&results, &provider_rows, &routing)?;
+        print_json(&results, &provider_rows, &routing, &global_warnings)?;
     } else {
         print_table(&results);
         print_providers(&provider_rows, &routing);
+        print_global_warnings(&global_warnings);
     }
 
     let has_failure = results.iter().any(|r| r.status == CheckStatus::Fail);
@@ -643,6 +681,7 @@ fn print_json(
     results: &[CheckResult],
     providers: &[ProviderRow],
     routing: &RoutingSummary,
+    warnings: &[String],
 ) -> anyhow::Result<()> {
     let passed = results
         .iter()
@@ -668,10 +707,25 @@ fn print_json(
         },
         providers: providers.to_vec(),
         routing: routing.clone(),
+        warnings: warnings.to_vec(),
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+/// Print global (non-check-specific) warnings to stdout with prominent
+/// WARN styling. Called only in human (non-JSON) output mode; the JSON
+/// path embeds the same strings under `report.warnings`.
+fn print_global_warnings(warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    println!();
+    for w in warnings {
+        println!("{} {}", "\u{26A0} WARN:".yellow().bold(), w);
+    }
+    println!();
 }
 
 fn print_providers(rows: &[ProviderRow], routing: &RoutingSummary) {
@@ -883,6 +937,7 @@ mod tests {
                 chat: "ollama-local/qwen3:1.7b".into(),
                 embeddings: "ollama-local/nomic-embed-text".into(),
             },
+            warnings: vec![],
         };
 
         let json = serde_json::to_value(&report).unwrap();
@@ -893,5 +948,115 @@ mod tests {
         assert_eq!(json["summary"]["total"], 2);
         assert!(json["providers"].as_array().unwrap().is_empty());
         assert_eq!(json["routing"]["chat"], "ollama-local/qwen3:1.7b");
+        // warnings absent when empty (skip_serializing_if).
+        assert!(json.get("warnings").is_none());
+    }
+
+    // T7 both-off observability tests --------------------------------
+
+    #[test]
+    fn both_layers_off_fires_warn_when_enabled_and_both_disabled() {
+        use clx_core::config::Config;
+        let mut cfg = Config::default();
+        cfg.validator.enabled = true;
+        cfg.validator.layer0_enabled = false;
+        cfg.validator.layer1_enabled = false;
+
+        let warn = check_validator_both_layers_off(Some(&cfg));
+        assert!(warn.is_some(), "expected WARN when both layers are off");
+        let msg = warn.unwrap();
+        assert!(
+            msg.contains("validator.enabled=true"),
+            "WARN must cite validator.enabled=true; got: {msg}"
+        );
+        assert!(
+            msg.contains("layer0_enabled") && msg.contains("layer1_enabled"),
+            "WARN must name both toggles; got: {msg}"
+        );
+        assert!(
+            msg.contains("no actual validation is running"),
+            "WARN must spell out the consequence; got: {msg}"
+        );
+        assert!(
+            msg.contains("enabled=false"),
+            "WARN must suggest enabled=false for full bypass; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn both_layers_off_no_warn_when_validator_disabled() {
+        use clx_core::config::Config;
+        let mut cfg = Config::default();
+        cfg.validator.enabled = false;
+        cfg.validator.layer0_enabled = false;
+        cfg.validator.layer1_enabled = false;
+        assert!(check_validator_both_layers_off(Some(&cfg)).is_none());
+    }
+
+    #[test]
+    fn both_layers_off_no_warn_when_l0_enabled() {
+        use clx_core::config::Config;
+        let mut cfg = Config::default();
+        cfg.validator.enabled = true;
+        cfg.validator.layer0_enabled = true;
+        cfg.validator.layer1_enabled = false;
+        assert!(check_validator_both_layers_off(Some(&cfg)).is_none());
+    }
+
+    #[test]
+    fn both_layers_off_no_warn_when_l1_enabled() {
+        use clx_core::config::Config;
+        let mut cfg = Config::default();
+        cfg.validator.enabled = true;
+        cfg.validator.layer0_enabled = false;
+        cfg.validator.layer1_enabled = true;
+        assert!(check_validator_both_layers_off(Some(&cfg)).is_none());
+    }
+
+    #[test]
+    fn both_layers_off_no_warn_on_default_config() {
+        use clx_core::config::Config;
+        let cfg = Config::default();
+        assert!(check_validator_both_layers_off(Some(&cfg)).is_none());
+    }
+
+    #[test]
+    fn both_layers_off_no_warn_when_config_absent() {
+        assert!(check_validator_both_layers_off(None).is_none());
+    }
+
+    #[test]
+    fn health_report_json_includes_warnings_when_present() {
+        let report = HealthReport {
+            version: "0.9.0".into(),
+            checks: vec![],
+            summary: Summary {
+                passed: 0,
+                warned: 0,
+                failed: 0,
+                total: 0,
+            },
+            providers: vec![],
+            routing: RoutingSummary {
+                chat: "n/a".into(),
+                embeddings: "n/a".into(),
+            },
+            warnings: vec![
+                "validator.enabled=true but both layer0_enabled and layer1_enabled are false \
+                 - every command will resolve to ask; no actual validation is running. \
+                 To disable validation entirely, set enabled=false."
+                    .to_owned(),
+            ],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let warnings = json["warnings"].as_array().expect("warnings present");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .contains("no actual validation is running"),
+            "WARN payload preserved through JSON"
+        );
     }
 }
