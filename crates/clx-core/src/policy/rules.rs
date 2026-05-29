@@ -253,6 +253,40 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Return a copy of this engine with project-local config loading disabled.
+    ///
+    /// This is the P6 safety gate for untrusted / not-seen Codex projects.
+    /// When a Codex project has `ProjectTrust::Untrusted` or
+    /// `ProjectTrust::NotSeen`, P4 calls this method before loading any
+    /// project-local rules so that a hostile `.clx/config.yaml` or
+    /// project-scoped learned rules cannot influence policy evaluation for
+    /// that session.
+    ///
+    /// ## What this changes
+    ///
+    /// Clears `project_path` on the returned engine so that
+    /// `load_learned_rules` (which filters by project path) will fetch only
+    /// global rules, and so that `matches_rule` will not apply
+    /// project-specific rule filters.
+    ///
+    /// ## What this does NOT change
+    ///
+    /// - Built-in blacklist / whitelist rules are preserved.
+    /// - File-loaded rules already present in `self` are preserved (the
+    ///   caller controls whether to call `load_rules_from_file` on the result).
+    /// - Rate-limiter state is preserved.
+    ///
+    /// ## Calling convention
+    ///
+    /// This is a pure, builder-style method: it consumes `self` and returns a
+    /// new `PolicyEngine`.  Existing behaviour is unchanged when this method
+    /// is not called.
+    #[must_use]
+    pub fn without_project_config(mut self) -> Self {
+        self.project_path = None;
+        self
+    }
+
     /// Load learned rules from the database
     pub fn load_learned_rules(&mut self, storage: &Storage) -> crate::Result<()> {
         let learned_rules = if let Some(ref project_path) = self.project_path {
@@ -294,5 +328,94 @@ impl PolicyEngine {
 
         debug!("Loaded {} learned rules from database", rules_count);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod without_project_config_tests {
+    use super::*;
+    use crate::policy::types::PolicyDecision;
+
+    // T1: without_project_config clears project_path
+    #[test]
+    fn clears_project_path() {
+        let engine = PolicyEngine::new()
+            .with_project_path("/home/user/myrepo")
+            .without_project_config();
+
+        // After calling without_project_config the project path is None,
+        // so project-specific rule filtering is disabled.
+        assert!(
+            engine.project_path.is_none(),
+            "project_path must be None after without_project_config"
+        );
+    }
+
+    // T2: without_project_config preserves built-in rules
+    #[test]
+    fn preserves_builtin_rules() {
+        let baseline = PolicyEngine::new();
+        let wl_count = baseline.whitelist_rules().len();
+        let bl_count = baseline.blacklist_rules().len();
+
+        let engine = PolicyEngine::new()
+            .with_project_path("/some/repo")
+            .without_project_config();
+
+        assert_eq!(
+            engine.whitelist_rules().len(),
+            wl_count,
+            "whitelist rule count must be unchanged"
+        );
+        assert_eq!(
+            engine.blacklist_rules().len(),
+            bl_count,
+            "blacklist rule count must be unchanged"
+        );
+    }
+
+    // T3: without_project_config is idempotent (calling twice has the same
+    // result as calling once)
+    #[test]
+    fn is_idempotent() {
+        let once = PolicyEngine::new()
+            .with_project_path("/some/repo")
+            .without_project_config();
+
+        let twice = PolicyEngine::new()
+            .with_project_path("/some/repo")
+            .without_project_config()
+            .without_project_config();
+
+        assert!(once.project_path.is_none());
+        assert!(twice.project_path.is_none());
+        assert_eq!(once.whitelist_rules().len(), twice.whitelist_rules().len());
+    }
+
+    // T4: without_project_config on an engine with no project_path is a no-op
+    #[test]
+    fn no_op_when_already_none() {
+        let baseline = PolicyEngine::new();
+        let bl_count = baseline.blacklist_rules().len();
+
+        let engine = PolicyEngine::new().without_project_config();
+
+        assert!(engine.project_path.is_none());
+        assert_eq!(engine.blacklist_rules().len(), bl_count);
+    }
+
+    // T5: evaluate still works correctly after without_project_config;
+    // Claude is not affected (deny for a known-dangerous pattern still fires)
+    #[test]
+    fn deny_still_fires_after_without_project_config() {
+        let engine = PolicyEngine::new()
+            .with_project_path("/any/repo")
+            .without_project_config();
+
+        let decision = engine.evaluate("Bash", "rm -rf /");
+        assert!(
+            matches!(decision, PolicyDecision::Deny { .. }),
+            "built-in deny rule must still fire; got {decision:?}"
+        );
     }
 }
