@@ -298,13 +298,24 @@ impl PolicyEngine {
         let rules_count = learned_rules.len();
 
         for rule in learned_rules {
+            // P7: canonical tool-name migration at the LOAD boundary only.
+            // Stored rules written by older (Claude-only) CLX use the four
+            // per-tool prefixes `Edit(`/`Write(`/`MultiEdit(`/`NotebookEdit(`.
+            // v0.10.0 collapses all four into the canonical `FileEdit(` class
+            // so multi-host matching does not bifurcate. The pattern is
+            // rewritten IN MEMORY only - the row on disk is left untouched so
+            // an older CLX build still reads its own patterns
+            // (downgrade-safe). Existing Claude `Edit(*)` rules therefore
+            // still fire after the in-memory migration to `FileEdit(*)`.
+            let migrated = migrate_learned_pattern_to_canonical(&rule.pattern);
+
             // B1-4: defense-in-depth at the load boundary. An overbroad
             // allow pattern (`*`, `Bash(*)`, ...) loaded into the L0
             // whitelist would make every L0-unknown command hard-Allow and
             // skip L1 entirely. Skip + WARN such rows; Deny rows are never
             // restricted (a broad deny only ever fails safe).
             if matches!(rule.rule_type, RuleType::Allow)
-                && super::matching::is_overbroad_allow_pattern(&rule.pattern)
+                && super::matching::is_overbroad_allow_pattern(&migrated)
             {
                 warn!(
                     pattern = %rule.pattern,
@@ -313,7 +324,7 @@ impl PolicyEngine {
                 );
                 continue;
             }
-            let pattern = convert_learned_pattern(&rule.pattern);
+            let pattern = convert_learned_pattern(&migrated);
             let policy_rule = match rule.rule_type {
                 RuleType::Allow => PolicyRule::whitelist(pattern),
                 RuleType::Deny => PolicyRule::blacklist(pattern),
@@ -328,6 +339,100 @@ impl PolicyEngine {
 
         debug!("Loaded {} learned rules from database", rules_count);
         Ok(())
+    }
+}
+
+/// Rewrite a stored learned-rule pattern to use the canonical `FileEdit(`
+/// tool-name class (P7). The four historical Claude file-mutator prefixes
+/// (`Edit(`, `Write(`, `MultiEdit(`, `NotebookEdit(`) all collapse to
+/// `FileEdit(` so that learned rules and L0 matching share one tool-name space
+/// across hosts (Codex `apply_patch`, Cursor `edit_file` also canonicalize to
+/// `FileEdit`).
+///
+/// This is an IN-MEMORY load-time transform only - callers never persist the
+/// result back to storage, keeping older CLX builds able to read their own
+/// rows (downgrade-safe). Patterns that do not start with one of the four
+/// prefixes (including any pattern already written as `FileEdit(`, and all
+/// `Bash(` / MCP patterns) are returned unchanged.
+///
+/// The match is anchored at the start so only the tool-name segment is
+/// rewritten; the argument portion after the `(` is preserved verbatim.
+#[must_use]
+fn migrate_learned_pattern_to_canonical(pattern: &str) -> String {
+    const LEGACY_FILE_EDIT_PREFIXES: &[&str] = &["Edit(", "Write(", "MultiEdit(", "NotebookEdit("];
+    for prefix in LEGACY_FILE_EDIT_PREFIXES {
+        if let Some(rest) = pattern.strip_prefix(prefix) {
+            return format!("FileEdit({rest}");
+        }
+    }
+    pattern.to_string()
+}
+
+#[cfg(test)]
+mod migrate_learned_pattern_tests {
+    use super::migrate_learned_pattern_to_canonical;
+
+    #[test]
+    fn migrates_all_four_legacy_prefixes() {
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Edit(*)"),
+            "FileEdit(*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Write(*)"),
+            "FileEdit(*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("MultiEdit(*)"),
+            "FileEdit(*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("NotebookEdit(*)"),
+            "FileEdit(*)"
+        );
+    }
+
+    #[test]
+    fn preserves_argument_portion_verbatim() {
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Edit(src/foo.rs)"),
+            "FileEdit(src/foo.rs)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Write(./out (1).txt)"),
+            "FileEdit(./out (1).txt)"
+        );
+    }
+
+    #[test]
+    fn already_canonical_is_unchanged() {
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("FileEdit(*)"),
+            "FileEdit(*)"
+        );
+    }
+
+    #[test]
+    fn non_file_edit_patterns_pass_through() {
+        // Bash and MCP patterns are not file-edit and must be untouched.
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Bash(git:*)"),
+            "Bash(git:*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("mcp__server__tool(*)"),
+            "mcp__server__tool(*)"
+        );
+    }
+
+    #[test]
+    fn only_matches_anchored_prefix() {
+        // A pattern that merely contains "Edit(" mid-string is NOT rewritten;
+        // only the leading tool-name segment is canonicalized.
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Bash(Edit(foo))"),
+            "Bash(Edit(foo))"
+        );
     }
 }
 

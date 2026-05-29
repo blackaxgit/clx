@@ -116,13 +116,20 @@ impl Host for ClaudeHost {
     }
 
     fn is_mutator_tool(&self, tool: &str) -> bool {
-        // Verbatim Claude mutator set (aggregator::MUTATOR_TOOLS).
+        // Verbatim Claude mutator set (aggregator::CLAUDE_MUTATOR_TOOLS).
         matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
     }
 
     fn canonical_tool_name(&self, tool: &str) -> String {
-        // Claude tool names are already canonical.
-        tool.to_string()
+        // P7: collapse the four Claude file-mutators into the shared canonical
+        // class `FileEdit` so learned rules and L0 matching do not bifurcate
+        // across hosts. Bash keeps its name (the canonical Bash class).
+        // Everything else passes through unchanged.
+        match tool {
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => "FileEdit".to_string(),
+            "Bash" => "Bash".to_string(),
+            other => other.to_string(),
+        }
     }
 }
 
@@ -211,7 +218,14 @@ mod tests {
         assert!(host.is_mutator_tool("Edit"));
         assert!(host.is_mutator_tool("NotebookEdit"));
         assert!(!host.is_mutator_tool("Bash"));
-        assert_eq!(host.canonical_tool_name("Edit"), "Edit");
+        // P7: the four file-mutators collapse to the canonical `FileEdit`.
+        assert_eq!(host.canonical_tool_name("Edit"), "FileEdit");
+        assert_eq!(host.canonical_tool_name("Write"), "FileEdit");
+        assert_eq!(host.canonical_tool_name("MultiEdit"), "FileEdit");
+        assert_eq!(host.canonical_tool_name("NotebookEdit"), "FileEdit");
+        assert_eq!(host.canonical_tool_name("Bash"), "Bash");
+        // Unknown / read-only tools pass through unchanged.
+        assert_eq!(host.canonical_tool_name("Read"), "Read");
     }
 
     #[test]

@@ -244,10 +244,13 @@ impl Host for CursorHost {
     }
 
     fn canonical_tool_name(&self, tool: &str) -> String {
-        // Cursor shell tool maps to the canonical Bash class; edit_file maps
-        // to the canonical file-edit class. Full map is finalized in P7.
+        // P7: Cursor shell tool maps to the canonical Bash class; `edit_file`
+        // maps to the canonical file-edit class (matching ClaudeHost's
+        // `FileEdit`). A literal `Bash` is honoured too so a forward-compat or
+        // override envelope already carrying the canonical name is stable.
+        // Everything else passes through unchanged.
         match tool {
-            "run_terminal_cmd" => "Bash".to_string(),
+            "run_terminal_cmd" | "Bash" => "Bash".to_string(),
             "edit_file" => "FileEdit".to_string(),
             other => other.to_string(),
         }
@@ -295,7 +298,10 @@ mod tests {
         assert!(host.is_mutator_tool("edit_file"));
         assert!(!host.is_mutator_tool("Bash"));
         assert_eq!(host.canonical_tool_name("run_terminal_cmd"), "Bash");
+        assert_eq!(host.canonical_tool_name("Bash"), "Bash");
         assert_eq!(host.canonical_tool_name("edit_file"), "FileEdit");
+        // Unknown tools pass through unchanged.
+        assert_eq!(host.canonical_tool_name("read_file"), "read_file");
     }
 
     #[test]

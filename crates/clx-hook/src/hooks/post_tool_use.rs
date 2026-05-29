@@ -14,7 +14,7 @@ use crate::learning::track_user_decision;
 use crate::types::HostNeutralInput;
 
 /// Handle `PostToolUse` hook - log events and track user decisions
-pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
+pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
     let tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
     let tool_use_id = input.tool_use_id.as_deref().unwrap_or("");
 
@@ -59,7 +59,7 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, _host: &dyn Ho
     // is failure-tolerant: any DB or derivation error is logged at warn and
     // does not affect the rest of the hook.
     let tool_input_value = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
-    if aggregator::should_aggregate(tool_name, &tool_input_value) {
+    if aggregator::should_aggregate(tool_name, &tool_input_value, host) {
         let outcome = if input.tool_response.is_some() {
             ToolOutcome::Success
         } else {
