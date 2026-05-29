@@ -1,6 +1,7 @@
 //! CLX MCP Server Binary
 //!
-//! This binary provides MCP (Model Context Protocol) tools for Claude Code integration.
+//! This binary provides MCP (Model Context Protocol) tools to CLX's supported
+//! coding-agent hosts (Claude Code, Codex CLI, Cursor).
 //! It communicates via JSON-RPC over stdio.
 //!
 //! Tools provided:

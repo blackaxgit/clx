@@ -304,15 +304,15 @@ clx/
 ├── crates/
 │   ├── clx-core/       # Core library
 │   │   └── src/
-│   │       ├── config.rs      # Configuration management
+│   │       ├── config/        # Configuration management
 │   │       ├── storage/       # SQLite storage (sessions, snapshots, rules)
 │   │       ├── policy/        # Command validation (L0 rules + L1 LLM)
-│   │       ├── recall.rs      # Hybrid search engine (semantic + FTS5)
-│   │       ├── ollama.rs      # Ollama client
+│   │       ├── recall/        # Hybrid search engine (semantic + FTS5)
+│   │       ├── llm.rs         # LLM client (Ollama + Azure OpenAI)
 │   │       └── embeddings.rs  # Vector search
-│   ├── clx-hook/       # Hook handler binary
+│   ├── clx-hook/       # Hook handler binary (host abstraction in host/)
 │   ├── clx-mcp/        # MCP server binary
-│   └── clx/            # CLI binary + dashboard
+│   └── clx/            # CLI binary + dashboard (codex/, cursor/ installers)
 ├── scripts/            # Docker compose, service management, packaging
 ├── INSTALL.md          # Installation guide
 └── CONTRIBUTING.md     # Contribution guide

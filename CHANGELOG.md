@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Codex CLI integration.** `~/.codex/hooks.json` per-event hook entries,
   `[mcp_servers.clx]` in `~/.codex/config.toml`, and a CLX section in
   `~/.codex/AGENTS.md` (with an `AGENTS.override.md` fallback when `AGENTS.md`
-  would exceed Codex's size cap). Codex-only `PermissionRequest` and
-  `PostCompact` handlers are registered.
+  would exceed Codex's size cap). The Codex `~/.codex/hooks.json` registers a
+  `PermissionRequest` entry, and the router additionally dispatches the
+  Codex-only `PostCompact` event when Codex emits it.
 - **Cursor integration.** `mcpServers.clx` in `~/.cursor/mcp.json`, a
   `~/.cursor/hooks.json` with `beforeShellExecution` / `beforeMCPExecution`
   gates (each `failClosed: true`), and a project-scoped
@@ -75,7 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - re-run if intended." The original ask reason is not leaked.
 - **Cursor `failClosed: true`.** CLX writes the Cursor command and MCP gates
   with `failClosed: true` so a hook error denies rather than silently allows;
-  `clx doctor` warns if the flag is absent.
+  `clx health` warns if the flag is absent.
 - **Best-effort guardrail caveats (honest scope).** Codex command validation
   is a guardrail, not a complete enforcement boundary; it applies to
   interactive Codex sessions, not `codex exec` automation. Cursor command

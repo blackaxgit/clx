@@ -47,8 +47,8 @@ CLX is a Cargo workspace with four crates. Understanding the boundaries helps yo
 
 | Crate | Role | Key contents |
 |-------|------|--------------|
-| `clx` | CLI entry point and dashboard | `commands/` (incl. `codex/`, `cursor/` host installers), `dashboard/` |
-| `clx-core` | Core library shared by all crates | `config`, `policy/`, `storage/`, `ollama`, `embeddings`, `credentials`, `paths`, `types`, `error` |
+| `clx` | CLI entry point and dashboard | `commands/`, `codex/` and `cursor/` host installers, `dashboard/` |
+| `clx-core` | Core library shared by all crates | `config/`, `policy/`, `storage/`, `llm`, `embeddings`, `credentials`, `paths`, `types`, `error` |
 | `clx-hook` | Hook handler binary (PreToolUse / PostToolUse / PreCompact / SessionStart / SessionEnd / SubagentStart / UserPromptSubmit / Stop, plus Codex PermissionRequest / PostCompact) | `host/`, `hooks/`, `audit`, `learning`, `transcript`, `context`, `embedding` |
 | `clx-mcp` | MCP server exposing CLX tools to the host agent (Claude Code, Codex CLI, Cursor) | `server`, `protocol/`, `tools/` (7 tools), `validation` |
 
