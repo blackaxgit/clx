@@ -207,6 +207,35 @@ fn fileedit_resolves_into_protected_dir(
                 ));
             }
         }
+        // (a2) hardlink identity: a hardlink to a protected file shares its
+        // (device, inode) but carries no `.codex` path component and is not a
+        // symlink, so (a)/(b) miss it. Compare the resolved target's inode
+        // against the known host trust/config files when they exist. (TOCTOU
+        // between this check and the host's actual write remains an inherent
+        // limit of any pre-execution gate; see the best-effort caveat.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(t) = std::fs::metadata(&resolved) {
+                let protected_files = [
+                    home.join(".codex").join("config.toml"),
+                    home.join(".claude").join("settings.json"),
+                    home.join(".cursor").join("mcp.json"),
+                    home.join(".cursor").join("hooks.json"),
+                ];
+                for pf in &protected_files {
+                    if let Ok(m) = std::fs::metadata(pf)
+                        && m.dev() == t.dev()
+                        && m.ino() == t.ino()
+                    {
+                        return Some(format!(
+                            "File edit targets a hardlink to protected file: {}",
+                            pf.display()
+                        ));
+                    }
+                }
+            }
+        }
         // (b) component-name match (case-insensitive, any location): catches
         // case variants on case-insensitive filesystems (~/.CODEX), the
         // not-yet-existing-dir fallback where canonicalize returns the literal
@@ -1199,6 +1228,29 @@ mod tests {
             fileedit_resolves_into_protected_dir(Some(&ti), cwd.to_str().unwrap(), home.path())
                 .is_some(),
             "repo-local .codex edit must be flagged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fileedit_hardlink_to_protected_file_denies() {
+        // Hardlink in an innocuous location pointing at ~/.codex/config.toml:
+        // no .codex path component, not a symlink, but same inode -> must deny.
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let real = codex.join("config.toml");
+        std::fs::write(&real, "trust_level = \"untrusted\"\n").unwrap();
+        let work = home.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let link = work.join("innocuous.toml");
+        if std::fs::hard_link(&real, &link).is_err() {
+            return; // some filesystems disallow hardlinks; skip
+        }
+        let ti = serde_json::json!({ "path": link.to_str().unwrap() });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "hardlink to ~/.codex/config.toml must be flagged by inode identity"
         );
     }
 
