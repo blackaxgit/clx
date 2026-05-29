@@ -6,11 +6,12 @@ use clx_core::types::{Snapshot, SnapshotTrigger};
 use tracing::{debug, error, info, warn};
 
 use crate::embedding::generate_and_store_embedding;
+use crate::host::Host;
 use crate::transcript::process_transcript;
-use crate::types::{HookInput, TranscriptResult};
+use crate::types::{HostNeutralInput, TranscriptResult};
 
 /// Handle `PreCompact` hook - create snapshot before context compression
-pub(crate) async fn handle_pre_compact(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_pre_compact(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
     let trigger = input.trigger.as_deref().unwrap_or("auto");
 
     info!(

@@ -182,6 +182,24 @@ impl PolicyEngine {
                 "Python one-liner with os module",
             ),
             ("Bash(perl*-e*system*)", "Perl one-liner with system call"),
+            // v0.10.0 R1-F2: protect CLX + host config/trust dirs from agent
+            // file-edits (Codex apply_patch / Cursor edit_file canonicalize to
+            // FileEdit). Without these, an agent file-write to
+            // ~/.codex/config.toml could self-declare trust_level=trusted, or
+            // tamper with ~/.claude/settings.json / ~/.cursor hooks / ~/.clx.
+            (
+                "FileEdit(*/.codex/*)",
+                "File edit targeting Codex config/trust dir",
+            ),
+            (
+                "FileEdit(*/.claude/*)",
+                "File edit targeting Claude config dir",
+            ),
+            (
+                "FileEdit(*/.cursor/*)",
+                "File edit targeting Cursor config dir",
+            ),
+            ("FileEdit(*/.clx/*)", "File edit targeting CLX config dir"),
         ];
 
         for (pattern, description) in blacklist_patterns {
@@ -253,6 +271,40 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Return a copy of this engine with project-local config loading disabled.
+    ///
+    /// This is the P6 safety gate for untrusted / not-seen Codex projects.
+    /// When a Codex project has `ProjectTrust::Untrusted` or
+    /// `ProjectTrust::NotSeen`, P4 calls this method before loading any
+    /// project-local rules so that a hostile `.clx/config.yaml` or
+    /// project-scoped learned rules cannot influence policy evaluation for
+    /// that session.
+    ///
+    /// ## What this changes
+    ///
+    /// Clears `project_path` on the returned engine so that
+    /// `load_learned_rules` (which filters by project path) will fetch only
+    /// global rules, and so that `matches_rule` will not apply
+    /// project-specific rule filters.
+    ///
+    /// ## What this does NOT change
+    ///
+    /// - Built-in blacklist / whitelist rules are preserved.
+    /// - File-loaded rules already present in `self` are preserved (the
+    ///   caller controls whether to call `load_rules_from_file` on the result).
+    /// - Rate-limiter state is preserved.
+    ///
+    /// ## Calling convention
+    ///
+    /// This is a pure, builder-style method: it consumes `self` and returns a
+    /// new `PolicyEngine`.  Existing behaviour is unchanged when this method
+    /// is not called.
+    #[must_use]
+    pub fn without_project_config(mut self) -> Self {
+        self.project_path = None;
+        self
+    }
+
     /// Load learned rules from the database
     pub fn load_learned_rules(&mut self, storage: &Storage) -> crate::Result<()> {
         let learned_rules = if let Some(ref project_path) = self.project_path {
@@ -264,13 +316,24 @@ impl PolicyEngine {
         let rules_count = learned_rules.len();
 
         for rule in learned_rules {
+            // P7: canonical tool-name migration at the LOAD boundary only.
+            // Stored rules written by older (Claude-only) CLX use the four
+            // per-tool prefixes `Edit(`/`Write(`/`MultiEdit(`/`NotebookEdit(`.
+            // v0.10.0 collapses all four into the canonical `FileEdit(` class
+            // so multi-host matching does not bifurcate. The pattern is
+            // rewritten IN MEMORY only - the row on disk is left untouched so
+            // an older CLX build still reads its own patterns
+            // (downgrade-safe). Existing Claude `Edit(*)` rules therefore
+            // still fire after the in-memory migration to `FileEdit(*)`.
+            let migrated = migrate_learned_pattern_to_canonical(&rule.pattern);
+
             // B1-4: defense-in-depth at the load boundary. An overbroad
             // allow pattern (`*`, `Bash(*)`, ...) loaded into the L0
             // whitelist would make every L0-unknown command hard-Allow and
             // skip L1 entirely. Skip + WARN such rows; Deny rows are never
             // restricted (a broad deny only ever fails safe).
             if matches!(rule.rule_type, RuleType::Allow)
-                && super::matching::is_overbroad_allow_pattern(&rule.pattern)
+                && super::matching::is_overbroad_allow_pattern(&migrated)
             {
                 warn!(
                     pattern = %rule.pattern,
@@ -279,7 +342,7 @@ impl PolicyEngine {
                 );
                 continue;
             }
-            let pattern = convert_learned_pattern(&rule.pattern);
+            let pattern = convert_learned_pattern(&migrated);
             let policy_rule = match rule.rule_type {
                 RuleType::Allow => PolicyRule::whitelist(pattern),
                 RuleType::Deny => PolicyRule::blacklist(pattern),
@@ -294,5 +357,227 @@ impl PolicyEngine {
 
         debug!("Loaded {} learned rules from database", rules_count);
         Ok(())
+    }
+}
+
+/// Rewrite a stored learned-rule pattern to use the canonical `FileEdit(`
+/// tool-name class (P7). The four historical Claude file-mutator prefixes
+/// (`Edit(`, `Write(`, `MultiEdit(`, `NotebookEdit(`) all collapse to
+/// `FileEdit(` so that learned rules and L0 matching share one tool-name space
+/// across hosts (Codex `apply_patch`, Cursor `edit_file` also canonicalize to
+/// `FileEdit`).
+///
+/// This is an IN-MEMORY load-time transform only - callers never persist the
+/// result back to storage, keeping older CLX builds able to read their own
+/// rows (downgrade-safe). Patterns that do not start with one of the four
+/// prefixes (including any pattern already written as `FileEdit(`, and all
+/// `Bash(` / MCP patterns) are returned unchanged.
+///
+/// The match is anchored at the start so only the tool-name segment is
+/// rewritten; the argument portion after the `(` is preserved verbatim.
+#[must_use]
+fn migrate_learned_pattern_to_canonical(pattern: &str) -> String {
+    const LEGACY_FILE_EDIT_PREFIXES: &[&str] = &["Edit(", "Write(", "MultiEdit(", "NotebookEdit("];
+    for prefix in LEGACY_FILE_EDIT_PREFIXES {
+        if let Some(rest) = pattern.strip_prefix(prefix) {
+            return format!("FileEdit({rest}");
+        }
+    }
+    pattern.to_string()
+}
+
+#[cfg(test)]
+mod migrate_learned_pattern_tests {
+    use super::migrate_learned_pattern_to_canonical;
+
+    #[test]
+    fn migrates_all_four_legacy_prefixes() {
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Edit(*)"),
+            "FileEdit(*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Write(*)"),
+            "FileEdit(*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("MultiEdit(*)"),
+            "FileEdit(*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("NotebookEdit(*)"),
+            "FileEdit(*)"
+        );
+    }
+
+    #[test]
+    fn preserves_argument_portion_verbatim() {
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Edit(src/foo.rs)"),
+            "FileEdit(src/foo.rs)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Write(./out (1).txt)"),
+            "FileEdit(./out (1).txt)"
+        );
+    }
+
+    #[test]
+    fn already_canonical_is_unchanged() {
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("FileEdit(*)"),
+            "FileEdit(*)"
+        );
+    }
+
+    #[test]
+    fn non_file_edit_patterns_pass_through() {
+        // Bash and MCP patterns are not file-edit and must be untouched.
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Bash(git:*)"),
+            "Bash(git:*)"
+        );
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("mcp__server__tool(*)"),
+            "mcp__server__tool(*)"
+        );
+    }
+
+    #[test]
+    fn only_matches_anchored_prefix() {
+        // A pattern that merely contains "Edit(" mid-string is NOT rewritten;
+        // only the leading tool-name segment is canonicalized.
+        assert_eq!(
+            migrate_learned_pattern_to_canonical("Bash(Edit(foo))"),
+            "Bash(Edit(foo))"
+        );
+    }
+}
+
+#[cfg(test)]
+mod without_project_config_tests {
+    use super::*;
+    use crate::policy::types::PolicyDecision;
+
+    // T1: without_project_config clears project_path
+    #[test]
+    fn clears_project_path() {
+        let engine = PolicyEngine::new()
+            .with_project_path("/home/user/myrepo")
+            .without_project_config();
+
+        // After calling without_project_config the project path is None,
+        // so project-specific rule filtering is disabled.
+        assert!(
+            engine.project_path.is_none(),
+            "project_path must be None after without_project_config"
+        );
+    }
+
+    // T2: without_project_config preserves built-in rules
+    #[test]
+    fn preserves_builtin_rules() {
+        let baseline = PolicyEngine::new();
+        let wl_count = baseline.whitelist_rules().len();
+        let bl_count = baseline.blacklist_rules().len();
+
+        let engine = PolicyEngine::new()
+            .with_project_path("/some/repo")
+            .without_project_config();
+
+        assert_eq!(
+            engine.whitelist_rules().len(),
+            wl_count,
+            "whitelist rule count must be unchanged"
+        );
+        assert_eq!(
+            engine.blacklist_rules().len(),
+            bl_count,
+            "blacklist rule count must be unchanged"
+        );
+    }
+
+    // T3: without_project_config is idempotent (calling twice has the same
+    // result as calling once)
+    #[test]
+    fn is_idempotent() {
+        let once = PolicyEngine::new()
+            .with_project_path("/some/repo")
+            .without_project_config();
+
+        let twice = PolicyEngine::new()
+            .with_project_path("/some/repo")
+            .without_project_config()
+            .without_project_config();
+
+        assert!(once.project_path.is_none());
+        assert!(twice.project_path.is_none());
+        assert_eq!(once.whitelist_rules().len(), twice.whitelist_rules().len());
+    }
+
+    // T4: without_project_config on an engine with no project_path is a no-op
+    #[test]
+    fn no_op_when_already_none() {
+        let baseline = PolicyEngine::new();
+        let bl_count = baseline.blacklist_rules().len();
+
+        let engine = PolicyEngine::new().without_project_config();
+
+        assert!(engine.project_path.is_none());
+        assert_eq!(engine.blacklist_rules().len(), bl_count);
+    }
+
+    // T5: evaluate still works correctly after without_project_config;
+    // Claude is not affected (deny for a known-dangerous pattern still fires)
+    #[test]
+    fn deny_still_fires_after_without_project_config() {
+        let engine = PolicyEngine::new()
+            .with_project_path("/any/repo")
+            .without_project_config();
+
+        let decision = engine.evaluate("Bash", "rm -rf /");
+        assert!(
+            matches!(decision, PolicyDecision::Deny { .. }),
+            "built-in deny rule must still fire; got {decision:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod v010_fileedit_protection_tests {
+    use super::*;
+    use crate::policy::PolicyDecision;
+
+    // R1-F2 regression: a FileEdit targeting a host config/trust dir must DENY.
+    #[test]
+    fn fileedit_into_codex_config_is_denied() {
+        let engine = PolicyEngine::new();
+        for path in [
+            "*** Update File: /home/victim/.codex/config.toml",
+            "/Users/x/.claude/settings.json",
+            "edit /home/u/.cursor/hooks.json",
+            "/home/u/.clx/config.yaml",
+        ] {
+            assert!(
+                matches!(
+                    engine.evaluate("FileEdit", path),
+                    PolicyDecision::Deny { .. }
+                ),
+                "FileEdit into protected dir must deny: {path}"
+            );
+        }
+    }
+
+    // Non-regression: an ordinary file edit is NOT denied by these rules.
+    #[test]
+    fn fileedit_ordinary_path_not_denied_by_protection_rules() {
+        let engine = PolicyEngine::new();
+        assert!(
+            !matches!(
+                engine.evaluate("FileEdit", "/home/u/project/src/main.rs"),
+                PolicyDecision::Deny { .. }
+            ),
+            "ordinary file edit must not be denied by the host-config protection rules"
+        );
     }
 }

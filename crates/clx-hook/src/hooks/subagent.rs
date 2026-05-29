@@ -5,8 +5,9 @@ use std::sync::Once;
 use anyhow::Result;
 use tracing::{debug, warn};
 
+use crate::host::Host;
 use crate::output::output_generic;
-use crate::types::HookInput;
+use crate::types::HostNeutralInput;
 
 /// Guards the per-process spawn of `clx model fetch --background` so we
 /// only kick off a single download attempt regardless of how many user
@@ -14,7 +15,7 @@ use crate::types::HookInput;
 static MODEL_PREFETCH_ONCE: Once = Once::new();
 
 /// Handle `SubagentStart` hook - inject specialist rules into subagent context
-pub(crate) async fn handle_subagent_start(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_subagent_start(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
     debug!(
         "SubagentStart: session_id={}, cwd={}",
         input.session_id, input.cwd
@@ -30,7 +31,10 @@ pub(crate) async fn handle_subagent_start(input: HookInput) -> Result<()> {
 const ORCHESTRATOR_CONTEXT: &str = "You are the Orchestrator. Delegate via Task tool. Check agent descriptions. Maximize parallelization.";
 
 /// Handle `UserPromptSubmit` hook - inject orchestrator reminder and auto-recall context.
-pub(crate) async fn handle_user_prompt_submit(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_user_prompt_submit(
+    input: HostNeutralInput,
+    _host: &dyn Host,
+) -> Result<()> {
     debug!(
         "UserPromptSubmit: session_id={}, cwd={}",
         input.session_id, input.cwd
@@ -110,7 +114,7 @@ fn spawn_background_fetch() -> std::io::Result<()> {
 /// Returns `None` if recall is disabled, prompt is missing, or prompt is too short.
 /// Otherwise returns the prompt string slice ready for querying.
 fn check_recall_preconditions<'a>(
-    input: &'a HookInput,
+    input: &'a HostNeutralInput,
     config: &clx_core::config::AutoRecallConfig,
 ) -> Option<&'a str> {
     if !config.enabled {
@@ -135,7 +139,7 @@ fn check_recall_preconditions<'a>(
 ///
 /// Returns `None` on any error or if recall is not applicable. The hook must
 /// always produce output regardless of recall availability.
-async fn build_recall_context(input: &HookInput) -> Option<String> {
+async fn build_recall_context(input: &HostNeutralInput) -> Option<String> {
     let config = clx_core::config::Config::load().ok()?;
 
     let prompt = check_recall_preconditions(input, &config.auto_recall)?;
@@ -296,8 +300,8 @@ mod tests {
     use clx_core::config::AutoRecallConfig;
     use clx_core::types::SessionId;
 
-    fn make_input(prompt: Option<&str>) -> HookInput {
-        HookInput {
+    fn make_input(prompt: Option<&str>) -> HostNeutralInput {
+        HostNeutralInput {
             session_id: SessionId::new("test-session"),
             transcript_path: None,
             cwd: "/tmp".to_string(),
@@ -309,6 +313,9 @@ mod tests {
             source: None,
             trigger: None,
             prompt: prompt.map(String::from),
+            direct_command: None,
+            host: crate::host::HostId::Claude,
+            extras: std::collections::HashMap::new(),
         }
     }
 

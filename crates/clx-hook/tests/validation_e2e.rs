@@ -222,21 +222,20 @@ fn l1_disabled_unknown_command_asks_and_not_cached() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].layer, "L0");
     assert_eq!(rows[0].decision.as_str(), "prompted");
-    // v0.9.0: audit reasoning string normalized "L1 disabled" -> "L1-DISABLED"
-    // with a parallel-change one-version dual-emit window — the row carries
-    // both the canonical "L1-DISABLED" and the legacy "L1 disabled" alias as
-    // substrings so v0.8.x log parsers keep working through v0.9.0. v0.10.0
-    // plan: drop the legacy alias. See `specs/2026-05-20-v090-red-findings.md`
-    // (T9.5 / L1-rename deprecation hygiene).
+    // v0.10.0: the audit reasoning carries only the canonical "L1-DISABLED"
+    // literal. The v0.9.0 one-version dual-emit window for the legacy
+    // "L1 disabled" alias is closed, so the alias must NOT appear.
+    // See `specs/2026-05-20-v090-red-findings.md` (T9.5 / L1-rename
+    // deprecation hygiene).
     let reasoning = rows[0].reasoning.as_deref().unwrap_or("");
     assert!(
         reasoning.contains("L1-DISABLED"),
         "L1-disabled reasoning must contain canonical 'L1-DISABLED'; got {reasoning:?}"
     );
     assert!(
-        reasoning.contains("L1 disabled"),
-        "L1-disabled reasoning must contain legacy 'L1 disabled' alias \
-         (v0.9.0 dual-emit window); got {reasoning:?}"
+        !reasoning.contains("L1 disabled"),
+        "L1-disabled reasoning must NOT contain legacy 'L1 disabled' alias \
+         (v0.10.0 dropped the dual-emit window); got {reasoning:?}"
     );
 
     // The L1-disabled branch must NOT write a decision-cache row.

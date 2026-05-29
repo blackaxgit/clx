@@ -20,7 +20,9 @@
 //! - uninstall: Remove CLX integration
 //! - version: Show version info
 
+mod codex;
 mod commands;
+mod cursor;
 mod dashboard;
 mod types;
 
@@ -36,10 +38,10 @@ use commands::{
     ModelAction, RulesAction, TrustAction,
 };
 
-/// CLX - Claude Code Extension
+/// CLX - Coding-Agent Extension Layer
 #[derive(Parser)]
 #[command(name = "clx")]
-#[command(author, version, about = "CLX - Claude Code Extension CLI")]
+#[command(author, version, about = "CLX - Coding-Agent Extension Layer CLI")]
 #[command(
     long_about = "Command-line interface for managing CLX configuration, rules, and context."
 )]
@@ -76,14 +78,23 @@ enum Commands {
         action: RulesAction,
     },
 
-    /// Install CLX integration into Claude Code
-    Install,
+    /// Install CLX integration into a host (Claude Code, Codex, Cursor)
+    Install {
+        /// Which host(s) to install into. `auto` (default) installs into every
+        /// detected host; `all` installs into all three unconditionally.
+        #[arg(long, value_enum, default_value_t = commands::InstallTarget::Auto)]
+        target: commands::InstallTarget,
+    },
 
-    /// Remove CLX integration from Claude Code
+    /// Remove CLX integration from a host (Claude Code, Codex, Cursor)
     Uninstall {
         /// Also remove ~/.clx/ directory and all data
         #[arg(long)]
         purge: bool,
+
+        /// Which host(s) to uninstall from. `auto`/`all` clean every host.
+        #[arg(long, value_enum, default_value_t = commands::InstallTarget::Auto)]
+        target: commands::InstallTarget,
     },
 
     /// Show version information
@@ -203,8 +214,10 @@ async fn run_command(cli: &Cli) -> Result<()> {
         Some(Commands::Recall { query }) => commands::cmd_recall(cli, query).await,
         Some(Commands::Config { action }) => commands::cmd_config(cli, action.as_ref()).await,
         Some(Commands::Rules { action }) => commands::cmd_rules(cli, action).await,
-        Some(Commands::Install) => commands::cmd_install(cli).await,
-        Some(Commands::Uninstall { purge }) => commands::cmd_uninstall(cli, *purge).await,
+        Some(Commands::Install { target }) => commands::cmd_install(cli, *target).await,
+        Some(Commands::Uninstall { purge, target }) => {
+            commands::cmd_uninstall(cli, *purge, *target).await
+        }
         Some(Commands::Version) => commands::cmd_version(cli),
         Some(Commands::Credentials { action }) => commands::cmd_credentials(cli, action),
         Some(Commands::KeychainTrust) => commands::cmd_keychain_trust(cli),

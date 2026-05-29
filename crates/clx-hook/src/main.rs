@@ -1,13 +1,17 @@
 //! CLX Hook Binary
 //!
 //! Thin entry point. Reads JSON from stdin, dispatches to the right handler,
-//! and prints the response on stdout. All real work lives in the `clx_hook`
-//! library (see `src/lib.rs` + `src/router.rs`). This binary owns only
-//! process-level concerns: argument parsing, tracing setup, sqlite-vec
-//! init, and constructing `HookDeps` for the router.
+//! and prints the response on stdout. Invoked automatically by the host
+//! coding agent (Claude Code, Codex CLI, or Cursor) via that host's hook
+//! protocol; the router detects the host from the envelope. All real work
+//! lives in the `clx_hook` library (see `src/lib.rs` + `src/router.rs`). This
+//! binary owns only process-level concerns: argument parsing, tracing setup,
+//! sqlite-vec init, and constructing `HookDeps` for the router.
 //!
-//! Hook handlers (in the library): `PreToolUse`, `PostToolUse`, `PreCompact`,
-//! `SessionStart`, `SessionEnd`, `SubagentStart`, `UserPromptSubmit`, Stop.
+//! Hook handlers (in the library): the eight Claude events `PreToolUse`,
+//! `PostToolUse`, `PreCompact`, `SessionStart`, `SessionEnd`, `SubagentStart`,
+//! `UserPromptSubmit`, `Stop`, plus the Codex-only `PermissionRequest` and
+//! `PostCompact`.
 
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
@@ -18,13 +22,16 @@ use clx_hook::{
 use tracing::warn;
 
 fn print_usage() {
-    eprintln!("clx-hook - Claude Code hook handler for CLX");
+    eprintln!("clx-hook - CLX hook handler for Claude Code, Codex CLI, and Cursor");
     eprintln!();
-    eprintln!("This binary is invoked automatically by Claude Code via hooks.");
-    eprintln!("It reads JSON input from stdin and is not intended for manual use.");
+    eprintln!("This binary is invoked automatically by the host coding agent via");
+    eprintln!("that host's hook protocol; the router detects the host from the");
+    eprintln!("envelope. It reads JSON input from stdin and is not intended for");
+    eprintln!("manual use.");
     eprintln!();
     eprintln!("Supported hook events: PreToolUse, PostToolUse, PreCompact,");
-    eprintln!("  SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop");
+    eprintln!("  SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop,");
+    eprintln!("  plus the Codex-only PermissionRequest and PostCompact");
     eprintln!();
     eprintln!("Configuration: ~/.clx/config.yaml");
     eprintln!("Documentation: https://github.com/blackaxgit/clx");

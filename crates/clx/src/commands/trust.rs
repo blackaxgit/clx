@@ -125,6 +125,27 @@ pub async fn cmd_trust(cli: &Cli, action: TrustAction) -> Result<()> {
     }
 }
 
+/// Resolve the env var carrying the current host session id (gap-scan gap #1,
+/// risk R9).
+///
+/// Mirrors `clx_hook::host::Host::session_id_env_var()` without a cross-crate
+/// dependency: the host is selected by the same `CLX_HOOK_HOST` override the
+/// hook binary uses, defaulting to Claude.
+///
+/// - Claude  -> `CLAUDE_CODE_SESSION_ID` (historical behaviour, default).
+/// - Codex   -> `None` (P0 finding F6: session id comes from the hook
+///   envelope, not an env var, so `clx trust --session` cannot bind to it
+///   from the CLI).
+/// - Cursor  -> `None` (no CLI session-id env var).
+fn host_session_id_env_var() -> Option<&'static str> {
+    let host = std::env::var("CLX_HOOK_HOST").unwrap_or_default();
+    match host.trim().to_ascii_lowercase().as_str() {
+        "codex" | "cursor" => None,
+        // "claude", empty, or any unknown value -> Claude default.
+        _ => Some("CLAUDE_CODE_SESSION_ID"),
+    }
+}
+
 fn handle_on(cli: &Cli, duration_str: Option<&String>, session: bool) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let max_secs = config.validator.trust_mode_max_duration;
@@ -153,7 +174,7 @@ fn handle_on(cli: &Cli, duration_str: Option<&String>, session: bool) -> Result<
     let expires = now + Duration::seconds(i64::try_from(duration_secs).unwrap_or(i64::MAX));
 
     let session_id = if session {
-        std::env::var("CLAUDE_CODE_SESSION_ID").ok()
+        host_session_id_env_var().and_then(|var| std::env::var(var).ok())
     } else {
         None
     };

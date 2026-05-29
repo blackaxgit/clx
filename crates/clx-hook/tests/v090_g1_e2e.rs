@@ -407,27 +407,27 @@ async fn g1_d_llm_gen_failed_default_allow_forces_ask() {
 }
 
 // =========================================================================
-// (e) T9.5 — L1-DISABLED dual-emit substring contract
+// (e) T9.5 — L1-DISABLED canonical-only reasoning contract
 // =========================================================================
 //
-// Single audit row, single reasoning string, contains BOTH the canonical
-// "L1-DISABLED" and the legacy "L1 disabled" alias as substrings (parallel-
-// change dual-emit window for v0.9.0; v0.10.0 plan: drop the alias).
+// Single audit row, single reasoning string, carries only the canonical
+// "L1-DISABLED" literal. The v0.9.0 dual-emit window for the legacy
+// "L1 disabled" alias is closed in v0.10.0; the alias must NOT appear.
 
 #[test]
-fn g1_e_l1_disabled_dual_emit_reasoning_contains_both_substrings() {
+fn g1_e_l1_disabled_reasoning_is_canonical_only() {
     let cfg = "validator:\n  \
                enabled: true\n  \
                layer0_enabled: true\n  \
                layer1_enabled: false\n  \
                cache_enabled: false\n  \
                auto_allow_reads: false\n";
-    let envelope = pre_tool_use("g1-e-dual-emit", ASK_CMD);
+    let envelope = pre_tool_use("g1-e-canonical", ASK_CMD);
     let (out, home) = run(cfg, &envelope);
 
     assert_eq!(decision(&out), "ask", "G1-e: L1-DISABLED path must ask");
 
-    let rows = audit_rows(home.path(), "g1-e-dual-emit");
+    let rows = audit_rows(home.path(), "g1-e-canonical");
     let cmd_rows: Vec<_> = rows.iter().filter(|r| r.command == ASK_CMD).collect();
     assert_eq!(
         cmd_rows.len(),
@@ -440,8 +440,9 @@ fn g1_e_l1_disabled_dual_emit_reasoning_contains_both_substrings() {
         "G1-e: reasoning must contain canonical 'L1-DISABLED'; got {reasoning:?}"
     );
     assert!(
-        reasoning.contains("L1 disabled"),
-        "G1-e: reasoning must contain legacy 'L1 disabled' alias; got {reasoning:?}"
+        !reasoning.contains("L1 disabled"),
+        "G1-e: legacy 'L1 disabled' alias must NOT appear (v0.10.0 dropped \
+         the dual-emit window); got {reasoning:?}"
     );
 }
 

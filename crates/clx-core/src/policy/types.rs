@@ -21,17 +21,52 @@ pub enum PolicyDecision {
     /// Command is allowed (bypass permission dialog)
     Allow,
 
-    /// Command is blocked with reason (sent to Claude as error)
+    /// Command is blocked with reason (returned to the host agent as an error)
     Deny { reason: String },
 
-    /// Command requires user confirmation (show Claude Code's permission dialog)
+    /// Command requires user confirmation (host shows its permission prompt;
+    /// hosts without an interactive ask channel may map this to a deny)
     Ask { reason: String },
 }
 
 impl PolicyDecision {
-    /// Convert to Claude Code's permissionDecision format
+    /// Convert to the canonical `permissionDecision` wire format.
+    ///
+    /// The canonical wire format is `allow` / `deny` / `ask` (originally the
+    /// Claude Code hook format, now shared as CLX's host-neutral baseline).
+    /// This method and its ~9 callers (with hardcoded string assertions) are
+    /// left unchanged; v0.10.0 adds the host-aware variants below additively
+    /// (gap-scan gap #3, comprehensive-plan REVIEW FIX #3).
     #[must_use]
     pub fn to_permission_decision(&self) -> &'static str {
+        match self {
+            PolicyDecision::Allow => "allow",
+            PolicyDecision::Deny { .. } => "deny",
+            PolicyDecision::Ask { .. } => "ask",
+        }
+    }
+
+    /// Convert to the Codex CLI permission-decision format.
+    ///
+    /// Codex 0.135.0 hooks support only `allow` / `deny` (P0 finding F1):
+    /// there is no interactive `ask`. CLX maps an `ask` verdict to a
+    /// fail-closed `deny` so an unconfirmed command is blocked rather than
+    /// silently allowed. `allow` and `deny` pass through unchanged.
+    #[must_use]
+    pub fn to_codex_format(&self) -> &'static str {
+        match self {
+            PolicyDecision::Allow => "allow",
+            // ask -> deny (fail closed): Codex has no interactive ask.
+            PolicyDecision::Deny { .. } | PolicyDecision::Ask { .. } => "deny",
+        }
+    }
+
+    /// Convert to Cursor's flat `permission` field format.
+    ///
+    /// Cursor supports interactive `ask` (unlike Codex), so the three-valued
+    /// verdict maps directly to `allow` / `deny` / `ask` (P0 finding F7).
+    #[must_use]
+    pub fn to_cursor_format(&self) -> &'static str {
         match self {
             PolicyDecision::Allow => "allow",
             PolicyDecision::Deny { .. } => "deny",
@@ -77,7 +112,7 @@ pub enum RuleSource {
 /// A policy rule for command validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
-    /// The pattern to match (Claude Code style)
+    /// The pattern to match (`ToolName(command:args)` style)
     pub pattern: String,
 
     /// Type of rule (whitelist or blacklist)
@@ -150,4 +185,51 @@ pub struct RulesConfig {
     /// Blacklist patterns
     #[serde(default)]
     pub blacklist: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PolicyDecision;
+
+    #[test]
+    fn claude_format_is_unchanged_three_valued() {
+        // Pins the historical Claude wire strings (additive-only obligation).
+        assert_eq!(PolicyDecision::Allow.to_permission_decision(), "allow");
+        assert_eq!(
+            PolicyDecision::Deny { reason: "x".into() }.to_permission_decision(),
+            "deny"
+        );
+        assert_eq!(
+            PolicyDecision::Ask { reason: "x".into() }.to_permission_decision(),
+            "ask"
+        );
+    }
+
+    #[test]
+    fn codex_format_maps_ask_to_fail_closed_deny() {
+        // P0 F1: Codex has no interactive ask -> ask becomes deny.
+        assert_eq!(PolicyDecision::Allow.to_codex_format(), "allow");
+        assert_eq!(
+            PolicyDecision::Deny { reason: "x".into() }.to_codex_format(),
+            "deny"
+        );
+        assert_eq!(
+            PolicyDecision::Ask { reason: "x".into() }.to_codex_format(),
+            "deny"
+        );
+    }
+
+    #[test]
+    fn cursor_format_preserves_ask() {
+        // P0 F7: Cursor supports interactive ask via the flat permission field.
+        assert_eq!(PolicyDecision::Allow.to_cursor_format(), "allow");
+        assert_eq!(
+            PolicyDecision::Deny { reason: "x".into() }.to_cursor_format(),
+            "deny"
+        );
+        assert_eq!(
+            PolicyDecision::Ask { reason: "x".into() }.to_cursor_format(),
+            "ask"
+        );
+    }
 }

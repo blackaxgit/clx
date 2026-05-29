@@ -9,11 +9,12 @@ use clx_core::types::{AuditDecision, AuditLogEntry, Event, EventType, ToolEvent,
 use tracing::{debug, warn};
 
 use crate::hooks::aggregator;
+use crate::host::Host;
 use crate::learning::track_user_decision;
-use crate::types::HookInput;
+use crate::types::HostNeutralInput;
 
 /// Handle `PostToolUse` hook - log events and track user decisions
-pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
     let tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
     let tool_use_id = input.tool_use_id.as_deref().unwrap_or("");
 
@@ -58,7 +59,7 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
     // is failure-tolerant: any DB or derivation error is logged at warn and
     // does not affect the rest of the hook.
     let tool_input_value = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
-    if aggregator::should_aggregate(tool_name, &tool_input_value) {
+    if aggregator::should_aggregate(tool_name, &tool_input_value, host) {
         let outcome = if input.tool_response.is_some() {
             ToolOutcome::Success
         } else {
@@ -132,7 +133,8 @@ pub(crate) async fn handle_post_tool_use(input: HookInput) -> Result<()> {
         );
         entry.working_dir = Some(input.cwd.clone());
 
-        if let Err(e) = storage.create_audit_log(&entry) {
+        let host_id = crate::audit::host_id_str(host.host_id());
+        if let Err(e) = storage.create_audit_log_with_host(&entry, host_id) {
             warn!("Failed to create audit log: {}", e);
         }
     }

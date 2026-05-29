@@ -624,7 +624,7 @@ fn test_load_project_rules_returns_none_when_no_claude_md() {
     // Act — project-specific path won't exist; global ~/.claude/CLAUDE.md may exist
     // We only verify no panic and handle None gracefully when project file is absent.
     // (Global path is outside our control in tests.)
-    let result = load_project_rules(cwd);
+    let result = load_project_rules(cwd, &crate::host::ClaudeHost);
 
     // Assert — result is either None (no global CLAUDE.md either) or Some with global rules only.
     // Either is acceptable; the key invariant is no panic and correct type returned.
@@ -649,7 +649,7 @@ fn test_load_project_rules_returns_content_when_claude_md_exists() {
     let cwd = dir.path().to_str().unwrap();
 
     // Act
-    let result = load_project_rules(cwd);
+    let result = load_project_rules(cwd, &crate::host::ClaudeHost);
 
     // Assert — at minimum the project section is present
     assert!(result.is_some());
@@ -804,6 +804,7 @@ fn test_log_audit_entry_does_not_panic_when_default_storage_unavailable() {
 
     // Act + Assert (no panic)
     crate::audit::log_audit_entry(
+        crate::host::HostId::Claude,
         &session_id,
         "echo hello",
         "/tmp",

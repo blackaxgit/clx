@@ -81,7 +81,7 @@ pub trait CredentialBackend: Send + Sync {
 ///   the same snapshot and silently drop each other's write. The lock is held
 ///   by an RAII guard released on every exit path including panic, and is
 ///   acquired with a bounded timeout so a stuck holder degrades the hook with
-///   a clear error instead of hanging Claude Code forever.
+///   a clear error instead of hanging the host agent forever.
 pub struct AgeFileBackend {
     dir: PathBuf,
     cred_file: PathBuf,
@@ -94,7 +94,7 @@ pub struct AgeFileBackend {
 
 /// Max time to wait for the inter-process credential lock before giving up.
 /// A hook that cannot acquire the lock returns a clear error and degrades
-/// gracefully rather than hanging Claude Code indefinitely.
+/// gracefully rather than hanging the host agent indefinitely.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll interval while waiting on a contended advisory lock.
@@ -334,8 +334,8 @@ impl AgeFileBackend {
     /// created once and never renamed, so its inode is stable.
     ///
     /// On timeout we return a clear error rather than block forever, so a
-    /// stuck holder degrades the hook gracefully instead of hanging Claude
-    /// Code. The kernel releases advisory locks on fd close AND on process
+    /// stuck holder degrades the hook gracefully instead of hanging the host
+    /// agent. The kernel releases advisory locks on fd close AND on process
     /// death, so a killed holder never permanently wedges other processes.
     fn acquire_interprocess_lock(&self) -> Result<InterProcessLockGuard> {
         self.ensure_dir()?;

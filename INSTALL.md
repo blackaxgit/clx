@@ -12,6 +12,23 @@
   brew install ollama
   ```
 
+### Host prerequisites (optional, per host)
+
+CLX always installs the Claude Code integration. To also install into Codex CLI
+or Cursor, make sure the host meets these requirements before running
+`clx install`:
+
+- **Codex CLI** — version **>= 0.23.0** is required (earlier releases are
+  affected by CVE-2025-61260). Command-validation hooks were stabilized later,
+  so **>= 0.124** is recommended for the PreToolUse guardrail. Install or update
+  with:
+  ```bash
+  npm install -g @openai/codex
+  ```
+- **Cursor** — hook support requires Cursor **>= 1.7**; the current release is
+  recommended. Cursor command gating fires in the IDE agent and cloud agents
+  only; the local `cursor-agent` CLI does not run hooks.
+
 ## Quick Install
 
 ### Option 1: Install via Claude Code
@@ -67,8 +84,33 @@ The install command sets up everything CLX needs to work with Claude Code:
    - `SubagentStart` - monitors subagent activity
    - `UserPromptSubmit` - injects context on user prompts
    - `Stop` - opt-in auto-summarize at end of turn
-5. **Registers MCP server** (`clx-mcp`) so Claude can use CLX tools
+5. **Registers MCP server** (`clx-mcp`) so the host agent can use CLX tools
 6. **Injects CLX section** into `~/.claude/CLAUDE.md` with tool documentation
+
+## Choosing which hosts to install (`--target`)
+
+By default `clx install` (and `clx uninstall`) act on every host CLX can detect
+on the machine. Claude Code is always treated as present; Codex CLI and Cursor
+are included automatically when detected. Override this with `--target`:
+
+```bash
+clx install --target claude   # Claude Code only (~/.claude)
+clx install --target codex    # Codex CLI only (~/.codex)
+clx install --target cursor    # Cursor only (~/.cursor + repo-local rule)
+clx install --target all       # all three hosts, unconditionally
+clx install --target auto      # every detected host (the default)
+```
+
+`clx uninstall` accepts the same `--target` values. What each host receives:
+
+- **Claude Code** — hooks + MCP server in `~/.claude/settings.json`, plus the
+  CLX section in `~/.claude/CLAUDE.md`.
+- **Codex CLI** — `~/.codex/hooks.json` hook entries, `[mcp_servers.clx]` in
+  `~/.codex/config.toml`, and the CLX section in `~/.codex/AGENTS.md` (falling
+  back to `AGENTS.override.md` when `AGENTS.md` would exceed Codex's size cap).
+- **Cursor** — `mcpServers.clx` in `~/.cursor/mcp.json`, `~/.cursor/hooks.json`
+  command/MCP gates with `failClosed: true`, and a project-scoped
+  `<repo>/.cursor/rules/clx.mdc` rule.
 
 ## After Installation
 
@@ -94,7 +136,15 @@ clx uninstall
 
 # Remove everything including data
 clx uninstall --purge
+
+# Uninstall from a specific host only
+clx uninstall --target codex
 ```
+
+Uninstall removes the per-host hook and MCP entries and strips the injected
+`# CLX Integration` section from each host's instructions file (`CLAUDE.md`,
+`AGENTS.md` and its `AGENTS.override.md` fallback); the Cursor
+`<repo>/.cursor/rules/clx.mdc` rule file is deleted.
 
 ## Troubleshooting
 

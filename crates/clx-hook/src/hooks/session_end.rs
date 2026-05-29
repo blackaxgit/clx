@@ -9,8 +9,9 @@ use clx_core::types::{Snapshot, SnapshotTrigger};
 use tracing::{debug, info, warn};
 
 use crate::embedding::{generate_and_store_embedding, truncate_to_char_boundary};
+use crate::host::Host;
 use crate::transcript::process_transcript;
-use crate::types::HookInput;
+use crate::types::HostNeutralInput;
 
 /// Maximum time the `SessionEnd` handler may run before being cancelled.
 /// Claude Code enforces a 1.5 s timeout on `SessionEnd` hooks; we use 1.0 s
@@ -26,7 +27,7 @@ const EMBEDDING_TIME_BUDGET: Duration = Duration::from_millis(500);
 ///
 /// Wraps the inner implementation in a tight timeout so the hook never
 /// exceeds Claude Code's 1.5 s limit.
-pub(crate) async fn handle_session_end(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_session_end(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
     if let Ok(result) =
         tokio::time::timeout(SESSION_END_TIMEOUT, handle_session_end_inner(input)).await
     {
@@ -41,7 +42,7 @@ pub(crate) async fn handle_session_end(input: HookInput) -> Result<()> {
 }
 
 /// Inner implementation that does the actual work.
-async fn handle_session_end_inner(input: HookInput) -> Result<()> {
+async fn handle_session_end_inner(input: HostNeutralInput) -> Result<()> {
     let start = Instant::now();
 
     info!("SessionEnd: Ending session {}", input.session_id);
@@ -178,7 +179,7 @@ mod tests {
             std::env::set_var("HOME", temp_home.to_str().unwrap());
         }
 
-        let input = HookInput {
+        let input = HostNeutralInput {
             session_id: "test-timeout-session".into(),
             transcript_path: Some(transcript_path.to_str().unwrap().to_string()),
             cwd: temp_home.to_str().unwrap().to_string(),
@@ -190,10 +191,13 @@ mod tests {
             source: None,
             trigger: None,
             prompt: None,
+            direct_command: None,
+            host: crate::host::HostId::Claude,
+            extras: std::collections::HashMap::new(),
         };
 
         let before = Instant::now();
-        let result = handle_session_end(input).await;
+        let result = handle_session_end(input, &crate::host::ClaudeHost).await;
         let elapsed = before.elapsed();
 
         // Restore env vars

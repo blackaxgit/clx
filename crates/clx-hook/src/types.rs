@@ -1,7 +1,11 @@
 //! Type definitions and constants for the CLX hook binary.
 
+use std::collections::HashMap;
+
 use clx_core::types::SessionId;
 use serde::{Deserialize, Serialize};
+
+use crate::host::HostId;
 
 /// Maximum input size from stdin (1MB) to prevent `DoS` via memory exhaustion.
 pub(crate) const MAX_INPUT_SIZE: u64 = 1_048_576;
@@ -19,11 +23,20 @@ Transcript:
 Respond in this JSON format:
 {"summary": "brief summary", "key_facts": ["fact1", "fact2"], "todos": ["todo1", "todo2"]}"#;
 
-/// Hook input from Claude Code (common fields for all hooks)
-/// Note: Claude Code sends `snake_case` JSON keys
+/// Host-neutral hook input (v0.10.0).
+///
+/// This is the former `HookInput` (the Claude Code envelope shape) plus three
+/// host-abstraction fields. For Claude the mapping is lossless: every legacy
+/// field is carried verbatim, and the three new fields default
+/// (`host = Claude`, `direct_command = None`, `extras = {}`). Other hosts
+/// populate `direct_command` (Cursor `beforeShellExecution.command`),
+/// `host`, and `extras` (Codex `model`/`turn_id`/`permission_mode`, etc.)
+/// during their `Host::parse_hook_input`.
+///
+/// Note: hosts send `snake_case` JSON keys for the shared fields.
 #[derive(Debug, Deserialize)]
-pub(crate) struct HookInput {
-    /// Session ID from Claude Code
+pub(crate) struct HostNeutralInput {
+    /// Session ID from the host.
     pub session_id: SessionId,
 
     /// Path to transcript JSONL file
@@ -44,7 +57,7 @@ pub(crate) struct HookInput {
     /// Tool input (for PreToolUse/PostToolUse)
     pub tool_input: Option<serde_json::Value>,
 
-    /// Tool response/output (for `PostToolUse`) - Claude Code sends "`tool_response`"
+    /// Tool response/output (for `PostToolUse`) - sent as "`tool_response`"
     pub tool_response: Option<serde_json::Value>,
 
     /// Session source (for `SessionStart`)
@@ -56,6 +69,27 @@ pub(crate) struct HookInput {
     /// User prompt text (for `UserPromptSubmit`)
     /// Used by auto-recall in the `UserPromptSubmit` hook handler.
     pub prompt: Option<String>,
+
+    /// A command surfaced at the top level of the envelope rather than under
+    /// `tool_input.command` (e.g. Cursor `beforeShellExecution.command`).
+    /// `None` for Claude. Defaulted on deserialize so the Claude envelope
+    /// parses losslessly. Populated and consumed by the P2 host parsers.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub direct_command: Option<String>,
+
+    /// Which host produced this input. Defaults to `Claude` (the historical
+    /// behaviour and the ambiguous-envelope fallback). Hosts overwrite this
+    /// in their `parse_hook_input`.
+    #[serde(default)]
+    pub host: HostId,
+
+    /// Host-specific envelope fields with no host-neutral home (Codex
+    /// `model`/`turn_id`/`permission_mode`, etc.). Empty for Claude.
+    /// Populated and consumed by the P2 host parsers.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub extras: HashMap<String, serde_json::Value>,
 }
 
 /// Hook output for `PreToolUse`

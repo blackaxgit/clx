@@ -148,11 +148,16 @@ impl McpServer {
                     }
                 }
 
-                // 2. Check global CLAUDE.md at ~/.claude/CLAUDE.md
-                if let Some(home) = dirs::home_dir() {
-                    let global_claude_md = home.join(".claude").join("CLAUDE.md");
-                    if global_claude_md.exists()
-                        && let Ok(content) = std::fs::read_to_string(&global_claude_md)
+                // 2. Check global instruction files. Multi-host: an explicit
+                //    `CLX_INSTRUCTIONS_FILE` override (set by the per-host MCP
+                //    install) wins; otherwise glob the well-known per-host
+                //    files (Claude `~/.claude/CLAUDE.md`, Codex
+                //    `~/.codex/AGENTS.md`) and return every one that exists,
+                //    each labeled with its provenance.
+                let global_sources = global_instruction_sources(dirs::home_dir().as_deref());
+                for (path, label) in &global_sources {
+                    if path.exists()
+                        && let Ok(content) = std::fs::read_to_string(path)
                     {
                         let rules = if let Some(ref cat) = category {
                             extract_rules_by_category(&content, cat)
@@ -160,15 +165,20 @@ impl McpServer {
                             extract_all_critical_rules(&content)
                         };
                         if !rules.is_empty() {
-                            all_rules
-                                .push(format!("## Global Rules (~/.claude/CLAUDE.md)\n{rules}"));
+                            all_rules.push(format!("## Global Rules [from {label}]\n{rules}"));
                         }
                     }
                 }
 
                 let combined_rules = if all_rules.is_empty() {
-                    "No CLAUDE.md rules found (checked project directory and ~/.claude/CLAUDE.md)"
-                        .to_string()
+                    let checked: Vec<String> = global_sources
+                        .iter()
+                        .map(|(p, _)| p.display().to_string())
+                        .collect();
+                    format!(
+                        "No rules found (checked project directory and global instruction files: {})",
+                        checked.join(", ")
+                    )
                 } else {
                     all_rules.join("\n\n")
                 };
@@ -228,6 +238,59 @@ fn path_is_within_home(project_path: &std::path::Path, home: Option<&std::path::
 }
 
 // =============================================================================
+// Global Instruction Source Resolution (multi-host)
+// =============================================================================
+
+/// Resolve the ordered list of global instruction files to read for
+/// `get_project_rules`, each paired with a short provenance label used in the
+/// returned output (e.g. `[from CLAUDE.md]`).
+///
+/// Resolution order:
+/// 1. If `CLX_INSTRUCTIONS_FILE` is set to a non-empty path that exists, use
+///    that file exclusively. This is the explicit per-host override written by
+///    the MCP install step (Codex/Cursor point it at their own instructions
+///    file). The provenance label is the file's base name so the agent can see
+///    which file the rules came from.
+/// 2. Otherwise glob the well-known per-host global files: Claude
+///    `~/.claude/CLAUDE.md` and Codex `~/.codex/AGENTS.md`. Both are returned
+///    (the caller reads each that exists), so a machine configured for multiple
+///    hosts surfaces every applicable rule set.
+///
+/// The returned paths are *candidates*; the caller checks `.exists()` before
+/// reading. When the override is present but its path does not exist, this
+/// falls through to the glob list so a stale env var never hides the real
+/// per-host files.
+fn global_instruction_sources(home: Option<&std::path::Path>) -> Vec<(std::path::PathBuf, String)> {
+    // 1. Explicit override wins when it points at an existing file.
+    if let Ok(raw) = env::var("CLX_INSTRUCTIONS_FILE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let path = std::path::PathBuf::from(trimmed);
+            if path.exists() {
+                let label = path
+                    .file_name()
+                    .map_or_else(|| trimmed.to_string(), |n| n.to_string_lossy().into_owned());
+                return vec![(path, label)];
+            }
+        }
+    }
+
+    // 2. Glob the well-known per-host global instruction files.
+    let mut sources = Vec::new();
+    if let Some(home) = home {
+        sources.push((
+            home.join(".claude").join("CLAUDE.md"),
+            "CLAUDE.md".to_string(),
+        ));
+        sources.push((
+            home.join(".codex").join("AGENTS.md"),
+            "AGENTS.md".to_string(),
+        ));
+    }
+    sources
+}
+
+// =============================================================================
 // CLAUDE.md Rule Extraction Helpers
 // =============================================================================
 
@@ -276,6 +339,55 @@ pub(crate) fn extract_rules_by_category(content: &str, category: &str) -> String
         format!("No rules found for category: {category}")
     } else {
         rules.join("\n---\n")
+    }
+}
+
+// =============================================================================
+// Global Instruction Source Resolution Tests
+// =============================================================================
+
+//
+// NOTE: This crate denies `unsafe-code`, so these in-process unit tests do not
+// mutate the process env (`set_var`/`remove_var` are `unsafe` on Edition 2024).
+// The `CLX_INSTRUCTIONS_FILE` override and fall-through branches are covered
+// hermetically in `tests/multi_host_rules_e2e.rs`, which sets the env on a
+// child process. The cases below cover the glob/`None` branches and only run
+// when the override is not externally set (read-only check, no mutation).
+#[cfg(test)]
+mod global_instruction_source_tests {
+    use super::global_instruction_sources;
+
+    fn override_is_set() -> bool {
+        std::env::var_os("CLX_INSTRUCTIONS_FILE").is_some_and(|v| !v.is_empty())
+    }
+
+    /// Override unset: both per-host global files are globbed, in the
+    /// documented order (Claude CLAUDE.md, then Codex AGENTS.md), each with its
+    /// provenance label.
+    #[test]
+    fn globs_both_hosts_when_no_override() {
+        if override_is_set() {
+            return; // env-dependent path is covered by the subprocess e2e test
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let sources = global_instruction_sources(Some(home));
+
+        assert_eq!(sources.len(), 2, "expected Claude + Codex sources");
+        assert_eq!(sources[0].0, home.join(".claude").join("CLAUDE.md"));
+        assert_eq!(sources[0].1, "CLAUDE.md");
+        assert_eq!(sources[1].0, home.join(".codex").join("AGENTS.md"));
+        assert_eq!(sources[1].1, "AGENTS.md");
+    }
+
+    /// No home directory and no override: no global sources (caller then emits
+    /// the no-rules message). Never panics.
+    #[test]
+    fn none_home_yields_no_sources() {
+        if override_is_set() {
+            return;
+        }
+        assert!(global_instruction_sources(None).is_empty());
     }
 }
 

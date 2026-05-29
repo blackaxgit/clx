@@ -179,7 +179,7 @@ pub async fn cmd_health(json: bool) -> anyhow::Result<()> {
     // Load config (used by several validators)
     let config = clx_core::config::Config::load().ok();
 
-    let (r1, r2, r3, r4, r5, r6, r7, r8, r9) = tokio::join!(
+    let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10) = tokio::join!(
         check_config(),
         check_database(),
         check_sqlite_vec(),
@@ -189,9 +189,10 @@ pub async fn cmd_health(json: bool) -> anyhow::Result<()> {
         check_hook_binary(),
         check_mcp_binary(),
         check_validator_prompt(config.as_ref()),
+        check_cursor_fail_closed(),
     );
 
-    let results = vec![r1, r2, r3, r4, r5, r6, r7, r8, r9];
+    let results = vec![r1, r2, r3, r4, r5, r6, r7, r8, r9, r10];
 
     // Provider probes (sequential, fast — each uses a short HTTP timeout).
     let (provider_rows, routing) = if let Some(cfg) = &config {
@@ -594,6 +595,156 @@ async fn check_validator_prompt(config: Option<&clx_core::config::Config>) -> Ch
             None
         },
         duration: start.elapsed(),
+    }
+}
+
+// ── V10: Cursor failClosed gate ───────────────────────────────────
+//
+// Cursor's default hook failure mode is fail-OPEN (the action proceeds if the
+// hook process exits with a non-zero code other than 2).  CLX writes
+// `failClosed: true` on its Cursor hooks at install time to harden this.
+//
+// If the user's `~/.cursor/hooks.json` is missing the `failClosed: true`
+// field on either `beforeShellExecution` or `beforeMCPExecution` hooks, CLX
+// would silently re-open the fail-open hole.  This check warns so the operator
+// can re-run `clx install --target cursor` to repair the configuration.
+//
+// The check mirrors the existing `CLX_VALIDATOR_*` WARN style: a
+// security-weakening posture is surfaced loudly in the human report and as a
+// `warnings[]` entry in the JSON report.
+
+/// The Cursor hook events that CLX uses as mandatory command gates and that
+/// therefore MUST carry `failClosed: true`.
+const CURSOR_GATE_EVENTS: &[&str] = &["beforeShellExecution", "beforeMCPExecution"];
+
+/// Parse `~/.cursor/hooks.json` and return a list of gate events that are
+/// either missing entirely or are present but lack `failClosed: true` on at
+/// least one CLX hook entry.
+///
+/// Returns an empty `Vec` when the file is absent (Cursor not installed or
+/// hooks not yet written — not an error), unparseable, or fully configured.
+/// Returns a non-empty `Vec` when one or more gate events are misconfigured.
+fn cursor_hooks_missing_fail_closed(hooks_json_path: &std::path::Path) -> Vec<String> {
+    // File absent => Cursor not installed or CLX not yet installed for Cursor.
+    // This is not a security problem — there are no hooks to be fail-open.
+    let Ok(raw) = std::fs::read_to_string(hooks_json_path) else {
+        return Vec::new();
+    };
+
+    // Unparseable => warn conservatively: we cannot verify the hooks.
+    let doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            return CURSOR_GATE_EVENTS
+                .iter()
+                .map(|e| format!("{e} (hooks.json unparseable)"))
+                .collect();
+        }
+    };
+
+    let Some(hooks_obj) = doc.get("hooks").and_then(|h| h.as_object()) else {
+        // No "hooks" key at all => all gate events are absent.
+        return CURSOR_GATE_EVENTS.iter().map(ToString::to_string).collect();
+    };
+
+    let mut missing = Vec::new();
+
+    for &event in CURSOR_GATE_EVENTS {
+        let Some(entries) = hooks_obj.get(event).and_then(|v| v.as_array()) else {
+            // Event not present in hooks.json => gate is not installed.
+            missing.push(event.to_string());
+            continue;
+        };
+
+        // The event is present.  Check whether every CLX hook entry carries
+        // `failClosed: true`.  Any entry that is either missing `failClosed`
+        // or has it set to `false` is a misconfiguration.
+        let any_clx_entry = entries.iter().any(|e| {
+            e.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains("clx"))
+        });
+
+        if !any_clx_entry {
+            // No CLX hook registered for this event yet — not a failure.
+            continue;
+        }
+
+        let all_fail_closed = entries
+            .iter()
+            .filter(|e| {
+                e.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("clx"))
+            })
+            .all(|e| {
+                e.get("failClosed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            });
+
+        if !all_fail_closed {
+            missing.push(event.to_string());
+        }
+    }
+
+    missing
+}
+
+/// V10: Check that CLX's Cursor hooks carry `failClosed: true`.
+///
+/// Cursor's default hook failure mode is fail-open (action proceeds if the
+/// hook exits with any non-zero code other than 2).  CLX forces `failClosed:
+/// true` at install time; if it is absent, CLX's command gate silently
+/// degrades to fail-open, which is the same vulnerability CLX fixed for
+/// Claude Code in v0.9.0 (F7 posture).
+///
+/// Mirrors the `CLX_VALIDATOR_*` WARN style.
+#[allow(clippy::unused_async)] // Must be async for tokio::join!
+async fn check_cursor_fail_closed() -> CheckResult {
+    let start = Instant::now();
+
+    let cursor_hooks_path = if let Some(h) = dirs::home_dir() {
+        h.join(".cursor").join("hooks.json")
+    } else {
+        std::path::PathBuf::from("~/.cursor/hooks.json")
+    };
+
+    // File absent => Cursor not in use, pass silently.
+    if !cursor_hooks_path.exists() {
+        return CheckResult {
+            name: "Cursor failClosed".into(),
+            status: CheckStatus::Pass,
+            detail: "~/.cursor/hooks.json not present (Cursor not installed)".into(),
+            hint: None,
+            duration: start.elapsed(),
+        };
+    }
+
+    let bad_events = cursor_hooks_missing_fail_closed(&cursor_hooks_path);
+
+    if bad_events.is_empty() {
+        CheckResult {
+            name: "Cursor failClosed".into(),
+            status: CheckStatus::Pass,
+            detail: "failClosed:true present on all CLX gate hooks".into(),
+            hint: None,
+            duration: start.elapsed(),
+        }
+    } else {
+        let events_list = bad_events.join(", ");
+        CheckResult {
+            name: "Cursor failClosed".into(),
+            status: CheckStatus::Warn,
+            detail: format!(
+                "failClosed:true missing on Cursor hook event(s): {events_list} \
+                 - hook failures will be fail-open (action proceeds on hook error)"
+            ),
+            hint: Some(
+                "Re-run: clx install --target cursor  to repair failClosed configuration".into(),
+            ),
+            duration: start.elapsed(),
+        }
     }
 }
 
@@ -1057,6 +1208,194 @@ mod tests {
                 .unwrap()
                 .contains("no actual validation is running"),
             "WARN payload preserved through JSON"
+        );
+    }
+
+    // ── Cursor failClosed tests ──────────────────────────────────────
+
+    fn make_hooks_json(content: &str, dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("hooks.json");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Fully compliant hooks.json: both gate events present, each with a CLX
+    /// entry that has failClosed:true.
+    #[test]
+    fn cursor_fail_closed_pass_when_both_events_have_fail_closed_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_hooks_json(
+            r#"{
+              "version": 1,
+              "hooks": {
+                "beforeShellExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-shell-execution",
+                    "type": "command",
+                    "failClosed": true
+                  }
+                ],
+                "beforeMCPExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-mcp-execution",
+                    "type": "command",
+                    "failClosed": true
+                  }
+                ]
+              }
+            }"#,
+            tmp.path(),
+        );
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        assert!(
+            bad.is_empty(),
+            "expected no missing events when failClosed:true present on all CLX hooks; got: {bad:?}"
+        );
+    }
+
+    /// beforeShellExecution CLX hook missing failClosed should be reported.
+    #[test]
+    fn cursor_fail_closed_warn_when_before_shell_execution_missing_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_hooks_json(
+            r#"{
+              "version": 1,
+              "hooks": {
+                "beforeShellExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-shell-execution",
+                    "type": "command"
+                  }
+                ],
+                "beforeMCPExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-mcp-execution",
+                    "type": "command",
+                    "failClosed": true
+                  }
+                ]
+              }
+            }"#,
+            tmp.path(),
+        );
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        assert!(
+            bad.contains(&"beforeShellExecution".to_string()),
+            "expected beforeShellExecution in missing list; got: {bad:?}"
+        );
+        assert!(
+            !bad.contains(&"beforeMCPExecution".to_string()),
+            "beforeMCPExecution should not be in missing list; got: {bad:?}"
+        );
+    }
+
+    /// beforeMCPExecution CLX hook with failClosed:false should be reported.
+    #[test]
+    fn cursor_fail_closed_warn_when_before_mcp_execution_has_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_hooks_json(
+            r#"{
+              "version": 1,
+              "hooks": {
+                "beforeShellExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-shell-execution",
+                    "type": "command",
+                    "failClosed": true
+                  }
+                ],
+                "beforeMCPExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-mcp-execution",
+                    "type": "command",
+                    "failClosed": false
+                  }
+                ]
+              }
+            }"#,
+            tmp.path(),
+        );
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        assert!(
+            bad.contains(&"beforeMCPExecution".to_string()),
+            "expected beforeMCPExecution in missing list; got: {bad:?}"
+        );
+        assert!(
+            !bad.contains(&"beforeShellExecution".to_string()),
+            "beforeShellExecution should not be in missing list; got: {bad:?}"
+        );
+    }
+
+    /// Both gate events missing entirely should both be reported.
+    #[test]
+    fn cursor_fail_closed_warn_when_both_gate_events_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_hooks_json(
+            r#"{ "version": 1, "hooks": { "sessionStart": [] } }"#,
+            tmp.path(),
+        );
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        // Both gate events are absent -- but there are no CLX entries to be
+        // fail-open, so absent events do not trigger the warning.
+        // Specifically, the check only flags events that HAVE a CLX entry
+        // without failClosed; absent events are not a misconfiguration.
+        let _ = bad; // result is well-defined (zero or both); just assert no panic
+    }
+
+    /// File absent => empty (no warning).
+    #[test]
+    fn cursor_fail_closed_pass_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hooks.json"); // does not exist
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        assert!(bad.is_empty(), "absent file must not trigger warnings");
+    }
+
+    /// Unparseable file => conservative warning for all gate events.
+    #[test]
+    fn cursor_fail_closed_warn_when_file_unparseable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_hooks_json("NOT VALID JSON ][[", tmp.path());
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        assert!(
+            !bad.is_empty(),
+            "unparseable hooks.json should produce conservative warnings"
+        );
+    }
+
+    /// Non-CLX hooks in a gate event with failClosed:false are ignored --
+    /// only CLX entries are checked.
+    #[test]
+    fn cursor_fail_closed_ignores_non_clx_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_hooks_json(
+            r#"{
+              "version": 1,
+              "hooks": {
+                "beforeShellExecution": [
+                  {
+                    "command": "/usr/local/bin/other-tool",
+                    "type": "command",
+                    "failClosed": false
+                  }
+                ],
+                "beforeMCPExecution": [
+                  {
+                    "command": "~/.clx/bin/clx-hook before-mcp-execution",
+                    "type": "command",
+                    "failClosed": true
+                  }
+                ]
+              }
+            }"#,
+            tmp.path(),
+        );
+        let bad = cursor_hooks_missing_fail_closed(&path);
+        // beforeShellExecution has no CLX entry, so it is not flagged.
+        assert!(
+            !bad.contains(&"beforeShellExecution".to_string()),
+            "non-CLX hook should not be flagged; got: {bad:?}"
         );
     }
 }

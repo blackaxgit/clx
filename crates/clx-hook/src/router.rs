@@ -27,12 +27,13 @@ use clx_core::storage::Storage;
 use tracing::{debug, error, warn};
 
 use crate::hooks::{
-    handle_post_tool_use, handle_pre_compact, handle_pre_tool_use, handle_session_end,
-    handle_session_start, handle_stop_auto_summary, handle_subagent_start,
-    handle_user_prompt_submit,
+    handle_permission_request, handle_post_compact, handle_post_tool_use, handle_pre_compact,
+    handle_pre_tool_use, handle_session_end, handle_session_start, handle_stop_auto_summary,
+    handle_subagent_start, handle_user_prompt_submit,
 };
+use crate::host::{Host, detect_host};
 use crate::output::output_decision;
-use crate::types::{HookInput, MAX_INPUT_SIZE};
+use crate::types::{HostNeutralInput, MAX_INPUT_SIZE};
 
 /// Dependencies the router needs to dispatch a hook event.
 ///
@@ -167,24 +168,56 @@ pub(crate) enum ReadOutcome {
     ReadFailed,
 }
 
-/// Parse a raw JSON string into `HookInput`. Wraps `serde_json::from_str`
-/// so the router can compose error handling consistently.
-pub(crate) fn parse_input(raw: &str) -> Result<HookInput, serde_json::Error> {
-    serde_json::from_str::<HookInput>(raw)
+/// Parse a raw JSON string into `HostNeutralInput` via the detected host.
+///
+/// For Claude this is the historical `serde_json::from_str` path (lossless
+/// lift); other hosts map their envelope to the host-neutral shape. The
+/// returned `serde_json::Error` keeps the existing error-handling contract.
+///
+/// `handle_event` uses `parse_input_with_host` (it has already detected the
+/// host); this convenience wrapper is retained for the parse-error unit tests
+/// and as the public single-arg parse entry point.
+#[allow(dead_code)]
+pub(crate) fn parse_input(raw: &str) -> Result<HostNeutralInput, serde_json::Error> {
+    parse_input_with_host(&*detect_host(raw), raw)
+}
+
+/// Host-explicit parse, used by `handle_event` (which has already detected
+/// the host) and by tests that want a deterministic host.
+pub(crate) fn parse_input_with_host(
+    host: &dyn Host,
+    raw: &str,
+) -> Result<HostNeutralInput, serde_json::Error> {
+    // `Host::parse_hook_input` returns `anyhow::Error`; the only failure mode
+    // for the Claude path is a serde parse error. Re-run the serde parse to
+    // surface the typed `serde_json::Error` the callers expect, preserving
+    // the historical parse-error behaviour exactly.
+    match host.parse_hook_input(raw) {
+        Ok(input) => Ok(input),
+        Err(_) => serde_json::from_str::<HostNeutralInput>(raw).map(|mut input| {
+            input.host = host.host_id();
+            input
+        }),
+    }
 }
 
 /// Run the parsed event through the matching handler. Unknown event names
 /// emit the safe "allow" fallback and return `Ok(())`.
-pub(crate) async fn dispatch(input: HookInput) -> anyhow::Result<()> {
+pub(crate) async fn dispatch(input: HostNeutralInput, host: &dyn Host) -> anyhow::Result<()> {
     match input.hook_event_name.as_str() {
-        "PreToolUse" => handle_pre_tool_use(input).await,
-        "PostToolUse" => handle_post_tool_use(input).await,
-        "PreCompact" => handle_pre_compact(input).await,
-        "SessionStart" => handle_session_start(input).await,
-        "SessionEnd" => handle_session_end(input).await,
-        "SubagentStart" => handle_subagent_start(input).await,
-        "UserPromptSubmit" => handle_user_prompt_submit(input).await,
-        "Stop" => handle_stop_auto_summary(input).await,
+        "PreToolUse" => handle_pre_tool_use(input, host).await,
+        "PostToolUse" => handle_post_tool_use(input, host).await,
+        "PreCompact" => handle_pre_compact(input, host).await,
+        // Codex-only events (P4). Cursor camelCase events are normalized to
+        // PascalCase in CursorHost::parse_hook_input (P2), so they reach the
+        // shared arms above; these two arms are only ever hit by Codex.
+        "PermissionRequest" => handle_permission_request(input, host).await,
+        "PostCompact" => handle_post_compact(input, host).await,
+        "SessionStart" => handle_session_start(input, host).await,
+        "SessionEnd" => handle_session_end(input, host).await,
+        "SubagentStart" => handle_subagent_start(input, host).await,
+        "UserPromptSubmit" => handle_user_prompt_submit(input, host).await,
+        "Stop" => handle_stop_auto_summary(input, host).await,
         unknown => {
             warn!("Unknown hook event: {}", unknown);
             output_decision("allow", None, None, None);
@@ -246,7 +279,12 @@ where
         debug!("Hook input: {}", redacted_dbg);
     }
 
-    let input = match parse_input(&raw) {
+    // Detect the host once, from the raw envelope (env override -> envelope
+    // shape -> Claude default). The same instance drives parsing and
+    // dispatch, so a single invocation never mixes hosts.
+    let host = detect_host(&raw);
+
+    let input = match parse_input_with_host(&*host, &raw) {
         Ok(input) => input,
         Err(e) => {
             error!("Failed to parse hook input: {}", e);
@@ -260,7 +298,7 @@ where
         }
     };
 
-    match dispatch(input).await {
+    match dispatch(input, &*host).await {
         Ok(()) => HookExit::Ok,
         Err(e) => {
             error!("Hook handler error: {}", e);

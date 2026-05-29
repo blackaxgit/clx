@@ -14,17 +14,19 @@ pub fn cmd_version(cli: &Cli) -> Result<()> {
             serde_json::json!({
                 "version": clx_core::VERSION,
                 "name": "clx",
-                "description": "Claude Code Extension"
+                "description": "Coding-Agent Extension Layer"
             })
         );
     } else {
         println!(
-            "{} {} - Claude Code Extension",
+            "{} {} - Coding-Agent Extension Layer",
             "clx".cyan().bold(),
             format!("v{}", clx_core::VERSION).yellow()
         );
         println!();
-        println!("A command validation and context persistence layer for Claude Code.");
+        println!(
+            "Command validation and context persistence for coding agents (Claude Code, Codex CLI, Cursor)."
+        );
         println!();
         println!("  Config: {}", clx_core::paths::clx_dir().display());
         println!("  License: MPL-2.0");
@@ -51,7 +53,9 @@ pub fn cmd_default(cli: &Cli) -> Result<()> {
             format!("v{}", clx_core::VERSION).dimmed()
         );
         println!();
-        println!("A command validation and context persistence layer for Claude Code.");
+        println!(
+            "Command validation and context persistence for coding agents (Claude Code, Codex CLI, Cursor)."
+        );
         println!();
         println!("{}:", "Quick Start".yellow().bold());
         println!("  clx dashboard   Interactive TUI dashboard");

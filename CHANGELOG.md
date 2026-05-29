@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-29
+
+### Added
+
+- **Three-host support.** CLX now installs into Claude Code, Codex CLI, and
+  Cursor. MCP tools and instructions injection work fully on all three;
+  command gating differs per host (see README "Supported Hosts").
+- **`clx install --target {claude,codex,cursor,all,auto}`** (and the same flag
+  on `clx uninstall`). `auto` (the default) acts on every detected host with
+  Claude always included; `all` acts on all three unconditionally; the
+  single-host variants target exactly one.
+- **Codex CLI integration.** `~/.codex/hooks.json` per-event hook entries,
+  `[mcp_servers.clx]` in `~/.codex/config.toml`, and a CLX section in
+  `~/.codex/AGENTS.md` (with an `AGENTS.override.md` fallback when `AGENTS.md`
+  would exceed Codex's size cap). The Codex `~/.codex/hooks.json` registers a
+  `PermissionRequest` entry, and the router additionally dispatches the
+  Codex-only `PostCompact` event when Codex emits it.
+- **Cursor integration.** `mcpServers.clx` in `~/.cursor/mcp.json`, a
+  `~/.cursor/hooks.json` with `beforeShellExecution` / `beforeMCPExecution`
+  gates (each `failClosed: true`), and a project-scoped
+  `<repo>/.cursor/rules/clx.mdc` rule (`alwaysApply: true`).
+- **`Host` trait** (`clx-hook/src/host.rs`) abstracts the per-host envelope
+  shape, response/ask-channel mapping, session-id and provenance discovery,
+  canonical tool-name mapping, and instructions-file path behind one seam, so a
+  single hook binary serves all three agents.
+- **Per-row agent-host attribution.** A `host` column (schema v8) on the
+  `audit_log` and `sessions` tables records which agent produced each row
+  (`claude` / `codex` / `cursor`), so cross-host audit rows are
+  distinguishable. The column defaults to `claude`, so all pre-v0.10.0 rows and
+  the Claude path are unchanged; the migration is additive and idempotent.
+
+### Changed
+
+- **`clx_rules` is multi-host.** `get_project_rules` honors the
+  `CLX_INSTRUCTIONS_FILE` override (set per host by the MCP registration) and
+  otherwise reads each host's instructions file (`CLAUDE.md`, `AGENTS.md`),
+  returning every one that exists with provenance tags.
+- **Canonical tool names.** Learned rules and L0 matching now operate on a
+  canonical tool-name space: Claude's `Edit` / `Write` / `MultiEdit` /
+  `NotebookEdit` and Codex's `apply_patch` all collapse to `FileEdit`. The
+  migration runs in memory at rule-load time only; stored rules are not
+  rewritten (downgrade-safe). The pre-existing `CLAUDE_MUTATOR_TOOLS` set is
+  kept as a fallback.
+
+### Fixed
+
+- **`clx uninstall` now removes the injected CLX section** (`# CLX Integration`)
+  from each host's instructions file — `CLAUDE.md` and `AGENTS.md` (plus its
+  `AGENTS.override.md` fallback) — and deletes the Cursor
+  `<repo>/.cursor/rules/clx.mdc` rule, in addition to removing hook and MCP
+  entries.
+
+### Removed
+
+- **Legacy `"L1 disabled"` audit-reason alias.** The v0.9.0 one-version
+  dual-emit window is closed. The L1-disabled audit row's reasoning now carries
+  only the canonical `"L1-DISABLED"` literal; the legacy `"L1 disabled"`
+  substring is no longer emitted. Downstream log parsers that still match the
+  legacy literal must switch to `"L1-DISABLED"`.
+
+### Security
+
+- **Codex project-trust gate.** When the host is Codex and the project is
+  untrusted or not yet seen, the hook evaluates commands without consulting any
+  project-local config: trust is read only from
+  `~/.codex/config.toml [projects.<path>].trust_level`, never from a repo-local
+  `.codex/config.toml`, so a hostile cloned repo cannot self-declare itself
+  trusted. Read or parse errors fail safe to "not seen".
+- **Codex ask is fail-closed.** Codex does not support an interactive `ask`
+  decision, so CLX maps its `ask` verdict to a `deny` under Codex with the
+  reason "CLX requires manual approval; Codex does not support interactive ask
+  - re-run if intended." The original ask reason is not leaked.
+- **Cursor `failClosed: true`.** CLX writes the Cursor command and MCP gates
+  with `failClosed: true` so a hook error denies rather than silently allows;
+  `clx health` warns if the flag is absent.
+- **Best-effort guardrail caveats (honest scope).** Codex command validation
+  is a guardrail, not a complete enforcement boundary; it applies to
+  interactive Codex sessions, not `codex exec` automation. Cursor command
+  gating fires in the IDE agent and cloud agents only; the local `cursor-agent`
+  CLI runs no hooks. MCP tools and instructions injection are unaffected on both
+  hosts.
+
 ## [0.9.0] - 2026-05-20
 
 ### Added

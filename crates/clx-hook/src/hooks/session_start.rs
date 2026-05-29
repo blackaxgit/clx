@@ -7,11 +7,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::{load_previous_session_summary, load_project_rules};
 use crate::embedding::truncate_to_char_boundary;
+use crate::host::Host;
 use crate::output::output_generic;
-use crate::types::HookInput;
+use crate::types::HostNeutralInput;
 
 /// Handle `SessionStart` hook - create session and load previous context
-pub(crate) async fn handle_session_start(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_session_start(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
     let source = input.source.as_deref().unwrap_or("startup");
 
     info!(
@@ -58,10 +59,11 @@ pub(crate) async fn handle_session_start(input: HookInput) -> Result<()> {
         session.transcript_path.clone_from(&input.transcript_path);
         session.source = session_source;
 
-        if let Err(e) = storage.create_session(&session) {
+        let host_id = crate::audit::host_id_str(host.host_id());
+        if let Err(e) = storage.create_session_with_host(&session, host_id) {
             warn!("Failed to create session: {}", e);
         } else {
-            debug!("Created session {}", input.session_id);
+            debug!("Created session {} (host={})", input.session_id, host_id);
         }
     }
 
@@ -108,8 +110,9 @@ pub(crate) async fn handle_session_start(input: HookInput) -> Result<()> {
     // Try to load previous session summary
     let previous_summary = load_previous_session_summary(&storage, &input.session_id, &input.cwd);
 
-    // Load project rules from CLAUDE.md
-    let project_rules = load_project_rules(&input.cwd);
+    // Load project rules from the host's instructions file (CLAUDE.md for
+    // Claude, AGENTS.md for Codex, .cursor/rules for Cursor).
+    let project_rules = load_project_rules(&input.cwd, host);
 
     // Output session info to stderr (terminal-visible for the user)
     eprintln!(
