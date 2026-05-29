@@ -176,19 +176,23 @@ fn fileedit_resolves_into_protected_dir(
         })
         .collect();
     let cwd_path = std::path::Path::new(cwd);
-    // Render the whole payload and tokenize on whitespace/quotes/control chars,
-    // then test every token that looks like a path.
-    let blob = tool_input
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default();
-    for raw in blob.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';'))
-    {
+    // Extract WHOLE candidate path strings (spaces preserved). Whitespace
+    // tokenizing a path is unsafe: a target like "safe link/config.toml" (where
+    // "safe link" is a symlink into ~/.codex) would shatter into fragments that
+    // never resolve. So we pull each candidate intact from the structured
+    // fields and the V4A/diff markers.
+    let candidates = fileedit_candidate_paths(tool_input);
+
+    // Per-candidate resolution + the three protection checks.
+    let check = |raw: &str| -> Option<String> {
         let tok = raw.trim();
-        if tok.len() < 2 || !(tok.contains('/') || tok.starts_with('~')) {
-            continue;
+        if tok.is_empty() {
+            return None;
         }
         let expanded = if let Some(rest) = tok.strip_prefix("~/") {
             home.join(rest)
+        } else if tok == "~" {
+            home.to_path_buf()
         } else {
             let p = std::path::Path::new(tok);
             if p.is_absolute() {
@@ -209,10 +213,10 @@ fn fileedit_resolves_into_protected_dir(
         }
         // (a2) hardlink identity: a hardlink to a protected file shares its
         // (device, inode) but carries no `.codex` path component and is not a
-        // symlink, so (a)/(b) miss it. Compare the resolved target's inode
-        // against the known host trust/config files when they exist. (TOCTOU
-        // between this check and the host's actual write remains an inherent
-        // limit of any pre-execution gate; see the best-effort caveat.)
+        // symlink. Compare the resolved target's inode against the known host
+        // trust/config files when they exist. (TOCTOU between this check and the
+        // host's actual write remains an inherent limit of any pre-execution
+        // gate; see the best-effort caveat.)
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -237,11 +241,8 @@ fn fileedit_resolves_into_protected_dir(
             }
         }
         // (b) component-name match (case-insensitive, any location): catches
-        // case variants on case-insensitive filesystems (~/.CODEX), the
-        // not-yet-existing-dir fallback where canonicalize returns the literal
-        // path, and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
-        // Editing any such dir is the trust-config attack surface, so denying
-        // it anywhere is correct defense-in-depth, not over-reach.
+        // case variants (~/.CODEX), the not-yet-existing-dir literal fallback,
+        // and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
         for comp in resolved.components() {
             if let std::path::Component::Normal(name) = comp {
                 let lower = name.to_string_lossy().to_ascii_lowercase();
@@ -252,8 +253,72 @@ fn fileedit_resolves_into_protected_dir(
                 }
             }
         }
+        None
+    };
+
+    candidates.iter().find_map(|c| check(c))
+}
+
+/// Extract whole candidate path strings from a `FileEdit` `tool_input`, preserving
+/// embedded spaces. Sources: structured path keys, V4A patch markers
+/// (`*** Update File: <path>`), and unified-diff `+++`/`---` lines.
+fn fileedit_candidate_paths(tool_input: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(v) = tool_input else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    // Structured path-bearing keys: take the whole string value.
+    for key in ["file_path", "path", "dst", "destination", "target", "to"] {
+        if let Some(s) = v.get(key).and_then(serde_json::Value::as_str)
+            && !s.trim().is_empty()
+        {
+            out.push(s.trim().to_string());
+        }
     }
-    None
+    // Patch/command text: scan line by line for path-bearing markers.
+    let mut texts: Vec<String> = Vec::new();
+    for key in ["command", "patch", "input", "summary", "content"] {
+        if let Some(s) = v.get(key).and_then(serde_json::Value::as_str) {
+            texts.push(s.to_string());
+        }
+    }
+    // Fallback: the whole compact render, so an unknown shape still yields lines.
+    texts.push(v.to_string());
+    for text in texts {
+        for line in text.lines() {
+            let l = line.trim();
+            // V4A apply_patch markers: "*** Update File: <path>", Add/Delete/Move.
+            for marker in [
+                "*** Update File: ",
+                "*** Add File: ",
+                "*** Delete File: ",
+                "*** Move to: ",
+                "*** Move Path: ",
+            ] {
+                if let Some(rest) = l.strip_prefix(marker)
+                    && !rest.trim().is_empty()
+                {
+                    out.push(rest.trim().to_string());
+                }
+            }
+            // Unified diff headers: "+++ b/<path>", "--- a/<path>".
+            for pre in ["+++ ", "--- "] {
+                if let Some(rest) = l.strip_prefix(pre) {
+                    let r = rest.trim();
+                    let r = r
+                        .strip_prefix("a/")
+                        .or_else(|| r.strip_prefix("b/"))
+                        .unwrap_or(r);
+                    // Strip a trailing tab-timestamp if present.
+                    let r = r.split('\t').next().unwrap_or(r).trim();
+                    if !r.is_empty() && r != "/dev/null" {
+                        out.push(r.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Handle `PreToolUse` hook - validate commands before execution
@@ -1251,6 +1316,40 @@ mod tests {
         assert!(
             fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
             "hardlink to ~/.codex/config.toml must be flagged by inode identity"
+        );
+    }
+
+    #[test]
+    fn fileedit_path_with_spaces_via_symlink_denies() {
+        // Codex PURPLE bypass: a target path CONTAINING SPACES (a repo-shipped
+        // symlink "safe link" -> ~/.codex) must not be shattered by whitespace
+        // tokenizing. Structured-field + marker extraction preserves the whole
+        // path so it resolves through the symlink.
+        let home = tempfile::tempdir().unwrap();
+        let real_codex = home.path().join(".codex");
+        std::fs::create_dir_all(&real_codex).unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let link = repo.join("safe link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_codex, &link).unwrap();
+        #[cfg(not(unix))]
+        return;
+        // structured field carries the space-containing path intact
+        let ti = serde_json::json!({ "file_path": format!("{}/config.toml", link.display()) });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), repo.to_str().unwrap(), home.path())
+                .is_some(),
+            "space-containing path through a symlink must be flagged"
+        );
+        // also via a V4A patch marker line (spaces preserved after the marker)
+        let ti2 = serde_json::json!({
+            "command": format!("*** Update File: {}/config.toml\n@@\n-x\n+y\n", link.display())
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti2), repo.to_str().unwrap(), home.path())
+                .is_some(),
+            "space-containing path in a patch marker must be flagged"
         );
     }
 
