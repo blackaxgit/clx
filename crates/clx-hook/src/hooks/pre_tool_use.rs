@@ -259,31 +259,46 @@ fn fileedit_resolves_into_protected_dir(
     candidates.iter().find_map(|c| check(c))
 }
 
+/// Recursively collect every string value in a JSON value.
+fn collect_json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => {
+            for e in a {
+                collect_json_strings(e, out);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for e in m.values() {
+                collect_json_strings(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extract whole candidate path strings from a `FileEdit` `tool_input`, preserving
-/// embedded spaces. Sources: structured path keys, V4A patch markers
-/// (`*** Update File: <path>`), and unified-diff `+++`/`---` lines.
+/// embedded spaces. Key-name-agnostic: EVERY string value anywhere in the payload
+/// is treated as a candidate path (so a host-specific key such as Cursor's
+/// `target_file`, or any future key, is covered without an allowlist), plus V4A
+/// patch markers (`*** Update File: <path>`) and unified-diff `+++`/`---` lines
+/// parsed out of any multi-line string value.
 fn fileedit_candidate_paths(tool_input: Option<&serde_json::Value>) -> Vec<String> {
     let Some(v) = tool_input else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
-    // Structured path-bearing keys: take the whole string value.
-    for key in ["file_path", "path", "dst", "destination", "target", "to"] {
-        if let Some(s) = v.get(key).and_then(serde_json::Value::as_str)
-            && !s.trim().is_empty()
-        {
-            out.push(s.trim().to_string());
-        }
-    }
-    // Patch/command text: scan line by line for path-bearing markers.
+    // Every string value, any key, any nesting: the whole value is a candidate
+    // path (preserves embedded spaces; non-path strings simply will not resolve
+    // into a protected dir, so there is no false-positive risk).
     let mut texts: Vec<String> = Vec::new();
-    for key in ["command", "patch", "input", "summary", "content"] {
-        if let Some(s) = v.get(key).and_then(serde_json::Value::as_str) {
-            texts.push(s.to_string());
+    collect_json_strings(v, &mut texts);
+    for s in &texts {
+        let t = s.trim();
+        if !t.is_empty() {
+            out.push(t.to_string());
         }
     }
-    // Fallback: the whole compact render, so an unknown shape still yields lines.
-    texts.push(v.to_string());
     for text in texts {
         for line in text.lines() {
             let l = line.trim();
@@ -1351,6 +1366,40 @@ mod tests {
                 .is_some(),
             "space-containing path in a patch marker must be flagged"
         );
+    }
+
+    #[test]
+    fn fileedit_arbitrary_key_with_path_denies() {
+        // Key-name-agnostic: Cursor's edit_file uses `target_file`; any future
+        // key holding a path must be covered without an allowlist.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        let ti = serde_json::json!({
+            "target_file": format!("{}/.cursor/mcp.json", home.path().display()),
+            "instructions": "edit it"
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "path under an arbitrary key (target_file) must be flagged"
+        );
+        // and via a space-containing symlink under that arbitrary key
+        let repo = home.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        let link = repo.join("safe link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.path().join(".cursor"), &link).unwrap();
+            let ti2 = serde_json::json!({ "target_file": format!("{}/mcp.json", link.display()) });
+            assert!(
+                fileedit_resolves_into_protected_dir(
+                    Some(&ti2),
+                    repo.to_str().unwrap(),
+                    home.path()
+                )
+                .is_some(),
+                "space-containing symlink under target_file must be flagged"
+            );
+        }
     }
 
     #[test]
