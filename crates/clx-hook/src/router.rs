@@ -27,9 +27,9 @@ use clx_core::storage::Storage;
 use tracing::{debug, error, warn};
 
 use crate::hooks::{
-    handle_post_tool_use, handle_pre_compact, handle_pre_tool_use, handle_session_end,
-    handle_session_start, handle_stop_auto_summary, handle_subagent_start,
-    handle_user_prompt_submit,
+    handle_permission_request, handle_post_compact, handle_post_tool_use, handle_pre_compact,
+    handle_pre_tool_use, handle_session_end, handle_session_start, handle_stop_auto_summary,
+    handle_subagent_start, handle_user_prompt_submit,
 };
 use crate::host::{Host, detect_host};
 use crate::output::output_decision;
@@ -208,6 +208,11 @@ pub(crate) async fn dispatch(input: HostNeutralInput, host: &dyn Host) -> anyhow
         "PreToolUse" => handle_pre_tool_use(input, host).await,
         "PostToolUse" => handle_post_tool_use(input, host).await,
         "PreCompact" => handle_pre_compact(input, host).await,
+        // Codex-only events (P4). Cursor camelCase events are normalized to
+        // PascalCase in CursorHost::parse_hook_input (P2), so they reach the
+        // shared arms above; these two arms are only ever hit by Codex.
+        "PermissionRequest" => handle_permission_request(input, host).await,
+        "PostCompact" => handle_post_compact(input, host).await,
         "SessionStart" => handle_session_start(input, host).await,
         "SessionEnd" => handle_session_end(input, host).await,
         "SubagentStart" => handle_subagent_start(input, host).await,

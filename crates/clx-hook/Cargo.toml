@@ -24,6 +24,7 @@ dirs.workspace = true
 chrono.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
+toml.workspace = true
 sha2 = "0.10"
 hex = "0.4"
 

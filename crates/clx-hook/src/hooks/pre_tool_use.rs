@@ -14,14 +14,133 @@ use tracing::{debug, warn};
 use crate::audit::log_audit_entry;
 use crate::audit_chain::{GENESIS_HASH, build_record};
 use crate::embedding::resolve_command_paths;
-use crate::host::Host;
+use crate::host::{Host, HostId};
 use crate::learning::track_user_decision;
-use crate::output::{RULES_REMINDER, output_decision};
+use crate::output::{RULES_REMINDER, output_decision_for};
 use crate::types::HostNeutralInput;
 
+/// Codex project-trust state, replicated from `clx::codex::trust` (P6).
+///
+/// The canonical reader lives in the `clx` binary crate, which `clx-hook`
+/// must NOT depend on (a hook binary linking the whole CLI binary crate is a
+/// layering inversion). The trust-read logic is therefore replicated here as
+/// a small, self-contained helper. The SECURITY INVARIANT is identical and
+/// load-bearing: trust is read ONLY from the user-owned `~/.codex/config.toml`,
+/// NEVER from a repo-local `.codex/config.toml`, so a hostile repository can
+/// never self-declare as trusted (RGP surface #1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectTrust {
+    /// `trust_level = "trusted"` in `~/.codex/config.toml [projects.<path>]`.
+    Trusted,
+    /// `trust_level = "untrusted"` in `~/.codex/config.toml`.
+    Untrusted,
+    /// Path absent, file missing, or unparseable. Treated as untrusted.
+    NotSeen,
+}
+
+/// Read the trust level for `repo` from the user-global `~/.codex/config.toml`.
+///
+/// Mirrors `clx::codex::trust::read_project_trust` exactly (P6): reads ONLY
+/// `home/.codex/config.toml`, canonicalizes `repo` as the lookup key, and
+/// returns [`ProjectTrust::NotSeen`] on any read/parse error (safe default).
+/// It deliberately never reads `repo/.codex/config.toml`.
+pub(crate) fn read_project_trust(home: &std::path::Path, repo: &std::path::Path) -> ProjectTrust {
+    let config_path = home.join(".codex").join("config.toml");
+
+    // Missing file -> NotSeen (safe default).
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        return ProjectTrust::NotSeen;
+    };
+
+    // Unparseable -> NotSeen (safe default).
+    let Ok(doc): Result<toml::Value, _> = toml::from_str(&raw) else {
+        return ProjectTrust::NotSeen;
+    };
+
+    // Canonicalize the repo path; failure is non-fatal (use original string).
+    let canonical_key: String = std::fs::canonicalize(repo)
+        .unwrap_or_else(|_| std::path::PathBuf::from(repo))
+        .display()
+        .to_string();
+
+    let trust_level = doc
+        .get("projects")
+        .and_then(toml::Value::as_table)
+        .and_then(|projects| projects.get(&canonical_key))
+        .and_then(toml::Value::as_table)
+        .and_then(|entry| entry.get("trust_level"))
+        .and_then(toml::Value::as_str);
+
+    match trust_level {
+        Some("trusted") => ProjectTrust::Trusted,
+        Some("untrusted") => ProjectTrust::Untrusted,
+        _ => ProjectTrust::NotSeen,
+    }
+}
+
+/// Build a policy engine for `input.cwd`, applying the Codex trust gate (P6).
+///
+/// For Codex projects that are `Untrusted` or `NotSeen` (the safe default),
+/// project-local config MUST NOT influence policy evaluation, so the engine
+/// is stripped of its project path via [`PolicyEngine::without_project_config`].
+/// For Claude/Cursor, and for trusted Codex projects, the engine keeps its
+/// project path (historical behaviour - the Claude path is byte-identical).
+pub(crate) fn build_trust_gated_engine(host: &dyn Host, cwd: &str) -> PolicyEngine {
+    let engine = PolicyEngine::new().with_project_path(cwd);
+    if host.host_id() != HostId::Codex {
+        return engine;
+    }
+    let Some(home) = dirs::home_dir() else {
+        // No home dir: cannot read ~/.codex; fail closed (drop project config).
+        warn!("Codex trust gate: home dir unavailable; dropping project config (fail closed)");
+        return engine.without_project_config();
+    };
+    match read_project_trust(&home, std::path::Path::new(cwd)) {
+        ProjectTrust::Trusted => engine,
+        ProjectTrust::Untrusted | ProjectTrust::NotSeen => {
+            debug!(
+                "Codex trust gate: project '{}' is not trusted; project-local config dropped",
+                cwd
+            );
+            engine.without_project_config()
+        }
+    }
+}
+
+/// Extract a representative summary string from a Codex `apply_patch`
+/// `tool_input` for policy evaluation under the canonical `FileEdit` class.
+///
+/// Codex `apply_patch` carries the patch under a `command`/`input`/`patch`
+/// field (shape not pinned by P0). We probe the common keys and fall back to
+/// the whole `tool_input` rendered as a compact string so a `FileEdit` deny
+/// rule still has text to match against. Returns an empty string only when
+/// there is no `tool_input` at all.
+fn apply_patch_summary(tool_input: Option<&serde_json::Value>) -> String {
+    let Some(v) = tool_input else {
+        return String::new();
+    };
+    for key in ["command", "patch", "input", "summary", "file_path", "path"] {
+        if let Some(s) = v.get(key).and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return s.to_string();
+        }
+    }
+    // Fallback: compact JSON render of the whole payload.
+    v.to_string()
+}
+
 /// Handle `PreToolUse` hook - validate commands before execution
-pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
-    let tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
+pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
+    let raw_tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
+
+    // P7 input canonicalization: collapse host-specific tool names to their
+    // canonical CLX class BEFORE policy evaluation so L0 rules match a single
+    // vocabulary across hosts (e.g. Cursor `run_terminal_cmd` -> `Bash`,
+    // Codex/Cursor file-edit tools -> `FileEdit`). For Claude this is the
+    // identity map, so the Claude path is byte-identical.
+    let canonical_tool = host.canonical_tool_name(raw_tool_name);
+    let tool_name = canonical_tool.as_str();
 
     // Load configuration early (needed for MCP tool routing)
     let config = Config::load().unwrap_or_default();
@@ -128,9 +247,55 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
         }
     }
 
+    // P4 FileEdit branch (Codex `apply_patch`, Cursor `edit_file`): these
+    // canonicalize to "FileEdit". They are not shell commands, so they do NOT
+    // enter the Bash L0+L1 pipeline. Instead we run a trust-gated L0 evaluation
+    // against the canonical FileEdit class: a FileEdit deny rule blocks the
+    // edit; otherwise the edit is allowed (parity with Claude, which auto-allows
+    // its Write/Edit file tools). This keeps "evaluated as FileEdit" honest
+    // without fail-closing benign patches under Codex.
+    if tool_name == "FileEdit" {
+        let summary = apply_patch_summary(input.tool_input.as_ref());
+        let engine = build_trust_gated_engine(host, &input.cwd);
+        if config.validator.enabled
+            && config.validator.layer0_enabled
+            && let PolicyDecision::Deny { reason } = engine.evaluate("FileEdit", &summary)
+        {
+            debug!("FileEdit L0: denied '{}': {}", summary, reason);
+            log_audit_entry(
+                &input.session_id,
+                &summary,
+                &input.cwd,
+                "L0",
+                AuditDecision::Blocked,
+                None,
+                Some(&reason),
+            );
+            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
+            return Ok(());
+        }
+        log_audit_entry(
+            &input.session_id,
+            &summary,
+            &input.cwd,
+            "L0-FILEEDIT",
+            AuditDecision::Allowed,
+            None,
+            Some("File edit allowed (no FileEdit deny rule matched)"),
+        );
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
+        return Ok(());
+    }
+
     // Route by tool type to extract the command to validate.
     // MCP command tools are evaluated through the same PolicyEngine as Bash.
-    let command_raw = if tool_name == "Bash" {
+    // A `direct_command` (Cursor `beforeShellExecution.command`) is treated as
+    // a Bash command even though the canonical tool name is not "Bash" (Cursor
+    // shell events carry no tool_name).
+    let command_raw = if let Some(direct) = input.direct_command.as_deref() {
+        // Host-surfaced top-level command (Cursor shell): evaluate as Bash.
+        direct.to_string()
+    } else if tool_name == "Bash" {
         // Bash: extract from tool_input.command
         input
             .tool_input
@@ -147,18 +312,18 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
             McpExtraction::NotCommandTool => {
                 // Not a command-bearing MCP tool — use configured default decision
                 let decision = config.mcp_tools.default_decision.as_str();
-                output_decision(decision, None, Some(RULES_REMINDER), None);
+                output_decision_for(host, decision, None, Some(RULES_REMINDER), None);
                 return Ok(());
             }
         }
     } else {
         // Non-Bash, non-MCP tools (Read, Write, etc.) → auto-allow
-        output_decision("allow", None, Some(RULES_REMINDER), None);
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     };
 
     if command_raw.is_empty() {
-        output_decision("allow", None, Some(RULES_REMINDER), None);
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     }
 
@@ -169,7 +334,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
 
     // Skip validation if disabled
     if !config.validator.enabled {
-        output_decision("allow", None, Some(RULES_REMINDER), None);
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     }
 
@@ -211,7 +376,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                         None,
                         Some(&reason),
                     );
-                    output_decision("allow", None, Some(RULES_REMINDER), None);
+                    output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                     return Ok(());
                 }
                 // Expired or session mismatch
@@ -244,7 +409,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                 None,
                 Some("Trust mode enabled (legacy token)"),
             );
-            output_decision("allow", None, Some(RULES_REMINDER), None);
+            output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             return Ok(());
         }
 
@@ -260,8 +425,10 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
     // Check if this is a read-only command (used later to skip confirmation dialog)
     let is_read_only = config.validator.auto_allow_reads && is_read_only_command(command);
 
-    // Initialize policy engine
-    let mut policy_engine = PolicyEngine::new().with_project_path(&input.cwd);
+    // Initialize policy engine (P6 Codex trust gate applied here: untrusted /
+    // not-seen Codex projects get project-local config dropped; Claude/Cursor
+    // and trusted Codex keep their project path - Claude path unchanged).
+    let mut policy_engine = build_trust_gated_engine(host, &input.cwd);
 
     // T2: Load learned rules ONLY when L1 is enabled. When `layer1_enabled=false`
     // the L0→Ask path falls through to the "L1-DISABLED → ask" branch
@@ -295,7 +462,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                     None,
                     None,
                 );
-                output_decision("allow", None, Some(RULES_REMINDER), None);
+                output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                 return Ok(());
             }
             PolicyDecision::Deny { reason } => {
@@ -309,7 +476,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                     None,
                     Some(&reason),
                 );
-                output_decision("deny", Some(reason), Some(RULES_REMINDER), None);
+                output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
                 return Ok(());
             }
             PolicyDecision::Ask { .. } => {
@@ -326,7 +493,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                         None,
                         Some("Read-only command auto-allowed"),
                     );
-                    output_decision("allow", None, Some(RULES_REMINDER), None);
+                    output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                     return Ok(());
                 }
                 debug!("L0: Unknown command '{}', checking L1", command);
@@ -365,7 +532,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                 None,
                 Some("Read-only command auto-allowed (L0 disabled)"),
             );
-            output_decision("allow", None, Some(RULES_REMINDER), None);
+            output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             return Ok(());
         }
         // else: fall through to cache lookup + L1 (which may itself be off,
@@ -408,7 +575,13 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                     cached.risk_score.map(|s| s as i32),
                     cached.reason.as_deref(),
                 );
-                output_decision(&cached.decision, cached.reason, Some(RULES_REMINDER), None);
+                output_decision_for(
+                    host,
+                    &cached.decision,
+                    cached.reason,
+                    Some(RULES_REMINDER),
+                    None,
+                );
                 return Ok(());
             }
         }
@@ -432,7 +605,8 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
             None,
             Some("L1-DISABLED (alias: L1 disabled)"),
         );
-        output_decision(
+        output_decision_for(
+            host,
             "ask",
             Some("Command requires review".to_string()),
             Some(RULES_REMINDER),
@@ -490,7 +664,13 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                      {effective_decision} (configured: {configured})"
                 )),
             );
-            output_decision(effective_decision, Some(reason), Some(RULES_REMINDER), None);
+            output_decision_for(
+                host,
+                effective_decision,
+                Some(reason),
+                Some(RULES_REMINDER),
+                None,
+            );
             return Ok(());
         }
     };
@@ -553,7 +733,13 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                  (configured: {configured})"
             )),
         );
-        output_decision(effective_decision, Some(reason), Some(RULES_REMINDER), None);
+        output_decision_for(
+            host,
+            effective_decision,
+            Some(reason),
+            Some(RULES_REMINDER),
+            None,
+        );
         return Ok(());
     }
 
@@ -615,7 +801,8 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                 config.validator.layer1_timeout_ms
             )),
         );
-        output_decision(
+        output_decision_for(
+            host,
             effective_decision,
             Some(fallback_reason),
             Some(RULES_REMINDER),
@@ -663,7 +850,8 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                  {effective_decision} (configured: {configured})"
             )),
         );
-        output_decision(
+        output_decision_for(
+            host,
             effective_decision,
             Some(fallback_reason),
             Some(RULES_REMINDER),
@@ -687,7 +875,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                 Some(1),
                 None,
             );
-            output_decision("allow", None, Some(RULES_REMINDER), None);
+            output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             // Cache allow decision
             if config.validator.cache_enabled {
                 let cache_key = compute_cache_key(command, &input.cwd);
@@ -727,7 +915,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
             if let Ok(storage) = Storage::open_default() {
                 track_user_decision(&storage, command, &input.cwd, false);
             }
-            output_decision("deny", Some(reason), Some(RULES_REMINDER), None);
+            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         }
         PolicyDecision::Ask { reason } => {
             // Read-only commands never reach here: `is_read_only`
@@ -760,7 +948,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Hos
                     );
                 }
             }
-            output_decision("ask", Some(reason), Some(RULES_REMINDER), None);
+            output_decision_for(host, "ask", Some(reason), Some(RULES_REMINDER), None);
         }
     }
 
@@ -778,6 +966,103 @@ fn rand_cleanup() -> bool {
 mod tests {
     use super::*;
     use crate::types::{HookOutput, HookSpecificOutput};
+
+    // =========================================================================
+    // P4 trust-read mirror (RGP surface #1): repo-local config has zero effect
+    // =========================================================================
+
+    fn write_global_codex_config(home: &std::path::Path, content: &str) {
+        let dir = home.join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), content).unwrap();
+    }
+
+    /// P6/RGP#1 mirror: a repo-local `.codex/config.toml` claiming trusted MUST
+    /// have zero effect. Trust is read ONLY from the user-global config; an
+    /// unregistered path is `NotSeen`, never `Trusted`. This is the load-bearing
+    /// security invariant of the replicated `read_project_trust`.
+    #[test]
+    fn p4_repo_local_codex_config_cannot_grant_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("hostile-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Hostile repo ships its own .codex/config.toml claiming trusted.
+        let repo_codex = repo.join(".codex");
+        std::fs::create_dir_all(&repo_codex).unwrap();
+        std::fs::write(
+            repo_codex.join("config.toml"),
+            "[projects.\".\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+
+        // Global config does NOT list this repo.
+        write_global_codex_config(&home, "[model]\ndefault = \"gpt-5.5\"\n");
+
+        let result = read_project_trust(&home, &repo);
+        assert_ne!(
+            result,
+            ProjectTrust::Trusted,
+            "SECURITY: repo-local .codex/config.toml must not grant trust"
+        );
+        assert_eq!(result, ProjectTrust::NotSeen);
+    }
+
+    /// Trusted path in the user-global config resolves to `Trusted`.
+    #[test]
+    fn p4_global_trusted_path_resolves_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let key = std::fs::canonicalize(&repo).unwrap().display().to_string();
+        write_global_codex_config(
+            &home,
+            &format!("[projects.\"{key}\"]\ntrust_level = \"trusted\"\n"),
+        );
+        assert_eq!(read_project_trust(&home, &repo), ProjectTrust::Trusted);
+    }
+
+    /// Missing config and unparseable config both default to the safe
+    /// `NotSeen` posture.
+    #[test]
+    fn p4_missing_and_unparseable_config_default_not_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_missing = tmp.path().join("missing-home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert_eq!(
+            read_project_trust(&home_missing, &repo),
+            ProjectTrust::NotSeen
+        );
+
+        let home_bad = tmp.path().join("bad-home");
+        write_global_codex_config(&home_bad, "NOT VALID TOML ][[\n");
+        assert_eq!(read_project_trust(&home_bad, &repo), ProjectTrust::NotSeen);
+    }
+
+    // =========================================================================
+    // P4 apply_patch summary extraction
+    // =========================================================================
+
+    #[test]
+    fn apply_patch_summary_prefers_command_key() {
+        let v = serde_json::json!({ "command": "*** Begin Patch", "extra": 1 });
+        assert_eq!(apply_patch_summary(Some(&v)), "*** Begin Patch");
+    }
+
+    #[test]
+    fn apply_patch_summary_falls_back_to_json_render() {
+        let v = serde_json::json!({ "unknown_shape": { "nested": true } });
+        let s = apply_patch_summary(Some(&v));
+        assert!(s.contains("unknown_shape"), "fallback render: {s}");
+    }
+
+    #[test]
+    fn apply_patch_summary_none_is_empty() {
+        assert!(apply_patch_summary(None).is_empty());
+    }
 
     /// Build the exact JSON envelope `output_decision` would emit, so tests
     /// assert the emitted block/ask/allow string (not just an enum).
