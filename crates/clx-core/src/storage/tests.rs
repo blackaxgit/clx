@@ -1475,6 +1475,383 @@ fn test_get_session_validates_id() {
 // Edge Case Tests
 // =========================================================================
 
+// =========================================================================
+// Audit host attribution + normalize_host
+// =========================================================================
+
+/// Branch: `create_audit_log_with_host` records the canonical host id and
+/// `get_audit_hosts_by_session` returns them in insertion order. Kills a
+/// mutant that ignores the host arg or transposes the column.
+#[test]
+fn test_audit_host_attribution_round_trips_per_host() {
+    let storage = create_test_storage();
+
+    storage
+        .create_audit_log_with_host(
+            &AuditLogEntry::new(
+                SessionId::new("host-sess"),
+                "cmd-codex".to_string(),
+                "layer0".to_string(),
+                AuditDecision::Allowed,
+            ),
+            "codex",
+        )
+        .unwrap();
+    storage
+        .create_audit_log_with_host(
+            &AuditLogEntry::new(
+                SessionId::new("host-sess"),
+                "cmd-cursor".to_string(),
+                "layer0".to_string(),
+                AuditDecision::Allowed,
+            ),
+            "cursor",
+        )
+        .unwrap();
+
+    let hosts = storage.get_audit_hosts_by_session("host-sess").unwrap();
+    assert_eq!(hosts, vec!["codex".to_string(), "cursor".to_string()]);
+}
+
+/// Branch: an unknown / empty / mixed-case host is normalised at the DB
+/// boundary so the `host` column is a closed enum. Kills a mutant that lets
+/// an arbitrary host string through (e.g. dropping the `_ => "claude"` arm)
+/// or that does not lowercase/trim the input.
+#[test]
+fn test_audit_host_normalisation_closes_the_enum() {
+    use super::audit::normalize_host;
+
+    // Direct unit assertions on the normaliser.
+    assert_eq!(normalize_host("CODEX"), "codex");
+    assert_eq!(normalize_host("  Cursor "), "cursor");
+    assert_eq!(normalize_host("claude"), "claude");
+    assert_eq!(normalize_host(""), "claude");
+    assert_eq!(normalize_host("hacker-host"), "claude");
+
+    // End-to-end through the audit row: a garbage host is stored as "claude".
+    let storage = create_test_storage();
+    storage
+        .create_audit_log_with_host(
+            &AuditLogEntry::new(
+                SessionId::new("norm-sess"),
+                "cmd".to_string(),
+                "layer0".to_string(),
+                AuditDecision::Allowed,
+            ),
+            "totally-unknown",
+        )
+        .unwrap();
+    let hosts = storage.get_audit_hosts_by_session("norm-sess").unwrap();
+    assert_eq!(hosts, vec!["claude".to_string()]);
+}
+
+/// Branch: the auto-created placeholder session inherits the SAME host as the
+/// audit row, so a Codex command firing before `SessionStart` is attributed
+/// correctly. Kills a mutant that hard-codes the placeholder host to "claude".
+#[test]
+fn test_audit_placeholder_session_inherits_host() {
+    let storage = create_test_storage();
+    storage
+        .create_audit_log_with_host(
+            &AuditLogEntry::new(
+                SessionId::new("ph-codex"),
+                "cmd".to_string(),
+                "layer0".to_string(),
+                AuditDecision::Allowed,
+            ),
+            "codex",
+        )
+        .unwrap();
+
+    let host: String = storage
+        .conn
+        .query_row(
+            "SELECT host FROM sessions WHERE id = ?1",
+            ["ph-codex"],
+            |row| row.get(0),
+        )
+        .expect("placeholder session row exists");
+    assert_eq!(host, "codex", "placeholder session must inherit the host");
+}
+
+// =========================================================================
+// Audit analytics queries (since: Some vs None branches)
+// =========================================================================
+
+/// Helper: seed one audit row for a session with explicit decision + risk.
+fn seed_audit(
+    storage: &Storage,
+    session: &str,
+    command: &str,
+    decision: AuditDecision,
+    risk: Option<i32>,
+) {
+    let mut e = AuditLogEntry::new(
+        SessionId::new(session),
+        command.to_string(),
+        "layer0".to_string(),
+        decision,
+    );
+    e.risk_score = risk;
+    storage.create_audit_log(&e).unwrap();
+}
+
+/// Branch: `count_audit_by_decision(None)` groups across all rows. Kills a
+/// mutant that drops the GROUP BY or miscounts a decision bucket.
+#[test]
+fn test_count_audit_by_decision_groups_all() {
+    let storage = create_test_storage();
+    seed_audit(&storage, "dec-sess", "a", AuditDecision::Allowed, None);
+    seed_audit(&storage, "dec-sess", "b", AuditDecision::Allowed, None);
+    seed_audit(
+        &storage,
+        "dec-sess",
+        "rm -rf /",
+        AuditDecision::Blocked,
+        None,
+    );
+
+    let counts = storage.count_audit_by_decision(None).unwrap();
+    assert_eq!(counts.get("allowed").copied(), Some(2));
+    assert_eq!(counts.get("blocked").copied(), Some(1));
+}
+
+/// Branch: `count_audit_by_decision(Some(future))` with a since-cutoff in the
+/// future excludes all existing rows; a past cutoff includes them. Kills a
+/// mutant that ignores the `since` predicate (WHERE timestamp >= ?1).
+#[test]
+fn test_count_audit_by_decision_respects_since_cutoff() {
+    let storage = create_test_storage();
+    seed_audit(&storage, "dec-sess", "a", AuditDecision::Allowed, None);
+
+    let future = chrono::Utc::now() + chrono::Duration::days(1);
+    let counts = storage.count_audit_by_decision(Some(future)).unwrap();
+    assert!(
+        counts.is_empty(),
+        "rows older than a future cutoff must be excluded, got {counts:?}"
+    );
+
+    let past = chrono::Utc::now() - chrono::Duration::days(1);
+    let counts_past = storage.count_audit_by_decision(Some(past)).unwrap();
+    assert_eq!(counts_past.get("allowed").copied(), Some(1));
+}
+
+/// Branch: `get_top_denied_patterns` extracts the base command (first word)
+/// from blocked rows and ranks by count. Covers both the `None` and `Some`
+/// query arms. Kills a mutant that counts allowed rows, drops the base-command
+/// extraction, or reverses the ORDER BY.
+#[test]
+fn test_get_top_denied_patterns_ranks_by_base_command() {
+    let storage = create_test_storage();
+    seed_audit(
+        &storage,
+        "den-sess",
+        "rm -rf /a",
+        AuditDecision::Blocked,
+        None,
+    );
+    seed_audit(
+        &storage,
+        "den-sess",
+        "rm -rf /b",
+        AuditDecision::Blocked,
+        None,
+    );
+    seed_audit(
+        &storage,
+        "den-sess",
+        "curl evil",
+        AuditDecision::Blocked,
+        None,
+    );
+    // An allowed row must NOT be counted.
+    seed_audit(
+        &storage,
+        "den-sess",
+        "rm safe",
+        AuditDecision::Allowed,
+        None,
+    );
+
+    let top = storage.get_top_denied_patterns(None, 10).unwrap();
+    assert_eq!(
+        top[0],
+        ("rm".to_string(), 2),
+        "rm is the top denied pattern"
+    );
+    assert!(top.contains(&("curl".to_string(), 1)));
+    // The allowed "rm safe" must not inflate the rm count beyond the 2 blocked.
+    let rm_count = top.iter().find(|(c, _)| c == "rm").map(|(_, n)| *n);
+    assert_eq!(
+        rm_count,
+        Some(2),
+        "allowed rows must not be counted as denied"
+    );
+
+    // since-arm: a future cutoff yields nothing.
+    let future = chrono::Utc::now() + chrono::Duration::days(1);
+    assert!(
+        storage
+            .get_top_denied_patterns(Some(future), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Branch: `get_risk_distribution` buckets risk scores into low/medium/high
+/// and ignores NULL risk. Covers both query arms. Kills a mutant that shifts a
+/// bucket boundary (e.g. 1-3 -> 1-4) or counts NULL risks.
+#[test]
+fn test_get_risk_distribution_buckets_by_score() {
+    let storage = create_test_storage();
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "low1",
+        AuditDecision::Allowed,
+        Some(2),
+    );
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "low2",
+        AuditDecision::Allowed,
+        Some(3),
+    );
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "med",
+        AuditDecision::Prompted,
+        Some(5),
+    );
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "high",
+        AuditDecision::Blocked,
+        Some(9),
+    );
+    // NULL risk must be excluded from every bucket.
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "norisk",
+        AuditDecision::Allowed,
+        None,
+    );
+
+    let (low, medium, high) = storage.get_risk_distribution(None).unwrap();
+    assert_eq!((low, medium, high), (2, 1, 1));
+
+    // since-arm: a future cutoff yields all-zero buckets.
+    let future = chrono::Utc::now() + chrono::Duration::days(1);
+    assert_eq!(
+        storage.get_risk_distribution(Some(future)).unwrap(),
+        (0, 0, 0)
+    );
+}
+
+/// Branch: `get_audit_log_since` returns only rows at/after the cutoff.
+/// Kills a mutant that ignores the timestamp predicate. Timestamps are stored
+/// as RFC3339 (matching `create_audit_log`) so the lexical `>=` comparison is
+/// well-defined.
+#[test]
+fn test_get_audit_log_since_filters_by_timestamp() {
+    let storage = create_test_storage();
+    // Create the bound session first (audit_log.session_id is a FK).
+    storage
+        .create_session(&Session::new(
+            SessionId::new("since-sess"),
+            "/p".to_string(),
+        ))
+        .unwrap();
+    // Old row, 2 days in the past, written in the SAME RFC3339 form that
+    // `create_audit_log` uses so the string comparison is unambiguous.
+    let old_ts = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+    storage
+        .conn
+        .execute(
+            "INSERT INTO audit_log (session_id, timestamp, command, layer, decision)
+             VALUES ('since-sess', ?1, 'old', 'layer0', 'allowed')",
+            params![old_ts],
+        )
+        .unwrap();
+    seed_audit(
+        &storage,
+        "since-sess",
+        "recent",
+        AuditDecision::Allowed,
+        None,
+    );
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+    let rows = storage.get_audit_log_since(cutoff).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the recent row is after the 1-day cutoff"
+    );
+    assert_eq!(rows[0].command, "recent");
+}
+
+// =========================================================================
+// recall_repo adapter: optional-embeddings branches
+// =========================================================================
+
+/// Branch: with `None` embeddings the adapter reports semantic disabled,
+/// `semantic_similar` returns empty, and `current_embedding_model` is None
+/// (`recall_repo.rs` lines 56-57, 60-63, 78-81). Kills a mutant that flips
+/// `semantic_enabled` to true or returns a non-empty vec without a store.
+#[test]
+fn test_recall_repo_without_embeddings_is_fts_only() {
+    use super::StorageSnapshotRepo;
+    use crate::recall::ports::SnapshotRepo;
+
+    let storage = create_test_storage();
+    let repo = StorageSnapshotRepo::new(&storage, None);
+
+    assert!(
+        !repo.semantic_enabled(),
+        "no embedding store => semantic disabled"
+    );
+    let similar = repo.semantic_similar(&[0.1f32; 8], 5).unwrap();
+    assert!(
+        similar.is_empty(),
+        "semantic_similar without a store must be empty"
+    );
+    assert!(
+        repo.current_embedding_model().unwrap().is_none(),
+        "no store => no stored embedding model"
+    );
+}
+
+/// Branch: the adapter forwards `snapshot_by_id` and `snapshots_by_session`
+/// to the underlying storage, and forwards Ok(None) for a missing id. Kills a
+/// mutant that swaps these lookups or fabricates a snapshot.
+#[test]
+fn test_recall_repo_forwards_snapshot_lookups() {
+    use super::StorageSnapshotRepo;
+    use crate::recall::ports::SnapshotRepo;
+
+    let storage = create_test_storage();
+    let session = Session::new(SessionId::new("repo-sess"), "/project".to_string());
+    storage.create_session(&session).unwrap();
+    let mut snap = Snapshot::new(SessionId::new("repo-sess"), SnapshotTrigger::Manual);
+    snap.summary = Some("adapter forwarding check".to_string());
+    let id = storage.create_snapshot(&snap).unwrap();
+
+    let repo = StorageSnapshotRepo::new(&storage, None);
+    let by_id = repo.snapshot_by_id(id).unwrap().expect("snapshot present");
+    assert_eq!(by_id.summary.as_deref(), Some("adapter forwarding check"));
+
+    let by_session = repo.snapshots_by_session("repo-sess").unwrap();
+    assert_eq!(by_session.len(), 1);
+
+    // Missing id forwards Ok(None).
+    assert!(repo.snapshot_by_id(999_999).unwrap().is_none());
+}
+
 #[test]
 fn test_get_nonexistent_session() {
     let storage = create_test_storage();

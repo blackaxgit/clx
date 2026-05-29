@@ -1247,3 +1247,154 @@ fn test_read_bounded_line_over_limit_returns_error() {
     let err = result.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
+
+// =========================================================================
+// tool_remember — auto session-creation branches (remember.rs lines 23-44)
+// =========================================================================
+
+/// Build a server with NO bound session id so `tool_remember` must fall back
+/// to the `clx-standalone` session id and auto-create that session row.
+fn create_standalone_server() -> McpServer {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    McpServer {
+        storage: Storage::open_in_memory().expect("Failed to create in-memory storage"),
+        session_id: None, // <- no bound session
+        db_path: ":memory:".to_string(),
+        credential_store: CredentialStore::with_service("com.clx.credentials.test"),
+        ollama_client: None,
+        embedding_store: None,
+        embed_model: String::new(),
+        runtime,
+    }
+}
+
+/// Branch: when `self.session_id` is None, `tool_remember` falls back to the
+/// `clx-standalone` session id (remember.rs lines 23-26). Kills a mutant that
+/// uses a different fallback id or panics on the missing session id.
+#[test]
+fn test_remember_standalone_uses_clx_standalone_session() {
+    let server = create_standalone_server();
+
+    let result = server.tool_remember(&json!({"text": "standalone memory"}));
+    assert!(
+        result.is_ok(),
+        "remember must succeed with no bound session id"
+    );
+
+    // The fallback session must now exist and own the snapshot.
+    let session = server
+        .storage
+        .get_session("clx-standalone")
+        .expect("get_session ok")
+        .expect("standalone session must be auto-created");
+    assert_eq!(session.id.as_str(), "clx-standalone");
+
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("clx-standalone")
+        .expect("snapshots query ok");
+    assert!(
+        !snapshots.is_empty(),
+        "snapshot must be persisted under the standalone session"
+    );
+}
+
+/// Branch: when the bound session does NOT yet exist in storage,
+/// `tool_remember` auto-creates it before inserting the snapshot
+/// (remember.rs lines 29-44). The existing happy-path tests always
+/// pre-create the session, leaving this guard uncovered. Kills a mutant that
+/// removes the `get_session(...).is_none()` auto-create block (the snapshot
+/// insert would then trip the snapshots->sessions FK constraint and error).
+#[test]
+fn test_remember_auto_creates_missing_bound_session() {
+    let server = create_test_server(); // session_id = Some("test-session")
+    // Deliberately do NOT create the "test-session" row first.
+    assert!(
+        server
+            .storage
+            .get_session("test-session")
+            .unwrap()
+            .is_none(),
+        "precondition: session row absent"
+    );
+
+    let result = server.tool_remember(&json!({"text": "auto-create the session"}));
+    assert!(
+        result.is_ok(),
+        "remember must auto-create the missing session, not fail on the FK: {:?}",
+        result.err()
+    );
+
+    // The session was created on demand and owns the snapshot.
+    assert!(
+        server
+            .storage
+            .get_session("test-session")
+            .unwrap()
+            .is_some(),
+        "missing session must be auto-created by tool_remember"
+    );
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .unwrap();
+    assert_eq!(snapshots.len(), 1, "exactly one snapshot persisted");
+}
+
+/// Branch: the snapshot summary embeds the tags suffix when tags are present
+/// and omits it when empty (`remember.rs` lines 48-57). Kills a mutant that
+/// always emits the tag suffix or drops it. The `key_facts` must always be the
+/// raw text regardless of tags.
+#[test]
+fn test_remember_tag_suffix_is_conditional() {
+    let server = create_test_server();
+    let session =
+        clx_core::types::Session::new(SessionId::new("test-session"), "/test/project".to_string());
+    server.storage.create_session(&session).unwrap();
+
+    // With tags.
+    server
+        .tool_remember(&json!({"text": "tagged note", "tags": ["alpha", "beta"]}))
+        .unwrap();
+    // Without tags.
+    server
+        .tool_remember(&json!({"text": "plain note"}))
+        .unwrap();
+
+    let snaps = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .unwrap();
+    let tagged = snaps
+        .iter()
+        .find(|s| s.summary.as_deref().unwrap_or("").contains("tagged note"))
+        .expect("tagged snapshot present");
+    assert!(
+        tagged
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("[tags: alpha, beta]"),
+        "tagged snapshot summary must include the tag suffix: {:?}",
+        tagged.summary
+    );
+    assert_eq!(
+        tagged.key_facts.as_deref(),
+        Some("tagged note"),
+        "key_facts must be the raw text, not the tag-decorated summary"
+    );
+
+    let plain = snaps
+        .iter()
+        .find(|s| s.summary.as_deref().unwrap_or("").contains("plain note"))
+        .expect("plain snapshot present");
+    assert!(
+        !plain.summary.as_deref().unwrap().contains("[tags:"),
+        "untagged snapshot summary must NOT include a tag suffix: {:?}",
+        plain.summary
+    );
+}

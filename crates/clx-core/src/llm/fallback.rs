@@ -240,4 +240,200 @@ mod tests {
         let out = fc.generate("hi again", Some("m")).await.unwrap();
         assert_eq!(out, "ok");
     }
+
+    // Branch: embed() primary transient failure -> fallback succeeds.
+    // Mirrors the generate() path but exercises the separate embed arm.
+    // Kills a mutant that drops the embed fallback (would surface the 503)
+    // or that forwards to the primary a second time.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn embed_falls_back_on_primary_transient() {
+        allow_local();
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .expect(1)
+            .mount(&primary_mock)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": vec![0.25f32; 8] }]
+            })))
+            .expect(1)
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new(
+            azure(primary_mock.uri()),
+            azure(fallback_mock.uri()),
+            Some("fb-embed-model".into()),
+        );
+
+        let v = fc
+            .embed("hi", Some("primary-embed-model"))
+            .await
+            .expect("embed should fall back to secondary");
+        assert_eq!(v.len(), 8);
+        assert!(fc.cooldown_active(), "embed failure must arm the cooldown");
+    }
+
+    // Branch: embed() primary terminal (401) error -> NO fallback, error surfaces.
+    // Kills a mutant that treats every embed error as transient and falls back.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn embed_terminal_error_does_not_fall_back() {
+        allow_local();
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(1)
+            .mount(&primary_mock)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+
+        let r = fc.embed("hi", Some("m")).await;
+        assert!(matches!(r, Err(LlmError::Auth(_))));
+        assert!(
+            !fc.cooldown_active(),
+            "a terminal error must NOT arm the fallback cooldown"
+        );
+    }
+
+    // Branch: fb_model() returns the caller's model when fallback_model is None.
+    // We prove this by mounting the fallback to only succeed for the caller's
+    // model arg. Kills a mutant that hard-codes the fallback model to None or
+    // drops the `.or(caller)` fallback in `fb_model`.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn fallback_uses_caller_model_when_no_override() {
+        allow_local();
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&primary_mock)
+            .await;
+
+        // Fallback only matches when the request carries the caller's model.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "model": "caller-model"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "via-caller-model" } }]
+            })))
+            .expect(1)
+            .mount(&fallback_mock)
+            .await;
+
+        // fallback_model = None -> fb_model must reuse the caller's model arg.
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+
+        let out = fc.generate("hi", Some("caller-model")).await.unwrap();
+        assert_eq!(out, "via-caller-model");
+    }
+
+    // Branch: is_available() short-circuits true when the PRIMARY is healthy.
+    // Kills a mutant that flips the `||` to `&&` (would require both up) or one
+    // that always returns false.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn is_available_true_when_primary_healthy() {
+        allow_local();
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(&primary_mock)
+            .await;
+        // Fallback would 500 if consulted; primary's 200 must short-circuit.
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        assert!(fc.is_available().await, "primary healthy => available");
+    }
+
+    // Branch: is_available() falls through to the FALLBACK when primary is down.
+    // Kills a mutant that only checks the primary (would return false here).
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn is_available_true_when_only_fallback_healthy() {
+        allow_local();
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&primary_mock)
+            .await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        assert!(
+            fc.is_available().await,
+            "primary down but fallback healthy => still available"
+        );
+    }
+
+    // Branch: is_available() returns false only when BOTH backends are down.
+    // Kills a mutant that returns true unconditionally.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn is_available_false_when_both_down() {
+        allow_local();
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&primary_mock)
+            .await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        assert!(
+            !fc.is_available().await,
+            "both backends down => not available"
+        );
+    }
 }

@@ -74,7 +74,7 @@ wiremock = "0.6"
 rstest = "0.26"
 insta = { version = "1", features = ["yaml", "json", "redactions"] }
 proptest = "1.5"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 # D4: RAGAS-style recall accuracy bench (`cargo bench --bench recall_accuracy`).
 # Dev-dep only; never enters the runtime crate graph. 0.8 uses
 # `std::hint::black_box`; we do not import the removed `criterion::black_box`.

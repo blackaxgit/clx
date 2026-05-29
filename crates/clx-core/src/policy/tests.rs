@@ -2354,3 +2354,93 @@ fn regression_file_loaded_deny_overbroad_is_kept() {
         "overbroad deny rule must be kept (deny-all is fail-safe)"
     );
 }
+
+// =========================================================================
+// ValidationCache TTL expiry + cleanup branches
+// =========================================================================
+
+// Branch: get() on an expired entry returns None AND removes the entry
+// (cache.rs lines 92-94). Uses a zero TTL so any elapsed wall-clock time
+// makes the freshly-inserted entry expired. Kills a mutant that returns the
+// stale decision instead of None, or that forgets to remove the dead entry.
+#[test]
+fn test_cache_get_expired_returns_none_and_evicts() {
+    let cache = ValidationCache::with_ttl(Duration::ZERO);
+    cache.insert("k".to_string(), PolicyDecision::Allow);
+    assert_eq!(cache.len(), 1, "entry present immediately after insert");
+
+    // Ensure measurable elapsed time so `elapsed() > ZERO` is true.
+    std::thread::sleep(Duration::from_millis(2));
+
+    assert_eq!(
+        cache.get("k"),
+        None,
+        "an expired entry must NOT be served from get()"
+    );
+    // get() removed the expired entry on the miss path.
+    assert_eq!(
+        cache.len(),
+        0,
+        "expired entry must be evicted by the get() miss path"
+    );
+}
+
+// Branch: a fresh (non-expired) entry is served by get(). Pairs with the
+// expiry test to pin the TTL comparison direction. Kills a mutant that
+// flips `is_expired` so live entries are dropped.
+#[test]
+#[allow(clippy::duration_suboptimal_units)]
+fn test_cache_get_fresh_entry_is_served() {
+    let cache = ValidationCache::with_ttl(Duration::from_secs(300));
+    cache.insert("k".to_string(), PolicyDecision::Allow);
+    assert_eq!(
+        cache.get("k"),
+        Some(PolicyDecision::Allow),
+        "a fresh entry within TTL must be returned"
+    );
+}
+
+// Branch: cleanup_expired() removes only the entries past their TTL
+// (cache.rs line 129). Kills a mutant that retains expired entries or
+// clears everything regardless of expiry.
+#[test]
+fn test_cache_cleanup_expired_removes_only_dead_entries() {
+    // Zero-TTL cache: every entry becomes expired after a tick.
+    let cache = ValidationCache::with_ttl(Duration::ZERO);
+    cache.insert("old1".to_string(), PolicyDecision::Allow);
+    cache.insert("old2".to_string(), PolicyDecision::Allow);
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!(cache.len(), 2, "len() does not itself prune");
+
+    cache.cleanup_expired();
+    assert_eq!(
+        cache.len(),
+        0,
+        "cleanup_expired must drop all expired entries"
+    );
+}
+
+// Branch: the periodic 100th-access cleanup in get() prunes expired entries
+// (cache.rs lines 83-89). We insert into a zero-TTL cache, let it expire, and
+// then perform get() misses until access #100 triggers the retain() sweep.
+// Kills a mutant that removes the periodic-cleanup block (the expired entry
+// would linger) or changes the modulus so the sweep never fires.
+#[test]
+fn test_cache_periodic_cleanup_prunes_on_hundredth_access() {
+    let cache = ValidationCache::with_ttl(Duration::ZERO);
+    cache.insert("stale".to_string(), PolicyDecision::Allow);
+    std::thread::sleep(Duration::from_millis(2));
+
+    // Access 99 times against absent keys (each get() bumps the counter but
+    // does not touch the "stale" entry directly). The 100th access fires the
+    // retain() sweep that drops the expired "stale" entry.
+    for _ in 0..100 {
+        let _ = cache.get("absent-key");
+    }
+
+    assert_eq!(
+        cache.len(),
+        0,
+        "the 100th-access periodic sweep must have pruned the expired entry"
+    );
+}

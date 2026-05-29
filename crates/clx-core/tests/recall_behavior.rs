@@ -496,3 +496,248 @@ async fn risk_m_r2_recall_default_is_rrf_not_legacy_linear() {
     let hits = engine.query("risk", &default_cfg).await;
     assert!(!hits.is_empty(), "default (RRF) recall returns the hit");
 }
+
+// ===========================================================================
+// Engine branches driven through fully-controllable port fakes
+//
+// These cover the semantic-stage edge cases and `check_model_mismatch` arms
+// that the DB-backed StorageSnapshotRepo cannot exercise deterministically
+// (distance thresholding, missing snapshot, embedder error, model identity).
+// ===========================================================================
+
+use clx_core::recall::{QueryEmbedder, SnapshotRepo};
+use clx_core::types::SessionSummary;
+
+/// A `SnapshotRepo` fake with per-method scripted outputs. Every field is a
+/// closure-free value so each test wires exactly the branch it targets.
+#[derive(Default)]
+struct FakeRepo {
+    semantic_on: bool,
+    similar: Vec<(i64, f32)>,
+    snapshots: std::collections::HashMap<i64, Snapshot>,
+    stored_model: Option<String>,
+    model_errors: bool,
+}
+
+impl FakeRepo {
+    fn snap(id: i64, summary: &str) -> Snapshot {
+        let mut s = Snapshot::new(SessionId::new(format!("s{id}")), SnapshotTrigger::Auto);
+        s.id = Some(id);
+        s.summary = Some(summary.to_string());
+        s.created_at = chrono::Utc::now();
+        s
+    }
+}
+
+impl SnapshotRepo for FakeRepo {
+    fn search_fts(&self, _q: &str, _limit: usize) -> clx_core::Result<Vec<(Snapshot, f64)>> {
+        Ok(Vec::new())
+    }
+    fn recent_session_summaries(
+        &self,
+        _n: usize,
+        _exclude: Option<&str>,
+    ) -> clx_core::Result<Vec<SessionSummary>> {
+        Ok(Vec::new())
+    }
+    fn semantic_similar(&self, _emb: &[f32], _limit: usize) -> clx_core::Result<Vec<(i64, f32)>> {
+        Ok(self.similar.clone())
+    }
+    fn semantic_enabled(&self) -> bool {
+        self.semantic_on
+    }
+    fn snapshot_by_id(&self, id: i64) -> clx_core::Result<Option<Snapshot>> {
+        Ok(self.snapshots.get(&id).cloned())
+    }
+    fn list_active_sessions(&self) -> clx_core::Result<Vec<Session>> {
+        Ok(Vec::new())
+    }
+    fn snapshots_by_session(&self, _session_id: &str) -> clx_core::Result<Vec<Snapshot>> {
+        Ok(Vec::new())
+    }
+    fn current_embedding_model(&self) -> clx_core::Result<Option<String>> {
+        if self.model_errors {
+            Err(clx_core::Error::ContextNotFound(
+                "forced model lookup error".into(),
+            ))
+        } else {
+            Ok(self.stored_model.clone())
+        }
+    }
+}
+
+/// Embedder fake: returns a fixed vector, or an error to drive the
+/// embed-failure fallback branch.
+struct FakeEmbedder {
+    fail: bool,
+}
+
+#[async_trait]
+impl QueryEmbedder for FakeEmbedder {
+    async fn embed_query(&self, _text: &str) -> clx_core::Result<Vec<f32>> {
+        if self.fail {
+            Err(clx_core::Error::InvalidInput("forced embed failure".into()))
+        } else {
+            Ok(vec![0.1f32; 8])
+        }
+    }
+}
+
+/// Branch: semantic candidates whose distance exceeds the threshold-derived
+/// ceiling are skipped, while close ones are kept (`engine.rs` lines 197-203).
+/// With `similarity_threshold`=0.35 the ceiling is (1-0.35)*2 = 1.3, so distance
+/// 0.5 is kept and 1.8 is dropped. Kills a mutant that flips the `>` to `<`
+/// (would surface only the far candidate) or removes the distance gate.
+#[tokio::test]
+async fn semantic_distance_threshold_filters_far_candidates() {
+    let mut repo = FakeRepo {
+        semantic_on: true,
+        similar: vec![(1, 0.5), (2, 1.8)],
+        ..Default::default()
+    };
+    repo.snapshots.insert(1, FakeRepo::snap(1, "near hit"));
+    repo.snapshots.insert(2, FakeRepo::snap(2, "far hit"));
+
+    let embedder = FakeEmbedder { fail: false };
+    let engine = RecallEngine::new(&repo).with_embedder(&embedder);
+    let config = RecallQueryConfig {
+        similarity_threshold: 0.35,
+        fallback_to_fts: false,
+        ..cfg()
+    };
+
+    let hits = engine.query("q", &config).await;
+    let ids: Vec<i64> = hits.iter().map(|h| h.snapshot_id).collect();
+    assert!(ids.contains(&1), "near candidate (d=0.5) must be kept");
+    assert!(
+        !ids.contains(&2),
+        "far candidate (d=1.8) above the 1.3 ceiling must be dropped, got {ids:?}"
+    );
+}
+
+/// Branch: a semantic candidate id with no backing snapshot row (Ok(None))
+/// is silently skipped (`engine.rs` lines 218-219). Kills a mutant that pushes a
+/// hit with empty/garbage fields instead of skipping.
+#[tokio::test]
+async fn semantic_skips_candidate_with_missing_snapshot() {
+    let mut repo = FakeRepo {
+        semantic_on: true,
+        similar: vec![(1, 0.4), (99, 0.4)],
+        ..Default::default()
+    };
+    // Only id 1 has a backing snapshot; id 99 is dangling.
+    repo.snapshots.insert(1, FakeRepo::snap(1, "present"));
+
+    let embedder = FakeEmbedder { fail: false };
+    let engine = RecallEngine::new(&repo).with_embedder(&embedder);
+    let config = RecallQueryConfig {
+        similarity_threshold: 0.0,
+        fallback_to_fts: false,
+        ..cfg()
+    };
+
+    let hits = engine.query("q", &config).await;
+    let ids: Vec<i64> = hits.iter().map(|h| h.snapshot_id).collect();
+    assert_eq!(ids, vec![1], "dangling candidate id 99 must be skipped");
+}
+
+/// Branch: when the embedder errors, the semantic stage returns empty and the
+/// pipeline degrades to FTS5 (`engine.rs` lines 164-168). With `fallback_to_fts`
+/// disabled and FTS empty, the result is empty rather than a panic. Kills a
+/// mutant that propagates the embed error or unwraps it.
+#[tokio::test]
+async fn semantic_embed_error_degrades_gracefully() {
+    let repo = FakeRepo {
+        semantic_on: true,
+        similar: vec![(1, 0.1)], // would match if embedding succeeded
+        ..Default::default()
+    };
+    let embedder = FakeEmbedder { fail: true };
+    let engine = RecallEngine::new(&repo).with_embedder(&embedder);
+    let config = RecallQueryConfig {
+        similarity_threshold: 0.0,
+        fallback_to_fts: false,
+        ..cfg()
+    };
+
+    let hits = engine.query("q", &config).await;
+    assert!(
+        hits.is_empty(),
+        "embed failure must yield no semantic hits (graceful degrade), got {hits:?}"
+    );
+}
+
+/// Branch: `check_model_mismatch` returns Some when stored != configured.
+/// Kills a mutant that returns None on mismatch or swaps the tuple order.
+#[test]
+fn check_model_mismatch_detects_drift() {
+    let repo = FakeRepo {
+        stored_model: Some("ollama:old-model".to_string()),
+        ..Default::default()
+    };
+    let engine = RecallEngine::new(&repo).with_model_ident("ollama:new-model");
+    let mismatch = engine.check_model_mismatch();
+    assert_eq!(
+        mismatch,
+        Some((
+            "ollama:old-model".to_string(),
+            "ollama:new-model".to_string()
+        )),
+        "stored vs configured drift must be reported as (stored, configured)"
+    );
+}
+
+/// Branch: matching stored/configured models report no mismatch.
+/// Kills a mutant that always reports a mismatch.
+#[test]
+fn check_model_mismatch_none_when_equal() {
+    let repo = FakeRepo {
+        stored_model: Some("ollama:same".to_string()),
+        ..Default::default()
+    };
+    let engine = RecallEngine::new(&repo).with_model_ident("ollama:same");
+    assert_eq!(engine.check_model_mismatch(), None);
+}
+
+/// Branch: no configured ident => None regardless of stored model
+/// (the `configured?` early return, engine.rs line 87). Kills a mutant that
+/// reports a mismatch when detection is disabled.
+#[test]
+fn check_model_mismatch_none_without_configured_ident() {
+    let repo = FakeRepo {
+        stored_model: Some("ollama:whatever".to_string()),
+        ..Default::default()
+    };
+    let engine = RecallEngine::new(&repo); // no with_model_ident
+    assert_eq!(engine.check_model_mismatch(), None);
+}
+
+/// Branch: no stored model (empty DB) => None (the `stored?` flatten,
+/// engine.rs line 88). Kills a mutant that treats absent storage as a mismatch.
+#[test]
+fn check_model_mismatch_none_when_no_stored_model() {
+    let repo = FakeRepo {
+        stored_model: None,
+        ..Default::default()
+    };
+    let engine = RecallEngine::new(&repo).with_model_ident("ollama:new");
+    assert_eq!(engine.check_model_mismatch(), None);
+}
+
+/// Branch: a repo error during the model lookup is swallowed and reported as
+/// None (the `.ok().flatten()`, engine.rs line 88). Kills a mutant that
+/// surfaces the error or reports a spurious mismatch.
+#[test]
+fn check_model_mismatch_none_on_repo_error() {
+    let repo = FakeRepo {
+        stored_model: Some("ollama:old".to_string()),
+        model_errors: true,
+        ..Default::default()
+    };
+    let engine = RecallEngine::new(&repo).with_model_ident("ollama:new");
+    assert_eq!(
+        engine.check_model_mismatch(),
+        None,
+        "a repo lookup error must degrade to None, not a false-positive mismatch"
+    );
+}

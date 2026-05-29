@@ -12,9 +12,29 @@ default:
 fast:
     bash scripts/test.sh fast
 
-# Instrumented coverage gate (>= 97% on the published denominator).
+# Instrumented coverage summary (honest ceiling ~90%; warn-only, no theater).
+#
+# Self-contained so it works WITHOUT rustup: cargo-llvm-cov needs an llvm-cov
+# and llvm-profdata that match the rustc LLVM. On a Homebrew-Rust machine there
+# is no `rustup component add llvm-tools-preview`, so we point cargo-llvm-cov at
+# the Homebrew LLVM (`brew install llvm`) when its binaries are present.
+# On a rustup setup these vars are simply left unset and cargo-llvm-cov finds
+# the llvm-tools-preview component as usual. The frozen ignore-filename-regex
+# in Cargo.toml [workspace.metadata.cargo-llvm-cov] is honored automatically.
 cov:
-    bash scripts/test.sh cov
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BREW_LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov
+    BREW_LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata
+    if [ -x "$BREW_LLVM_COV" ] && [ -x "$BREW_LLVM_PROFDATA" ]; then
+        export LLVM_COV="$BREW_LLVM_COV"
+        export LLVM_PROFDATA="$BREW_LLVM_PROFDATA"
+        echo "cov: using Homebrew LLVM ($LLVM_COV)"
+    else
+        echo "cov: Homebrew LLVM not found; relying on rustup llvm-tools-preview"
+    fi
+    CLX_MODEL_FETCH_DRYRUN=1 CLX_CREDENTIALS_BACKEND=age \
+        cargo llvm-cov --workspace --summary-only
 
 # TUI pixel snapshots: cargo insta test --review.
 snapshots:

@@ -31,4 +31,61 @@ impl RateLimiter {
         }
         self.request_count.fetch_add(1, Ordering::Relaxed) < self.max_per_minute
     }
+
+    /// Test-only: rewind the window start by `secs` seconds so the
+    /// minute-boundary reset branch in [`Self::check`] can be exercised
+    /// deterministically without sleeping for a real minute. Does not touch
+    /// the request counter.
+    #[cfg(test)]
+    pub(crate) fn rewind_window(&self, secs: u64) {
+        if let Ok(mut start) = self.window_start.lock() {
+            *start -= Duration::from_secs(secs);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RateLimiter;
+
+    // Branch: when the window is older than 1 minute, `check` resets the
+    // counter so requests are allowed again. Kills a mutant that drops the
+    // reset (the limiter would stay saturated forever) or flips the `>`
+    // comparison so the window never rolls over.
+    #[test]
+    fn window_reset_after_one_minute_reallows_requests() {
+        let limiter = RateLimiter::new(2);
+
+        // Saturate the window: 2 allowed, 3rd denied.
+        assert!(limiter.check());
+        assert!(limiter.check());
+        assert!(!limiter.check(), "3rd request in the window must be denied");
+
+        // Simulate the window aging past the 1-minute boundary.
+        limiter.rewind_window(61);
+
+        // The next check must observe the rollover, reset the counter, and
+        // allow the request again.
+        assert!(
+            limiter.check(),
+            "after the window rolls over, requests must be allowed again"
+        );
+    }
+
+    // Branch: a window that is NOT yet a minute old must NOT reset.
+    // Kills a mutant that resets unconditionally (would never rate-limit).
+    #[test]
+    fn window_does_not_reset_within_the_minute() {
+        let limiter = RateLimiter::new(2);
+        assert!(limiter.check());
+        assert!(limiter.check());
+
+        // Age the window by only 30s — under the 1-minute threshold.
+        limiter.rewind_window(30);
+
+        assert!(
+            !limiter.check(),
+            "within the same minute the limiter must stay saturated"
+        );
+    }
 }

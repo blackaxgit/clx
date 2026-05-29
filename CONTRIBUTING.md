@@ -131,6 +131,45 @@ cargo test -p clx-core policy::tests::test_whitelist_match
 - Some integration tests require Ollama to be running. They are gated behind the `integration` feature or will be skipped automatically when Ollama is unavailable.
 - Tests that depend on environment variables are serialized with `serial_test` to avoid flaky failures under parallel execution.
 
+### Running coverage locally
+
+Coverage uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```sh
+cargo install cargo-llvm-cov
+just cov
+```
+
+`just cov` honors the frozen `ignore-filename-regex` in
+`Cargo.toml [workspace.metadata.cargo-llvm-cov]` and runs hermetically
+(`CLX_MODEL_FETCH_DRYRUN=1 CLX_CREDENTIALS_BACKEND=age`).
+
+`cargo-llvm-cov` needs an `llvm-cov` and `llvm-profdata` whose version matches
+the toolchain's LLVM. There are two supported setups:
+
+- **rustup toolchains:** add the bundled tools once with
+  `rustup component add llvm-tools-preview`. Nothing else is required.
+- **Homebrew Rust (no rustup):** there is no `llvm-tools-preview` component, so
+  install LLVM via Homebrew and let the recipe find it:
+
+  ```sh
+  brew install llvm
+  ```
+
+  `just cov` auto-detects `/opt/homebrew/opt/llvm/bin/llvm-cov` and
+  `/opt/homebrew/opt/llvm/bin/llvm-profdata` and exports `LLVM_COV` /
+  `LLVM_PROFDATA` for cargo-llvm-cov. If you invoke `cargo llvm-cov` directly
+  instead of through `just`, set those two variables yourself:
+
+  ```sh
+  LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov \
+  LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata \
+    cargo llvm-cov --workspace --summary-only
+  ```
+
+The coverage number is reported honestly (workspace ceiling ~90%); it is a
+warn-only signal, not a hard gate, to avoid incentivizing test theater.
+
 ---
 
 ## Code Style
