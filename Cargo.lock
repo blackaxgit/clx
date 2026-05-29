@@ -927,6 +927,7 @@ dependencies = [
  "hex",
  "insta",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
