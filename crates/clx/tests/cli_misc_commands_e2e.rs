@@ -52,7 +52,7 @@ fn bare_clx_human_prints_quick_start_default_screen() {
         .success()
         .stdout(predicate::str::contains("CLX"))
         .stdout(predicate::str::contains(
-            "A command validation and context persistence layer for Claude Code.",
+            "Command validation and context persistence for coding agents",
         ))
         .stdout(predicate::str::contains("Quick Start"))
         .stdout(predicate::str::contains("clx dashboard"))

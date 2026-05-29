@@ -291,7 +291,7 @@ const CLX_CLAUDE_MD_SECTION: &str = r#"
 
 **[SCOPE: ALL AGENTS]**
 
-CLX (Claude Code Enhancement Layer) provides MCP tools for context persistence across sessions.
+CLX (Coding-Agent Extension Layer) provides MCP tools for context persistence across sessions.
 
 ## Available CLX Tools (MANDATORY knowledge)
 

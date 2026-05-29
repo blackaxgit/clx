@@ -38,10 +38,10 @@ use commands::{
     ModelAction, RulesAction, TrustAction,
 };
 
-/// CLX - Claude Code Extension
+/// CLX - Coding-Agent Extension Layer
 #[derive(Parser)]
 #[command(name = "clx")]
-#[command(author, version, about = "CLX - Claude Code Extension CLI")]
+#[command(author, version, about = "CLX - Coding-Agent Extension Layer CLI")]
 #[command(
     long_about = "Command-line interface for managing CLX configuration, rules, and context."
 )]

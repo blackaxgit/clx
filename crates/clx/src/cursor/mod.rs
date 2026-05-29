@@ -29,7 +29,7 @@ alwaysApply: true
 ---
 # CLX Integration
 
-CLX (Claude Code Enhancement Layer) provides MCP tools for context persistence
+CLX (Coding-Agent Extension Layer) provides MCP tools for context persistence
 and command validation across Cursor sessions.
 
 ## Available CLX Tools

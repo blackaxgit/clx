@@ -1,6 +1,6 @@
 # Contributing to CLX
 
-Thank you for your interest in contributing to CLX (Claude Code Extension Layer). This document covers everything you need to get started.
+Thank you for your interest in contributing to CLX (Coding-Agent Extension Layer). This document covers everything you need to get started.
 
 ## Table of Contents
 

@@ -384,9 +384,9 @@ fn version_human_full_output_fields() {
         .assert()
         .success()
         .stdout(predicate::str::contains("clx"))
-        .stdout(predicate::str::contains("Claude Code Extension"))
+        .stdout(predicate::str::contains("Coding-Agent Extension Layer"))
         .stdout(predicate::str::contains(
-            "A command validation and context persistence layer",
+            "Command validation and context persistence for coding agents",
         ))
         .stdout(predicate::str::contains("Config:"))
         .stdout(predicate::str::contains("License: MPL-2.0"));
@@ -404,7 +404,7 @@ fn version_json_arm_has_name_version_description() {
         .clone();
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
     assert_eq!(v["name"], "clx");
-    assert_eq!(v["description"], "Claude Code Extension");
+    assert_eq!(v["description"], "Coding-Agent Extension Layer");
     assert!(
         v["version"].as_str().is_some_and(|s| !s.is_empty()),
         "version must be a non-empty semver string: {v}"

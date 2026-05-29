@@ -44,7 +44,7 @@ pub const AGENTS_MD_FALLBACK_BYTES: usize = 30 * 1024;
 pub const CLX_AGENTS_MD_SECTION: &str = r#"
 # CLX Integration
 
-CLX (Claude Code Enhancement Layer) provides MCP tools for context persistence
+CLX (Coding-Agent Extension Layer) provides MCP tools for context persistence
 and command validation across Codex sessions.
 
 ## Available CLX Tools
