@@ -17,7 +17,7 @@ pub mod version;
 pub use config::cmd_config;
 pub use credentials::cmd_credentials;
 pub use embeddings::{cmd_embed_backfill, cmd_embeddings};
-pub use install::{cmd_install, cmd_uninstall};
+pub use install::{InstallTarget, cmd_install, cmd_uninstall};
 pub use keychain_trust::cmd_keychain_trust;
 pub use maintenance::cmd_maintenance;
 pub use model::{ModelAction, cmd_model};

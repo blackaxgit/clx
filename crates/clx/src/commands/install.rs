@@ -12,6 +12,110 @@ use clx_core::config::Config;
 use clx_core::storage::Storage;
 
 use crate::Cli;
+use crate::codex;
+use crate::cursor;
+
+/// Which host(s) `clx install` / `clx uninstall` should act on.
+///
+/// `Auto` (the default) installs into every host CLX can detect on the machine
+/// (Claude is always treated as present); `All` acts on all three
+/// unconditionally; the single-host variants target exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallTarget {
+    /// Claude Code only (`~/.claude`).
+    Claude,
+    /// Codex CLI only (`~/.codex`).
+    Codex,
+    /// Cursor IDE only (`~/.cursor` + repo-local rule).
+    Cursor,
+    /// All three hosts, unconditionally.
+    All,
+    /// Every detected host (default). Claude is always included.
+    Auto,
+}
+
+impl InstallTarget {
+    /// Whether Claude should be acted on for this target. Claude is the CLX
+    /// baseline host, so `Auto`/`All` always include it.
+    fn wants_claude(self) -> bool {
+        matches!(self, Self::Claude | Self::All | Self::Auto)
+    }
+
+    /// Whether Codex should be acted on. `All` forces it; `Auto` gates on
+    /// detection (resolved by the caller); `Codex` selects it explicitly.
+    fn wants_codex(self, detected: bool) -> bool {
+        match self {
+            Self::Codex | Self::All => true,
+            Self::Auto => detected,
+            _ => false,
+        }
+    }
+
+    /// Whether Cursor should be acted on. Same gating logic as Codex.
+    fn wants_cursor(self, detected: bool) -> bool {
+        match self {
+            Self::Cursor | Self::All => true,
+            Self::Auto => detected,
+            _ => false,
+        }
+    }
+}
+
+/// Strip a marker-delimited section (`# CLX Integration`-style H1 through the
+/// next top-level `# ` heading or EOF) from a markdown file. Used by D8
+/// uninstall for `CLAUDE.md`, `AGENTS.md`, and `AGENTS.override.md`.
+///
+/// Returns `Ok(true)` if the file existed, contained the marker, and was
+/// rewritten without it. A file without the marker (or missing) is a clean
+/// no-op returning `Ok(false)`. The marker is matched only at the start of a
+/// line so it is never confused with an inline mention.
+fn remove_clx_section_from_file(path: &std::path::Path, marker: &str) -> Result<bool> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let stripped = strip_marker_section(&content, marker);
+    if stripped == content {
+        return Ok(false);
+    }
+    fs::write(path, stripped).context("rewrite file after stripping CLX section")?;
+    Ok(true)
+}
+
+/// Pure string transform behind [`remove_clx_section_from_file`]: drop the
+/// block beginning at a line equal to `marker` (an H1 heading) up to but not
+/// including the next line that starts a new top-level `# ` heading (or EOF).
+fn strip_marker_section(content: &str, marker: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    // The CLX heading may carry a trailing tag (e.g. `# CLX Integration
+    // [STRICT]`), so match an H1 line that begins with the marker rather than
+    // one that equals it exactly.
+    let is_marker = |l: &str| l.starts_with(marker);
+    let Some(start) = lines.iter().position(|l| is_marker(l)) else {
+        return content.to_string();
+    };
+    // Find the next top-level H1 after the marker (a line starting with "# "
+    // that is not the marker itself).
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.starts_with("# ") {
+            end = i;
+            break;
+        }
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    kept.extend_from_slice(&lines[..start]);
+    kept.extend_from_slice(&lines[end..]);
+    // Re-join, trimming trailing blank lines that the removed section left
+    // behind, and preserve a single trailing newline if the original had one.
+    let mut out = kept.join("\n");
+    while out.ends_with('\n') || out.ends_with(' ') {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
 
 /// Default docker-compose.yml embedded from scripts/docker-compose.yml
 const DOCKER_COMPOSE_YML: &str = include_str!("../../../../scripts/docker-compose.yml");
@@ -552,8 +656,160 @@ async fn pull_ollama_model(model: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write the Codex host artifacts (`~/.codex/hooks.json`, `config.toml`
+/// `[mcp_servers.clx]`, and the AGENTS.md CLX section). Failures are recorded
+/// as warnings, never fatal, so a partial host install does not abort the rest.
+fn install_codex_host(
+    cli: &Cli,
+    home: &std::path::Path,
+    installed_items: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if !cli.json {
+        println!();
+        println!("{}", "Codex Integration".cyan().bold());
+        println!("{}", "-".repeat(30));
+    }
+
+    match codex::write_codex_hooks(home) {
+        Ok(_) => {
+            if !cli.json {
+                println!(
+                    "  {} Configured {}",
+                    "+".green(),
+                    codex::hooks_json_path(home).display()
+                );
+            }
+            installed_items.push("codex hooks.json".to_string());
+        }
+        Err(e) => warnings.push(format!("Could not write Codex hooks.json: {e}")),
+    }
+
+    match codex::write_codex_mcp(home) {
+        Ok(_) => {
+            if !cli.json {
+                println!(
+                    "  {} Configured MCP server (clx) in {}",
+                    "+".green(),
+                    codex::config_toml_path(home).display()
+                );
+            }
+            installed_items.push("codex config.toml [mcp_servers.clx]".to_string());
+        }
+        Err(e) => warnings.push(format!("Could not write Codex config.toml: {e}")),
+    }
+
+    match codex::inject_codex_agents_md(home) {
+        Ok(codex::AgentsInjectOutcome::Injected) => {
+            if !cli.json {
+                println!(
+                    "  {} Added CLX section to {}",
+                    "+".green(),
+                    codex::agents_md_path(home).display()
+                );
+            }
+            installed_items.push("codex AGENTS.md CLX section".to_string());
+        }
+        Ok(codex::AgentsInjectOutcome::OverrideFallback) => {
+            if !cli.json {
+                println!(
+                    "  {} AGENTS.md near 32 KiB cap; wrote {}",
+                    "!".yellow(),
+                    codex::agents_override_md_path(home).display()
+                );
+            }
+            installed_items.push("codex AGENTS.override.md CLX section".to_string());
+        }
+        Ok(codex::AgentsInjectOutcome::AlreadyPresent) => {
+            if !cli.json {
+                println!(
+                    "  {} CLX section already present in {}",
+                    "*".dimmed(),
+                    codex::agents_md_path(home).display()
+                );
+            }
+        }
+        Err(e) => warnings.push(format!("Could not update Codex AGENTS.md: {e}")),
+    }
+}
+
+/// Write the Cursor host artifacts (`~/.cursor/mcp.json`, `~/.cursor/hooks.json`
+/// with `failClosed:true`, and - when `write_repo_rule` is set - the repo-local
+/// `.cursor/rules/clx.mdc`). The rule is project-scoped (Cursor has no global
+/// instructions file) and is written into the current working directory; it is
+/// only emitted on an explicit Cursor target (`--target cursor`/`all`), never
+/// under `auto`, so a plain `clx install` never drops a file into the user's
+/// cwd. Failures are warnings.
+fn install_cursor_host(
+    cli: &Cli,
+    home: &std::path::Path,
+    write_repo_rule: bool,
+    installed_items: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if !cli.json {
+        println!();
+        println!("{}", "Cursor Integration".cyan().bold());
+        println!("{}", "-".repeat(30));
+    }
+
+    match cursor::write_cursor_mcp(home) {
+        Ok(_) => {
+            if !cli.json {
+                println!(
+                    "  {} Configured MCP server (clx) in {}",
+                    "+".green(),
+                    cursor::mcp_json_path(home).display()
+                );
+            }
+            installed_items.push("cursor mcp.json".to_string());
+        }
+        Err(e) => warnings.push(format!("Could not write Cursor mcp.json: {e}")),
+    }
+
+    match cursor::write_cursor_hooks(home) {
+        Ok(_) => {
+            if !cli.json {
+                println!(
+                    "  {} Configured {} (failClosed)",
+                    "+".green(),
+                    cursor::hooks_json_path(home).display()
+                );
+            }
+            installed_items.push("cursor hooks.json".to_string());
+        }
+        Err(e) => warnings.push(format!("Could not write Cursor hooks.json: {e}")),
+    }
+
+    // Project-scoped rule: written into the current repo (cwd), only on an
+    // explicit Cursor target so `auto` never touches the user's cwd.
+    if write_repo_rule {
+        match env::current_dir() {
+            Ok(repo) => match cursor::write_cursor_rule(&repo) {
+                Ok(_) => {
+                    if !cli.json {
+                        println!(
+                            "  {} Wrote {}",
+                            "+".green(),
+                            cursor::rule_mdc_path(&repo).display()
+                        );
+                    }
+                    installed_items.push("cursor .cursor/rules/clx.mdc".to_string());
+                }
+                Err(e) => warnings.push(format!("Could not write Cursor rule: {e}")),
+            },
+            Err(e) => warnings.push(format!("Could not resolve repo for Cursor rule: {e}")),
+        }
+    } else if !cli.json {
+        println!(
+            "  {} Skipped repo-local .cursor/rules/clx.mdc (run `clx install --target cursor` in a repo to add it)",
+            "*".dimmed()
+        );
+    }
+}
+
 /// Install CLX integration
-pub async fn cmd_install(cli: &Cli) -> Result<()> {
+pub async fn cmd_install(cli: &Cli, target: InstallTarget) -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let clx_dir = clx_core::paths::clx_dir();
     let claude_dir = home.join(".claude");
@@ -980,112 +1236,140 @@ pub async fn cmd_install(cli: &Cli) -> Result<()> {
         }
     }
 
-    // Step 7: Configure ~/.claude/settings.json
-    if !cli.json {
-        println!();
-        println!("{}", "Claude Code Integration".cyan().bold());
-        println!("{}", "-".repeat(30));
-    }
-
-    // Ensure ~/.claude/ directory exists
-    if !claude_dir.exists() {
-        fs::create_dir_all(&claude_dir)?;
-        if !cli.json {
-            println!("  {} Created {}", "+".green(), claude_dir.display());
-        }
-    }
-
-    // Read existing settings
-    let mut settings = read_claude_settings(&settings_path)?;
-
-    // Add hooks configuration
-    let hooks_config = get_hooks_config();
-    settings["hooks"] = hooks_config;
-    if !cli.json {
-        println!(
-            "  {} Configured hooks (PreToolUse, PostToolUse, PreCompact, SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop)",
-            "+".green()
-        );
-    }
-    installed_items.push("hooks configuration".to_string());
-
-    // Add MCP server configuration
-    let mcp_config = get_mcp_config();
-    if settings.get("mcpServers").is_none() {
-        settings["mcpServers"] = serde_json::json!({});
-    }
-    if let Some(mcp_servers) = settings.get_mut("mcpServers")
-        && let Some(obj) = mcp_servers.as_object_mut()
-    {
-        obj.insert("clx".to_string(), mcp_config["clx"].clone());
-    }
-    if !cli.json {
-        println!("  {} Configured MCP server (clx)", "+".green());
-    }
-    installed_items.push("mcp server configuration".to_string());
-
-    // Write updated settings
-    write_claude_settings(&settings_path, &settings)?;
-    if !cli.json {
-        println!("  {} Updated {}", "+".green(), settings_path.display());
-    }
-
-    // GAP-2: install the 6 CLX skills into the personal skills location so a
-    // non-plugin (cargo/manual) install is self-contained.
-    match install_skills(&claude_dir) {
-        Ok(skill_names) => {
-            if !cli.json {
-                println!(
-                    "  {} Installed {} skills to {}",
-                    "+".green(),
-                    skill_names.len(),
-                    claude_dir.join("skills").display()
-                );
-            }
-            installed_items.push(format!("skills: {}", skill_names.join(", ")));
-        }
-        Err(e) => {
-            if !cli.json {
-                println!("  {} Failed to install skills: {}", "!".yellow(), e);
-            }
-            warnings.push(format!("Could not install skills: {e}"));
-        }
-    }
-
-    // Step 8: Inject CLX section into CLAUDE.md
     let claude_md_path = claude_dir.join("CLAUDE.md");
-    if !cli.json {
-        println!();
-        println!("{}", "CLAUDE.md Integration".cyan().bold());
-        println!("{}", "-".repeat(30));
+
+    // Step 7: Configure ~/.claude (Claude Code host). Gated on the target so
+    // `--target codex`/`cursor` skip Claude wiring; `auto`/`all`/`claude`
+    // include it. The body below is byte-identical to the pre-P3 Claude path.
+    if target.wants_claude() {
+        // Step 7: Configure ~/.claude/settings.json
+        if !cli.json {
+            println!();
+            println!("{}", "Claude Code Integration".cyan().bold());
+            println!("{}", "-".repeat(30));
+        }
+
+        // Ensure ~/.claude/ directory exists
+        if !claude_dir.exists() {
+            fs::create_dir_all(&claude_dir)?;
+            if !cli.json {
+                println!("  {} Created {}", "+".green(), claude_dir.display());
+            }
+        }
+
+        // Read existing settings
+        let mut settings = read_claude_settings(&settings_path)?;
+
+        // Add hooks configuration
+        let hooks_config = get_hooks_config();
+        settings["hooks"] = hooks_config;
+        if !cli.json {
+            println!(
+                "  {} Configured hooks (PreToolUse, PostToolUse, PreCompact, SessionStart, SessionEnd, SubagentStart, UserPromptSubmit, Stop)",
+                "+".green()
+            );
+        }
+        installed_items.push("hooks configuration".to_string());
+
+        // Add MCP server configuration
+        let mcp_config = get_mcp_config();
+        if settings.get("mcpServers").is_none() {
+            settings["mcpServers"] = serde_json::json!({});
+        }
+        if let Some(mcp_servers) = settings.get_mut("mcpServers")
+            && let Some(obj) = mcp_servers.as_object_mut()
+        {
+            obj.insert("clx".to_string(), mcp_config["clx"].clone());
+        }
+        if !cli.json {
+            println!("  {} Configured MCP server (clx)", "+".green());
+        }
+        installed_items.push("mcp server configuration".to_string());
+
+        // Write updated settings
+        write_claude_settings(&settings_path, &settings)?;
+        if !cli.json {
+            println!("  {} Updated {}", "+".green(), settings_path.display());
+        }
+
+        // GAP-2: install the 6 CLX skills into the personal skills location so a
+        // non-plugin (cargo/manual) install is self-contained.
+        match install_skills(&claude_dir) {
+            Ok(skill_names) => {
+                if !cli.json {
+                    println!(
+                        "  {} Installed {} skills to {}",
+                        "+".green(),
+                        skill_names.len(),
+                        claude_dir.join("skills").display()
+                    );
+                }
+                installed_items.push(format!("skills: {}", skill_names.join(", ")));
+            }
+            Err(e) => {
+                if !cli.json {
+                    println!("  {} Failed to install skills: {}", "!".yellow(), e);
+                }
+                warnings.push(format!("Could not install skills: {e}"));
+            }
+        }
+
+        // Step 8: Inject CLX section into CLAUDE.md
+        if !cli.json {
+            println!();
+            println!("{}", "CLAUDE.md Integration".cyan().bold());
+            println!("{}", "-".repeat(30));
+        }
+
+        match inject_clx_to_claude_md(&claude_md_path) {
+            Ok(true) => {
+                if !cli.json {
+                    println!(
+                        "  {} Added CLX tools section to {}",
+                        "+".green(),
+                        claude_md_path.display()
+                    );
+                }
+                installed_items.push("CLAUDE.md CLX section".to_string());
+            }
+            Ok(false) => {
+                if !cli.json {
+                    println!(
+                        "  {} CLX section already present in {}",
+                        "*".dimmed(),
+                        claude_md_path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                if !cli.json {
+                    println!("  {} Failed to update CLAUDE.md: {}", "!".yellow(), e);
+                }
+                warnings.push(format!("Could not update CLAUDE.md: {e}"));
+            }
+        }
     }
 
-    match inject_clx_to_claude_md(&claude_md_path) {
-        Ok(true) => {
-            if !cli.json {
-                println!(
-                    "  {} Added CLX tools section to {}",
-                    "+".green(),
-                    claude_md_path.display()
-                );
-            }
-            installed_items.push("CLAUDE.md CLX section".to_string());
-        }
-        Ok(false) => {
-            if !cli.json {
-                println!(
-                    "  {} CLX section already present in {}",
-                    "*".dimmed(),
-                    claude_md_path.display()
-                );
-            }
-        }
-        Err(e) => {
-            if !cli.json {
-                println!("  {} Failed to update CLAUDE.md: {}", "!".yellow(), e);
-            }
-            warnings.push(format!("Could not update CLAUDE.md: {e}"));
-        }
+    // Step 9: Codex host integration (~/.codex). Written when the target asks
+    // for Codex (explicit, `all`, or `auto` with a detected `codex` binary).
+    let codex_detected = codex::detect_codex().installed;
+    if target.wants_codex(codex_detected) {
+        install_codex_host(cli, &home, &mut installed_items, &mut warnings);
+    }
+
+    // Step 10: Cursor host integration (~/.cursor + repo-local rule). The
+    // repo-local rule is only written on an explicit Cursor target so a plain
+    // `clx install` (auto) never drops a file into the user's cwd.
+    let cursor_detected = cursor::detect_cursor().installed;
+    if target.wants_cursor(cursor_detected) {
+        let write_repo_rule = matches!(target, InstallTarget::Cursor | InstallTarget::All);
+        install_cursor_host(
+            cli,
+            &home,
+            write_repo_rule,
+            &mut installed_items,
+            &mut warnings,
+        );
     }
 
     // Output summary
@@ -1188,14 +1472,92 @@ fn remove_clx_from_settings(settings: &mut serde_json::Value) -> (bool, bool) {
     (hooks_removed, mcp_removed)
 }
 
+/// D8 Codex cleanup: remove `~/.codex/hooks.json` (CLX-managed),
+/// `[mcp_servers.clx]` from `config.toml`, and the CLX section from both
+/// `AGENTS.md` and `AGENTS.override.md`. All steps are best-effort.
+fn uninstall_codex_host(cli: &Cli, home: &std::path::Path, removed_items: &mut Vec<String>) {
+    if !cli.json {
+        println!();
+        println!("{}", "Codex Configuration".cyan().bold());
+        println!("{}", "-".repeat(30));
+    }
+    let mut any = false;
+    if codex::remove_codex_hooks(home).unwrap_or(false) {
+        any = true;
+        removed_items.push("codex hooks.json".to_string());
+    }
+    if codex::remove_codex_mcp(home).unwrap_or(false) {
+        any = true;
+        removed_items.push("codex config.toml [mcp_servers.clx]".to_string());
+    }
+    for path in [
+        codex::agents_md_path(home),
+        codex::agents_override_md_path(home),
+    ] {
+        if remove_clx_section_from_file(&path, codex::CLX_SECTION_MARKER).unwrap_or(false) {
+            any = true;
+            removed_items.push(format!("codex CLX section: {}", path.display()));
+        }
+    }
+    if !any && !cli.json {
+        println!("  {} No CLX Codex configuration found", "*".dimmed());
+    } else if any && !cli.json {
+        println!("  {} Removed CLX Codex artifacts", "-".red());
+    }
+}
+
+/// D8 Cursor cleanup: remove `mcpServers.clx` from `~/.cursor/mcp.json`, the
+/// CLX-managed `~/.cursor/hooks.json`, and the repo-local
+/// `.cursor/rules/clx.mdc`. Best-effort.
+fn uninstall_cursor_host(cli: &Cli, home: &std::path::Path, removed_items: &mut Vec<String>) {
+    if !cli.json {
+        println!();
+        println!("{}", "Cursor Configuration".cyan().bold());
+        println!("{}", "-".repeat(30));
+    }
+    let mut any = false;
+    if cursor::remove_cursor_mcp(home).unwrap_or(false) {
+        any = true;
+        removed_items.push("cursor mcp.json".to_string());
+    }
+    if cursor::remove_cursor_hooks(home).unwrap_or(false) {
+        any = true;
+        removed_items.push("cursor hooks.json".to_string());
+    }
+    if let Ok(repo) = env::current_dir()
+        && cursor::remove_cursor_rule(&repo).unwrap_or(false)
+    {
+        any = true;
+        removed_items.push("cursor .cursor/rules/clx.mdc".to_string());
+    }
+    if !any && !cli.json {
+        println!("  {} No CLX Cursor configuration found", "*".dimmed());
+    } else if any && !cli.json {
+        println!("  {} Removed CLX Cursor artifacts", "-".red());
+    }
+}
+
 /// Uninstall CLX integration
-pub async fn cmd_uninstall(cli: &Cli, purge: bool) -> Result<()> {
+pub async fn cmd_uninstall(cli: &Cli, purge: bool, target: InstallTarget) -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let clx_dir = clx_core::paths::clx_dir();
     let claude_dir = home.join(".claude");
     let settings_path = claude_dir.join("settings.json");
 
     let mut removed_items: Vec<String> = Vec::new();
+
+    // Uninstall removes whatever a host might have; `auto`/`all` clean every
+    // host so a switch of install target never strands artifacts. The
+    // single-host variants scope the cleanup.
+    let do_claude = target.wants_claude();
+    let do_codex = matches!(
+        target,
+        InstallTarget::Codex | InstallTarget::All | InstallTarget::Auto
+    );
+    let do_cursor = matches!(
+        target,
+        InstallTarget::Cursor | InstallTarget::All | InstallTarget::Auto
+    );
 
     if !cli.json {
         println!("{}", "CLX Uninstallation".cyan().bold());
@@ -1204,7 +1566,7 @@ pub async fn cmd_uninstall(cli: &Cli, purge: bool) -> Result<()> {
     }
 
     // Step 1: Remove hooks and MCP server from settings.json
-    if settings_path.exists() {
+    if do_claude && settings_path.exists() {
         if !cli.json {
             println!("{}", "Claude Code Configuration".cyan().bold());
             println!("{}", "-".repeat(30));
@@ -1238,7 +1600,7 @@ pub async fn cmd_uninstall(cli: &Cli, purge: bool) -> Result<()> {
                 "*".dimmed()
             );
         }
-    } else if !cli.json {
+    } else if do_claude && !cli.json {
         println!(
             "  {} settings.json not found, nothing to remove",
             "*".dimmed()
@@ -1247,20 +1609,55 @@ pub async fn cmd_uninstall(cli: &Cli, purge: bool) -> Result<()> {
 
     // Step 1b: Remove CLX-installed skills (symmetric with install GAP-2).
     // Never touches user-authored files: only our SKILL.md / empty dirs.
-    let removed_skills = uninstall_skills(&claude_dir);
-    if removed_skills.is_empty() {
-        if !cli.json {
-            println!("  {} No CLX skills found to remove", "*".dimmed());
+    if do_claude {
+        let removed_skills = uninstall_skills(&claude_dir);
+        if removed_skills.is_empty() {
+            if !cli.json {
+                println!("  {} No CLX skills found to remove", "*".dimmed());
+            }
+        } else {
+            if !cli.json {
+                println!(
+                    "  {} Removed {} CLX skills",
+                    "-".red(),
+                    removed_skills.len()
+                );
+            }
+            removed_items.push(format!("skills: {}", removed_skills.join(", ")));
         }
-    } else {
-        if !cli.json {
-            println!(
-                "  {} Removed {} CLX skills",
-                "-".red(),
-                removed_skills.len()
-            );
+
+        // D8: strip the CLX section from ~/.claude/CLAUDE.md (marker-to-next-H1).
+        let claude_md = claude_dir.join("CLAUDE.md");
+        match remove_clx_section_from_file(&claude_md, CLX_SECTION_MARKER) {
+            Ok(true) => {
+                if !cli.json {
+                    println!(
+                        "  {} Removed CLX section from {}",
+                        "-".red(),
+                        claude_md.display()
+                    );
+                }
+                removed_items.push("CLAUDE.md CLX section".to_string());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                if !cli.json {
+                    println!("  {} Could not update CLAUDE.md: {}", "!".yellow(), e);
+                }
+            }
         }
-        removed_items.push(format!("skills: {}", removed_skills.join(", ")));
+    }
+
+    // Step 1c-codex: D8 Codex cleanup (~/.codex hooks.json, config.toml MCP,
+    // AGENTS.md + AGENTS.override.md CLX section).
+    if do_codex {
+        uninstall_codex_host(cli, &home, &mut removed_items);
+    }
+
+    // Step 1c-cursor: D8 Cursor cleanup (~/.cursor mcp.json + hooks.json, and
+    // the repo-local .cursor/rules/clx.mdc).
+    if do_cursor {
+        uninstall_cursor_host(cli, &home, &mut removed_items);
     }
 
     // Step 1c: Remove the version stamp (symmetric with install GAP-3).
@@ -1525,5 +1922,86 @@ mod tests {
         let (merged, added) = merge_missing_config_keys("", "alpha: 1\n").unwrap();
         assert!(added.is_empty());
         assert_eq!(merged, "");
+    }
+
+    // D8: strip_marker_section drops the marker H1 through the next H1.
+    #[test]
+    fn strip_section_removes_marker_block_keeps_surrounding() {
+        let content = "# User Rules\n\nkeep me\n\n# CLX Integration\n\nclx body\nmore clx\n\n# After\n\ntail\n";
+        let out = strip_marker_section(content, CLX_SECTION_MARKER);
+        assert!(out.contains("# User Rules"));
+        assert!(out.contains("keep me"));
+        assert!(out.contains("# After"));
+        assert!(out.contains("tail"));
+        assert!(!out.contains("# CLX Integration"));
+        assert!(!out.contains("clx body"));
+    }
+
+    #[test]
+    fn strip_section_at_eof_removes_to_end() {
+        let content = "# Head\n\nbody\n\n# CLX Integration\n\nclx tail\n";
+        let out = strip_marker_section(content, CLX_SECTION_MARKER);
+        assert!(out.contains("# Head"));
+        assert!(out.contains("body"));
+        assert!(!out.contains("CLX Integration"));
+        assert!(!out.contains("clx tail"));
+    }
+
+    #[test]
+    fn strip_section_noop_without_marker() {
+        let content = "# Only\n\nno clx here\n";
+        let out = strip_marker_section(content, CLX_SECTION_MARKER);
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn strip_section_ignores_inline_mention() {
+        // A line that merely mentions the marker text inline is not an H1.
+        let content = "# Head\n\nsee # CLX Integration notes\n";
+        let out = strip_marker_section(content, CLX_SECTION_MARKER);
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn remove_section_from_file_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("CLAUDE.md");
+        fs::write(&path, "# A\n\nkeep\n\n# CLX Integration\n\nclx\n").unwrap();
+        assert!(remove_clx_section_from_file(&path, CLX_SECTION_MARKER).unwrap());
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# A"));
+        assert!(!out.contains("CLX Integration"));
+        // Idempotent: second call is a no-op.
+        assert!(!remove_clx_section_from_file(&path, CLX_SECTION_MARKER).unwrap());
+    }
+
+    #[test]
+    fn remove_section_missing_file_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("absent.md");
+        assert!(!remove_clx_section_from_file(&path, CLX_SECTION_MARKER).unwrap());
+    }
+
+    // Target gating truth table.
+    #[test]
+    fn target_gating_matrix() {
+        assert!(InstallTarget::Claude.wants_claude());
+        assert!(InstallTarget::Auto.wants_claude());
+        assert!(InstallTarget::All.wants_claude());
+        assert!(!InstallTarget::Codex.wants_claude());
+        assert!(!InstallTarget::Cursor.wants_claude());
+
+        // Codex: explicit/all always; auto only when detected.
+        assert!(InstallTarget::Codex.wants_codex(false));
+        assert!(InstallTarget::All.wants_codex(false));
+        assert!(InstallTarget::Auto.wants_codex(true));
+        assert!(!InstallTarget::Auto.wants_codex(false));
+        assert!(!InstallTarget::Claude.wants_codex(true));
+
+        // Cursor: same shape.
+        assert!(InstallTarget::Cursor.wants_cursor(false));
+        assert!(InstallTarget::All.wants_cursor(false));
+        assert!(InstallTarget::Auto.wants_cursor(true));
+        assert!(!InstallTarget::Auto.wants_cursor(false));
     }
 }
