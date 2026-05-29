@@ -198,12 +198,29 @@ fn fileedit_resolves_into_protected_dir(
             }
         };
         let resolved = canonicalize_best_effort(&expanded);
+        // (a) canonical prefix match against the home config/trust dirs.
         for prot in &protected {
             if resolved.starts_with(prot) {
                 return Some(format!(
                     "File edit resolves into protected config/trust dir: {}",
                     prot.display()
                 ));
+            }
+        }
+        // (b) component-name match (case-insensitive, any location): catches
+        // case variants on case-insensitive filesystems (~/.CODEX), the
+        // not-yet-existing-dir fallback where canonicalize returns the literal
+        // path, and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
+        // Editing any such dir is the trust-config attack surface, so denying
+        // it anywhere is correct defense-in-depth, not over-reach.
+        for comp in resolved.components() {
+            if let std::path::Component::Normal(name) = comp {
+                let lower = name.to_string_lossy().to_ascii_lowercase();
+                if matches!(lower.as_str(), ".codex" | ".claude" | ".cursor" | ".clx") {
+                    return Some(format!(
+                        "File edit targets a protected config/trust dir component: {lower}"
+                    ));
+                }
             }
         }
     }
@@ -1153,6 +1170,35 @@ mod tests {
             fileedit_resolves_into_protected_dir(Some(&ti), cwd.to_str().unwrap(), home.path())
                 .is_some(),
             "relative ../.claude traversal must resolve and be flagged"
+        );
+    }
+
+    #[test]
+    fn fileedit_case_variant_protected_dir_denies() {
+        // macOS case-insensitive FS / not-yet-existing-dir fallback: a target
+        // written as ~/.CODEX must still be caught (component-name match).
+        let home = tempfile::tempdir().unwrap();
+        let ti = serde_json::json!({
+            "path": format!("{}/.CODEX/config.toml", home.path().display())
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "case-variant ~/.CODEX must be flagged"
+        );
+    }
+
+    #[test]
+    fn fileedit_repo_local_config_dir_denies() {
+        // A repo-local .codex/ is itself the trust-config attack surface; an
+        // agent edit to it must be denied regardless of home.
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ti = serde_json::json!({ "path": ".codex/config.toml" });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), cwd.to_str().unwrap(), home.path())
+                .is_some(),
+            "repo-local .codex edit must be flagged"
         );
     }
 
