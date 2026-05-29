@@ -73,19 +73,31 @@ mod tests {
     }
 
     // Branch: a window that is NOT yet a minute old must NOT reset.
-    // Kills a mutant that resets unconditionally (would never rate-limit).
+    // Kills a mutant that resets unconditionally (would never rate-limit) and,
+    // via the 59s case, any mutant that LOWERS the threshold (e.g. `> 30s`,
+    // `> 45s`): at 59s+epsilon the production `> 60s` must still not reset.
+    //
+    // Equivalent-mutant note: the exact `> 60s` vs `>= 60s` off-by-one is NOT
+    // killable by a wall-clock test - `rewind_window(60)` yields 60s+epsilon
+    // from real `Instant` arithmetic, which resets under BOTH operators, and
+    // exactly 60.000000s with zero epsilon is unobservable. Killing it would
+    // need an injected clock; that seam is not worth adding for a rate limiter.
     #[test]
     fn window_does_not_reset_within_the_minute() {
         let limiter = RateLimiter::new(2);
         assert!(limiter.check());
         assert!(limiter.check());
 
-        // Age the window by only 30s — under the 1-minute threshold.
+        // 30s in: well under the threshold.
         limiter.rewind_window(30);
+        assert!(!limiter.check(), "30s in, the limiter must stay saturated");
 
+        // 59s in: just under the 60s boundary. Deterministic (59s+epsilon < 60s)
+        // and kills any threshold-lowered mutant.
+        limiter.rewind_window(29); // total ~59s
         assert!(
             !limiter.check(),
-            "within the same minute the limiter must stay saturated"
+            "59s in, still within the minute - must not reset"
         );
     }
 }

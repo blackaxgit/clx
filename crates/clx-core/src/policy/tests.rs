@@ -2405,18 +2405,31 @@ fn test_cache_get_fresh_entry_is_served() {
 // clears everything regardless of expiry.
 #[test]
 fn test_cache_cleanup_expired_removes_only_dead_entries() {
-    // Zero-TTL cache: every entry becomes expired after a tick.
-    let cache = ValidationCache::with_ttl(Duration::ZERO);
+    // Finite TTL so we can have BOTH expired and live entries in one cache:
+    // insert old entries, sleep past the TTL so they die, then insert a fresh
+    // entry that is still within its TTL. cleanup_expired must drop ONLY the
+    // dead ones and KEEP the fresh one. This kills a "clear-everything" mutant
+    // that ignores the `!is_expired` predicate (a zero-TTL-only test could not).
+    let cache = ValidationCache::with_ttl(Duration::from_millis(100));
     cache.insert("old1".to_string(), PolicyDecision::Allow);
     cache.insert("old2".to_string(), PolicyDecision::Allow);
-    std::thread::sleep(Duration::from_millis(2));
-    assert_eq!(cache.len(), 2, "len() does not itself prune");
+    std::thread::sleep(Duration::from_millis(200)); // old1/old2 now expired
+    cache.insert("fresh".to_string(), PolicyDecision::Allow); // within its TTL
+    assert_eq!(cache.len(), 3, "len() does not itself prune");
 
     cache.cleanup_expired();
     assert_eq!(
         cache.len(),
-        0,
-        "cleanup_expired must drop all expired entries"
+        1,
+        "cleanup_expired must drop ONLY the expired entries, keeping the fresh one"
+    );
+    assert!(
+        cache.get("fresh").is_some(),
+        "the still-live entry must survive cleanup_expired"
+    );
+    assert!(
+        cache.get("old1").is_none(),
+        "the expired entry must be gone after cleanup_expired"
     );
 }
 

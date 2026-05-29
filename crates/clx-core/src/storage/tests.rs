@@ -1718,12 +1718,28 @@ fn test_get_risk_distribution_buckets_by_score() {
         AuditDecision::Allowed,
         Some(3),
     );
+    // score 4 pins the low/medium seam (3 vs 4): must land in MEDIUM, not low.
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "med4",
+        AuditDecision::Prompted,
+        Some(4),
+    );
     seed_audit(
         &storage,
         "risk-sess",
         "med",
         AuditDecision::Prompted,
         Some(5),
+    );
+    // score 8 pins the medium/high seam (7 vs 8): must land in HIGH, not medium.
+    seed_audit(
+        &storage,
+        "risk-sess",
+        "high8",
+        AuditDecision::Blocked,
+        Some(8),
     );
     seed_audit(
         &storage,
@@ -1742,7 +1758,9 @@ fn test_get_risk_distribution_buckets_by_score() {
     );
 
     let (low, medium, high) = storage.get_risk_distribution(None).unwrap();
-    assert_eq!((low, medium, high), (2, 1, 1));
+    // low={2,3}=2, medium={4,5}=2, high={8,9}=2; score-4 and score-8 at the
+    // seams catch any bucket-boundary shift mutant.
+    assert_eq!((low, medium, high), (2, 2, 2));
 
     // since-arm: a future cutoff yields all-zero buckets.
     let future = chrono::Utc::now() + chrono::Duration::days(1);
