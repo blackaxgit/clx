@@ -14,12 +14,13 @@ use tracing::{debug, warn};
 use crate::audit::log_audit_entry;
 use crate::audit_chain::{GENESIS_HASH, build_record};
 use crate::embedding::resolve_command_paths;
+use crate::host::Host;
 use crate::learning::track_user_decision;
 use crate::output::{RULES_REMINDER, output_decision};
-use crate::types::HookInput;
+use crate::types::HostNeutralInput;
 
 /// Handle `PreToolUse` hook - validate commands before execution
-pub(crate) async fn handle_pre_tool_use(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
     let tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
 
     // Load configuration early (needed for MCP tool routing)

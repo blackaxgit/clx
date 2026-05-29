@@ -16,7 +16,13 @@ pub(crate) mod audit;
 pub(crate) mod audit_chain;
 pub(crate) mod context;
 pub(crate) mod embedding;
+// The host abstraction lands in P1; several capability methods, enums, and
+// the Codex/Cursor stubs are consumed by later phases (P2 parsers, P3 install
+// path lookups, P4 ask-channel routing). Allow dead code crate-locally so the
+// P1 scaffolding compiles under `-D warnings` before its consumers exist.
 pub(crate) mod hooks;
+#[allow(dead_code)]
+pub(crate) mod host;
 pub(crate) mod learning;
 pub(crate) mod output;
 pub mod router;

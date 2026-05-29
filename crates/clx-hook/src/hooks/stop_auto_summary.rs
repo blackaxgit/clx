@@ -31,8 +31,9 @@ use clx_core::summarize::{TurnSlice, summarize_turns};
 use clx_core::types::{Snapshot, SnapshotTrigger};
 use tracing::{debug, warn};
 
+use crate::host::Host;
 use crate::transcript::{OwnedTurn, last_n_turns};
-use crate::types::HookInput;
+use crate::types::HostNeutralInput;
 
 /// Hard ceiling on the entire handler's wall-clock time. The LLM call is
 /// the dominant cost; this guards against any wedge in the provider
@@ -48,14 +49,17 @@ fn turns_to_sample(cfg: &AutoSummarizeConfig) -> usize {
 }
 
 /// Public entry point invoked from the Stop event router.
-pub(crate) async fn handle_stop_auto_summary(input: HookInput) -> Result<()> {
+pub(crate) async fn handle_stop_auto_summary(
+    input: HostNeutralInput,
+    _host: &dyn Host,
+) -> Result<()> {
     // Soft timeout: if the LLM call (or anything else) wedges, abandon
     // the summary attempt and let the Stop event complete cleanly.
     let _ = tokio::time::timeout(HANDLER_TIMEOUT, run_inner(input)).await;
     Ok(())
 }
 
-async fn run_inner(input: HookInput) -> Result<()> {
+async fn run_inner(input: HostNeutralInput) -> Result<()> {
     // Capture the moment this handler started. Used as the optimistic-
     // concurrency reference point for the duplicate-snapshot guard below.
     let started_at = Utc::now();
@@ -213,8 +217,8 @@ mod tests {
     use clx_core::config::{AutoSummarizeConfig, MemoryConfig};
     use clx_core::types::SessionId;
 
-    fn input_with_session(session: &str) -> HookInput {
-        HookInput {
+    fn input_with_session(session: &str) -> HostNeutralInput {
+        HostNeutralInput {
             session_id: SessionId::new(session),
             transcript_path: None,
             cwd: "/tmp".to_string(),
@@ -226,6 +230,9 @@ mod tests {
             source: None,
             trigger: None,
             prompt: None,
+            direct_command: None,
+            host: crate::host::HostId::Claude,
+            extras: std::collections::HashMap::new(),
         }
     }
 
@@ -276,7 +283,7 @@ mod tests {
         // has auto_summarize.enabled = false). The handler must not panic
         // and must return Ok(()).
         let input = input_with_session("stop-disabled-noop");
-        let result = handle_stop_auto_summary(input).await;
+        let result = handle_stop_auto_summary(input, &crate::host::ClaudeHost).await;
         assert!(result.is_ok());
     }
 
