@@ -87,9 +87,16 @@ fn remove_clx_section_from_file(path: &std::path::Path, marker: &str) -> Result<
 fn strip_marker_section(content: &str, marker: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     // The CLX heading may carry a trailing tag (e.g. `# CLX Integration
-    // [STRICT]`), so match an H1 line that begins with the marker rather than
-    // one that equals it exactly.
-    let is_marker = |l: &str| l.starts_with(marker);
+    // [STRICT]`), so accept either the bare marker or the marker followed by a
+    // bracketed tag. R2-F5: do NOT match a user's own heading like
+    // `# CLX Integration Guide` (remainder does not start with `[`), which the
+    // old `starts_with` over-deleted.
+    let is_marker = |l: &str| {
+        let t = l.trim_end();
+        t == marker
+            || t.strip_prefix(marker)
+                .is_some_and(|rest| rest.trim_start().starts_with('['))
+    };
     let Some(start) = lines.iter().position(|l| is_marker(l)) else {
         return content.to_string();
     };

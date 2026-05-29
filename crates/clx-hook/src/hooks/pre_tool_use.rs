@@ -320,8 +320,24 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 return Ok(());
             }
         }
+    } else if let Some(cmd) = input
+        .tool_input
+        .as_ref()
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.is_empty())
+    {
+        // R2-F1 (fail-closed): an unknown/unexpected tool name that nonetheless
+        // carries a `command` string (e.g. a shell-bearing envelope misrouted to
+        // the wrong host adapter) must NOT silently auto-allow. Validate the
+        // command through the same pipeline as Bash rather than fail open.
+        warn!(
+            "Tool '{}' is not Bash/MCP but carries a command; validating it rather than auto-allowing",
+            tool_name
+        );
+        cmd.to_string()
     } else {
-        // Non-Bash, non-MCP tools (Read, Write, etc.) → auto-allow
+        // Non-Bash, non-MCP tools with no command (Read, Write, etc.) → auto-allow
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     };

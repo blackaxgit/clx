@@ -182,6 +182,24 @@ impl PolicyEngine {
                 "Python one-liner with os module",
             ),
             ("Bash(perl*-e*system*)", "Perl one-liner with system call"),
+            // v0.10.0 R1-F2: protect CLX + host config/trust dirs from agent
+            // file-edits (Codex apply_patch / Cursor edit_file canonicalize to
+            // FileEdit). Without these, an agent file-write to
+            // ~/.codex/config.toml could self-declare trust_level=trusted, or
+            // tamper with ~/.claude/settings.json / ~/.cursor hooks / ~/.clx.
+            (
+                "FileEdit(*/.codex/*)",
+                "File edit targeting Codex config/trust dir",
+            ),
+            (
+                "FileEdit(*/.claude/*)",
+                "File edit targeting Claude config dir",
+            ),
+            (
+                "FileEdit(*/.cursor/*)",
+                "File edit targeting Cursor config dir",
+            ),
+            ("FileEdit(*/.clx/*)", "File edit targeting CLX config dir"),
         ];
 
         for (pattern, description) in blacklist_patterns {
@@ -521,6 +539,45 @@ mod without_project_config_tests {
         assert!(
             matches!(decision, PolicyDecision::Deny { .. }),
             "built-in deny rule must still fire; got {decision:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod v010_fileedit_protection_tests {
+    use super::*;
+    use crate::policy::PolicyDecision;
+
+    // R1-F2 regression: a FileEdit targeting a host config/trust dir must DENY.
+    #[test]
+    fn fileedit_into_codex_config_is_denied() {
+        let engine = PolicyEngine::new();
+        for path in [
+            "*** Update File: /home/victim/.codex/config.toml",
+            "/Users/x/.claude/settings.json",
+            "edit /home/u/.cursor/hooks.json",
+            "/home/u/.clx/config.yaml",
+        ] {
+            assert!(
+                matches!(
+                    engine.evaluate("FileEdit", path),
+                    PolicyDecision::Deny { .. }
+                ),
+                "FileEdit into protected dir must deny: {path}"
+            );
+        }
+    }
+
+    // Non-regression: an ordinary file edit is NOT denied by these rules.
+    #[test]
+    fn fileedit_ordinary_path_not_denied_by_protection_rules() {
+        let engine = PolicyEngine::new();
+        assert!(
+            !matches!(
+                engine.evaluate("FileEdit", "/home/u/project/src/main.rs"),
+                PolicyDecision::Deny { .. }
+            ),
+            "ordinary file edit must not be denied by the host-config protection rules"
         );
     }
 }
