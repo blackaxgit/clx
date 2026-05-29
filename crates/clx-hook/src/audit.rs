@@ -5,8 +5,32 @@ use clx_core::storage::Storage;
 use clx_core::types::{AuditDecision, AuditLogEntry, SessionId};
 use tracing::warn;
 
-/// Log an audit entry to the database
+use crate::host::HostId;
+
+/// Lowercase, stable string id for a host, recorded in the audit `host`
+/// column (schema v8). Lives here (not on `HostId` in `host.rs`) so the
+/// audit write path owns its own storage contract.
+pub(crate) fn host_id_str(host: HostId) -> &'static str {
+    match host {
+        HostId::Claude => "claude",
+        HostId::Codex => "codex",
+        HostId::Cursor => "cursor",
+    }
+}
+
+/// Log an audit entry to the database.
+///
+/// `host` records which agent host produced the row so cross-host audit rows
+/// are distinguishable. Callers that have no host in scope pass
+/// [`HostId::Claude`] (the historical default), which is also the column
+/// default for every pre-v0.10.0 row.
+// One audit row has eight orthogonal facets (host, session, command,
+// working_dir, layer, decision, risk_score, reasoning); bundling them into a
+// struct here would only add indirection at the ~24 call sites for no clarity
+// gain, so the lint is suppressed deliberately.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn log_audit_entry(
+    host: HostId,
     session_id: &SessionId,
     command: &str,
     working_dir: &str,
@@ -37,7 +61,7 @@ pub(crate) fn log_audit_entry(
     entry.risk_score = risk_score;
     entry.reasoning = reasoning.map(redact_secrets);
 
-    if let Err(e) = storage.create_audit_log(&entry) {
+    if let Err(e) = storage.create_audit_log_with_host(&entry, host_id_str(host)) {
         warn!("Failed to create audit log: {}", e);
     }
 }
@@ -72,6 +96,7 @@ mod tests {
         let dirty_cwd = "/home/user/proj/sk-abc123LONGTOKEN456/work";
 
         log_audit_entry(
+            HostId::Claude,
             &session,
             "ls",
             dirty_cwd,

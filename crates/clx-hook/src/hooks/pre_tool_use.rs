@@ -190,6 +190,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 record.entry_hash
             );
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 "<env-override>",
                 &input.cwd,
@@ -236,6 +237,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 record.entry_hash
             );
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 "<cfg-layer-disable>",
                 &input.cwd,
@@ -263,6 +265,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         {
             debug!("FileEdit L0: denied '{}': {}", summary, reason);
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 &summary,
                 &input.cwd,
@@ -275,6 +278,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             return Ok(());
         }
         log_audit_entry(
+            host.host_id(),
             &input.session_id,
             &summary,
             &input.cwd,
@@ -368,6 +372,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                         tool_name, command_raw, reason
                     );
                     log_audit_entry(
+                        host.host_id(),
                         &input.session_id,
                         &command_raw,
                         &input.cwd,
@@ -401,6 +406,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 tool_name, command_raw
             );
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 &command_raw,
                 &input.cwd,
@@ -454,6 +460,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             PolicyDecision::Allow => {
                 debug!("L0: Allowed command '{}'", command);
                 log_audit_entry(
+                    host.host_id(),
                     &input.session_id,
                     command,
                     &input.cwd,
@@ -468,6 +475,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             PolicyDecision::Deny { reason } => {
                 debug!("L0: Denied command '{}': {}", command, reason);
                 log_audit_entry(
+                    host.host_id(),
                     &input.session_id,
                     command,
                     &input.cwd,
@@ -485,6 +493,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 if is_read_only {
                     debug!("L0: Unknown read-only command '{}', auto-allowing", command);
                     log_audit_entry(
+                        host.host_id(),
                         &input.session_id,
                         command,
                         &input.cwd,
@@ -508,6 +517,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             command
         );
         log_audit_entry(
+            host.host_id(),
             &input.session_id,
             command,
             &input.cwd,
@@ -524,6 +534,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 command
             );
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,
@@ -567,6 +578,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                     _ => AuditDecision::Prompted,
                 };
                 log_audit_entry(
+                    host.host_id(),
                     &input.session_id,
                     command,
                     &input.cwd,
@@ -594,6 +606,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         // audit reasoning now carries only the canonical "L1-DISABLED"
         // literal; the legacy "L1 disabled" alias is no longer emitted.
         log_audit_entry(
+            host.host_id(),
             &input.session_id,
             command,
             &input.cwd,
@@ -646,6 +659,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             };
             let reason = format!("LLM unavailable — fallback: {effective_decision}");
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,
@@ -715,6 +729,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         };
         let reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
+            host.host_id(),
             &input.session_id,
             command,
             &input.cwd,
@@ -782,6 +797,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         };
         let fallback_reason = format!("LLM timeout — fallback: {effective_decision}");
         log_audit_entry(
+            host.host_id(),
             &input.session_id,
             command,
             &input.cwd,
@@ -832,6 +848,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         };
         let fallback_reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
+            host.host_id(),
             &input.session_id,
             command,
             &input.cwd,
@@ -864,6 +881,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         PolicyDecision::Allow => {
             debug!("L1: Allowed command '{}'", command);
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,
@@ -890,6 +908,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         PolicyDecision::Deny { reason } => {
             debug!("L1: Denied command '{}': {}", command, reason);
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,
@@ -924,6 +943,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             // (unreachable for any HookInput) and has been removed.
             debug!("L1: Ask for command '{}': {}", command, reason);
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,

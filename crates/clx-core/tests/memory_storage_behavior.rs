@@ -296,13 +296,13 @@ fn auto_summary_stale_does_not_block_new() {
 // ===========================================================================
 
 /// A freshly opened DB is at the highest schema version (spec 5: migration
-/// chain v1..v7 contiguous, `SCHEMA_VERSION` matches highest = 7).
+/// chain v1..v8 contiguous, `SCHEMA_VERSION` matches highest = 8).
 #[test]
-fn fresh_db_is_at_schema_version_7() {
+fn fresh_db_is_at_schema_version_8() {
     let s = mem();
     assert_eq!(
         s.schema_version().unwrap(),
-        7,
+        8,
         "fresh DB must be migrated to the highest schema version"
     );
 }
@@ -345,11 +345,12 @@ fn migrated_db_has_all_pipeline_tables() {
 }
 
 /// A DB stuck at a v5-era state (no `tool_events` table, `schema_version`=5)
-/// upgrades cleanly to v7 with no data loss: a pre-existing snapshot row
-/// survives and the v6/v7 `tool_events` table appears (spec 6: additive
-/// migration, no data loss; edge "v5-state DB upgrades to v7").
+/// upgrades cleanly to v8 with no data loss: a pre-existing snapshot row
+/// survives, the v6/v7 `tool_events` table appears, and the v8 `host` column
+/// is added (spec 6: additive migration, no data loss; edge "v5-state DB
+/// upgrades to head").
 #[test]
-fn v5_state_db_upgrades_to_v7_without_data_loss() {
+fn v5_state_db_upgrades_to_v8_without_data_loss() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = tmp.path().join("legacy.db");
 
@@ -382,12 +383,12 @@ fn v5_state_db_upgrades_to_v7_without_data_loss() {
         .unwrap();
     }
 
-    // Re-open through the real Storage path: migrations v6 + v7 must run.
+    // Re-open through the real Storage path: migrations v6 + v7 + v8 must run.
     let s = Storage::open(&db).expect("upgrade open");
     assert_eq!(
         s.schema_version().unwrap(),
-        7,
-        "v5 DB must migrate forward to v7"
+        8,
+        "v5 DB must migrate forward to v8"
     );
 
     // No data loss: the legacy snapshot survived.
@@ -405,6 +406,21 @@ fn v5_state_db_upgrades_to_v7_without_data_loss() {
     ))
     .unwrap();
     assert_eq!(s.count_tool_events("legacy-sess").unwrap(), 1);
+
+    // v8 additive: the `host` column now exists on the legacy row and was
+    // backfilled to the 'claude' default (no data loss for pre-v0.10.0 rows).
+    let host: String = s
+        .connection()
+        .query_row(
+            "SELECT host FROM sessions WHERE id = 'legacy-sess'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("v8 host column must exist and be readable");
+    assert_eq!(
+        host, "claude",
+        "pre-v8 session row must backfill host to the 'claude' default"
+    );
 }
 
 /// RISK M-R1 (resolved): the newer-schema guard now exists. A DB whose

@@ -102,6 +102,7 @@ pub(crate) async fn handle_permission_request(
         PolicyDecision::Allow => {
             debug!("PermissionRequest L0: allow '{}'", command);
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,
@@ -115,6 +116,7 @@ pub(crate) async fn handle_permission_request(
         PolicyDecision::Deny { reason } => {
             debug!("PermissionRequest L0: deny '{}': {}", command, reason);
             log_audit_entry(
+                host.host_id(),
                 &input.session_id,
                 command,
                 &input.cwd,
@@ -134,6 +136,7 @@ pub(crate) async fn handle_permission_request(
                     command
                 );
                 log_audit_entry(
+                    host.host_id(),
                     &input.session_id,
                     command,
                     &input.cwd,
@@ -149,6 +152,7 @@ pub(crate) async fn handle_permission_request(
                     command
                 );
                 log_audit_entry(
+                    host.host_id(),
                     &input.session_id,
                     command,
                     &input.cwd,

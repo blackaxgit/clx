@@ -17,16 +17,40 @@ impl Storage {
     /// safe defaults). Without this guard, fast-path / synthetic / fabricated
     /// session IDs trip the `audit_log` → `sessions` FOREIGN KEY constraint.
     pub fn create_audit_log(&self, entry: &AuditLogEntry) -> crate::Result<i64> {
+        // Default host attribution is Claude (the historical behaviour and the
+        // ambiguous-envelope fallback). Callers that know the originating host
+        // use `create_audit_log_with_host`.
+        self.create_audit_log_with_host(entry, "claude")
+    }
+
+    /// Create an audit log entry attributed to a specific agent host.
+    ///
+    /// `host` is the lowercase host id (`"claude"` / `"codex"` / `"cursor"`)
+    /// recorded in the `host` column (schema v8) so cross-host audit rows are
+    /// distinguishable. An unknown / empty `host` is normalised to `"claude"`
+    /// so the column never carries a surprising value.
+    ///
+    /// First ensures the referenced session row exists (INSERT OR IGNORE with
+    /// safe defaults). Without this guard, fast-path / synthetic / fabricated
+    /// session IDs trip the `audit_log` → `sessions` FOREIGN KEY constraint.
+    pub fn create_audit_log_with_host(
+        &self,
+        entry: &AuditLogEntry,
+        host: &str,
+    ) -> crate::Result<i64> {
+        let host = normalize_host(host);
         // Ensure the FK target exists. No-op if the session was already created
-        // by SessionStart hook; a synthetic placeholder otherwise.
+        // by SessionStart hook; a synthetic placeholder otherwise. The
+        // placeholder inherits the same host so a Codex/Cursor command that
+        // fires before SessionStart is still attributed correctly.
         self.conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, project_path, started_at, source, status) \
-             VALUES (?1, '', datetime('now'), 'audit-placeholder', 'active')",
-            params![entry.session_id],
+            "INSERT OR IGNORE INTO sessions (id, project_path, started_at, source, status, host) \
+             VALUES (?1, '', datetime('now'), 'audit-placeholder', 'active', ?2)",
+            params![entry.session_id, host],
         )?;
         self.conn.execute(
-            "INSERT INTO audit_log (session_id, timestamp, command, working_dir, layer, decision, risk_score, reasoning, user_decision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO audit_log (session_id, timestamp, command, working_dir, layer, decision, risk_score, reasoning, user_decision, host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 entry.session_id,
                 entry.timestamp.to_rfc3339(),
@@ -37,11 +61,38 @@ impl Storage {
                 entry.risk_score,
                 entry.reasoning,
                 entry.user_decision.as_ref().map(super::super::types::UserDecision::as_str),
+                host,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        debug!("Created audit log {} for session {}", id, entry.session_id);
+        debug!(
+            "Created audit log {} for session {} (host={})",
+            id, entry.session_id, host
+        );
         Ok(id)
+    }
+
+    /// Return the host values recorded against a session's audit rows, in
+    /// insertion order.
+    ///
+    /// Used by cross-host integration tests to prove that the same command
+    /// sent through different host envelopes is attributed to the correct
+    /// host via the v8 `host` column.
+    pub fn get_audit_hosts_by_session(&self, session_id: &str) -> crate::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT host FROM audit_log WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC",
+        )?;
+        let hosts = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("Row deserialization error (skipped): {}", e);
+                    None
+                }
+            })
+            .collect();
+        Ok(hosts)
     }
 
     /// Get audit log entries for a session
@@ -294,5 +345,18 @@ impl Storage {
             reasoning: row.get(8)?,
             user_decision: user_decision_str.map(|s| UserDecision::parse(&s)),
         })
+    }
+}
+
+/// Normalise a host id for storage.
+///
+/// Accepts the three known host ids case-insensitively and maps anything else
+/// (empty string, garbage, future host) to `"claude"` so the `host` column is
+/// a closed enum at the database boundary.
+pub(super) fn normalize_host(host: &str) -> &'static str {
+    match host.trim().to_ascii_lowercase().as_str() {
+        "codex" => "codex",
+        "cursor" => "cursor",
+        _ => "claude",
     }
 }

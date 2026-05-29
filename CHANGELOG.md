@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shape, response/ask-channel mapping, session-id and provenance discovery,
   canonical tool-name mapping, and instructions-file path behind one seam, so a
   single hook binary serves all three agents.
+- **Per-row agent-host attribution.** A `host` column (schema v8) on the
+  `audit_log` and `sessions` tables records which agent produced each row
+  (`claude` / `codex` / `cursor`), so cross-host audit rows are
+  distinguishable. The column defaults to `claude`, so all pre-v0.10.0 rows and
+  the Claude path are unchanged; the migration is additive and idempotent.
 
 ### Changed
 

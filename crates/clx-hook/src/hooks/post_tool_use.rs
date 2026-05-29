@@ -133,7 +133,8 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
         );
         entry.working_dir = Some(input.cwd.clone());
 
-        if let Err(e) = storage.create_audit_log(&entry) {
+        let host_id = crate::audit::host_id_str(host.host_id());
+        if let Err(e) = storage.create_audit_log_with_host(&entry, host_id) {
             warn!("Failed to create audit log: {}", e);
         }
     }

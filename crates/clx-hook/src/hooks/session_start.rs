@@ -59,10 +59,11 @@ pub(crate) async fn handle_session_start(input: HostNeutralInput, host: &dyn Hos
         session.transcript_path.clone_from(&input.transcript_path);
         session.source = session_source;
 
-        if let Err(e) = storage.create_session(&session) {
+        let host_id = crate::audit::host_id_str(host.host_id());
+        if let Err(e) = storage.create_session_with_host(&session, host_id) {
             warn!("Failed to create session: {}", e);
         } else {
-            debug!("Created session {}", input.session_id);
+            debug!("Created session {} (host={})", input.session_id, host_id);
         }
     }
 

@@ -804,6 +804,7 @@ fn test_log_audit_entry_does_not_panic_when_default_storage_unavailable() {
 
     // Act + Assert (no panic)
     crate::audit::log_audit_entry(
+        crate::host::HostId::Claude,
         &session_id,
         "echo hello",
         "/tmp",

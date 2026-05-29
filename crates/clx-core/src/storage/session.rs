@@ -13,12 +13,25 @@ use super::util::{parse_datetime, validate_session_id};
 use crate::types::{Session, SessionId, SessionSource, SessionStatus, SessionSummary};
 
 impl Storage {
-    /// Create a new session
+    /// Create a new session.
+    ///
+    /// Attributes the row to the Claude host (the historical default). Hosts
+    /// that know their identity call [`Storage::create_session_with_host`].
     pub fn create_session(&self, session: &Session) -> crate::Result<()> {
+        self.create_session_with_host(session, "claude")
+    }
+
+    /// Create a new session attributed to a specific agent host.
+    ///
+    /// `host` is the lowercase host id (`"claude"` / `"codex"` / `"cursor"`)
+    /// stored in the `host` column (schema v8). Unknown values normalise to
+    /// `"claude"` (see `normalize_host`), so the column is a closed enum.
+    pub fn create_session_with_host(&self, session: &Session, host: &str) -> crate::Result<()> {
         validate_session_id(session.id.as_str())?;
+        let host = super::audit::normalize_host(host);
         self.conn.execute(
-            "INSERT INTO sessions (id, project_path, transcript_path, started_at, ended_at, source, message_count, command_count, input_tokens, output_tokens, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO sessions (id, project_path, transcript_path, started_at, ended_at, source, message_count, command_count, input_tokens, output_tokens, status, host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 session.id,
                 session.project_path,
@@ -31,9 +44,10 @@ impl Storage {
                 session.input_tokens,
                 session.output_tokens,
                 session.status.as_str(),
+                host,
             ],
         )?;
-        debug!("Created session: {}", session.id);
+        debug!("Created session: {} (host={})", session.id, host);
         Ok(())
     }
 
