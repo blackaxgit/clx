@@ -1,6 +1,7 @@
 //! CLX Core Library
 //!
-//! This crate provides the core functionality for the CLX Claude Code extension:
+//! This crate provides the core functionality for CLX across its supported
+//! coding-agent hosts (Claude Code, Codex CLI, Cursor):
 //! - Command validation and policy enforcement
 //! - Context persistence with `SQLite` storage
 //! - Shared types and error definitions

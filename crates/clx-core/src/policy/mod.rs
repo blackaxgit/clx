@@ -10,7 +10,7 @@
 //! Uses Ollama LLM to assess risk of unknown commands. Only invoked when
 //! Layer 0 returns Ask (command not in whitelist or blacklist).
 //!
-//! Pattern syntax (Claude Code style):
+//! Pattern syntax (canonical `ToolName(command:args)` form, host-neutral):
 //! - `Bash(git:*)` - matches all git commands
 //! - `Bash(npm:test*)` - matches npm test, npm test:unit, etc.
 //! - `Bash(rm:-rf /*)` - matches rm -rf from root

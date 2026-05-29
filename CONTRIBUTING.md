@@ -47,14 +47,35 @@ CLX is a Cargo workspace with four crates. Understanding the boundaries helps yo
 
 | Crate | Role | Key contents |
 |-------|------|--------------|
-| `clx` | CLI entry point and dashboard | `commands/`, `dashboard/` |
+| `clx` | CLI entry point and dashboard | `commands/` (incl. `codex/`, `cursor/` host installers), `dashboard/` |
 | `clx-core` | Core library shared by all crates | `config`, `policy/`, `storage/`, `ollama`, `embeddings`, `credentials`, `paths`, `types`, `error` |
-| `clx-hook` | Hook handler binary (PreToolUse / PostToolUse / PreCompact / SessionStart / SessionEnd / SubagentStart / UserPromptSubmit / Stop) | `hooks/`, `audit`, `learning`, `transcript`, `context`, `embedding` |
-| `clx-mcp` | MCP server exposing CLX tools to Claude Code | `server`, `protocol/`, `tools/` (7 tools), `validation` |
+| `clx-hook` | Hook handler binary (PreToolUse / PostToolUse / PreCompact / SessionStart / SessionEnd / SubagentStart / UserPromptSubmit / Stop, plus Codex PermissionRequest / PostCompact) | `host/`, `hooks/`, `audit`, `learning`, `transcript`, `context`, `embedding` |
+| `clx-mcp` | MCP server exposing CLX tools to the host agent (Claude Code, Codex CLI, Cursor) | `server`, `protocol/`, `tools/` (7 tools), `validation` |
+
+### The `host/` abstraction
+
+`clx-hook/src/host.rs` defines the `Host` trait, the seam that lets one hook
+binary serve three coding agents (Claude Code, Codex CLI, Cursor). The router
+detects the host from the incoming envelope and dispatches every handler with a
+`&dyn Host`. The trait owns all host-specific behavior, including:
+
+- the input envelope shape (parsed into a host-neutral form),
+- the output/response shape and the ask-channel mapping (Claude inline `ask`,
+  Cursor flat `permission: "ask"`, Codex fail-closed `deny`),
+- session-id and provenance discovery,
+- canonical tool-name mapping (`is_mutator_tool` / `canonical_tool_name`, e.g.
+  Claude `Edit`/`Write`/`MultiEdit`/`NotebookEdit` and Codex `apply_patch` all
+  collapse to the canonical `FileEdit` class),
+- the instructions file path (`CLAUDE.md` / `AGENTS.md` / `.cursor/rules`).
+
+Implementations live in `host/claude.rs`, `host/codex.rs`, and
+`host/cursor.rs`. Keep host-specific logic inside these modules; the rest of
+`clx-hook` and all of `clx-core` stay host-neutral.
 
 **Guiding principles:**
-- `clx-core` must remain free of binary-only concerns.
+- `clx-core` must remain free of binary-only and host-specific concerns.
 - Each hook handler in `clx-hook/src/hooks/` has one responsibility.
+- Host-specific behavior belongs behind the `Host` trait in `clx-hook/src/host/`.
 - MCP tool implementations live in `clx-mcp/src/tools/`, one file per tool.
 - Business logic belongs in `clx-core`; I/O belongs at the edges.
 

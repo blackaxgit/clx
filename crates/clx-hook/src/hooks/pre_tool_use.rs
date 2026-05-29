@@ -590,12 +590,9 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     // Layer 1: LLM-based validation (if enabled)
     if !config.validator.layer1_enabled {
         debug!("L1 disabled, defaulting to ask");
-        // T9.5 / L1-rename dual-emit: emit BOTH the canonical "L1-DISABLED"
-        // (v0.9.0 normalized) AND the legacy "L1 disabled" (v0.8.x literal)
-        // as substrings of a single reasoning string so a v0.8.x consumer
-        // that regex-matches the legacy literal still finds this row during
-        // the parallel-change deprecation window. v0.10.0 plan: drop the
-        // legacy alias and keep only "L1-DISABLED".
+        // v0.10.0: the v0.9.0 dual-emit deprecation window is closed. The
+        // audit reasoning now carries only the canonical "L1-DISABLED"
+        // literal; the legacy "L1 disabled" alias is no longer emitted.
         log_audit_entry(
             &input.session_id,
             command,
@@ -603,7 +600,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             "L0",
             AuditDecision::Prompted,
             None,
-            Some("L1-DISABLED (alias: L1 disabled)"),
+            Some("L1-DISABLED"),
         );
         output_decision_for(
             host,

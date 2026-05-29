@@ -21,19 +21,21 @@ pub enum PolicyDecision {
     /// Command is allowed (bypass permission dialog)
     Allow,
 
-    /// Command is blocked with reason (sent to Claude as error)
+    /// Command is blocked with reason (returned to the host agent as an error)
     Deny { reason: String },
 
-    /// Command requires user confirmation (show Claude Code's permission dialog)
+    /// Command requires user confirmation (host shows its permission prompt;
+    /// hosts without an interactive ask channel may map this to a deny)
     Ask { reason: String },
 }
 
 impl PolicyDecision {
-    /// Convert to Claude Code's permissionDecision format.
+    /// Convert to the canonical `permissionDecision` wire format.
     ///
-    /// Historical Claude wire format: `allow` / `deny` / `ask`. This method
-    /// and its ~9 callers (with hardcoded string assertions) are left
-    /// unchanged; v0.10.0 adds the host-aware variants below additively
+    /// The canonical wire format is `allow` / `deny` / `ask` (originally the
+    /// Claude Code hook format, now shared as CLX's host-neutral baseline).
+    /// This method and its ~9 callers (with hardcoded string assertions) are
+    /// left unchanged; v0.10.0 adds the host-aware variants below additively
     /// (gap-scan gap #3, comprehensive-plan REVIEW FIX #3).
     #[must_use]
     pub fn to_permission_decision(&self) -> &'static str {
@@ -110,7 +112,7 @@ pub enum RuleSource {
 /// A policy rule for command validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
-    /// The pattern to match (Claude Code style)
+    /// The pattern to match (`ToolName(command:args)` style)
     pub pattern: String,
 
     /// Type of rule (whitelist or blacklist)

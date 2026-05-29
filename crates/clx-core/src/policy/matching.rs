@@ -1,7 +1,8 @@
 //! Pattern matching for policy rules.
 //!
-//! Supports glob-style patterns with `*` wildcards and the
-//! `ToolName(command:args)` format used by Claude Code.
+//! Supports glob-style patterns with `*` wildcards and the canonical
+//! `ToolName(command:args)` rule format (host-neutral; tool names are
+//! mapped to their canonical form per host before matching).
 
 /// Parse a pattern in the format `ToolName(command_pattern)`
 ///
@@ -42,7 +43,7 @@ pub fn parse_pattern(pattern: &str) -> Option<(String, String)> {
     Some((tool_name.to_string(), command_pattern.to_string()))
 }
 
-/// Convert a learned pattern to Claude Code style pattern
+/// Convert a learned pattern to the canonical `ToolName(command:args)` pattern
 ///
 /// Learned patterns may be stored in different formats, this normalizes them.
 /// Accepts any `ToolName(...)` format (e.g., `Bash(git:*)`, `Write(path)`)

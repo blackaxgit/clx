@@ -1,4 +1,4 @@
-# CLX - Claude Code Extension
+# CLX - Coding-Agent Extension Layer
 
 [![CI](https://github.com/blackaxgit/clx/actions/workflows/ci.yml/badge.svg)](https://github.com/blackaxgit/clx/actions/workflows/ci.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
@@ -6,7 +6,9 @@
 
 > **Note:** Currently supports macOS (Apple Silicon / ARM64) only.
 
-Intelligent command validation and context persistence for Claude Code.
+Intelligent command validation and context persistence for coding agents.
+CLX supports Claude Code, Codex CLI, and Cursor (see
+[Supported Hosts](#supported-hosts) for what each host can and cannot enforce).
 
 ## Features
 
@@ -29,7 +31,7 @@ Intelligent command validation and context persistence for Claude Code.
   - Tracks approved/denied commands
   - Auto-generates rules based on usage patterns
 
-- **MCP Tools** - Claude can access:
+- **MCP Tools** - the host agent can access (Claude Code, Codex CLI, Cursor):
   - `clx_recall` - Search historical context
   - `clx_remember` - Explicitly save information
   - `clx_checkpoint` - Create manual snapshots
@@ -37,6 +39,22 @@ Intelligent command validation and context persistence for Claude Code.
   - `clx_session_info` - Get current session details
   - `clx_credentials` - Manage stored provider credentials
   - `clx_stats` - Report usage and storage statistics
+
+## Supported Hosts
+
+CLX installs into three coding-agent hosts. MCP tools and instructions
+injection work fully on all three; command gating differs by host because each
+host exposes a different hook surface.
+
+| Host | Command gating | Instructions injection | MCP tools |
+|------|----------------|------------------------|-----------|
+| **Claude Code** | Full CLI gating: PreToolUse `allow` / `deny` / `ask` enforced on every tool call | `~/.claude/CLAUDE.md` | Full (7 tools) |
+| **Codex CLI** | Interactive-only, best-effort guardrail: `allow` / `deny` in interactive Codex sessions; no `ask` channel | `~/.codex/AGENTS.md` (with `AGENTS.override.md` fallback) | Full (7 tools) |
+| **Cursor** | IDE agent and cloud agents only: `beforeShellExecution` / `beforeMCPExecution` with `failClosed: true`; the local `cursor-agent` CLI runs no hooks | `<repo>/.cursor/rules/clx.mdc` | Full (7 tools) |
+
+> **Codex caveat:** Command validation is a guardrail, not a complete enforcement boundary (OpenAI's wording); it applies to interactive Codex sessions, not codex exec automation, and ask is mapped to deny pending Codex ask support.
+
+> **Cursor caveat:** Command gating fires in the IDE agent and cloud agents only; the cursor-agent local CLI does not run hooks.
 
 ## Quick Install
 
