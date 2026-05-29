@@ -130,6 +130,86 @@ fn apply_patch_summary(tool_input: Option<&serde_json::Value>) -> String {
     v.to_string()
 }
 
+/// Resolve `path` to a canonical absolute path, resolving symlinks on the
+/// longest existing ancestor and re-appending the not-yet-existing tail (so a
+/// file that does not exist yet still resolves through symlinked parents).
+fn canonicalize_best_effort(path: &std::path::Path) -> std::path::PathBuf {
+    let mut ancestor = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&ancestor) {
+            let mut result = c;
+            for comp in tail.iter().rev() {
+                result.push(comp);
+            }
+            return result;
+        }
+        match ancestor.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !ancestor.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    path.to_path_buf()
+}
+
+/// R1-F2 (canonical guard, Codex PURPLE follow-up): a `FileEdit` deny based on
+/// string patterns is bypassable via symlink / relative alias / a target that
+/// does not literally contain `/.codex/`. This resolves every path-shaped token
+/// in the patch payload to a canonical absolute path (symlinks resolved) and
+/// returns a deny reason if any target lands inside a protected config/trust
+/// dir (`~/.codex`, `~/.claude`, `~/.cursor`, `~/.clx`). Returns None otherwise.
+fn fileedit_resolves_into_protected_dir(
+    tool_input: Option<&serde_json::Value>,
+    cwd: &str,
+    home: &std::path::Path,
+) -> Option<String> {
+    let protected: Vec<std::path::PathBuf> = [".codex", ".claude", ".cursor", ".clx"]
+        .iter()
+        .map(|d| {
+            let p = home.join(d);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect();
+    let cwd_path = std::path::Path::new(cwd);
+    // Render the whole payload and tokenize on whitespace/quotes/control chars,
+    // then test every token that looks like a path.
+    let blob = tool_input
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default();
+    for raw in blob.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';'))
+    {
+        let tok = raw.trim();
+        if tok.len() < 2 || !(tok.contains('/') || tok.starts_with('~')) {
+            continue;
+        }
+        let expanded = if let Some(rest) = tok.strip_prefix("~/") {
+            home.join(rest)
+        } else {
+            let p = std::path::Path::new(tok);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd_path.join(p)
+            }
+        };
+        let resolved = canonicalize_best_effort(&expanded);
+        for prot in &protected {
+            if resolved.starts_with(prot) {
+                return Some(format!(
+                    "File edit resolves into protected config/trust dir: {}",
+                    prot.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Handle `PreToolUse` hook - validate commands before execution
 pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
     let raw_tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
@@ -258,6 +338,29 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     // without fail-closing benign patches under Codex.
     if tool_name == "FileEdit" {
         let summary = apply_patch_summary(input.tool_input.as_ref());
+        // R1-F2 canonical guard (runs first, symlink/alias-resistant): deny any
+        // file-edit whose target resolves into a protected config/trust dir,
+        // regardless of how the path string is written.
+        if config.validator.enabled
+            && config.validator.layer0_enabled
+            && let Some(home) = dirs::home_dir()
+            && let Some(reason) =
+                fileedit_resolves_into_protected_dir(input.tool_input.as_ref(), &input.cwd, &home)
+        {
+            debug!("FileEdit L0 (canonical guard): denied: {}", reason);
+            log_audit_entry(
+                host.host_id(),
+                &input.session_id,
+                &summary,
+                &input.cwd,
+                "L0",
+                AuditDecision::Blocked,
+                None,
+                Some(&reason),
+            );
+            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
+            return Ok(());
+        }
         let engine = build_trust_gated_engine(host, &input.cwd);
         if config.validator.enabled
             && config.validator.layer0_enabled
@@ -999,6 +1102,72 @@ fn rand_cleanup() -> bool {
 mod tests {
     use super::*;
     use crate::types::{HookOutput, HookSpecificOutput};
+
+    // =========================================================================
+    // R1-F2 canonical guard (Codex PURPLE follow-up): symlink/alias-resistant
+    // protected-dir denial. Hermetic - home is a parameter, no env mutation.
+    // =========================================================================
+
+    #[test]
+    fn fileedit_direct_path_into_protected_dir_denies() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let ti = serde_json::json!({
+            "command": format!("*** Update File: {}/.codex/config.toml", home.path().display())
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "direct edit into ~/.codex must be flagged"
+        );
+    }
+
+    #[test]
+    fn fileedit_via_symlink_into_protected_dir_denies() {
+        // The bypass Codex PURPLE flagged: a target path that does NOT literally
+        // contain `/.codex/` but resolves there via a symlink.
+        let home = tempfile::tempdir().unwrap();
+        let real_codex = home.path().join(".codex");
+        std::fs::create_dir_all(&real_codex).unwrap();
+        let link = home.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_codex, &link).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let ti = serde_json::json!({
+            "command": format!("*** Update File: {}/config.toml", link.display())
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "edit through a symlink that resolves into ~/.codex must be flagged"
+        );
+    }
+
+    #[test]
+    fn fileedit_relative_traversal_into_protected_dir_denies() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let cwd = home.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ti = serde_json::json!({ "path": "../.claude/settings.json" });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), cwd.to_str().unwrap(), home.path())
+                .is_some(),
+            "relative ../.claude traversal must resolve and be flagged"
+        );
+    }
+
+    #[test]
+    fn fileedit_ordinary_path_is_not_flagged() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ti = serde_json::json!({ "path": "src/main.rs" });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), cwd.to_str().unwrap(), home.path())
+                .is_none(),
+            "ordinary project file edit must not be flagged"
+        );
+    }
 
     // =========================================================================
     // P4 trust-read mirror (RGP surface #1): repo-local config has zero effect
