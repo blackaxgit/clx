@@ -131,7 +131,10 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
             "PostToolUse".to_string(),
             AuditDecision::Allowed,
         );
-        entry.working_dir = Some(input.cwd.clone());
+        // R1-J: redact working_dir before persistence, matching the
+        // pre_tool_use path (audit.rs). cwd is agent-influenced and can embed
+        // inline secrets/tenant paths; storing it raw violated B6-3.
+        entry.working_dir = Some(redact_secrets(&input.cwd));
 
         let host_id = crate::audit::host_id_str(host.host_id());
         if let Err(e) = storage.create_audit_log_with_host(&entry, host_id) {

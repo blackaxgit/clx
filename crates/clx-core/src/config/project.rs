@@ -86,6 +86,11 @@ const NON_INERT_KEY_PATTERNS: &[&str] = &[
     "logging.file",  // no log exfiltration to an attacker-chosen path
     "validator",     // entire validator.* — security policy, never repo-settable
     "user_learning", // entire user_learning.* (auto_whitelist_threshold:1 = bypass)
+    // R2-F3 (holistic RGP): entire mcp_tools.* — a repo emptying
+    // `mcp_tools.command_tools` replaces the secure default registry so MCP
+    // command tools fall to `mcp_tools.default_decision` (= allow) and skip
+    // L0/L1. Same B4-1 bypass class as validator.*; never repo-settable.
+    "mcp_tools",
 ];
 
 /// Strip non-inert keys from a parsed project YAML before merging.

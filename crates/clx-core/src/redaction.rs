@@ -248,18 +248,29 @@ pub fn redact_secrets(text: &str) -> String {
     //    eat just the `bearer` word and leave the token behind.
     // -------------------------------------------------------------------------
     for scheme in &["bearer ", "basic "] {
-        let lower_search = redacted.to_lowercase();
-        if let Some(scheme_start) = lower_search.find(scheme) {
+        // R1-A: scan ALL occurrences, not just the first - a blob with a second
+        // `Authorization: Bearer <token>` previously leaked the later tokens.
+        let mut from = 0usize;
+        loop {
+            let lower_search = redacted.to_lowercase();
+            let Some(rel) = lower_search[from..].find(scheme) else {
+                break;
+            };
+            let scheme_start = from + rel;
             let token_start = scheme_start + scheme.len();
-            if redacted.len() > token_start + 6 {
-                let token_end = redacted[token_start..]
-                    .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                    .map_or(redacted.len(), |i| token_start + i);
-                if token_end - token_start >= 6
-                    && !redacted[token_start..token_end].contains("***REDACTED***")
-                {
-                    redacted.replace_range(token_start..token_end, "***REDACTED***");
-                }
+            if redacted.len() <= token_start + 6 {
+                break;
+            }
+            let token_end = redacted[token_start..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .map_or(redacted.len(), |i| token_start + i);
+            if token_end - token_start >= 6
+                && !redacted[token_start..token_end].contains("***REDACTED***")
+            {
+                redacted.replace_range(token_start..token_end, "***REDACTED***");
+                from = token_start + "***REDACTED***".len();
+            } else {
+                from = token_end;
             }
         }
     }
@@ -300,10 +311,9 @@ pub fn redact_secrets(text: &str) -> String {
                 continue;
             }
             cursor += 1; // past separator
-            while cursor < redacted.len()
-                && redacted.as_bytes()[cursor].is_ascii_whitespace()
-                && redacted.as_bytes()[cursor] != b'\n'
-            {
+            // R1-D: skip newlines too, so `password:\n<secret>` (value on the
+            // next line, common in YAML / pretty-printed error bodies) is caught.
+            while cursor < redacted.len() && redacted.as_bytes()[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
             // Skip over scheme tokens (`Bearer`, `Basic`) so the actual
@@ -323,7 +333,10 @@ pub fn redact_secrets(text: &str) -> String {
             }
             let value_start = cursor;
             let value_end = after_word_end;
-            if value_end > value_start + 4
+            // R1-B: redact ANY non-empty value after a security keyword. The
+            // prior `> value_start + 4` floor let short secrets (PINs, OTPs,
+            // short tokens) slip; the strong keyword context justifies it.
+            if value_end > value_start
                 && !redacted[value_start..value_end].contains("***REDACTED***")
             {
                 tolerant_replacements.push((value_start, value_end));
