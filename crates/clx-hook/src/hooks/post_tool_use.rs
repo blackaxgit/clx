@@ -66,7 +66,7 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
             ToolOutcome::Error
         };
         let target = aggregator::derive_target(tool_name, &tool_input_value);
-        let summary = aggregator::derive_summary(tool_name, &tool_input_value, outcome);
+        let summary = redacted_summary_for_persistence(tool_name, &tool_input_value, outcome);
         let now_unix = chrono::Utc::now().timestamp();
         let ev = ToolEvent::new(
             input.session_id.clone(),
@@ -184,4 +184,139 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
     }
 
     Ok(())
+}
+
+/// Build the redacted summary that is persisted into the `tool_events` row.
+///
+/// SECURITY: the summary embeds attacker-influenced content (e.g. the raw Bash
+/// command string, see [`aggregator::derive_summary`]). It MUST pass through
+/// [`redact_secrets`] before persistence so a Bearer token / API key passed as a
+/// CLI arg is not written to the local `tool_events` store in clear text. This
+/// mirrors the `tool_input` / `tool_output` redaction and the
+/// `audit_log.command` redaction in [`handle_post_tool_use`].
+///
+/// This is the single chokepoint for summary redaction: every persisted
+/// `tool_events` summary flows through here, so no other `derive_summary` caller
+/// can bypass it (B-PURPLE NO-SHIP #1).
+fn redacted_summary_for_persistence(
+    tool_name: &str,
+    tool_input_value: &serde_json::Value,
+    outcome: ToolOutcome,
+) -> String {
+    redact_secrets(&aggregator::derive_summary(
+        tool_name,
+        tool_input_value,
+        outcome,
+    ))
+}
+
+#[cfg(test)]
+mod summary_redaction_tests {
+    //! Regression coverage for B-PURPLE NO-SHIP #1: tool-event summaries were
+    //! persisted UNREDACTED, leaking secrets passed as Bash CLI args into the
+    //! local `SQLite` `tool_events` store in clear text.
+    //!
+    //! These tests call the SAME production chokepoint the hook uses
+    //! ([`super::redacted_summary_for_persistence`]) and persist the resulting
+    //! `ToolEvent` into an in-memory `SQLite` store, then read it back and assert
+    //! the synthetic secret is ABSENT. Because the test and the production hook
+    //! share that one function, reverting the redaction there fails these tests.
+    //! All secrets here are synthetic; no real credential or tenant URL appears.
+
+    use clx_core::storage::Storage;
+    use clx_core::types::{SessionId, ToolEvent, ToolOutcome};
+    use serde_json::json;
+
+    use super::redacted_summary_for_persistence;
+    use crate::hooks::aggregator;
+
+    /// Persist a summary through the real storage path and read it back.
+    fn round_trip_summary(command: &str) -> String {
+        let storage = Storage::open_in_memory().expect("in-memory store");
+        let input = json!({ "command": command });
+        // Drive the EXACT production chokepoint (no re-implementation): reverting
+        // the redaction inside `redacted_summary_for_persistence` breaks these.
+        let summary = redacted_summary_for_persistence("Bash", &input, ToolOutcome::Success);
+        let target = aggregator::derive_target("Bash", &json!({ "command": command }));
+        let session = SessionId::from("sess-redaction-test");
+        let ev = ToolEvent::new(
+            session.clone(),
+            "Bash",
+            target,
+            &summary,
+            ToolOutcome::Success,
+            1_700_000_000,
+        );
+        storage
+            .append_or_extend_tool_event(&ev)
+            .expect("persist tool_event");
+        let events = storage
+            .recent_tool_events_for_session(session.as_str(), 10)
+            .expect("read tool_events");
+        assert_eq!(events.len(), 1, "exactly one persisted event expected");
+        events[0].summary.clone()
+    }
+
+    #[test]
+    fn bearer_token_in_bash_command_is_redacted_in_persisted_summary() {
+        // Synthetic Bearer token passed as a CLI arg to a Bash tool call.
+        let secret = "SYNTHvalue12345";
+        let cmd = format!("curl -H 'Authorization: Bearer {secret}' https://example.com");
+        let persisted = round_trip_summary(&cmd);
+        assert!(
+            !persisted.contains(secret),
+            "Bearer token leaked into persisted tool_event summary: {persisted}"
+        );
+        assert!(
+            persisted.contains("***REDACTED***"),
+            "redaction marker must be present: {persisted}"
+        );
+    }
+
+    #[test]
+    fn sk_api_key_in_bash_command_is_redacted_in_persisted_summary() {
+        // Synthetic `sk-` style API key.
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz1234567890";
+        let cmd = format!("git commit -m 'set key {secret}'");
+        let persisted = round_trip_summary(&cmd);
+        assert!(
+            !persisted.contains("abcdefghijklmnopqrstuvwxyz"),
+            "sk- API key leaked into persisted tool_event summary: {persisted}"
+        );
+        assert!(
+            persisted.contains("***REDACTED***"),
+            "redaction marker must be present: {persisted}"
+        );
+    }
+
+    #[test]
+    fn password_keyword_in_bash_command_is_redacted_in_persisted_summary() {
+        // Synthetic `password=...` keyword form.
+        let secret = "hunter2synthetic";
+        let cmd = format!("rm -rf /tmp/x && mysql --password={secret}");
+        let persisted = round_trip_summary(&cmd);
+        assert!(
+            !persisted.contains(secret),
+            "password value leaked into persisted tool_event summary: {persisted}"
+        );
+        assert!(
+            persisted.contains("***REDACTED***"),
+            "redaction marker must be present: {persisted}"
+        );
+    }
+
+    #[test]
+    fn benign_bash_summary_is_not_over_redacted() {
+        // A mutator Bash command with no secret must pass through verbatim so the
+        // fix does not destroy the legitimate summary content.
+        let persisted = round_trip_summary("git commit -m 'fix typo'");
+        assert!(
+            persisted.contains("git commit -m 'fix typo'"),
+            "benign command must survive redaction unchanged: {persisted}"
+        );
+        assert!(
+            !persisted.contains("***REDACTED***"),
+            "benign command must not be redacted: {persisted}"
+        );
+    }
 }

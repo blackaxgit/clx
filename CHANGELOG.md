@@ -15,6 +15,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   survived unredacted and could leak into logs/audit/events. The floor is dropped:
   any non-empty token after the scheme word is redacted, matching the keyword
   path's rule. No-code-exec disclosure class; closes RGP finding R1-DELTA-A/A2.
+- **Tool-event summaries are redacted before being persisted.** The `tool_events`
+  summary (which embeds raw Bash command text) was written to the local SQLite
+  store unredacted, so a secret passed as a CLI argument could land on disk in
+  clear text even though the sibling input/output fields were already scrubbed.
+  Summaries now pass through `redact_secrets` at the persistence boundary.
+- **MCP tool handlers no longer log raw user content.** `remember` (text, tags),
+  `checkpoint` (note), and `recall` (query) logged user-supplied text verbatim at
+  debug level, leaking secrets into a configured `logging.file`. These sites now
+  redact before logging; stored data and return values are unchanged.
+- **Untrusted project config can no longer set capability routing.** The `llm`
+  block was missing from the config-trust denylist, so a hostile repo
+  `.clx/config.yaml` could redirect chat/embeddings/validator/recall to an
+  attacker-chosen provider or suppress required model pulls. `llm` (and its whole
+  subtree) is now stripped from untrusted project configs; global and explicitly
+  trusted configs are unaffected.
+- **Version-stamp read is bounded.** `version_skew_warning` read
+  `~/.clx/bin/.clx-version` with an unbounded read and no file-type guard; a
+  FIFO/oversized/non-regular file could hang or balloon memory at hook/MCP
+  startup. The read now requires a regular file and caps at 256 bytes, returning
+  no warning on any anomaly.
 
 ### Changed
 
