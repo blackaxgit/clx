@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`clx embeddings status` detects model/provider migration, not just dimension.**
+  Status now displays the model that actually produced the stored vectors (from the
+  index) and flags "migration needed" when the active `llm.embeddings` route's
+  `{provider, model, dim}` differs from the stored index - not only on a dimension
+  change. Previously a same-dimension provider swap (e.g. local qwen3 -> Azure
+  text-embedding-3-small at the same dim) showed the config model and "migration
+  needed: no", silently degrading recall.
 - **Runtime version-skew warning.** `clx-hook` and `clx-mcp` now compare their
   embedded version against the `~/.clx/bin/.clx-version` stamp at startup and
   emit a one-line warning to STDERR (never STDOUT, so the hook/MCP protocol is

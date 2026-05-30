@@ -22,6 +22,29 @@ fn make_model_ident(provider: &str, model: &str) -> String {
     format!("{provider}:{model}")
 }
 
+/// Pure decision for `clx embeddings status` display + migration verdict.
+///
+/// Inputs:
+/// * `stored_model` - the per-snapshot producing-model ident actually in the
+///   index (`None` for an empty index or pre-migration sentinel rows).
+/// * `configured_model` - the active route's model name, used only as the
+///   display fallback when nothing is stored yet.
+/// * `dim_migration` - whether the table dimension differs from configured.
+/// * `model_migration` - whether the stored model differs from the active route.
+///
+/// Returns `(display_model, needs_migration)` where `display_model` is the
+/// STORED model when known (Finding #4: never the config model when a stored
+/// model exists), and `needs_migration` is the OR of dimension and model drift.
+fn status_display(
+    stored_model: Option<&str>,
+    configured_model: &str,
+    dim_migration: bool,
+    model_migration: bool,
+) -> (String, bool) {
+    let display_model = stored_model.unwrap_or(configured_model).to_owned();
+    (display_model, dim_migration || model_migration)
+}
+
 // ---------------------------------------------------------------------------
 // Embed-client seam
 // ---------------------------------------------------------------------------
@@ -229,28 +252,72 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 Storage::create_embedding_store_with_dimension(&db_path, ollama_cfg.embedding_dim)
                     .context("Failed to open embedding store. Run 'clx install' first.")?;
 
-            let model = &ollama_cfg.embedding_model;
             let dim = ollama_cfg.embedding_dim;
             let vec_enabled = emb_store.is_vector_search_enabled();
             let count = emb_store.count_embeddings().unwrap_or(0);
-            let needs_migration = emb_store.needs_dimension_migration(dim);
+
+            // Resolve the active embeddings route (provider + model) the same
+            // way rebuild/backfill do, falling back to legacy ollama defaults
+            // when no routing section is present. The configured model is what
+            // the active route WILL use; the stored model is what produced the
+            // vectors currently in the index.
+            let (configured_model, provider_name) =
+                match config.capability_route(Capability::Embeddings) {
+                    Ok(r) => (r.model.clone(), r.provider.clone()),
+                    Err(_) => (
+                        ollama_cfg.embedding_model.clone(),
+                        "ollama-local".to_owned(),
+                    ),
+                };
+            let active_ident = make_model_ident(&provider_name, &configured_model);
+
+            // The model actually stored in the index (per-snapshot provenance).
+            // `None` means an empty index or only pre-migration sentinel rows.
+            let stored_model = emb_store
+                .current_model()
+                .context("Failed to read stored embedding model")?;
+
+            // Migration is needed when EITHER the table dimension differs from
+            // the configured dimension OR the stored producing-model differs
+            // from the active route (a same-dimension provider/model swap).
+            let dim_migration = emb_store.needs_dimension_migration(dim);
+            let model_migration = emb_store
+                .needs_model_migration(&active_ident)
+                .context("Failed to compare stored embedding model")?;
+
+            // Display the STORED model when known; otherwise surface the
+            // configured model so the field is never blank. `needs_migration`
+            // is the OR of dimension drift and model drift.
+            let (display_model, needs_migration) = status_display(
+                stored_model.as_deref(),
+                &configured_model,
+                dim_migration,
+                model_migration,
+            );
 
             if cli.json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "model": model,
+                        "model": display_model.as_str(),
+                        "stored_model": stored_model,
+                        "configured_model": active_ident,
                         "dimension": dim,
                         "vector_search_enabled": vec_enabled,
                         "stored_embeddings": count,
                         "needs_migration": needs_migration,
+                        "needs_dimension_migration": dim_migration,
+                        "needs_model_migration": model_migration,
                     })
                 );
             } else {
                 println!("{}", "Embedding Status".cyan().bold());
                 println!("{}", "=".repeat(50));
                 println!();
-                println!("  Model:              {}", model.green());
+                println!("  Model (stored):     {}", display_model.green());
+                if stored_model.as_deref().is_some_and(|s| s != active_ident) {
+                    println!("  Model (configured): {}", active_ident.yellow());
+                }
                 println!("  Dimension:          {dim}");
                 println!(
                     "  Vector search:      {}",
@@ -259,11 +326,20 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
                 println!("  Stored embeddings:  {count}");
                 if needs_migration {
                     println!();
-                    println!(
-                        "  {}",
-                        "Migration needed: table dimension differs from configured dimension."
-                            .yellow()
-                    );
+                    if dim_migration {
+                        println!(
+                            "  {}",
+                            "Migration needed: table dimension differs from configured dimension."
+                                .yellow()
+                        );
+                    }
+                    if model_migration {
+                        println!(
+                            "  {}",
+                            "Migration needed: stored model differs from the active embeddings route."
+                                .yellow()
+                        );
+                    }
                     println!("  Run {} to rebuild.", "clx embeddings rebuild".cyan());
                 } else {
                     println!("  Migration needed:   {}", "no".green());
@@ -600,4 +676,79 @@ pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod status_tests {
+    //! Finding #4: `clx embeddings status` must display the STORED model (not
+    //! the config model) and must flag migration on a same-dimension
+    //! provider/model swap. These tests exercise the pure decision
+    //! [`status_display`] used by the Status branch. The store-level migration
+    //! logic (`needs_model_migration`) is tested over an in-memory `SQLite`
+    //! index in `clx_core::embeddings`; here we pin the command-layer mapping
+    //! from (stored, configured, dim-drift, model-drift) to (display, verdict)
+    //! with no config/network/keychain.
+
+    use super::{make_model_ident, status_display};
+
+    /// 4-tuple #1 (the bug): stored qwen3, active Azure text-embedding-3-small
+    /// at the SAME dim -> dim drift false, model drift true -> migration NEEDED,
+    /// and the displayed model is the STORED qwen3, not the configured Azure.
+    #[test]
+    fn same_dim_provider_swap_needs_migration_and_shows_stored() {
+        let stored_ident = make_model_ident("ollama-local", "qwen3-embedding:0.6b");
+        // Same dim => dim_migration = false. Model differs => model_migration = true.
+        let (display, needs) = status_display(
+            Some(&stored_ident),
+            "text-embedding-3-small", // configured (active route) model
+            false,                    // dim_migration
+            true,                     // model_migration (qwen3 != azure)
+        );
+        assert!(
+            needs,
+            "status must report migration NEEDED on a same-dim swap"
+        );
+        assert_eq!(
+            display, stored_ident,
+            "status must display the STORED model, not the configured one"
+        );
+    }
+
+    /// 4-tuple #2: stored == active -> no migration; displayed model is stored.
+    #[test]
+    fn stored_equals_active_no_migration() {
+        let ident = make_model_ident("azure-prod", "text-embedding-3-small");
+        let (display, needs) = status_display(Some(&ident), "text-embedding-3-small", false, false);
+        assert!(
+            !needs,
+            "matching stored and active route must NOT need migration"
+        );
+        assert_eq!(
+            display, ident,
+            "display must be the stored (== active) model"
+        );
+    }
+
+    /// 4-tuple #3: dimension change -> migration (existing behavior preserved),
+    /// display remains the stored model.
+    #[test]
+    fn dimension_change_needs_migration() {
+        let ident = make_model_ident("ollama-local", "qwen3-embedding:0.6b");
+        // Dim differs, model unchanged: dim drift carries the verdict.
+        let (display, needs) = status_display(Some(&ident), "qwen3-embedding:0.6b", true, false);
+        assert!(needs, "dimension change must report migration NEEDED");
+        assert_eq!(display, ident, "display must remain the stored model");
+    }
+
+    /// Empty index: nothing stored -> no false migration, display falls back
+    /// to the configured model so the field is never blank.
+    #[test]
+    fn empty_index_uses_configured_model_no_migration() {
+        let (display, needs) = status_display(None, "text-embedding-3-small", false, false);
+        assert!(!needs, "empty index must not raise a false migration alarm");
+        assert_eq!(
+            display, "text-embedding-3-small",
+            "with nothing stored, display falls back to the configured model"
+        );
+    }
 }

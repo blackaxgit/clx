@@ -236,6 +236,29 @@ impl EmbeddingStore {
         }
     }
 
+    /// Decide whether the stored vectors need regenerating because the
+    /// active embeddings route uses a different provider/model than the one
+    /// that produced them.
+    ///
+    /// `active_ident` is the `"{provider}:{model}"` identifier of the active
+    /// `llm.embeddings` route (the same format written by `store_with_model`).
+    ///
+    /// Returns `true` only when a concrete stored model identifier exists AND
+    /// it differs from `active_ident`. When the index is empty or every row
+    /// still carries the pre-migration sentinel (i.e. `current_model()` is
+    /// `None`), no stored provenance is available to compare, so this returns
+    /// `false` and does not raise a false migration alarm. Dimension-based
+    /// migration is handled separately by [`needs_dimension_migration`].
+    ///
+    /// # Errors
+    /// Returns an error if reading the stored model identifier fails.
+    pub fn needs_model_migration(&self, active_ident: &str) -> crate::Result<bool> {
+        Ok(match self.current_model()? {
+            Some(stored_ident) => stored_ident != active_ident,
+            None => false,
+        })
+    }
+
     /// Rebuild the embedding table with a new dimension.
     ///
     /// Drops the existing `snapshot_embeddings` table and recreates it with
@@ -327,9 +350,13 @@ impl EmbeddingStore {
     /// Return the most-recently-stored model identifier, ignoring the
     /// pre-migration sentinel `'<unknown-pre-migration>'`.
     ///
-    /// Returns `None` when the database is empty or every row still
-    /// carries the migration sentinel (i.e. no vector has been stored
-    /// after schema v5 was applied).
+    /// Returns `None` when the database is empty, every row still carries the
+    /// migration sentinel (i.e. no vector has been stored after schema v5 was
+    /// applied), OR the `snapshots` table does not exist yet. A fresh embedding
+    /// store (created before `clx install` provisions the main schema, e.g. on
+    /// a brand-new HOME) has only the vec0 table and no `snapshots` table; that
+    /// case is treated as "no stored model", not an error, so
+    /// `clx embeddings status` works on a never-installed HOME.
     pub fn current_model(&self) -> crate::Result<Option<String>> {
         use rusqlite::OptionalExtension;
         let v = self
@@ -341,8 +368,19 @@ impl EmbeddingStore {
                 [],
                 |r| r.get::<_, String>(0),
             )
-            .optional()?;
-        Ok(v)
+            .optional();
+        match v {
+            Ok(model) => Ok(model),
+            // A missing `snapshots` table means the main schema has not been
+            // provisioned yet (fresh store). Report no stored model rather than
+            // surfacing a hard error to the status command.
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("no such table") =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Return every snapshot's `(id, full_text)` for a complete rebuild.
@@ -678,6 +716,31 @@ mod tests {
     }
 
     #[test]
+    fn current_model_returns_none_when_snapshots_table_absent() {
+        // A fresh embedding store (vec0 table only, no `snapshots` table, as on
+        // a brand-new HOME before `clx install`) must report no stored model
+        // rather than erroring, so `clx embeddings status` succeeds.
+        let store = create_test_store();
+        assert_eq!(
+            store.current_model().unwrap(),
+            None,
+            "missing snapshots table must map to None, not an error"
+        );
+    }
+
+    #[test]
+    fn needs_model_migration_none_when_snapshots_table_absent() {
+        // Same fresh-store condition must not raise a false migration alarm.
+        let store = create_test_store();
+        assert!(
+            !store
+                .needs_model_migration("azure-prod:text-embedding-3-small")
+                .unwrap(),
+            "missing snapshots table must not flag model migration"
+        );
+    }
+
+    #[test]
     fn store_with_model_persists_identifier() {
         let store = create_test_store_with_snapshots();
         let snap_id = insert_snapshot(&store, "hello world");
@@ -721,6 +784,88 @@ mod tests {
         assert!(
             rows[1].1.contains("second summary"),
             "second row text should include its summary"
+        );
+    }
+
+    // =========================================================================
+    // needs_model_migration tests (Finding #4: same-dim provider/model swap)
+    // =========================================================================
+
+    #[test]
+    fn needs_model_migration_false_when_stored_matches_active() {
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "snapshot text");
+        store
+            .store_with_model(
+                snap_id,
+                vec![0.1f32; DEFAULT_EMBEDDING_DIM],
+                "ollama-local:qwen3-embedding:0.6b",
+            )
+            .unwrap();
+        assert!(
+            !store
+                .needs_model_migration("ollama-local:qwen3-embedding:0.6b")
+                .unwrap(),
+            "no migration when stored model equals the active route ident"
+        );
+    }
+
+    #[test]
+    fn needs_model_migration_true_on_same_dim_provider_swap() {
+        // The bug case: index built with qwen3 at 1024 dims, config now routes
+        // embeddings to Azure text-embedding-3-small at the SAME 1024 dims.
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "snapshot text");
+        store
+            .store_with_model(
+                snap_id,
+                vec![0.1f32; DEFAULT_EMBEDDING_DIM],
+                "ollama-local:qwen3-embedding:0.6b",
+            )
+            .unwrap();
+
+        // Dimension check alone would say "no migration" (both 1024)...
+        assert!(
+            !store.needs_dimension_migration(DEFAULT_EMBEDDING_DIM),
+            "dimension is unchanged, so dim-only check must NOT flag migration"
+        );
+        // ...but the model identifier differs, so model migration IS needed.
+        assert!(
+            store
+                .needs_model_migration("azure-prod:text-embedding-3-small")
+                .unwrap(),
+            "a same-dim provider/model swap must require model migration"
+        );
+    }
+
+    #[test]
+    fn needs_model_migration_false_when_no_stored_model() {
+        // Empty index: no stored provenance to compare against, so no false alarm.
+        let store = create_test_store_with_snapshots();
+        assert_eq!(store.current_model().unwrap(), None);
+        assert!(
+            !store
+                .needs_model_migration("azure-prod:text-embedding-3-small")
+                .unwrap(),
+            "empty index must not raise a false model-migration alarm"
+        );
+    }
+
+    #[test]
+    fn needs_model_migration_ignores_pre_migration_sentinel() {
+        // Pre-migration rows carry the sentinel; current_model() returns None,
+        // so model migration must not be flagged for old indexes.
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "old snapshot");
+        store
+            .store_embedding(snap_id, vec![0.1f32; DEFAULT_EMBEDDING_DIM])
+            .unwrap();
+        assert_eq!(store.current_model().unwrap(), None);
+        assert!(
+            !store
+                .needs_model_migration("azure-prod:text-embedding-3-small")
+                .unwrap(),
+            "sentinel-only index must not raise a false model-migration alarm"
         );
     }
 
