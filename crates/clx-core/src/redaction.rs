@@ -273,7 +273,14 @@ pub fn redact_secrets(text: &str) -> String {
             let token_end = redacted[token_start..]
                 .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
                 .map_or(redacted.len(), |i| token_start + i);
-            if token_end - token_start >= 6
+            // R1-DELTA-A: redact ANY non-empty token after a `Bearer`/`Basic`
+            // scheme word, matching the keyword path's "any non-empty value"
+            // rule (section 2b). The prior `>= 6` length floor let short tokens
+            // (<=5 chars, e.g. `ab123`, OTP/PIN-style creds) slip through and
+            // leak into logs/audit (Codex PURPLE NO-SHIP disclosure class).
+            // The whitespace-skip above guarantees a non-empty token here, so a
+            // bare `Bearer` / `Bearer ` (no following token) never reaches this.
+            if token_end > token_start
                 && !redacted[token_start..token_end].contains("***REDACTED***")
             {
                 redacted.replace_range(token_start..token_end, "***REDACTED***");

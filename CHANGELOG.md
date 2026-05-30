@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Redaction now scrubs short credentials after a `Bearer`/`Basic` scheme word.**
+  The scheme path kept a `>= 6` minimum-length floor, so a token of five or fewer
+  characters (e.g. an OTP/PIN-style credential) after a bare `Bearer `/`Basic `
+  survived unredacted and could leak into logs/audit/events. The floor is dropped:
+  any non-empty token after the scheme word is redacted, matching the keyword
+  path's rule. No-code-exec disclosure class; closes RGP finding R1-DELTA-A/A2.
+
 ### Changed
 
 - **`clx install` only pulls Ollama models that are actually routed to Ollama.**

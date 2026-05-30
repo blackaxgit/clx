@@ -19,11 +19,12 @@ use clx_core::redaction::redact_secrets;
 #[test]
 #[ignore = "RED-R1 delta PoC; run with --ignored"]
 fn r1_delta_short_bearer_token_leaks() {
-    let out = redact_secrets("Bearer ab123"); // 5-char token, under the >=6 floor
+    let out = redact_secrets("Bearer ab123"); // 5-char token, was under the >=6 floor
     println!("R1-DELTA-A out={out:?}");
+    // CLOSED (post-GREEN): scheme path now redacts any non-empty token.
     assert!(
-        out.contains("ab123"),
-        "EXPECTED LEAK (pre-fix): short bearer token should survive; got {out}"
+        !out.contains("ab123"),
+        "CLOSURE: short bearer token must be redacted; got {out}"
     );
 }
 
@@ -86,12 +87,11 @@ fn r1_delta_multi_bearer_all_redact() {
 fn r1_delta_keyword_then_short_bearer_token() {
     let out = redact_secrets("authorization: Bearer ab12");
     println!("R1-DELTA-F out={out:?}");
-    // CONFIRMED compound leak (pre-fix): NEITHER path redacts the short token.
-    // The keyword path defers to the scheme path on the `Bearer` first word;
-    // the scheme path declines under the >=6 floor. The token survives with no
-    // marker at all. GREEN's DELTA-A floor fix must make this assertion FAIL.
+    // CLOSED (post-GREEN): the compound leak is closed. Pre-fix NEITHER path
+    // redacted the short token (keyword path defers to scheme on `Bearer`; the
+    // scheme path declined under the >=6 floor). GREEN's floor fix closes it.
     assert!(
-        out.contains("ab12"),
-        "EXPECTED LEAK (pre-fix): keyword+short-scheme token should survive; got {out}"
+        !out.contains("ab12"),
+        "CLOSURE: keyword+short-scheme token must be redacted; got {out}"
     );
 }
