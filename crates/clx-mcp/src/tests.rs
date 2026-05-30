@@ -1398,3 +1398,209 @@ fn test_remember_tag_suffix_is_conditional() {
         plain.summary
     );
 }
+
+// =========================================================================
+// Codex PURPLE NO-SHIP #2 — MCP tool handlers must not LOG raw user content
+//
+// If `tracing` output is directed to a file (the `logging.file` global-config
+// setting), a secret a user passes into clx_remember / clx_checkpoint /
+// clx_recall would be persisted to the log file in clear text. The handlers
+// log at `debug!` on entry; the fix routes that content through
+// `redact_secrets` before interpolation.
+//
+// These tests install a scoped `tracing` subscriber backed by an in-process
+// shared buffer (no file, no network, no extra DB side effects), drive each
+// handler with a SYNTHETIC secret, and assert the secret never appears in the
+// captured log output while the redaction marker does.
+//
+// Pre-fix: FAIL (raw value interpolated into the debug! line).
+// Post-fix: PASS (value scrubbed by redact_secrets).
+//
+// ALL secrets below are SYNTHETIC — no real credential or tenant URL appears.
+// =========================================================================
+mod log_redaction_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::create_test_server;
+    use clx_core::types::{Session, SessionId};
+
+    /// A `MakeWriter` that appends every log line to a shared byte buffer.
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install a scoped subscriber that writes DEBUG+ logs into `buf`.
+    /// The returned guard restores the previous subscriber on drop, so the
+    /// capture is confined to the current thread for the test's duration.
+    fn capture_into(buf: Arc<Mutex<Vec<u8>>>) -> DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufferWriter(buf))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    fn captured(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).expect("log output is UTF-8")
+    }
+
+    /// Sanity: the capture harness itself records emitted logs. Guards against
+    /// a false-green where the buffer is silently never written.
+    #[test]
+    fn capture_harness_records_log_output() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            tracing::debug!("harness sentinel CANARY12345");
+        }
+        let logged = captured(&buf);
+        assert!(
+            logged.contains("CANARY12345"),
+            "capture harness must record emitted logs, got: {logged}"
+        );
+    }
+
+    /// `clx_remember` must NOT log the raw `text` (Bearer token in this case).
+    #[test]
+    fn remember_does_not_log_secret_in_text() {
+        let server = create_test_server();
+        server
+            .storage
+            .create_session(&Session::new(
+                SessionId::new("test-session"),
+                "/test/project".to_string(),
+            ))
+            .unwrap();
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            let result =
+                server.tool_remember(&json!({"text": "deploy key Bearer SYNTHvalue12345"}));
+            assert!(result.is_ok(), "remember should still succeed");
+        }
+
+        let logged = captured(&buf);
+        assert!(
+            logged.contains("Remember text:"),
+            "the debug entry line must have been emitted: {logged}"
+        );
+        assert!(
+            !logged.contains("SYNTHvalue12345"),
+            "secret in `text` leaked into log output: {logged}"
+        );
+    }
+
+    /// `clx_remember` must NOT log a raw secret carried in a `tags` element.
+    #[test]
+    fn remember_does_not_log_secret_in_tags() {
+        let server = create_test_server();
+        server
+            .storage
+            .create_session(&Session::new(
+                SessionId::new("test-session"),
+                "/test/project".to_string(),
+            ))
+            .unwrap();
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            let result = server.tool_remember(&json!({
+                "text": "harmless note",
+                "tags": ["safe-tag", "api_key=SYNTHtagsecret67890"]
+            }));
+            assert!(result.is_ok(), "remember should still succeed");
+        }
+
+        let logged = captured(&buf);
+        assert!(
+            !logged.contains("SYNTHtagsecret67890"),
+            "secret in a `tags` element leaked into log output: {logged}"
+        );
+    }
+
+    /// `clx_checkpoint` must NOT log the raw `note`.
+    #[test]
+    fn checkpoint_does_not_log_secret_in_note() {
+        let server = create_test_server();
+        server
+            .storage
+            .create_session(&Session::new(
+                SessionId::new("test-session"),
+                "/test/project".to_string(),
+            ))
+            .unwrap();
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            let result =
+                server.tool_checkpoint(&json!({"note": "ship it Bearer SYNTHnote34567890"}));
+            assert!(result.is_ok(), "checkpoint should still succeed");
+        }
+
+        let logged = captured(&buf);
+        assert!(
+            logged.contains("Checkpoint with note:"),
+            "the debug entry line must have been emitted: {logged}"
+        );
+        assert!(
+            !logged.contains("SYNTHnote34567890"),
+            "secret in `note` leaked into log output: {logged}"
+        );
+    }
+
+    /// `clx_recall` must NOT log the raw `query` (a third site beyond the two
+    /// reported handlers).
+    #[test]
+    fn recall_does_not_log_secret_in_query() {
+        let server = create_test_server();
+        server
+            .storage
+            .create_session(&Session::new(
+                SessionId::new("test-session"),
+                "/test/project".to_string(),
+            ))
+            .unwrap();
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            let result = server.tool_recall(&json!({"query": "find Bearer SYNTHquery98765432"}));
+            assert!(result.is_ok(), "recall should still succeed");
+        }
+
+        let logged = captured(&buf);
+        assert!(
+            logged.contains("Recall query:"),
+            "the debug entry line must have been emitted: {logged}"
+        );
+        assert!(
+            !logged.contains("SYNTHquery98765432"),
+            "secret in `query` leaked into log output: {logged}"
+        );
+    }
+}

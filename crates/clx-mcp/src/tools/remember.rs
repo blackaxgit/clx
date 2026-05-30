@@ -18,7 +18,17 @@ impl McpServer {
         let text = validate_string_param(args, "text", MAX_CONTENT_LEN)?;
         let tags = validate_optional_string_array(args, "tags", 50, MAX_KEY_LEN)?;
 
-        debug!("Remember text: {}, tags: {:?}", text, tags);
+        // SECURITY: user-supplied `text`/`tags` may contain secrets. If logging
+        // is directed to a file, raw interpolation would persist them in clear
+        // text, so scrub through `redact_secrets` before logging (the stored
+        // snapshot is unaffected — only the log output is redacted).
+        debug!(
+            "Remember text: {}, tags: {:?}",
+            clx_core::redaction::redact_secrets(&text),
+            tags.iter()
+                .map(|t| clx_core::redaction::redact_secrets(t))
+                .collect::<Vec<_>>()
+        );
 
         let session_id = self
             .session_id

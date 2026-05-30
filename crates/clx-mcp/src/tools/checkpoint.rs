@@ -14,7 +14,13 @@ impl McpServer {
     pub(crate) fn tool_checkpoint(&self, args: &Value) -> Result<Value, (i32, String)> {
         let note = validate_optional_string_param(args, "note", MAX_CONTENT_LEN)?;
 
-        debug!("Checkpoint with note: {:?}", note);
+        // SECURITY: the user-supplied `note` may contain secrets. Scrub it
+        // through `redact_secrets` before logging so a file-backed log never
+        // persists a secret in clear text (the stored snapshot is unaffected).
+        debug!(
+            "Checkpoint with note: {:?}",
+            note.as_deref().map(clx_core::redaction::redact_secrets)
+        );
 
         let session_id = self
             .session_id

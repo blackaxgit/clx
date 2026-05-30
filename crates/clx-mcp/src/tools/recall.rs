@@ -26,7 +26,13 @@ impl McpServer {
     pub(crate) fn tool_recall(&self, args: &Value) -> Result<Value, (i32, String)> {
         let query = validate_string_param(args, "query", MAX_QUERY_LEN)?;
 
-        debug!("Recall query: {}", query);
+        // SECURITY: the user-supplied `query` may contain secrets. Scrub it
+        // through `redact_secrets` before logging so a file-backed log never
+        // persists a secret in clear text (search behavior is unaffected).
+        debug!(
+            "Recall query: {}",
+            clx_core::redaction::redact_secrets(&query)
+        );
 
         let auto_recall = Config::load().unwrap_or_default().auto_recall;
         let reranker = auto_recall
