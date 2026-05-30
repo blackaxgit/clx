@@ -262,6 +262,40 @@ mod tests {
         assert_eq!(host_id_for(&claude_envelope(), None), HostId::Claude);
     }
 
+    /// Regression: a Claude Code envelope carrying a top-level `permission_mode`
+    /// (Claude emits default/acceptEdits/plan/bypassPermissions) must STILL
+    /// resolve to Claude - not Codex. Pre-fix this matched the Codex heuristic
+    /// and turned `ask` verdicts into Codex fail-closed denies (the reported
+    /// `git rm -r --cached .claude/` block in Claude Code).
+    #[test]
+    fn claude_envelope_with_permission_mode_is_not_codex() {
+        let env = serde_json::json!({
+            "session_id": "sess-pm",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "permission_mode": "default",
+            "tool_input": { "command": "git rm -r --cached .claude/" }
+        })
+        .to_string();
+        assert_eq!(host_id_for(&env, None), HostId::Claude);
+    }
+
+    /// A genuine Codex envelope (carries `turn_id`) still resolves to Codex.
+    #[test]
+    fn codex_envelope_via_turn_id_only_resolves_to_codex() {
+        let env = serde_json::json!({
+            "session_id": "sess-codex2",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "turn_id": "turn-9",
+            "tool_input": { "command": "echo hi" }
+        })
+        .to_string();
+        assert_eq!(host_id_for(&env, None), HostId::Codex);
+    }
+
     #[test]
     fn codex_envelope_resolves_to_codex() {
         let env = serde_json::json!({

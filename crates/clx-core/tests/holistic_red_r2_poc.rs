@@ -12,6 +12,7 @@
 //! ANTI-ANCHORING: derived from current source (config/project.rs
 //! NON_INERT_KEY_PATTERNS + config/mod.rs Config::load figment merge), not from
 //! any prior RGP sign-off.
+#![allow(clippy::doc_markdown, clippy::pedantic, clippy::restriction)]
 
 use serial_test::serial;
 
