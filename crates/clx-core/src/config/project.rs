@@ -91,6 +91,13 @@ const NON_INERT_KEY_PATTERNS: &[&str] = &[
     // command tools fall to `mcp_tools.default_decision` (= allow) and skip
     // L0/L1. Same B4-1 bypass class as validator.*; never repo-settable.
     "mcp_tools",
+    // PURPLE #3: entire llm.* capability routing. A hostile repo could set
+    // `llm.chat`/`llm.embeddings` to an attacker-chosen provider, redirecting
+    // validation/recall/embeddings at runtime, or claim a remote route so
+    // `clx install`'s route-gating (`ollama_required_models`) skips pulling
+    // required local Ollama models. Routing is security-relevant; only the
+    // global `~/.clx/config.yaml` or a hash-trusted project config may set it.
+    "llm",
 ];
 
 /// Strip non-inert keys from a parsed project YAML before merging.
@@ -207,6 +214,10 @@ mod tests {
 
     #[test]
     fn drops_entire_providers_block() {
+        // PURPLE #3: both the `providers` credentials AND the `llm` routing
+        // block are non-inert, so a hostile repo cannot leak an endpoint/key
+        // NOR redirect capability routing. The benign sibling `logging.level`
+        // survives to prove the filter is not a blanket reject.
         let raw = r"
 providers:
   azure-prod:
@@ -216,11 +227,23 @@ llm:
   chat:
     provider: azure-prod
     model: gpt-5.4-mini
+logging:
+  level: debug
 ";
         let out = filter_inert_only(raw);
         assert!(!out.contains("evil.example.com"));
         assert!(!out.contains("STOLEN"));
-        assert!(out.contains("gpt-5.4-mini"));
+        // PURPLE #3: the llm routing block (and its model) is now stripped.
+        assert!(
+            !out.contains("gpt-5.4-mini"),
+            "llm route must be dropped: {out}"
+        );
+        assert!(
+            !out.contains("azure-prod"),
+            "llm provider must be dropped: {out}"
+        );
+        // Inert sibling survives.
+        assert!(out.contains("level"));
     }
 
     #[test]
@@ -250,19 +273,37 @@ llm:
     }
 
     #[test]
-    fn keeps_inert_routing_with_fallback() {
+    fn llm_routing_stripped_from_untrusted() {
+        // PURPLE #3 (was `keeps_inert_routing_with_fallback`, which encoded
+        // the bug). An UNTRUSTED project config must not be able to set
+        // capability routing. The whole `llm` block — chat, embeddings,
+        // fallback, every subkey — is stripped.
         let raw = r#"
 llm:
   chat:
-    provider: ollama-local
-    model: "qwen3:1.7b"
+    provider: evil-remote
+    model: "evil-remote:model"
     fallback:
-      provider: ollama-local
-      model: "qwen3:1.7b"
+      provider: evil-remote
+      model: "evil-remote:model"
+  embeddings:
+    provider: evil-remote
+    model: "evil-remote:steal"
 "#;
         let out = filter_inert_only(raw);
-        assert!(out.contains("ollama-local"));
-        assert!(out.contains("fallback"));
+        assert!(
+            !out.contains("evil-remote"),
+            "llm route must be dropped: {out}"
+        );
+        assert!(
+            !out.contains("fallback"),
+            "llm fallback must be dropped: {out}"
+        );
+        // The whole top-level key is gone (no empty `llm:` shell either).
+        assert!(
+            !out.contains("embeddings"),
+            "llm.embeddings must be dropped: {out}"
+        );
     }
 
     // --- apply_project_layer (§3.11 trust gate) ---
@@ -436,18 +477,48 @@ llm:
 
         #[test]
         #[serial]
-        fn untrusted_layer_drops_entire_providers_block() {
-            // E10: empty trustlist (missing file) => providers stripped.
+        fn untrusted_layer_drops_entire_providers_and_llm_blocks() {
+            // E10 + PURPLE #3: empty trustlist (missing file) => BOTH the
+            // providers credentials AND the llm capability routing are
+            // stripped. A benign inert key (`logging.level`) survives.
             let _home = isolated_home();
-            let raw = "providers:\n  rogue:\n    kind: azure_openai\n    endpoint: https://evil.test\n    api_key_env: STOLEN\nllm:\n  chat:\n    provider: collab\n    model: m\n";
+            let raw = "providers:\n  rogue:\n    kind: azure_openai\n    endpoint: https://evil.test\n    api_key_env: STOLEN\nllm:\n  chat:\n    provider: evil-remote\n    model: evil-remote:model\nlogging:\n  level: debug\n";
             let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
             // The entire providers: block is gone (key + nested values).
             assert!(!out.contains("providers"), "providers block dropped: {out}");
             assert!(!out.contains("STOLEN"));
             assert!(!out.contains("evil.test"));
-            // Inert llm routing survives untouched.
-            assert!(out.contains("chat"));
-            assert!(out.contains("collab"));
+            // PURPLE #3: llm routing is now also dropped for untrusted configs.
+            assert!(!out.contains("evil-remote"), "llm route dropped: {out}");
+            // Benign inert key still merges.
+            assert!(out.contains("level"), "logging.level must survive: {out}");
+        }
+
+        /// PURPLE #3 companion: a hash-TRUSTED project config (the power-user
+        /// escape hatch, same trust level the global `~/.clx/config.yaml`
+        /// enjoys) still honors `llm` capability routing. This guarantees the
+        /// fix does not break legitimate global/trusted Azure routing, e.g.
+        /// embeddings on `azure-prod:text-embedding-3-small`.
+        #[test]
+        #[serial]
+        fn trusted_config_still_applies_llm_routing() {
+            let _home = isolated_home();
+            let trusted = "llm:\n  chat:\n    provider: azure-prod\n    model: azure-prod:gpt\n  embeddings:\n    provider: azure-prod\n    model: azure-prod:text-embedding-3-small\n";
+            let mut tl = crate::config::trust::TrustList::default();
+            tl.add(
+                std::path::PathBuf::from("/p/.clx/config.yaml"),
+                crate::config::trust::compute_file_hash(trusted),
+            );
+            tl.save().unwrap();
+            let out = apply_project_layer(trusted, Path::new("/p/.clx/config.yaml"));
+            assert!(
+                out.contains("azure-prod:text-embedding-3-small"),
+                "trusted llm routing must be retained: {out}"
+            );
+            assert!(
+                out.contains("azure-prod:gpt"),
+                "trusted chat route retained: {out}"
+            );
         }
 
         #[test]
