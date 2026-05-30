@@ -51,8 +51,8 @@ Strong invocation signals:
 
 ### Branch B: embedding model mismatch
 
-1. Run `clx embeddings status` and compare `current_model` vs
-   `index_model`.
+1. Run `clx embeddings status` and compare `configured_model` (active route) vs
+   `stored_model` (vectors in the index).
 2. If different: user changed embedding provider; run
    `clx embeddings rebuild`. Until rebuild completes, recall returns
    empty by design.
