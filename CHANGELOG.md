@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`clx health` no longer reports false negatives under remote (Azure) routing.**
+  The embedding-model check resolves the active `llm.embeddings` capability route:
+  a remote route reports PASS ("model managed remotely") instead of a false
+  "Embedding model nomic-embed-text not found", and an Ollama route probes the
+  real routed model. The validator-model check short-circuits to PASS when
+  `validator.enabled = false` (and is route-aware otherwise), removing the false
+  "Validator model qwen3:1.7b not found". `clx health` also gained a version-skew
+  row that WARNs when `~/.clx/bin` is stale (surfacing the same skew the hook/MCP
+  binaries warn about at startup).
 - **`clx embeddings status` detects model/provider migration, not just dimension.**
   Status now displays the model that actually produced the stored vectors (from the
   index) and flags "migration needed" when the active `llm.embeddings` route's

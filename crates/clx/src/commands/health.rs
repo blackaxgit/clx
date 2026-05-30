@@ -1,6 +1,6 @@
 //! Health check command for CLX.
 //!
-//! Runs 9 concurrent validators to verify all CLX components are working
+//! Runs concurrent validators to verify all CLX components are working
 //! correctly and reports status in a clear, actionable format.
 //! Also probes every configured LLM provider and shows routing assignments.
 
@@ -168,7 +168,7 @@ fn check_validator_both_layers_off(config: Option<&clx_core::config::Config>) ->
 
 /// Run the health check command.
 ///
-/// Executes all 9 validators concurrently, then probes each configured LLM
+/// Executes all validators concurrently, then probes each configured LLM
 /// provider and prints results as either a colored table (default) or
 /// structured JSON (`--json`).
 ///
@@ -179,7 +179,7 @@ pub async fn cmd_health(json: bool) -> anyhow::Result<()> {
     // Load config (used by several validators)
     let config = clx_core::config::Config::load().ok();
 
-    let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10) = tokio::join!(
+    let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11) = tokio::join!(
         check_config(),
         check_database(),
         check_sqlite_vec(),
@@ -190,9 +190,10 @@ pub async fn cmd_health(json: bool) -> anyhow::Result<()> {
         check_mcp_binary(),
         check_validator_prompt(config.as_ref()),
         check_cursor_fail_closed(),
+        check_version_skew(),
     );
 
-    let results = vec![r1, r2, r3, r4, r5, r6, r7, r8, r9, r10];
+    let results = vec![r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11];
 
     // Provider probes (sequential, fast — each uses a short HTTP timeout).
     let (provider_rows, routing) = if let Some(cfg) = &config {
@@ -407,8 +408,96 @@ async fn check_ollama(config: Option<&clx_core::config::Config>) -> CheckResult 
 
 // ── V5: Validator Model ────────────────────────────────────────────
 
+/// Classification of how a capability is routed, used to decide whether a
+/// local Ollama model probe is meaningful.
+enum RouteProbe {
+    /// Route resolves to a local Ollama provider; probe `(host, model)`.
+    Ollama { host: String, model: String },
+    /// Route resolves to a remote provider (e.g. Azure `OpenAI`); the model is
+    /// managed by that provider and there is no local Ollama model to probe.
+    /// `provider` is the route's provider name for the report detail.
+    Remote { provider: String },
+    /// Route could not be resolved (no `llm:` routing, unconfigured capability,
+    /// or the provider name is absent from `config.providers`). The caller
+    /// falls back to legacy Ollama-default behavior.
+    Unresolved,
+}
+
+/// Resolve a capability route into a [`RouteProbe`], consulting
+/// `config.providers` to distinguish a local Ollama route (which has a real
+/// model to probe in `/api/tags`) from a remote provider route (which does
+/// not, so probing the local Ollama literal would be a false negative -
+/// Findings #2/#3).
+fn classify_capability_route(
+    config: &clx_core::config::Config,
+    capability: clx_core::config::Capability,
+) -> RouteProbe {
+    use clx_core::config::ProviderConfig;
+
+    let Ok(route) = config.capability_route(capability) else {
+        return RouteProbe::Unresolved;
+    };
+
+    // Resolve the provider name against `config.providers` (the flat map that
+    // `build_client_for_provider` / `create_llm_client_by_name` also resolve
+    // against), so a route's provider name is a valid key here.
+    match config.providers.get(&route.provider) {
+        Some(ProviderConfig::Ollama(o)) => RouteProbe::Ollama {
+            host: o.host.clone(),
+            model: route.model.clone(),
+        },
+        Some(ProviderConfig::AzureOpenai(_)) => RouteProbe::Remote {
+            provider: route.provider.clone(),
+        },
+        None => RouteProbe::Unresolved,
+    }
+}
+
+/// Build a PASS result for a capability whose model is managed by a remote
+/// provider, so no local Ollama probe is performed.
+fn remote_route_pass(label: &str, provider: &str, start: Instant) -> CheckResult {
+    CheckResult {
+        name: label.into(),
+        status: CheckStatus::Pass,
+        detail: format!("routed to {provider} (model managed remotely)"),
+        hint: None,
+        duration: start.elapsed(),
+    }
+}
+
 async fn check_validator_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
+
+    // Finding #3: when the validator is disabled there is no validator LLM in
+    // play, so probing Ollama for the validator model is a false negative.
+    if let Some(c) = config
+        && !c.validator.enabled
+    {
+        return CheckResult {
+            name: "Validator model".into(),
+            status: CheckStatus::Pass,
+            detail: "validator disabled (skipping model check)".into(),
+            hint: None,
+            duration: start.elapsed(),
+        };
+    }
+
+    // Finding #3 (route-awareness): when the validator is enabled and chat is
+    // routed to a remote provider, do not probe the local Ollama literal.
+    if let Some(c) = config {
+        match classify_capability_route(c, clx_core::config::Capability::Chat) {
+            RouteProbe::Ollama { host, model } => {
+                return check_model_available(&host, &model, "Validator model", start).await;
+            }
+            RouteProbe::Remote { provider } => {
+                return remote_route_pass("Validator model", &provider, start);
+            }
+            RouteProbe::Unresolved => {}
+        }
+    }
+
+    // Fallback: legacy ollama defaults (also covers config == None). A
+    // genuinely-missing local model still reports as FAIL.
     let (host, model) = match config {
         Some(c) => {
             let ollama = c.ollama.as_ref();
@@ -426,6 +515,25 @@ async fn check_validator_model(config: Option<&clx_core::config::Config>) -> Che
 
 async fn check_embedding_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
+
+    // Finding #2: resolve the active embeddings route. When embeddings are
+    // routed to a remote provider (e.g. Azure) the model is managed remotely;
+    // probing the local Ollama literal (default nomic-embed-text) is a false
+    // negative. When routed to Ollama, probe the REAL routed model.
+    if let Some(c) = config {
+        match classify_capability_route(c, clx_core::config::Capability::Embeddings) {
+            RouteProbe::Ollama { host, model } => {
+                return check_model_available(&host, &model, "Embedding model", start).await;
+            }
+            RouteProbe::Remote { provider } => {
+                return remote_route_pass("Embedding model", &provider, start);
+            }
+            RouteProbe::Unresolved => {}
+        }
+    }
+
+    // Fallback: legacy ollama defaults (also covers config == None). A
+    // genuinely-missing local model still reports as FAIL.
     let (host, model) = match config {
         Some(c) => {
             let ollama = c.ollama.as_ref();
@@ -745,6 +853,74 @@ async fn check_cursor_fail_closed() -> CheckResult {
             ),
             duration: start.elapsed(),
         }
+    }
+}
+
+// ── V11: Version skew ─────────────────────────────────────────────
+//
+// Finding #1 surfacing: `clx install` copies the clx/clx-hook/clx-mcp
+// binaries into ~/.clx/bin and stamps the installing version. After a
+// package-manager upgrade those copies can go stale while the on-PATH `clx`
+// does not. This row surfaces the same skew the hook/MCP binaries warn about
+// at startup, as a WARN in the health report.
+//
+// The skew comparison mirrors `clx_core::version::version_skew_warning`
+// (Stream A's shared helper). It is reimplemented locally so this command
+// crate stays self-contained in its isolated worktree; swap to the shared
+// helper if/when it is exported from `clx_core` (behavior is identical).
+
+#[allow(clippy::unused_async)] // Must be async for tokio::join!
+async fn check_version_skew() -> CheckResult {
+    let start = Instant::now();
+    let home = clx_core::paths::clx_dir();
+    let warning = version_skew_warning(&home, clx_core::VERSION);
+    version_skew_row(warning, start)
+}
+
+/// Compare the `~/.clx/bin/.clx-version` install stamp under `home` against the
+/// `running` binary version.
+///
+/// Returns `Some(message)` when a non-empty stamp is present and differs from
+/// `running`; `None` when they match or no stamp exists (an absent stamp means
+/// CLX is not installed into `~/.clx/bin`, so reporting skew would be a false
+/// alarm).
+fn version_skew_warning(home: &std::path::Path, running: &str) -> Option<String> {
+    let stamp_path = home.join("bin").join(".clx-version");
+    let installed = std::fs::read_to_string(stamp_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if installed == running {
+        return None;
+    }
+    Some(format!(
+        "CLX version skew: installed stamp {installed} != running binary {running}; \
+         run `clx install` to refresh ~/.clx/bin"
+    ))
+}
+
+/// Build the "Version skew" row from a precomputed [`version_skew_warning`]
+/// result. Pure (aside from the elapsed clock), so it is unit-testable without
+/// touching `~/.clx`.
+///
+/// `Some(warning)` -> WARN row carrying the warning; `None` (versions match or
+/// no install stamp) -> PASS row.
+fn version_skew_row(warning: Option<String>, start: Instant) -> CheckResult {
+    match warning {
+        Some(warning) => CheckResult {
+            name: "Version skew".into(),
+            status: CheckStatus::Warn,
+            detail: warning,
+            hint: Some("Run: clx install  to refresh ~/.clx/bin".into()),
+            duration: start.elapsed(),
+        },
+        None => CheckResult {
+            name: "Version skew".into(),
+            status: CheckStatus::Pass,
+            detail: format!("~/.clx/bin matches running CLX v{}", clx_core::VERSION),
+            hint: None,
+            duration: start.elapsed(),
+        },
     }
 }
 
@@ -1397,5 +1573,286 @@ mod tests {
             !bad.contains(&"beforeShellExecution".to_string()),
             "non-CLX hook should not be flagged; got: {bad:?}"
         );
+    }
+
+    // ── Route-aware model checks (Findings #2 / #3) ──────────────────
+
+    use clx_core::config::Config;
+
+    /// Build a `Config` from a YAML document, the project's native config
+    /// format. The provider enum is tagged on `kind:` (`snake_case`), and `llm:`
+    /// carries the `chat` / `embeddings` capability routes. Deserializing the
+    /// full `Config` exercises the same shape `Config::load` produces, so the
+    /// route-awareness tests do not need the (non-exported) inner provider
+    /// structs.
+    fn config_from_yaml(yaml: &str) -> Config {
+        serde_yml::from_str::<Config>(yaml).expect("valid Config YAML")
+    }
+
+    /// Finding #2: embeddings routed to a remote (Azure) provider must NOT
+    /// report the local ollama literal as missing.
+    #[tokio::test]
+    async fn embedding_check_passes_when_routed_to_remote_provider() {
+        let cfg = config_from_yaml(
+            r#"
+providers:
+  azure:
+    kind: azure_openai
+    endpoint: "https://synthetic.example.invalid"
+llm:
+  chat:
+    provider: azure
+    model: gpt-4o-mini
+  embeddings:
+    provider: azure
+    model: text-embedding-3-small
+"#,
+        );
+
+        let result = check_embedding_model(Some(&cfg)).await;
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "remote embeddings route must PASS, got: {result:?}"
+        );
+        assert!(
+            !result.detail.contains("not found"),
+            "must not report a local model as missing; got: {}",
+            result.detail
+        );
+        assert!(
+            !result.detail.contains("nomic-embed-text"),
+            "must not mention the hardcoded ollama literal; got: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("azure"),
+            "detail should name the remote provider; got: {}",
+            result.detail
+        );
+    }
+
+    /// Finding #3: validator disabled must short-circuit to PASS/SKIP, never
+    /// probing the ollama validator model.
+    #[tokio::test]
+    async fn validator_check_skips_when_disabled() {
+        let mut cfg = Config::default();
+        cfg.validator.enabled = false;
+
+        let result = check_validator_model(Some(&cfg)).await;
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "disabled validator must PASS, got: {result:?}"
+        );
+        assert!(
+            !result.detail.contains("not found"),
+            "disabled validator must not report a missing model; got: {}",
+            result.detail
+        );
+        assert!(
+            !result.detail.contains("qwen3"),
+            "disabled validator must not mention the ollama literal; got: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("disabled"),
+            "detail should say the validator is disabled; got: {}",
+            result.detail
+        );
+    }
+
+    /// Finding #3 (route-awareness): validator enabled + chat routed to a
+    /// remote provider must not probe the local ollama literal.
+    #[tokio::test]
+    async fn validator_check_passes_when_chat_routed_to_remote() {
+        let mut cfg = config_from_yaml(
+            r#"
+providers:
+  azure:
+    kind: azure_openai
+    endpoint: "https://synthetic.example.invalid"
+llm:
+  chat:
+    provider: azure
+    model: gpt-4o-mini
+  embeddings:
+    provider: azure
+    model: text-embedding-3-small
+"#,
+        );
+        cfg.validator.enabled = true;
+
+        let result = check_validator_model(Some(&cfg)).await;
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "remote chat route must PASS the validator-model check, got: {result:?}"
+        );
+        assert!(
+            !result.detail.contains("not found") && !result.detail.contains("qwen3"),
+            "must not report the ollama validator literal as missing; got: {}",
+            result.detail
+        );
+    }
+
+    /// Finding #2 (correct-negative preserved): an ollama-routed embeddings
+    /// model that is genuinely absent from `/api/tags` must still FAIL, and
+    /// must probe the REAL routed model (not the nomic literal).
+    #[tokio::test]
+    async fn embedding_check_reports_missing_ollama_model() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Empty model list => routed model is absent.
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = config_from_yaml(&format!(
+            r#"
+providers:
+  local:
+    kind: ollama
+    host: "{uri}"
+llm:
+  chat:
+    provider: local
+    model: synthetic-chat-model
+  embeddings:
+    provider: local
+    model: synthetic-embed-model
+"#,
+            uri = server.uri(),
+        ));
+
+        let result = check_embedding_model(Some(&cfg)).await;
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "genuinely-absent ollama model must FAIL, got: {result:?}"
+        );
+        assert!(
+            result.detail.contains("synthetic-embed-model"),
+            "must probe the REAL routed model, not the nomic literal; got: {}",
+            result.detail
+        );
+        assert!(
+            !result.detail.contains("nomic-embed-text"),
+            "must not fall back to the hardcoded literal; got: {}",
+            result.detail
+        );
+    }
+
+    /// Finding #2 (positive): an ollama-routed embeddings model that IS
+    /// present must PASS.
+    #[tokio::test]
+    async fn embedding_check_finds_present_ollama_model() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [ { "name": "synthetic-embed-model" } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = config_from_yaml(&format!(
+            r#"
+providers:
+  local:
+    kind: ollama
+    host: "{uri}"
+llm:
+  chat:
+    provider: local
+    model: synthetic-chat-model
+  embeddings:
+    provider: local
+    model: synthetic-embed-model
+"#,
+            uri = server.uri(),
+        ));
+
+        let result = check_embedding_model(Some(&cfg)).await;
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "present ollama model must PASS, got: {result:?}"
+        );
+        assert!(result.detail.contains("synthetic-embed-model"));
+    }
+
+    // ── Version-skew row + helper (Finding #1 surfacing) ─────────────
+
+    #[test]
+    fn version_skew_row_warns_when_present() {
+        let row = version_skew_row(
+            Some("CLX version skew: installed stamp 0.9.0 != running binary 0.10.0".to_owned()),
+            Instant::now(),
+        );
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert_eq!(row.name, "Version skew");
+        assert!(
+            row.detail.contains("0.9.0") && row.detail.contains("0.10.0"),
+            "WARN row must carry the skew detail; got: {}",
+            row.detail
+        );
+        assert!(
+            row.hint.is_some(),
+            "WARN row must offer remediation (clx install)"
+        );
+    }
+
+    #[test]
+    fn version_skew_row_passes_when_none() {
+        let row = version_skew_row(None, Instant::now());
+        assert_eq!(row.status, CheckStatus::Pass);
+        assert_eq!(row.name, "Version skew");
+        assert!(
+            row.hint.is_none(),
+            "PASS row needs no remediation hint; got: {:?}",
+            row.hint
+        );
+    }
+
+    /// A stamp older than the running binary yields a skew message naming both
+    /// versions and the remediation.
+    #[test]
+    fn version_skew_warning_detects_stale_stamp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin dir");
+        std::fs::write(bin.join(".clx-version"), "0.9.0\n").expect("write stamp");
+
+        let warning =
+            version_skew_warning(home, "0.10.0").expect("expected skew when stamp differs");
+        assert!(warning.contains("0.9.0"), "names installed: {warning}");
+        assert!(warning.contains("0.10.0"), "names running: {warning}");
+        assert!(warning.contains("clx install"), "remediation: {warning}");
+    }
+
+    /// A matching stamp is not skew; an absent stamp is not a false alarm.
+    #[test]
+    fn version_skew_warning_none_when_matching_or_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        // Absent stamp => None (CLX not installed into ~/.clx/bin).
+        assert_eq!(version_skew_warning(home, "0.10.0"), None);
+
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin dir");
+        std::fs::write(bin.join(".clx-version"), "0.10.0\n").expect("write stamp");
+        // Matching stamp => None.
+        assert_eq!(version_skew_warning(home, "0.10.0"), None);
     }
 }

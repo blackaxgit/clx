@@ -380,9 +380,10 @@ fn health_json_produces_valid_json() {
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("health --json output must be valid JSON");
     assert!(parsed["checks"].is_array());
-    // V10 (Cursor failClosed) was added in P6; count is now 10.
-    assert_eq!(parsed["checks"].as_array().unwrap().len(), 10);
-    assert_eq!(parsed["summary"]["total"].as_u64().unwrap(), 10);
+    // V10 (Cursor failClosed) added in P6; V11 (Version skew) added for the
+    // CLI-bugs fix (Finding #1 surfacing); count is now 11.
+    assert_eq!(parsed["checks"].as_array().unwrap().len(), 11);
+    assert_eq!(parsed["summary"]["total"].as_u64().unwrap(), 11);
 }
 
 #[test]
