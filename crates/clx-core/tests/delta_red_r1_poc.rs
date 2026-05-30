@@ -9,6 +9,7 @@
 //! at base `main` @ 63ec0d3. A PoC that asserts a secret SURVIVED proves a
 //! no-code-exec leak; when GREEN closes it, that assertion flips and the test
 //! must be updated to assert absence.
+#![allow(clippy::doc_markdown)]
 
 use clx_core::redaction::redact_secrets;
 
@@ -34,7 +35,10 @@ fn r1_delta_short_bearer_token_leaks() {
 fn r1_delta_long_bearer_token_redacts_control() {
     let out = redact_secrets("Bearer abc123def");
     println!("R1-DELTA-A2 out={out:?}");
-    assert!(!out.contains("abc123def"), "control: long token must redact: {out}");
+    assert!(
+        !out.contains("abc123def"),
+        "control: long token must redact: {out}"
+    );
 }
 
 /// R1-DELTA-B (CRLF probe): CR/LF after the scheme word. `is_ascii_whitespace`
@@ -56,7 +60,10 @@ fn r1_delta_crlf_after_bearer_redacts() {
 fn r1_delta_newline_separated_value_redacts() {
     let out = redact_secrets("password:\nSYNTHSECRET99");
     println!("R1-DELTA-C out={out:?}");
-    assert!(!out.contains("SYNTHSECRET99"), "newline-value must redact: {out}");
+    assert!(
+        !out.contains("SYNTHSECRET99"),
+        "newline-value must redact: {out}"
+    );
 }
 
 /// R1-DELTA-D (short keyword value, R1-B): any non-empty value after a keyword.
@@ -65,7 +72,10 @@ fn r1_delta_newline_separated_value_redacts() {
 fn r1_delta_short_keyword_value_redacts() {
     let out = redact_secrets("password:1234");
     println!("R1-DELTA-D out={out:?}");
-    assert!(!out.contains("1234"), "short keyword value must redact: {out}");
+    assert!(
+        !out.contains("1234"),
+        "short keyword value must redact: {out}"
+    );
 }
 
 /// R1-DELTA-E (multi-Bearer all-occurrences): both tokens must redact.

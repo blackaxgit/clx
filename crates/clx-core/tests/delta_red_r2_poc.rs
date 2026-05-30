@@ -8,6 +8,7 @@
 //! NEVER reproduces the previously-leaked Azure tenant URL or key; the only
 //! "azure"-shaped strings here are the synthetic `azure-prod:text-embedding-*`
 //! idents and `*.example.invalid` hosts.
+#![allow(clippy::doc_markdown)]
 
 use rusqlite::Connection;
 
@@ -197,4 +198,3 @@ fn poc_status_dim_sourced_from_ollama_block_not_route() {
 // PATTERNS` array which includes `"mcp_tools"` (project.rs:93). Re-confirmed by
 // inspection; documented in the fragment doc REFUTED-7a. No external PoC.
 // ===========================================================================
-
