@@ -247,20 +247,29 @@ pub fn redact_secrets(text: &str) -> String {
     //    has the scheme prefix consumed first; otherwise section 2b would
     //    eat just the `bearer` word and leave the token behind.
     // -------------------------------------------------------------------------
-    for scheme in &["bearer ", "basic "] {
-        // R1-A: scan ALL occurrences, not just the first - a blob with a second
-        // `Authorization: Bearer <token>` previously leaked the later tokens.
+    for scheme in &["bearer", "basic"] {
+        // R1-A + PURPLE follow-up: match the scheme WORD then ANY whitespace
+        // (space/tab/newline), at EVERY occurrence. The prior `"bearer "`
+        // literal-space match missed `Bearer\t...` / `Bearer\n...` and is a
+        // no-code-exec leak into logs/audit (Codex PURPLE NO-SHIP).
         let mut from = 0usize;
         loop {
             let lower_search = redacted.to_lowercase();
-            let Some(rel) = lower_search[from..].find(scheme) else {
+            let Some(rel) = lower_search.get(from..).and_then(|s| s.find(scheme)) else {
                 break;
             };
-            let scheme_start = from + rel;
-            let token_start = scheme_start + scheme.len();
-            if redacted.len() <= token_start + 6 {
-                break;
+            let after_kw = from + rel + scheme.len();
+            // Require >=1 whitespace after the scheme word so `bearertoken`
+            // is not treated as a scheme prefix.
+            let mut cursor = after_kw;
+            while cursor < redacted.len() && redacted.as_bytes()[cursor].is_ascii_whitespace() {
+                cursor += 1;
             }
+            if cursor == after_kw {
+                from = after_kw;
+                continue;
+            }
+            let token_start = cursor;
             let token_end = redacted[token_start..]
                 .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
                 .map_or(redacted.len(), |i| token_start + i);
@@ -270,7 +279,7 @@ pub fn redact_secrets(text: &str) -> String {
                 redacted.replace_range(token_start..token_end, "***REDACTED***");
                 from = token_start + "***REDACTED***".len();
             } else {
-                from = token_end;
+                from = after_kw;
             }
         }
     }
@@ -590,6 +599,36 @@ mod tests {
         let redacted = redact_secrets(input);
         assert!(redacted.contains("Bearer ***REDACTED***"));
         assert!(!redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+    }
+
+    // Codex PURPLE NO-SHIP regression: scheme followed by tab/newline (not just
+    // a literal space) must still redact the token, at EVERY occurrence.
+    #[test]
+    fn test_redact_secrets_bearer_tab_and_newline_after_scheme() {
+        let r = redact_secrets("Authorization:\nBearer\tSECRETVALUE123456");
+        assert!(
+            !r.contains("SECRETVALUE123456"),
+            "tab-after-Bearer must redact: {r}"
+        );
+        let r2 = redact_secrets("Bearer\nANOTHERSECRET987654");
+        assert!(
+            !r2.contains("ANOTHERSECRET987654"),
+            "newline-after-Bearer must redact: {r2}"
+        );
+        let r3 = redact_secrets("Bearer firsttoken111111 and Bearer secondtoken222222");
+        assert!(
+            !r3.contains("firsttoken111111"),
+            "first token must redact: {r3}"
+        );
+        assert!(
+            !r3.contains("secondtoken222222"),
+            "second token must redact: {r3}"
+        );
+        let r4 = redact_secrets("Basic\tdXNlcjpwYXNzd29yZA==");
+        assert!(
+            !r4.contains("dXNlcjpwYXNzd29yZA=="),
+            "tab-after-Basic must redact: {r4}"
+        );
     }
 
     // =========================================================================
