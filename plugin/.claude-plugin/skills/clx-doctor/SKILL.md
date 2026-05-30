@@ -3,8 +3,8 @@ name: clx-doctor
 description: >
   Use when CLX recall returns no results, looks empty, or behaves
   unexpectedly; diagnoses provider, embedding, DB, and config issues
-  via shell commands (clx doctor, clx embeddings status, clx providers
-  ping) and log inspection. Examples: "why isn't recall working", "clx
+  via shell commands (clx health, clx health --json, clx embeddings
+  status) and log inspection. Examples: "why isn't recall working", "clx
   returns empty", "diagnose embedding model mismatch", "check provider
   fallback status". Do NOT invoke for normal "no relevant context"
   outcomes; only for outright failures or recall results that look
@@ -60,14 +60,15 @@ Strong invocation signals:
 
 ### Branch C: provider 5xx or timeout
 
-1. Run `clx providers ping` to test primary and fallback for each
-   capability (chat, embeddings).
+1. Run `clx health` (or `clx health --json` for machine-readable output)
+   to check provider reachability and routing for each capability
+   (chat, embeddings).
 2. Inspect `~/.clx/logs/clx-hook.log` for recent provider errors
    (`tail -n 200`); look for `provider=... status=5xx` lines.
 3. If primary is cold and fallback is healthy: CLX is already on
    fallback; the 30s cooldown will retry primary automatically.
-4. If both fail: network or auth issue; check `clx doctor` for the
-   secret-source health check (keychain, env var, file).
+4. If both fail: network or auth issue; `clx health` reports the
+   secret-source / provider health check (keychain, env var, file).
 
 ### Branch D: Stop hook not firing
 
@@ -79,9 +80,9 @@ Strong invocation signals:
 
 ### Branch E: corrupt or locked DB
 
-1. Run `clx doctor`; it runs `PRAGMA integrity_check` on the snapshot
-   DB.
-2. If `ok`: DB is fine; problem is elsewhere.
+1. Run `clx health`; it reports snapshot-DB status as part of the
+   overall health check.
+2. If healthy: DB is fine; problem is elsewhere.
 3. If errors: back up `~/.clx/store.db` first, then
    `clx maintenance rebuild --from-snapshots` if available, or restore
    from a `.bak` and replay recent `events`.
@@ -94,9 +95,8 @@ Strong invocation signals:
 invocations and log reads; Claude orchestrates them and reports findings
 back to the user.
 
-- `clx doctor` (top-level health check)
+- `clx health` (top-level health check) / `clx health --json`
 - `clx embeddings status` / `clx embeddings rebuild`
-- `clx providers ping`
 - `tail -n 200 ~/.clx/logs/clx-hook.log`
 - `pgrep -fl clx-hook`
 - `clx install --check`

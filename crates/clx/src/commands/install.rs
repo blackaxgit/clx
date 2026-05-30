@@ -554,18 +554,83 @@ struct OllamaStatus {
     missing_models: Vec<String>,
 }
 
-/// Check Ollama prerequisites
-async fn check_ollama_prerequisites() -> OllamaStatus {
+/// Compute the set of Ollama models that must be present for the *active*
+/// configuration, gated on capability routing.
+///
+/// Only models that some active capability actually routes to Ollama are
+/// returned, so an Azure-only deployment (chat + embeddings on Azure, validator
+/// off) yields an empty list and triggers no pulls. Specifically:
+///
+/// - The chat/validator model is included only when the validator is enabled
+///   AND the chat capability routes to an Ollama-backed provider (the L1
+///   validator runs against the chat route's Ollama model).
+/// - The embedding model is included only when the embeddings capability routes
+///   to an Ollama-backed provider.
+///
+/// Legacy/default configs (no `llm:` routing section) are treated as
+/// Ollama-routed for backward compatibility: the legacy `ollama:` block (or the
+/// built-in defaults) supplies the chat model (validator-gated) and the
+/// embedding model, preserving the historical pull behavior for local setups.
+fn ollama_required_models(config: &Config) -> Vec<String> {
+    use clx_core::config::{Capability, ProviderConfig};
+
+    // Model name if the route for `cap` points at an Ollama-backed provider.
+    let routes_to_ollama = |cap: Capability| -> Option<String> {
+        let route = config.capability_route(cap).ok()?;
+        match config.providers.get(&route.provider)? {
+            ProviderConfig::Ollama(_) => Some(route.model.clone()),
+            ProviderConfig::AzureOpenai(_) => None,
+        }
+    };
+
+    let mut models: Vec<String> = Vec::new();
+
+    if config.llm.is_some() {
+        // New-style routing: honor the resolved capability routes.
+        if config.validator.enabled
+            && let Some(model) = routes_to_ollama(Capability::Chat)
+        {
+            models.push(model);
+        }
+        if let Some(model) = routes_to_ollama(Capability::Embeddings) {
+            models.push(model);
+        }
+    } else {
+        // Legacy/default: no `llm:` section means the local Ollama path is in
+        // use. Pull the (validator-gated) chat model and the embedding model
+        // from the legacy `ollama:` block, falling back to built-in defaults.
+        let legacy = config.ollama.as_ref();
+        if config.validator.enabled {
+            models.push(
+                legacy.map_or_else(clx_core::config::default_ollama_model, |o| o.model.clone()),
+            );
+        }
+        models.push(
+            legacy.map_or_else(clx_core::config::default_embedding_model, |o| {
+                o.embedding_model.clone()
+            }),
+        );
+    }
+
+    // De-duplicate while preserving order (chat and embeddings could coincide).
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| seen.insert(m.clone()));
+    models
+}
+
+/// Check Ollama prerequisites.
+///
+/// `required_models` is the route-gated set of Ollama models this deployment
+/// actually needs (see [`ollama_required_models`]). An empty list means no
+/// model is routed to Ollama, so nothing is reported missing or pulled.
+async fn check_ollama_prerequisites(required_models: Vec<String>) -> OllamaStatus {
     // Check if ollama binary exists
     let binary_installed = std::process::Command::new("which")
         .arg("ollama")
         .output()
         .is_ok_and(|o| o.status.success());
 
-    let all_models = vec![
-        clx_core::config::default_ollama_model(),
-        clx_core::config::default_embedding_model(),
-    ];
+    let all_models = required_models;
 
     if !binary_installed {
         return OllamaStatus {
@@ -849,14 +914,21 @@ pub async fn cmd_install(cli: &Cli, target: InstallTarget) -> Result<()> {
         }
     }
 
-    // Step 0: Check Ollama prerequisites
+    // Step 0: Check Ollama prerequisites.
+    //
+    // Only models that the active config actually routes to Ollama are
+    // considered. An Azure-only deployment yields an empty set, so no Ollama
+    // models are reported missing or pulled. A broken/missing config falls back
+    // to defaults (legacy local-Ollama behavior) rather than failing install.
+    let active_config = Config::load().unwrap_or_default();
+    let required_models = ollama_required_models(&active_config);
     let ollama_status = if cli.json {
-        check_ollama_prerequisites().await
+        check_ollama_prerequisites(required_models.clone()).await
     } else {
         let spinner = indicatif::ProgressBar::new_spinner();
         spinner.set_message("Checking Ollama availability...");
         spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-        let status = check_ollama_prerequisites().await;
+        let status = check_ollama_prerequisites(required_models.clone()).await;
         spinner.finish_and_clear();
         status
     };
@@ -953,7 +1025,7 @@ pub async fn cmd_install(cli: &Cli, target: InstallTarget) -> Result<()> {
                     ollama_status.server_running = true;
 
                     // Re-check models now that server is running
-                    let fresh = check_ollama_prerequisites().await;
+                    let fresh = check_ollama_prerequisites(required_models.clone()).await;
                     ollama_status.missing_models = fresh.missing_models;
                 }
                 Err(e) => {
@@ -963,7 +1035,7 @@ pub async fn cmd_install(cli: &Cli, target: InstallTarget) -> Result<()> {
             }
         } else if start_ollama_server().await.is_ok() {
             ollama_status.server_running = true;
-            let fresh = check_ollama_prerequisites().await;
+            let fresh = check_ollama_prerequisites(required_models.clone()).await;
             ollama_status.missing_models = fresh.missing_models;
         }
 
@@ -2010,5 +2082,157 @@ mod tests {
         assert!(InstallTarget::All.wants_cursor(false));
         assert!(InstallTarget::Auto.wants_cursor(true));
         assert!(!InstallTarget::Auto.wants_cursor(false));
+    }
+
+    // -- ollama_required_models: route-gated model pulls (Finding #5 caveat) --
+
+    fn config_from_yaml(yaml: &str) -> Config {
+        serde_yml::from_str(yaml).expect("test YAML should deserialize into Config")
+    }
+
+    #[test]
+    fn required_models_empty_when_azure_only_and_validator_off() {
+        // Chat + embeddings both routed to Azure, validator disabled. A user
+        // with local Ollama installed must NOT be made to pull unused models.
+        let yaml = r#"
+validator:
+  enabled: false
+providers:
+  azure-prod:
+    kind: azure_openai
+    endpoint: "https://example.openai.azure.com"
+    deployment: "gpt-test"
+    api_key_env: "AZURE_KEY"
+    timeout_ms: 30000
+llm:
+  chat:
+    provider: azure-prod
+    model: gpt-test
+  embeddings:
+    provider: azure-prod
+    model: text-embedding-3-small
+"#;
+        let config = config_from_yaml(yaml);
+        assert!(
+            ollama_required_models(&config).is_empty(),
+            "Azure-only routes with validator off must require no Ollama models"
+        );
+    }
+
+    #[test]
+    fn required_models_embedding_only_when_chat_azure_embeddings_ollama() {
+        // Validator enabled but chat routes to Azure (so no chat/validator pull);
+        // embeddings route to Ollama, so only the embedding model is required.
+        let yaml = r#"
+validator:
+  enabled: true
+providers:
+  azure-prod:
+    kind: azure_openai
+    endpoint: "https://example.openai.azure.com"
+    deployment: "gpt-test"
+    api_key_env: "AZURE_KEY"
+    timeout_ms: 30000
+  ollama-local:
+    kind: ollama
+    host: "http://127.0.0.1:11434"
+    model: "qwen3:1.7b"
+    embedding_model: "qwen3-embedding:0.6b"
+    embedding_dim: 1024
+llm:
+  chat:
+    provider: azure-prod
+    model: gpt-test
+  embeddings:
+    provider: ollama-local
+    model: "qwen3-embedding:0.6b"
+"#;
+        let config = config_from_yaml(yaml);
+        assert_eq!(
+            ollama_required_models(&config),
+            vec!["qwen3-embedding:0.6b".to_string()],
+            "only the Ollama-routed embedding model should be required"
+        );
+    }
+
+    #[test]
+    fn required_models_present_when_fully_ollama_routed() {
+        // Both capabilities routed to Ollama with the validator enabled: pull the
+        // chat/validator model AND the embedding model, as before.
+        let yaml = r#"
+validator:
+  enabled: true
+providers:
+  ollama-local:
+    kind: ollama
+    host: "http://127.0.0.1:11434"
+    model: "qwen3:1.7b"
+    embedding_model: "qwen3-embedding:0.6b"
+    embedding_dim: 1024
+llm:
+  chat:
+    provider: ollama-local
+    model: "qwen3:1.7b"
+  embeddings:
+    provider: ollama-local
+    model: "qwen3-embedding:0.6b"
+"#;
+        let config = config_from_yaml(yaml);
+        let models = ollama_required_models(&config);
+        assert!(
+            models.contains(&"qwen3:1.7b".to_string()),
+            "Ollama chat/validator model must be required: {models:?}"
+        );
+        assert!(
+            models.contains(&"qwen3-embedding:0.6b".to_string()),
+            "Ollama embedding model must be required: {models:?}"
+        );
+    }
+
+    #[test]
+    fn required_models_ollama_chat_dropped_when_validator_off() {
+        // Chat routed to Ollama but validator disabled: the chat/validator model
+        // is not needed; only the Ollama-routed embedding model remains.
+        let yaml = r#"
+validator:
+  enabled: false
+providers:
+  ollama-local:
+    kind: ollama
+    host: "http://127.0.0.1:11434"
+    model: "qwen3:1.7b"
+    embedding_model: "qwen3-embedding:0.6b"
+    embedding_dim: 1024
+llm:
+  chat:
+    provider: ollama-local
+    model: "qwen3:1.7b"
+  embeddings:
+    provider: ollama-local
+    model: "qwen3-embedding:0.6b"
+"#;
+        let config = config_from_yaml(yaml);
+        assert_eq!(
+            ollama_required_models(&config),
+            vec!["qwen3-embedding:0.6b".to_string()],
+            "chat/validator model must be dropped when validator is off"
+        );
+    }
+
+    #[test]
+    fn required_models_legacy_default_keeps_both() {
+        // No `llm:` section (legacy/default): preserve historical local-Ollama
+        // behavior - validator-gated chat model plus the embedding model.
+        let config = Config::default();
+        let models = ollama_required_models(&config);
+        // Default validator is enabled, so both default models are required.
+        assert!(
+            models.contains(&clx_core::config::default_ollama_model()),
+            "legacy/default config must keep the chat/validator model: {models:?}"
+        );
+        assert!(
+            models.contains(&clx_core::config::default_embedding_model()),
+            "legacy/default config must keep the embedding model: {models:?}"
+        );
     }
 }

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`clx install` only pulls Ollama models that are actually routed to Ollama.**
+  Required Ollama models are now derived from the active capability routing: the
+  chat/validator model is pulled only when the validator is enabled and chat
+  routes to an Ollama provider, and the embedding model only when embeddings
+  route to an Ollama provider. An Azure-only deployment (validator off) pulls
+  nothing, even when a local Ollama is installed. Legacy/default configs (no
+  `llm:` section) keep the previous local-Ollama pull behavior.
+
+### Fixed
+
+- **`clx-doctor` skill referenced nonexistent CLI subcommands.** The skill now
+  uses `clx health` / `clx health --json` (and `clx embeddings status`) instead
+  of the nonexistent `clx doctor` and `clx providers ping`.
+
 ## [0.10.0] - 2026-05-29
 
 ### Added
