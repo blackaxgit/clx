@@ -12,6 +12,7 @@
 //! binaries call once at startup so the skew becomes a loud, actionable signal
 //! instead of a silent no-op.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Version of the currently-running binary (the crate's `CARGO_PKG_VERSION`,
@@ -20,6 +21,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// File name of the install stamp written under `~/.clx/bin`.
 pub const VERSION_STAMP_FILE: &str = ".clx-version";
+
+/// Upper bound on bytes read from the version stamp. A legitimate stamp is a
+/// short semver string; anything larger is treated as anomalous and ignored so
+/// a FIFO, dangling/oversized file, or hostile path at the stamp location cannot
+/// hang or balloon memory at hook/MCP startup.
+const STAMP_READ_CAP: u64 = 256;
 
 /// Path to the install version stamp for the given CLX home directory
 /// (`<home>/bin/.clx-version`). `home` is the `~/.clx` directory.
@@ -30,11 +37,30 @@ pub fn version_stamp_path(home: &Path) -> PathBuf {
 
 /// Reads the install version stamp under `home`, if present and non-empty.
 ///
-/// Returns `None` when the stamp file is absent or contains only whitespace
-/// (CLX has not been installed into `~/.clx/bin`).
+/// Returns `None` when the stamp file is absent, contains only whitespace
+/// (CLX has not been installed into `~/.clx/bin`), or is anomalous in a way that
+/// makes reading it unsafe. Specifically, `None` is returned without hanging or
+/// panicking when the stamp path:
+/// - is not a regular file (directory, FIFO, or a symlink resolving to a
+///   non-regular file — `metadata` follows symlinks), or
+/// - reports a size greater than [`STAMP_READ_CAP`].
+///
+/// The read itself is also capped at [`STAMP_READ_CAP`] bytes independently of
+/// the reported size, defending against special files whose metadata understates
+/// their length.
 #[must_use]
 pub fn read_version_stamp(home: &Path) -> Option<String> {
-    std::fs::read_to_string(version_stamp_path(home))
+    let path = version_stamp_path(home);
+    // `metadata` follows symlinks, so a symlink to a dir/FIFO is rejected here
+    // exactly as a direct dir/FIFO would be.
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > STAMP_READ_CAP {
+        return None;
+    }
+    let file = std::fs::File::open(&path).ok()?;
+    let mut buf = Vec::new();
+    file.take(STAMP_READ_CAP).read_to_end(&mut buf).ok()?;
+    String::from_utf8(buf)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -137,6 +163,32 @@ mod tests {
             None,
             "blank/whitespace stamp must be treated as absent, not skew"
         );
+    }
+
+    #[test]
+    fn oversized_stamp_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        // Well past STAMP_READ_CAP; differs from the running version, so the
+        // only reason to return None is the size guard.
+        let big = "9".repeat((STAMP_READ_CAP as usize) + 1024);
+        write_stamp(home, &big);
+
+        // Must not hang or panic, and must not report skew.
+        assert_eq!(read_version_stamp(home), None);
+        assert_eq!(version_skew_warning(home, "0.10.0"), None);
+    }
+
+    #[test]
+    fn non_regular_stamp_path_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        // Create a directory where the stamp file is expected.
+        fs::create_dir_all(version_stamp_path(home)).expect("mkdir stamp-as-dir");
+
+        // Must not panic; a non-regular path is treated as "no stamp".
+        assert_eq!(read_version_stamp(home), None);
+        assert_eq!(version_skew_warning(home, "0.10.0"), None);
     }
 
     #[test]
