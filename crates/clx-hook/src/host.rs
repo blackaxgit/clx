@@ -230,8 +230,12 @@ fn sniff_envelope(raw: &str) -> HostId {
         return HostId::Cursor;
     }
 
-    // Codex: envelope carries Codex-specific extras not present in Claude.
-    if obj.contains_key("turn_id") || obj.contains_key("permission_mode") {
+    // Codex: envelope carries the Codex-only `turn_id` key. NOTE: do NOT key on
+    // `permission_mode` here - Claude Code ALSO emits a top-level `permission_mode`
+    // (default/acceptEdits/plan/bypassPermissions), so matching it misclassified
+    // every Claude envelope as Codex, turning `ask` verdicts into Codex
+    // fail-closed denies (e.g. `git rm --cached` blocked in Claude Code).
+    if obj.contains_key("turn_id") {
         return HostId::Codex;
     }
 
