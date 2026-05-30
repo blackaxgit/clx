@@ -1,0 +1,35 @@
+# gitleaks configuration for CLX.
+#
+# Extends the default ruleset. The allowlist covers ONLY the synthetic,
+# credential-shaped fixtures that security regression tests must contain to prove
+# `redact_secrets` and the config-trust filter scrub real-looking input. None is
+# a real credential.
+#
+# Defense in depth (addresses the "over-broad allowlist" review finding):
+#   * `paths` scopes the allowlist to the specific redaction/security test-vector
+#     files, so an identical synthetic value placed in PRODUCTION code (anything
+#     outside these files) would STILL trip the scanner.
+#   * `regexes` are anchored with word boundaries and require a discriminating
+#     tail (no bare `SYNTH` substring), as a secondary guard for the named fakes.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic-only fixtures in CLX redaction/security regression tests"
+# File paths whose purpose is to hold credential-shaped test vectors.
+paths = [
+  '''crates/clx-core/src/redaction\.rs''',
+  '''crates/clx-core/src/storage/tests\.rs''',
+  '''crates/clx-mcp/src/tests\.rs''',
+  '''crates/clx-core/tests/.*_poc\.rs''',
+  '''crates/clx-core/tests/redaction_scheme_floor_regression\.rs''',
+]
+# Named synthetic tokens, anchored and with a required tail.
+regexes = [
+  '''\bSYNTH[A-Za-z0-9]{3,}\b''',
+  '''\bSYNTHETICTOKEN[0-9]+\b''',
+  '''\bsk_test_[A-Za-z0-9]+\b''',
+  '''\bsk-abcdefghijklmnopqrstuvwxyz1234567890\b''',
+  '''\blongsecrettokenvalue[0-9]+\b''',
+  '''\bhunter2synthetic\b''',
+]
