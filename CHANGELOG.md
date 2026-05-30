@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-05-30
+
 ### Security
 
 - **Redaction now scrubs short credentials after a `Bearer`/`Basic` scheme word.**
