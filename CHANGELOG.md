@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   block was missing from the config-trust denylist, so a hostile repo
   `.clx/config.yaml` could redirect chat/embeddings/validator/recall to an
   attacker-chosen provider or suppress required model pulls. `llm` (and its whole
-  subtree) is now stripped from untrusted project configs; global and explicitly
+  subtree) plus the legacy `ollama` block (which is translated into `providers`/`llm`
+  routing) are now stripped from untrusted project configs; global and explicitly
   trusted configs are unaffected.
 - **Version-stamp read is bounded.** `version_skew_warning` read
   `~/.clx/bin/.clx-version` with an unbounded read and no file-type guard; a

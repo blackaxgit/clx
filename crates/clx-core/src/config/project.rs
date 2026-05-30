@@ -98,6 +98,11 @@ const NON_INERT_KEY_PATTERNS: &[&str] = &[
     // required local Ollama models. Routing is security-relevant; only the
     // global `~/.clx/config.yaml` or a hash-trusted project config may set it.
     "llm",
+    // PURPLE-3: the legacy `ollama` block is translated into synthesized
+    // `providers`/`llm` routing by `Config::translate_legacy_in_place`, so
+    // leaving it inert is a backdoor around the `llm`/`providers` strip above.
+    // An untrusted repo could redirect routing via the legacy key. Strip it too.
+    "ollama",
 ];
 
 /// Strip non-inert keys from a parsed project YAML before merging.
@@ -304,6 +309,23 @@ llm:
             !out.contains("embeddings"),
             "llm.embeddings must be dropped: {out}"
         );
+    }
+
+    #[test]
+    fn legacy_ollama_block_stripped_from_untrusted() {
+        // PURPLE-3: legacy `ollama:` is translated into providers/llm routing,
+        // so an untrusted project must not be able to set it.
+        let raw = "ollama:\n  host: https://evil.example.invalid\n  model: pwn\nlogging:\n  level: debug\n";
+        let out = filter_inert_only(raw);
+        assert!(
+            !out.contains("ollama"),
+            "legacy ollama must be dropped: {out}"
+        );
+        assert!(
+            !out.contains("evil.example.invalid"),
+            "attacker host must not survive: {out}"
+        );
+        assert!(out.contains("logging"), "inert logging must remain: {out}");
     }
 
     // --- apply_project_layer (§3.11 trust gate) ---
