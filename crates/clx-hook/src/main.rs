@@ -39,6 +39,8 @@ fn print_usage() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    warn_on_version_skew();
+
     let args: Vec<String> = std::env::args().collect();
 
     // --help / -h short-circuits before any I/O.
@@ -98,6 +100,23 @@ async fn main() -> ExitCode {
     // hook stderr noise.
     let _exit = handle_event(io::stdin(), io::stdout(), deps).await;
     ExitCode::SUCCESS
+}
+
+/// Emits a one-shot version-skew warning to STDERR if the installed stamp in
+/// `~/.clx/bin` differs from this binary's version.
+///
+/// STDERR only: clx-hook's STDOUT carries the JSON hook protocol the host
+/// consumes, so a warning there would corrupt it. Never aborts: a stale hook
+/// that warns is strictly better than one that hard-fails the host. Runs once,
+/// before tracing is initialized, so it bypasses the (ERROR-only) stderr
+/// tracing layer and is unconditional.
+fn warn_on_version_skew() {
+    if let Some(warning) = clx_core::version::version_skew_warning(
+        &clx_core::paths::clx_dir(),
+        clx_core::version::VERSION,
+    ) {
+        eprintln!("clx-hook: {warning}");
+    }
 }
 
 /// Initialize tracing.

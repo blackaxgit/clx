@@ -21,6 +21,7 @@ pub mod storage;
 pub mod summarize;
 pub mod text;
 pub mod types;
+pub mod version;
 
 pub use error::{Error, Result};
 

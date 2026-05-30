@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Runtime version-skew warning.** `clx-hook` and `clx-mcp` now compare their
+  embedded version against the `~/.clx/bin/.clx-version` stamp at startup and
+  emit a one-line warning to STDERR (never STDOUT, so the hook/MCP protocol is
+  intact) when they differ, pointing the user to re-run `clx install`. Previously
+  a `brew upgrade clx` left stale binaries in `~/.clx/bin` that the host called by
+  absolute path, so hooks and MCP silently became no-ops with no signal. The
+  warning is advisory (does not abort); `clx health` also surfaces the skew.
 - **`clx-doctor` skill referenced nonexistent CLI subcommands.** The skill now
   uses `clx health` / `clx health --json` (and `clx embeddings status`) instead
   of the nonexistent `clx doctor` and `clx providers ping`.

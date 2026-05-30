@@ -28,6 +28,8 @@ use tracing::info;
 use server::McpServer;
 
 fn main() -> Result<()> {
+    warn_on_version_skew();
+
     clx_core::init_sqlite_vec();
 
     tracing_subscriber::fmt()
@@ -45,4 +47,18 @@ fn main() -> Result<()> {
 
     info!("CLX MCP Server shutting down");
     Ok(())
+}
+
+/// Emits a one-shot version-skew warning to STDERR if the installed stamp in
+/// `~/.clx/bin` differs from this binary's version.
+///
+/// Writes only to STDERR (the MCP stdio transport owns STDOUT) and never aborts
+/// startup. Runs once, before any other startup work.
+fn warn_on_version_skew() {
+    if let Some(warning) = clx_core::version::version_skew_warning(
+        &clx_core::paths::clx_dir(),
+        clx_core::version::VERSION,
+    ) {
+        eprintln!("clx-mcp: {warning}");
+    }
 }
