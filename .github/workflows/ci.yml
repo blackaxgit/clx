@@ -128,10 +128,9 @@ jobs:
     # PR #20: 6h5m) burns billable CI minutes. 30 min is ~6x historical
     # green-run wall time; genuine slowdowns still pass.
     timeout-minutes: 30
-    # Coverage is informational, not a merge gate. Decoupling it from the
-    # PR check rollup means a single instrumentation flake does not block
-    # user-facing fixes from merging.
-    continue-on-error: true
+    # Coverage is a hard merge gate: the suite sits at the ~90% honest
+    # ceiling (measured 90.26% lines), so a regression below the floor must
+    # block merge rather than be silently tolerated.
 
     steps:
       - name: Checkout repository
@@ -165,13 +164,15 @@ jobs:
         timeout-minutes: 20
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
-      # Hard gate: fail the job if line coverage is below 70%.
-      # Threshold is 70% rather than 80% because the dashboard event loop
-      # (event.rs, mod.rs) and complex UI render code (settings/render.rs)
-      # are inherently untestable in CI (terminal I/O, crossterm events).
-      - name: Enforce 70% line coverage threshold
+      # Hard gate: fail the job if line coverage is below 88%.
+      # 88% is a deliberate floor below the measured 90.26% workspace line
+      # coverage (the honest ceiling), leaving ~2pt margin for instrumentation
+      # noise. The remaining gap is the dashboard event loop (event.rs, mod.rs)
+      # and complex UI render code (settings/render.rs), inherently untestable
+      # in CI (terminal I/O, crossterm events).
+      - name: Enforce 88% line coverage threshold
         timeout-minutes: 5
-        run: cargo llvm-cov --all-features --workspace --fail-under-lines 70
+        run: cargo llvm-cov --all-features --workspace --fail-under-lines 88
 
       # Upload lcov.info so it can be inspected in the Actions UI or fed
       # to a coverage viewer without re-running the full build.
