@@ -46,5 +46,4 @@ clx-sbom.xml
 # Local-only / personal testing scripts (not distributed)
 /install.sh
 /scripts/install-local.sh
-/scripts/test.sh
 /scripts/generate_golden_set.py
