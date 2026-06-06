@@ -45,6 +45,7 @@
 //! - `CLX_AUTO_RECALL_INCLUDE_KEY_FACTS`
 //! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
+pub mod codex_trust;
 pub(crate) mod project;
 pub mod trust;
 

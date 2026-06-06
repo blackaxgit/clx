@@ -32,6 +32,8 @@ figment.workspace = true
 async-trait = "0.1"
 regex.workspace = true
 shlex = { workspace = true }
+# Codex project-trust reader parses the user-global Codex config.toml.
+toml = { workspace = true }
 
 # Per-project config trust (file-hash allowlist, §3.11). sha2/hex are already
 # in the transitive graph; pin direct versions so we own the API surface.
