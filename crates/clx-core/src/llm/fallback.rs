@@ -1,14 +1,22 @@
 //! Primary→secondary LLM provider fallback wrapper.
 //!
 //! Wraps two `LlmClient` instances. On a transient error from the primary,
-//! falls back to the secondary. After a fallback event, a 30-second
-//! in-process cooldown skips the primary entirely so a sustained outage
-//! does not pay the latency penalty of always hitting the dead primary first.
+//! falls back to the secondary. After a fallback event, a 30-second cooldown
+//! skips the primary entirely so a sustained outage does not pay the latency
+//! penalty of always hitting the dead primary first.
+//!
+//! The cooldown is enforced at two scopes (FIX-7):
+//! 1. an in-process `Mutex<Option<Instant>>` fast path, and
+//! 2. a cross-process file marker in [`crate::llm_health`], so that a recent
+//!    primary failure recorded by a *prior* hook process (CLX runs
+//!    one-process-per-event) still short-circuits to the fallback.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::llm::{LlmClient, LlmError, LocalLlmBackend};
+use crate::llm_health;
 
 /// Sticky-fallback duration after a primary failure.
 const COOLDOWN: Duration = Duration::from_secs(30);
@@ -22,8 +30,11 @@ pub struct FallbackClient {
     /// (e.g. `gpt-5.4-mini` only exists on Azure).
     fallback_model: Option<String>,
     /// `Some(t)` means primary failed at instant `t`; skip primary until
-    /// `t.elapsed() >= COOLDOWN`.
+    /// `t.elapsed() >= COOLDOWN`. In-process fast path.
     last_primary_failure: Mutex<Option<Instant>>,
+    /// Optional override for the cross-process marker's base directory. `None`
+    /// uses the real CLX data dir; tests point this at a temp dir.
+    health_base: Option<PathBuf>,
 }
 
 impl FallbackClient {
@@ -34,18 +45,48 @@ impl FallbackClient {
             fallback: Box::new(fallback),
             fallback_model,
             last_primary_failure: Mutex::new(None),
+            health_base: None,
+        }
+    }
+
+    /// Test-only constructor that routes the cross-process failure marker
+    /// through `base` instead of the real CLX data dir.
+    #[cfg(test)]
+    fn new_with_health_base(
+        primary: LlmClient,
+        fallback: LlmClient,
+        fallback_model: Option<String>,
+        base: PathBuf,
+    ) -> Self {
+        Self {
+            primary: Box::new(primary),
+            fallback: Box::new(fallback),
+            fallback_model,
+            last_primary_failure: Mutex::new(None),
+            health_base: Some(base),
+        }
+    }
+
+    /// Cross-process check: did a prior (or this) process record a primary
+    /// failure within the cooldown window? Bounded, non-blocking file read.
+    fn cross_process_failure_active(&self) -> bool {
+        match &self.health_base {
+            Some(base) => llm_health::primary_failure_active_in(base, COOLDOWN),
+            None => llm_health::primary_failure_active(COOLDOWN),
         }
     }
 
     fn use_fallback_directly(&self) -> bool {
-        match *self
-            .last_primary_failure
-            .lock()
-            .expect("poisoned cooldown lock")
-        {
-            Some(t) => t.elapsed() < COOLDOWN,
-            None => false,
-        }
+        // Fast path: in-process cooldown.
+        let in_process_active = matches!(
+            *self
+                .last_primary_failure
+                .lock()
+                .expect("poisoned cooldown lock"),
+            Some(t) if t.elapsed() < COOLDOWN
+        );
+        // Cross-process path: a prior hook process may have recorded a failure.
+        in_process_active || self.cross_process_failure_active()
     }
 
     fn record_primary_failure(&self) {
@@ -53,6 +94,12 @@ impl FallbackClient {
             .last_primary_failure
             .lock()
             .expect("poisoned cooldown lock") = Some(Instant::now());
+        // Seed the cross-process marker so the next per-event process skips
+        // the dead primary too. Best-effort; never blocks the LLM path.
+        match &self.health_base {
+            Some(base) => llm_health::record_primary_failure_in(base),
+            None => llm_health::record_primary_failure(),
+        }
     }
 
     fn fb_model<'a>(&'a self, caller: Option<&'a str>) -> Option<&'a str> {
@@ -153,6 +200,27 @@ mod tests {
         LlmClient::Azure(backend)
     }
 
+    /// Counter for unique isolated health-cache base dirs across tests.
+    static FC_BASE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Build a `FallbackClient` whose cross-process failure marker lives in a
+    /// fresh, unique temp dir, so no test touches the real CLX data dir or
+    /// observes another test's marker.
+    fn fc_isolated(
+        primary: LlmClient,
+        fallback: LlmClient,
+        fallback_model: Option<String>,
+    ) -> FallbackClient {
+        let n = FC_BASE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "clx-fallback-iso-{}-{:?}-{n}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        FallbackClient::new_with_health_base(primary, fallback, fallback_model, base)
+    }
+
     #[tokio::test]
     #[serial(env_azure_hosts_fallback)]
     async fn fallback_on_primary_503_succeeds() {
@@ -176,7 +244,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(
+        let fc = fc_isolated(
             azure(primary_mock.uri()),
             azure(fallback_mock.uri()),
             Some("fallback-model".into()),
@@ -205,7 +273,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
 
         let r = fc.generate("hi", Some("m")).await;
         assert!(matches!(r, Err(LlmError::Auth(_))));
@@ -232,7 +300,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
 
         let _ = fc.generate("hi", Some("m")).await.unwrap();
         assert!(fc.cooldown_active());
@@ -268,7 +336,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(
+        let fc = fc_isolated(
             azure(primary_mock.uri()),
             azure(fallback_mock.uri()),
             Some("fb-embed-model".into()),
@@ -305,7 +373,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
 
         let r = fc.embed("hi", Some("m")).await;
         assert!(matches!(r, Err(LlmError::Auth(_))));
@@ -347,10 +415,164 @@ mod tests {
             .await;
 
         // fallback_model = None -> fb_model must reuse the caller's model arg.
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
 
         let out = fc.generate("hi", Some("caller-model")).await.unwrap();
         assert_eq!(out, "via-caller-model");
+    }
+
+    /// Unique temp base dir for the cross-process failure marker.
+    fn temp_health_base(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "clx-fallback-health-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    // FIX-7: a primary failure recorded by a PRIOR process (file marker) must
+    // make a freshly-constructed FallbackClient (clean in-process state) skip
+    // the primary entirely. Before the fix the cooldown lived only in an
+    // in-process Mutex, so a new process always re-hit the dead primary.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn cross_process_recorded_failure_skips_primary() {
+        allow_local();
+        let base = temp_health_base("recent");
+        // Simulate a prior process recording a recent primary failure.
+        crate::llm_health::record_primary_failure_in(&base);
+
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        // Primary must NOT be contacted at all.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "should-not-happen" } }]
+            })))
+            .expect(0)
+            .mount(&primary_mock)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "from fallback" } }]
+            })))
+            .expect(1)
+            .mount(&fallback_mock)
+            .await;
+
+        // Fresh client: in-process cooldown is empty, only the file marker is set.
+        let fc = FallbackClient::new_with_health_base(
+            azure(primary_mock.uri()),
+            azure(fallback_mock.uri()),
+            None,
+            base.clone(),
+        );
+        assert!(
+            fc.cooldown_active(),
+            "recent cross-process failure must arm the cooldown"
+        );
+        let out = fc.generate("hi", Some("m")).await.unwrap();
+        assert_eq!(out, "from fallback");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // FIX-7: an ABSENT cross-process marker must NOT short-circuit; the primary
+    // is contacted normally.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn absent_cross_process_marker_uses_primary() {
+        allow_local();
+        let base = temp_health_base("absent");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(&base);
+
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "from primary" } }]
+            })))
+            .expect(1)
+            .mount(&primary_mock)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new_with_health_base(
+            azure(primary_mock.uri()),
+            azure(fallback_mock.uri()),
+            None,
+            base.clone(),
+        );
+        assert!(
+            !fc.cooldown_active(),
+            "no recorded failure => cooldown inactive"
+        );
+        let out = fc.generate("hi", Some("m")).await.unwrap();
+        assert_eq!(out, "from primary");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // FIX-7: an EXPIRED marker (older than COOLDOWN) must NOT short-circuit.
+    #[tokio::test]
+    #[serial(env_azure_hosts_fallback)]
+    async fn expired_cross_process_marker_uses_primary() {
+        allow_local();
+        let base = temp_health_base("expired");
+        crate::llm_health::record_primary_failure_in(&base);
+
+        // Backdate the marker well beyond COOLDOWN (30s).
+        let marker = base.join("primary_llm_failure");
+        let past = std::time::SystemTime::now() - Duration::from_mins(2);
+        let times = std::fs::FileTimes::new().set_modified(past);
+        let f = std::fs::File::options().write(true).open(&marker).unwrap();
+        f.set_times(times).unwrap();
+        drop(f);
+
+        let primary_mock = MockServer::start().await;
+        let fallback_mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "from primary" } }]
+            })))
+            .expect(1)
+            .mount(&primary_mock)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&fallback_mock)
+            .await;
+
+        let fc = FallbackClient::new_with_health_base(
+            azure(primary_mock.uri()),
+            azure(fallback_mock.uri()),
+            None,
+            base.clone(),
+        );
+        assert!(
+            !fc.cooldown_active(),
+            "expired marker must NOT arm the cooldown"
+        );
+        let out = fc.generate("hi", Some("m")).await.unwrap();
+        assert_eq!(out, "from primary");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // Branch: is_available() short-circuits true when the PRIMARY is healthy.
@@ -377,7 +599,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
         assert!(fc.is_available().await, "primary healthy => available");
     }
 
@@ -403,7 +625,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
         assert!(
             fc.is_available().await,
             "primary down but fallback healthy => still available"
@@ -430,7 +652,7 @@ mod tests {
             .mount(&fallback_mock)
             .await;
 
-        let fc = FallbackClient::new(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
+        let fc = fc_isolated(azure(primary_mock.uri()), azure(fallback_mock.uri()), None);
         assert!(
             !fc.is_available().await,
             "both backends down => not available"
