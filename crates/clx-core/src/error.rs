@@ -3,7 +3,6 @@
 use thiserror::Error;
 
 use crate::credentials::CredentialError;
-use crate::llm::OllamaError;
 
 /// Main error type for CLX operations
 #[non_exhaustive]
@@ -12,6 +11,14 @@ pub enum Error {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Config-trustlist error (malformed, unsupported version, or IO).
+    ///
+    /// Distinct from [`Error::Config`] so callers can tell a trustlist
+    /// failure apart from a general configuration problem. The wrapped
+    /// [`TrustError`] preserves the malformed-vs-version-vs-IO distinction.
+    #[error("Trustlist error: {0}")]
+    Trust(#[from] TrustError),
 
     /// Storage/database error
     #[error("Storage error: {0}")]
@@ -29,10 +36,6 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Policy violation
-    #[error("Policy violation: {0}")]
-    PolicyViolation(String),
-
     /// Context not found
     #[error("Context not found: {0}")]
     ContextNotFound(String),
@@ -41,10 +44,6 @@ pub enum Error {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
-    /// Ollama LLM service error
-    #[error("Ollama error: {0}")]
-    Ollama(#[from] OllamaError),
-
     /// Credential/keychain error
     #[error("Credential error: {0}")]
     Credential(#[from] CredentialError),
@@ -52,6 +51,57 @@ pub enum Error {
     /// HTTP request error
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+}
+
+/// Errors from the per-project config trustlist loader
+/// ([`crate::config::trust`]).
+///
+/// The variants preserve the fail-loud semantics of the original
+/// `anyhow`-based loader while letting callers distinguish a malformed
+/// file from an unsupported schema version from an IO failure. All three
+/// are fail-loud: a trustlist read error must never silently re-trust.
+#[derive(Error, Debug)]
+pub enum TrustError {
+    /// The trustlist file exists but is not valid JSON. Refusing to
+    /// silently reset is itself a security property.
+    #[error("trustlist at {path} is malformed JSON; refusing to silently reset: {source}")]
+    Malformed {
+        /// Path to the offending trustlist file.
+        path: String,
+        /// Underlying JSON parse error.
+        source: serde_json::Error,
+    },
+
+    /// The trustlist declares a schema version this build does not support.
+    #[error(
+        "trustlist at {path} has unsupported version {found} (expected {expected}); \
+         re-run `clx config-trust add` to upgrade"
+    )]
+    UnsupportedVersion {
+        /// Path to the trustlist file.
+        path: String,
+        /// Version found on disk.
+        found: u32,
+        /// Version this build supports.
+        expected: u32,
+    },
+
+    /// An IO error occurred while reading or writing the trustlist.
+    #[error("trustlist IO error at {path}: {source}")]
+    Io {
+        /// Path to the trustlist file.
+        path: String,
+        /// Underlying IO error.
+        source: std::io::Error,
+    },
+
+    /// A serialization error occurred while persisting the trustlist.
+    #[error("failed to serialize trustlist: {0}")]
+    Serialize(serde_json::Error),
+
+    /// A supplied hash prefix was invalid (empty or ambiguous).
+    #[error("{0}")]
+    InvalidHashPrefix(String),
 }
 
 /// Result type alias using CLX Error

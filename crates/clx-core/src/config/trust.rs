@@ -43,10 +43,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::error::TrustError;
+use crate::{Error, Result};
 
 /// Current on-disk schema version. Bump on breaking format changes; older
 /// versions fail-loud rather than silently re-trust.
@@ -105,25 +107,25 @@ impl TrustList {
     pub fn load_from(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(content) => {
-                let parsed: Self = serde_json::from_str(&content).with_context(|| {
-                    format!(
-                        "trustlist at {} is malformed JSON; refusing to silently reset",
-                        path.display()
-                    )
-                })?;
+                let parsed: Self =
+                    serde_json::from_str(&content).map_err(|source| TrustError::Malformed {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
                 if parsed.version != TRUSTLIST_VERSION {
-                    bail!(
-                        "trustlist at {} has unsupported version {} (expected {}); re-run `clx config-trust add` to upgrade",
-                        path.display(),
-                        parsed.version,
-                        TRUSTLIST_VERSION
-                    );
+                    return Err(Error::Trust(TrustError::UnsupportedVersion {
+                        path: path.display().to_string(),
+                        found: parsed.version,
+                        expected: TRUSTLIST_VERSION,
+                    }));
                 }
                 Ok(parsed)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(anyhow::Error::from(e)
-                .context(format!("failed to read trustlist at {}", path.display()))),
+            Err(source) => Err(Error::Trust(TrustError::Io {
+                path: path.display().to_string(),
+                source,
+            })),
         }
     }
 
@@ -137,13 +139,14 @@ impl TrustList {
     /// `0600` on Unix, then renames over the target.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create trustlist parent dir {}", parent.display())
+            fs::create_dir_all(parent).map_err(|source| TrustError::Io {
+                path: parent.display().to_string(),
+                source,
             })?;
         }
 
         let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(self)?;
+        let json = serde_json::to_string_pretty(self).map_err(TrustError::Serialize)?;
 
         // Open with mode 0600 from the start on Unix to avoid a window where
         // the file is world-readable.
@@ -154,10 +157,15 @@ impl TrustList {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts
-            .open(&tmp)
-            .with_context(|| format!("failed to open trustlist tmp file {}", tmp.display()))?;
-        f.write_all(json.as_bytes())?;
+        let mut f = opts.open(&tmp).map_err(|source| TrustError::Io {
+            path: tmp.display().to_string(),
+            source,
+        })?;
+        f.write_all(json.as_bytes())
+            .map_err(|source| TrustError::Io {
+                path: tmp.display().to_string(),
+                source,
+            })?;
         f.sync_all().ok();
         drop(f);
 
@@ -170,8 +178,10 @@ impl TrustList {
             fs::set_permissions(&tmp, perms).ok();
         }
 
-        fs::rename(&tmp, path)
-            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+        fs::rename(&tmp, path).map_err(|source| TrustError::Io {
+            path: format!("{} -> {}", tmp.display(), path.display()),
+            source,
+        })?;
         Ok(())
     }
 
@@ -202,7 +212,9 @@ impl TrustList {
     pub fn remove(&mut self, hash_or_prefix: &str) -> Result<bool> {
         let needle = hash_or_prefix.trim();
         if needle.is_empty() {
-            bail!("hash prefix is empty");
+            return Err(Error::Trust(TrustError::InvalidHashPrefix(
+                "hash prefix is empty".to_string(),
+            )));
         }
 
         let matches: Vec<usize> = self
@@ -219,7 +231,9 @@ impl TrustList {
                 self.entries.remove(matches[0]);
                 Ok(true)
             }
-            n => bail!("hash prefix '{needle}' is ambiguous ({n} matches); supply more characters"),
+            n => Err(Error::Trust(TrustError::InvalidHashPrefix(format!(
+                "hash prefix '{needle}' is ambiguous ({n} matches); supply more characters"
+            )))),
         }
     }
 
