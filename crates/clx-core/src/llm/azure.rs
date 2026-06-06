@@ -24,6 +24,15 @@ use url::Url;
 /// embedded, so even within the cap any recognised secret pattern is scrubbed.
 const MAX_BODY_EXCERPT_BYTES: usize = 80;
 
+/// Per-request timeout for the `is_available` health probe (2 seconds).
+///
+/// Mirrors Ollama's `HEALTH_CHECK_TIMEOUT_MS`. Without a dedicated per-request
+/// timeout the probe inherits the chat client timeout (default 30s), so an
+/// unreachable/slow endpoint would stall the health check far beyond its
+/// budget. A slow-but-alive Azure may report unavailable under this budget,
+/// which is the safe direction (falls back).
+const HEALTH_CHECK_TIMEOUT_MS: u64 = 2_000;
+
 /// Build a bounded, structured, redacted error summary from a raw HTTP
 /// response body and the Azure `x-request-id` header value (B6-1 fix).
 ///
@@ -381,6 +390,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
             .http
             .get(url)
             .header("api-key", self.api_key.expose_secret())
+            .timeout(Duration::from_millis(HEALTH_CHECK_TIMEOUT_MS))
             .send()
             .await;
         matches!(resp, Ok(r) if r.status().is_success())
@@ -608,6 +618,44 @@ mod tests {
             AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
                 .unwrap();
         assert!(!backend.is_available().await);
+    }
+
+    /// FIX-5 regression — the health probe must use a SHORT dedicated
+    /// per-request timeout (`HEALTH_CHECK_TIMEOUT_MS`), not inherit the chat
+    /// client timeout. A `/models` endpoint that delays well beyond the probe
+    /// budget must yield `false` within ~the budget. Before the fix the probe
+    /// had no `.timeout(...)`, so it would block on the much larger client
+    /// timeout and this test would exceed its own wall-clock guard.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn is_available_false_when_probe_exceeds_budget() {
+        allow_local();
+        let mock = MockServer::start().await;
+        // Delay far beyond HEALTH_CHECK_TIMEOUT_MS (2s) but well under the
+        // chat client timeout (5s in `cfg`); a regression (no per-request
+        // timeout) would wait the full client timeout instead.
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/openai/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(4_500))
+                    .set_body_json(serde_json::json!({"data":[]})),
+            )
+            .mount(&mock)
+            .await;
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+        let start = std::time::Instant::now();
+        let available = backend.is_available().await;
+        let elapsed = start.elapsed();
+        assert!(!available, "slow probe must report unavailable");
+        // Generous upper bound: well below the 4.5s delay / chat timeout, but
+        // above the 2s budget plus scheduling slack.
+        assert!(
+            elapsed < Duration::from_millis(3_500),
+            "probe should bail at ~{HEALTH_CHECK_TIMEOUT_MS}ms, took {elapsed:?}"
+        );
     }
 
     /// TC-AZ-013 — Dated URL shape: when `api_version` is set, URL builders
