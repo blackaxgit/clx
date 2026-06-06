@@ -78,6 +78,10 @@ url = "2"
 # Regex
 regex = "1"
 
+# Shell-aware tokenizer for read-only command classification. We use ONLY
+# `shlex::split` (RUSTSEC-2024-0006 affects `quote`/`join`, fixed at 1.3.0).
+shlex = "1.3"
+
 # Password input
 rpassword = "7"
 
