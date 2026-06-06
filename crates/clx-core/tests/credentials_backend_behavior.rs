@@ -193,6 +193,63 @@ fn zero_byte_blob_is_corruption_not_empty_and_no_wipe() {
     );
 }
 
+// FIX-8: a TRANSIENT zero-byte window on the READ path (e.g. an external
+// truncate immediately before a valid blob reappears) must NOT hard-error.
+// The lock-free `get` retries a few times; once the valid blob is back the
+// read succeeds. Before the fix `get` read the map once and surfaced the
+// "corrupt: zero bytes" error on the very first observation.
+#[test]
+fn transient_zero_byte_read_recovers_via_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let b = file_backend(tmp.path());
+    b.set("clx:global:real", "recover-me").unwrap();
+
+    let cred = tmp.path().join("credentials.age");
+    // Capture the valid blob, then simulate an external truncate window.
+    let valid_blob = std::fs::read(&cred).unwrap();
+    assert!(!valid_blob.is_empty());
+    std::fs::write(&cred, b"").unwrap();
+    assert_eq!(std::fs::metadata(&cred).unwrap().len(), 0);
+
+    // A concurrent "writer" restores the valid blob shortly after, inside the
+    // read-retry budget (3 retries x 20ms = ~60ms).
+    let cred_for_thread = cred.clone();
+    let restorer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&cred_for_thread, &valid_blob).unwrap();
+    });
+
+    // get must ride out the transient zero-byte window and succeed.
+    let got = b
+        .get("clx:global:real")
+        .expect("transient zero-byte file must recover via retry, not hard-error");
+    assert_eq!(got.as_deref(), Some("recover-me"));
+    restorer.join().unwrap();
+}
+
+// FIX-8 guard: a PERSISTENTLY zero-byte file still hard-errors on read after
+// the bounded retries are exhausted (a real truncation is not masked).
+#[test]
+fn persistent_zero_byte_read_still_errors_after_retries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let b = file_backend(tmp.path());
+    b.set("clx:global:real", "do-not-lose-me").unwrap();
+
+    let cred = tmp.path().join("credentials.age");
+    std::fs::write(&cred, b"").unwrap();
+
+    let err = b
+        .get("clx:global:real")
+        .expect_err("a persistently zero-byte file must still surface corruption");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("corrupt") && msg.contains("zero bytes"),
+        "actionable corruption message expected, got: {msg}"
+    );
+    // The file is untouched (read path never writes).
+    assert_eq!(std::fs::metadata(&cred).unwrap().len(), 0);
+}
+
 #[test]
 fn absent_file_is_legitimate_empty_store_and_writable() {
     // Fresh install (no credentials.age): empty store, zero prompts, and a

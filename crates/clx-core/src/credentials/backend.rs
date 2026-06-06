@@ -100,6 +100,19 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll interval while waiting on a contended advisory lock.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Number of times the READ path retries a transient zero-byte
+/// `credentials.age` before surfacing a hard corruption error (FIX-8).
+///
+/// A zero-byte file is the brief window an external truncation (or a crash
+/// mid-write) leaves before a valid blob reappears. The lock-free read path
+/// can observe that window and would otherwise hard-error on the LLM-auth
+/// path. A few short retries ride out the transient window without weakening
+/// the WRITE path, which still fail-closes on zero bytes (never overwrites).
+const READ_ZERO_BYTE_RETRIES: u32 = 3;
+
+/// Delay between zero-byte read retries.
+const READ_ZERO_BYTE_RETRY_DELAY: Duration = Duration::from_millis(20);
+
 /// RAII guard holding the cross-process advisory exclusive lock. The lock is
 /// released when the underlying file handle is dropped (and, as a hard
 /// guarantee, on process death: advisory `flock`/`fcntl` locks are released
@@ -265,16 +278,7 @@ impl AgeFileBackend {
             Err(e) => return Err(Self::map_err("read credentials.age", e)),
         };
         if encrypted.is_empty() {
-            return Err(CredentialError::Storage(format!(
-                "credentials store is corrupt: {} exists but is zero bytes \
-                 (a crash or external truncate during a prior write). CLX will \
-                 NOT overwrite it, to avoid destroying credentials that may \
-                 have existed. To recover, delete the empty file deliberately \
-                 (`rm {}`) and re-run `clx credentials set <key> <value>` (or \
-                 `clx credentials migrate`) to repopulate it.",
-                self.cred_file.display(),
-                self.cred_file.display(),
-            )));
+            return Err(self.zero_byte_corruption_error());
         }
         let decryptor = age::Decryptor::new(&encrypted[..])
             .map_err(|e| Self::map_err("init age decryptor (corrupt credentials.age?)", e))?;
@@ -287,6 +291,55 @@ impl AgeFileBackend {
             .map_err(|e| Self::map_err("read decrypted credentials", e))?;
         serde_json::from_slice(&plaintext)
             .map_err(|e| Self::map_err("parse decrypted credentials json", e))
+    }
+
+    /// The hard, actionable error surfaced when `credentials.age` exists but is
+    /// zero bytes. Centralised so the read-retry path (FIX-8) and the
+    /// write/`with_map` path share one message and the WRITE path keeps its
+    /// never-overwrite guarantee.
+    fn zero_byte_corruption_error(&self) -> CredentialError {
+        CredentialError::Storage(format!(
+            "credentials store is corrupt: {} exists but is zero bytes \
+             (a crash or external truncate during a prior write). CLX will \
+             NOT overwrite it, to avoid destroying credentials that may \
+             have existed. To recover, delete the empty file deliberately \
+             (`rm {}`) and re-run `clx credentials set <key> <value>` (or \
+             `clx credentials migrate`) to repopulate it.",
+            self.cred_file.display(),
+            self.cred_file.display(),
+        ))
+    }
+
+    /// Read-path map loader with a short bounded retry on a *transient*
+    /// zero-byte file (FIX-8).
+    ///
+    /// The lock-free `get`/`list_keys` paths can momentarily observe the brief
+    /// window where an external truncation has emptied `credentials.age` before
+    /// a valid blob reappears. Rather than hard-error on the LLM-auth path, we
+    /// retry the read a few times. A *persistently* zero-byte file still
+    /// surfaces the same corruption error as before — so a real truncation is
+    /// not masked, and the WRITE path's fail-closed no-overwrite behaviour is
+    /// untouched (writes never call this).
+    fn load_map_read(
+        &self,
+        identity: &age::x25519::Identity,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut attempt = 0u32;
+        loop {
+            // Distinguish a zero-byte file (retryable) from any other error
+            // (NotFound -> empty map, decode errors -> hard error). We only
+            // retry when the file is present AND empty.
+            let is_zero_byte = matches!(
+                fs::metadata(&self.cred_file),
+                Ok(meta) if meta.len() == 0
+            );
+            if is_zero_byte && attempt < READ_ZERO_BYTE_RETRIES {
+                attempt += 1;
+                std::thread::sleep(READ_ZERO_BYTE_RETRY_DELAY);
+                continue;
+            }
+            return self.load_map(identity);
+        }
     }
 
     /// Encrypt+atomically persist the map (temp file + rename).
@@ -398,7 +451,7 @@ impl AgeFileBackend {
 impl CredentialBackend for AgeFileBackend {
     fn get(&self, scoped_key: &str) -> Result<Option<String>> {
         let identity = self.load_identity()?;
-        Ok(self.load_map(&identity)?.get(scoped_key).cloned())
+        Ok(self.load_map_read(&identity)?.get(scoped_key).cloned())
     }
 
     fn set(&self, scoped_key: &str, value: &str) -> Result<()> {
@@ -419,7 +472,7 @@ impl CredentialBackend for AgeFileBackend {
 
     fn list_keys(&self) -> Result<Vec<String>> {
         let identity = self.load_identity()?;
-        Ok(self.load_map(&identity)?.into_keys().collect())
+        Ok(self.load_map_read(&identity)?.into_keys().collect())
     }
 
     fn label(&self) -> &'static str {
