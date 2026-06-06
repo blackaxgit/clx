@@ -99,6 +99,22 @@ fn test_glob_command_colon_format() {
 }
 
 #[test]
+fn test_glob_colon_symmetry() {
+    // FIX-4: `:` is normalized to space in BOTH pattern and text, so a
+    // literal-colon command is matched by a literal-colon pattern (e.g. an
+    // npm script name with a `:` in it).
+    assert!(
+        glob_match("npm run build:prod", "npm run build:prod"),
+        "colon-bearing pattern must match colon-bearing command"
+    );
+    // Wildcards still compose with the colon normalization.
+    assert!(
+        glob_match("npm run build:*", "npm run build:prod"),
+        "wildcard after a colon segment must still match"
+    );
+}
+
+#[test]
 fn test_glob_empty_patterns() {
     assert!(glob_match("", ""));
     assert!(!glob_match("", "text"));

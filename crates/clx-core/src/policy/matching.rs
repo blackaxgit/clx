@@ -92,6 +92,16 @@ pub fn is_overbroad_allow_pattern(raw: &str) -> bool {
 /// - `*` matches any sequence of characters
 /// - Literal character matching
 /// - Pattern in format `command:args` where `:` separates command from args
+///
+/// # Invariant: `:` normalization is symmetric
+///
+/// `:` is normalized to a space in BOTH the pattern and the text. This keeps
+/// matching symmetric so a literal-colon pattern matches a literal-colon
+/// command (e.g. `npm run build:prod` matches `npm run build:prod`).
+/// Normalizing only one side would make `:`-bearing deny rules silently fail
+/// to match `:`-bearing commands. This function backs BOTH deny and
+/// allow/whitelist matching (see `policy/mod.rs`), so the symmetry must hold
+/// for both directions.
 #[must_use]
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     // Handle the special command:args format
@@ -99,7 +109,10 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     let normalized_pattern = pattern.replace(':', " ");
     let normalized_pattern = normalized_pattern.trim();
 
-    glob_match_impl(normalized_pattern, text.trim())
+    let normalized_text = text.replace(':', " ");
+    let normalized_text = normalized_text.trim();
+
+    glob_match_impl(normalized_pattern, normalized_text)
 }
 
 /// Internal glob matching implementation
