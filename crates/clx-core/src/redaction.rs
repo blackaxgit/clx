@@ -109,7 +109,6 @@ fn redact_azure_hosts(text: &str) -> String {
     // prevent the hostname token from being recognised and scrubbed.
     let mut result = String::with_capacity(out.len());
     let mut pos = 0usize;
-    let out_bytes = out.as_bytes();
     while pos < out.len() {
         // A word boundary: find the next non-space, non-quote, non-special run.
         // We tokenise on whitespace and a small set of punctuation.
@@ -123,9 +122,18 @@ fn redact_azure_hosts(text: &str) -> String {
             .map_or(out.len(), |i| pos + i);
 
         if token_start == token_end {
-            // Delimiter — emit and advance.
-            result.push(out_bytes[pos] as char);
-            pos += 1;
+            // Delimiter — emit the next CHAR (not a raw byte) and advance by its
+            // UTF-8 length. All delimiters in the set above are ASCII, so this
+            // preserves the previous output exactly while removing the
+            // `byte as char` hazard (which would corrupt any multi-byte char if
+            // the boundary set ever grew). We always make progress: `pos`
+            // advances by at least one byte.
+            let ch = out[pos..]
+                .chars()
+                .next()
+                .expect("pos < out.len() guarantees a char");
+            result.push(ch);
+            pos += ch.len_utf8();
             continue;
         }
 
@@ -1121,5 +1129,72 @@ mod tests {
             result, text,
             "T6: safe non-Azure host with port was over-redacted: {result}"
         );
+    }
+
+    /// FIX-18: pass-2 of `redact_azure_hosts` previously emitted delimiters via
+    /// `out_bytes[pos] as char` while byte-indexing a UTF-8 string — a latent
+    /// corruption/panic hazard. After refactoring to char-aware iteration the
+    /// output must be byte-for-byte identical on the existing ASCII vectors AND
+    /// correct (lossless) on multi-byte input that passes through pass-2
+    /// unchanged.
+    #[test]
+    fn fix18_redact_azure_hosts_preserves_existing_ascii_vectors() {
+        // Each pair is (input, expected) for the pass-2 host scrubber. These
+        // mirror the existing T6/B6-2 forms and must be unchanged by the
+        // refactor.
+        let cases = [
+            // Bare Azure host with various trailing delimiters -> redacted.
+            (
+                "synthetic-tenant.openai.azure.com:443",
+                "***AZURE-HOST-REDACTED***:443",
+            ),
+            (
+                "host=synthetic-tenant.openai.azure.com&port=443",
+                "host=***AZURE-HOST-REDACTED***&port=443",
+            ),
+            // Non-Azure host with a boundary char -> untouched.
+            ("api.openai.com:443 is fine", "api.openai.com:443 is fine"),
+            // Plain ASCII prose with delimiters -> untouched, structure intact.
+            ("a:b;c<d>e=f&g?h\\i", "a:b;c<d>e=f&g?h\\i"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                redact_azure_hosts(input),
+                expected,
+                "pass-2 output changed for input: {input:?}"
+            );
+        }
+    }
+
+    /// FIX-18: multi-byte-safe case. Pass-2 must not split or corrupt
+    /// multi-byte UTF-8 characters when emitting delimiter runs. An Azure host
+    /// surrounded by non-ASCII text must be scrubbed while the surrounding
+    /// multi-byte characters survive intact.
+    #[test]
+    fn fix18_redact_azure_hosts_is_multibyte_safe() {
+        // Emoji + CJK around delimiters; no Azure host -> lossless round-trip.
+        let prose = "café — 日本語: 🚀 ok";
+        assert_eq!(
+            redact_azure_hosts(prose),
+            prose,
+            "multi-byte prose must pass through pass-2 unchanged"
+        );
+
+        // Multi-byte chars adjacent to an Azure host, separated by ASCII
+        // delimiters from the boundary set (space and `;`). The host token must
+        // be scrubbed while the surrounding multi-byte arrows survive intact.
+        let mixed = "→ synthetic-tenant.openai.azure.com ←";
+        let out = redact_azure_hosts(mixed);
+        assert!(
+            out.contains("***AZURE-HOST-REDACTED***"),
+            "azure host must still be scrubbed amid multi-byte text: {out}"
+        );
+        assert!(
+            !out.contains("synthetic-tenant.openai.azure.com"),
+            "azure host leaked: {out}"
+        );
+        // The surrounding multi-byte arrows must be intact (valid UTF-8, no
+        // mojibake), and the redaction sits between them.
+        assert_eq!(out, "→ ***AZURE-HOST-REDACTED*** ←", "got: {out}");
     }
 }

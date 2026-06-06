@@ -88,10 +88,11 @@ pub fn apply_percentile_gate(hits: Vec<RecallHit>, percentile: u32) -> Vec<Recal
     let mut scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
     scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Linear-interpolation percentile (NIST method R6): for n samples,
-    // the p-th percentile index is `(p/100) * (n - 1)` zero-based.
-    // We use the nearest-rank variant via index clamping to keep the math
-    // straightforward; for our use case (top-K filtering) this is sufficient.
+    // Nearest-rank percentile: for n samples the zero-based fractional rank is
+    // `(p/100) * (n - 1)`, which we ROUND to the nearest integer index (not
+    // linearly interpolated between the two surrounding samples). The threshold
+    // is the score at that index. This nearest-rank form keeps the math
+    // straightforward; for our use case (top-K filtering) it is sufficient.
     let n = scores.len();
     let rank = (f64::from(percentile) / 100.0) * (n as f64 - 1.0);
     let idx = rank.round() as usize;
