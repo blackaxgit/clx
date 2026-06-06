@@ -149,7 +149,12 @@ impl Storage {
     }
 
     /// Migrate to schema version 1
+    ///
+    /// Wrapped in a transaction so the whole base-schema step commits
+    /// atomically, matching v2-v8. `IF NOT EXISTS` keeps it idempotent.
     pub(super) fn migrate_to_v1(&self) -> crate::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
         self.conn.execute_batch(
             "
             -- Sessions table
@@ -252,6 +257,7 @@ impl Storage {
             ",
         )?;
 
+        tx.commit()?;
         info!("Completed migration to schema version 1");
         Ok(())
     }
@@ -565,6 +571,46 @@ mod tests {
             fresh.schema_version().expect("schema version"),
             SCHEMA_VERSION
         );
+    }
+
+    /// FIX-10: a fresh DB migrates through the v1 base-schema step (now wrapped
+    /// in an explicit transaction + commit, matching v2-v8) all the way to the
+    /// latest schema. The v1 base tables must exist and be committed, and the
+    /// recorded schema version must be the latest. A regression where the v1
+    /// transaction did not commit (or left the base schema half-applied) would
+    /// surface here as a missing table or a wrong version.
+    #[test]
+    fn fresh_db_commits_v1_base_schema_and_reaches_latest() {
+        let storage = Storage::open_in_memory().expect("fresh db opens and migrates");
+
+        // Reached the latest schema version.
+        assert_eq!(
+            storage.schema_version().expect("schema version"),
+            SCHEMA_VERSION,
+            "a fresh DB must migrate to the latest schema version"
+        );
+
+        // All v1 base tables were committed by the v1 step.
+        for table in [
+            "sessions",
+            "snapshots",
+            "events",
+            "audit_log",
+            "learned_rules",
+            "analytics",
+        ] {
+            assert!(
+                storage.table_exists(table),
+                "v1 base table `{table}` must exist after a committed v1 migration"
+            );
+        }
+
+        // v1 remains idempotent (IF NOT EXISTS): re-running it is a no-op, not
+        // a transaction/commit error.
+        storage
+            .migrate_to_v1()
+            .expect("second v1 migration must be a committed no-op");
+        assert!(storage.table_exists("sessions"));
     }
 
     /// v8 (D6): a freshly-migrated database carries the `host` column on both
