@@ -150,9 +150,26 @@ impl ValidationCache {
 
 /// Compute a cache key from command and working directory.
 ///
-/// Uses full string concatenation instead of hashing to eliminate
-/// collision risk from non-cryptographic hash functions.
+/// Uses a NUL (`\0`) separator rather than a printable delimiter so the
+/// `(working_dir, command)` pair maps injectively to a key. NUL is illegal in
+/// both filesystem paths and shell command strings, so it cannot appear in
+/// either field; the encoding therefore has no collisions (unlike a `:`
+/// separator, where `("/a", "b:c")` and `("/a:b", "c")` collide).
 #[must_use]
 pub fn compute_cache_key(command: &str, working_dir: &str) -> String {
-    format!("{working_dir}:{command}")
+    format!("{working_dir}\0{command}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_cache_key;
+
+    #[test]
+    fn cache_key_is_injective_for_colon_bearing_pairs() {
+        // These two distinct (cwd, cmd) pairs collided under a `:` separator
+        // (both produced "/a:b:c"); the NUL separator keeps them distinct.
+        let a = compute_cache_key("b:c", "/a");
+        let b = compute_cache_key("c", "/a:b");
+        assert_ne!(a, b, "distinct (cwd,cmd) pairs must yield distinct keys");
+    }
 }
