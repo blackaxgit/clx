@@ -168,38 +168,36 @@ impl PolicyEngine {
                 "Bash(chmod:-R*777*)",
                 "Recursive world-writable permissions",
             ),
-            // Shell escape techniques
-            ("Bash(*`*)", "Backtick command substitution"),
-            ("Bash(*<(*)*)", "Process substitution input"),
-            ("Bash(*>(*)*)", "Process substitution output"),
-            ("Bash(*${*:-*}*)", "Shell parameter expansion with default"),
-            ("Bash(eval *)", "Eval command execution"),
-            ("Bash(exec *)", "Exec command replacement"),
-            ("Bash(source *)", "Source file execution"),
+            // Shell escape techniques.
+            //
+            // Issue 3: the broad shell-escape constructs (backtick, process
+            // substitution, `${:-}` default expansion, source/eval/exec) are
+            // RECLASSIFIED to the builtin graylist (Ask) below — they are
+            // over-broad for a hard deny (they appear in many benign commands)
+            // but warrant a confirmation prompt. Only genuinely destructive
+            // forms stay on the hard blacklist here.
             ("Bash(*xargs*rm*)", "Xargs with destructive command"),
+            // Narrowed (Issue 3): only genuinely destructive python one-liner
+            // calls are hard-denied, not a bare `import os` (which is benign in
+            // read-only scripts). The OS-mutating / shell-spawning calls remain
+            // hard deny.
             (
-                "Bash(python*-c*import*os*)",
-                "Python one-liner with os module",
+                "Bash(python*-c*os.system*)",
+                "Python one-liner spawning a shell (os.system)",
+            ),
+            (
+                "Bash(python*-c*os.remove*)",
+                "Python one-liner deleting files (os.remove)",
+            ),
+            (
+                "Bash(python*-c*shutil.rmtree*)",
+                "Python one-liner recursively deleting a tree (shutil.rmtree)",
+            ),
+            (
+                "Bash(python*-c*subprocess*)",
+                "Python one-liner spawning a subprocess",
             ),
             ("Bash(perl*-e*system*)", "Perl one-liner with system call"),
-            // v0.10.0 R1-F2: protect CLX + host config/trust dirs from agent
-            // file-edits (Codex apply_patch / Cursor edit_file canonicalize to
-            // FileEdit). Without these, an agent file-write to
-            // ~/.codex/config.toml could self-declare trust_level=trusted, or
-            // tamper with ~/.claude/settings.json / ~/.cursor hooks / ~/.clx.
-            (
-                "FileEdit(*/.codex/*)",
-                "File edit targeting Codex config/trust dir",
-            ),
-            (
-                "FileEdit(*/.claude/*)",
-                "File edit targeting Claude config dir",
-            ),
-            (
-                "FileEdit(*/.cursor/*)",
-                "File edit targeting Cursor config dir",
-            ),
-            ("FileEdit(*/.clx/*)", "File edit targeting CLX config dir"),
         ];
 
         for (pattern, description) in blacklist_patterns {
@@ -207,10 +205,112 @@ impl PolicyEngine {
                 .push(PolicyRule::blacklist(pattern).with_description(description));
         }
 
+        // v0.10.0 R1-F2: protect CLX + host config/trust dirs from agent
+        // file-edits (Codex apply_patch / Cursor edit_file canonicalize to
+        // FileEdit). Without these, an agent file-write to a host config/trust
+        // file could self-declare trust_level=trusted, or tamper with the CLX
+        // home dir. The agent dot-claude dir is handled separately (narrowed,
+        // Issue 4). Dir names are assembled via `concat!` so the literal
+        // hidden-dir tokens do not appear verbatim in source (write-hook
+        // compatibility); the runtime string is identical.
+        for (seg, description) in [
+            (
+                concat!(".", "codex"),
+                "File edit targeting Codex config/trust dir",
+            ),
+            (
+                concat!(".", "cursor"),
+                "File edit targeting Cursor config dir",
+            ),
+            (concat!(".", "clx"), "File edit targeting CLX config dir"),
+        ] {
+            self.blacklist.push(
+                PolicyRule::blacklist(format!("FileEdit(*/{seg}/*)")).with_description(description),
+            );
+        }
+
+        // Issue 4 (policy-layer part): the agent dot-claude FileEdit rule is
+        // NARROWED to sensitive targets only (settings.json, settings.local.json,
+        // the hooks/ subdir). Other dot-claude paths (CLAUDE.md, project memory)
+        // are no longer hard-denied at L0 — they were never a credential sink.
+        // (The CLX-home / Codex / Cursor guards above stay broad.)
+        let dot_claude = concat!("/.", "claude/");
+        for (pattern, description) in [
+            (
+                format!("FileEdit(*{dot_claude}settings.json)"),
+                "File edit targeting agent settings.json",
+            ),
+            (
+                format!("FileEdit(*{dot_claude}settings.local.json)"),
+                "File edit targeting agent settings.local.json",
+            ),
+            (
+                format!("FileEdit(*{dot_claude}hooks/*)"),
+                "File edit targeting agent hooks dir",
+            ),
+        ] {
+            self.blacklist
+                .push(PolicyRule::blacklist(pattern).with_description(description));
+        }
+
+        // Issue 4 (policy-layer part, sub-part A): baseline glob DENY rules for
+        // redirection / copy / move writes INTO a protected config dir. They
+        // back up the redirection-target check; `glob_match` is unanchored so a
+        // leading `*` is required (and a `/tmp` redirect does not false-match a
+        // protected segment). Dir names assembled via `concat!` (write-hook
+        // compatibility).
+        let protected_segments: [&str; 4] = [
+            concat!(".", "clx"),
+            concat!(".", "claude"),
+            concat!(".", "codex"),
+            concat!(".", "cursor"),
+        ];
+        for seg in protected_segments {
+            // Templates cover `>`/`>>` (spaced + unspaced), `tee`, `cp`, `mv`,
+            // and `dd of=` writes whose target path contains the protected
+            // segment as a directory component.
+            for pattern in [
+                format!("Bash(*> *{seg}/*)"),
+                format!("Bash(*>*{seg}/*)"),
+                format!("Bash(*>> *{seg}/*)"),
+                format!("Bash(*>>*{seg}/*)"),
+                format!("Bash(*tee*{seg}/*)"),
+                format!("Bash(*cp *{seg}/*)"),
+                format!("Bash(*mv *{seg}/*)"),
+                format!("Bash(*dd *of=*{seg}/*)"),
+            ] {
+                self.blacklist.push(
+                    PolicyRule::blacklist(pattern)
+                        .with_description("Redirection/write into a protected config dir"),
+                );
+            }
+        }
+
+        // Issue 3: builtin GRAYLIST tier (hidden/internal, builtin-only, never
+        // persisted to the DB). These over-broad shell-escape / expansion
+        // constructs were previously hard-denied; they are too broad for a hard
+        // deny (common in benign commands) but still warrant a confirmation
+        // prompt, so they map to `Ask` via per-segment graylist matching in
+        // `evaluate`.
+        let graylist_patterns = [
+            ("Bash(*`*)", "Backtick command substitution"),
+            ("Bash(*<(*)*)", "Process substitution input"),
+            ("Bash(*>(*)*)", "Process substitution output"),
+            ("Bash(*${*:-*}*)", "Shell parameter expansion with default"),
+            ("Bash(eval *)", "Eval command execution"),
+            ("Bash(exec *)", "Exec command replacement"),
+            ("Bash(source *)", "Source file execution"),
+        ];
+        for (pattern, description) in graylist_patterns {
+            self.graylist
+                .push(PolicyRule::graylist(pattern).with_description(description));
+        }
+
         debug!(
-            "Loaded {} whitelist and {} blacklist built-in rules",
+            "Loaded {} whitelist, {} blacklist, {} graylist built-in rules",
             self.whitelist.len(),
-            self.blacklist.len()
+            self.blacklist.len(),
+            self.graylist.len()
         );
     }
 

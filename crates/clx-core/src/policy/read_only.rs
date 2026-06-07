@@ -97,7 +97,7 @@ fn contains_dangerous_metachar(command: &str) -> bool {
 /// including arbitrary file descriptors (`3>`, `4>>`) and `&>`/`&>>`. Strips an
 /// optional leading fd number or `&` before checking for a leading `>`/`<`, so
 /// `3>/tmp/o` is caught as a write target (fail-closed).
-fn is_redirection_token(token: &str) -> bool {
+pub(crate) fn is_redirection_token(token: &str) -> bool {
     let mut rest = token.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
     // Bash named file descriptor: `{varname}>file`.
     if rest.starts_with('{')
@@ -114,7 +114,7 @@ fn is_redirection_token(token: &str) -> bool {
 /// operators collapse and empty segments are dropped. Returns `None` on
 /// unbalanced quotes (fail-closed). Redirection (`>`/`<`) is NOT a separator —
 /// it stays in the segment and is rejected later by `is_redirection_token`.
-fn split_segments_quote_aware(command: &str) -> Option<Vec<String>> {
+pub(crate) fn split_segments_quote_aware(command: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -212,7 +212,16 @@ fn segment_is_read_only(tokens: &[String]) -> bool {
         | "file" | "stat" | "wc" | "du" | "df" | "ag" | "ack" | "locate" | "which" | "whereis"
         | "type" | "pwd" | "whoami" | "uname" | "uptime" | "cal" | "printenv" | "ps" | "top"
         | "htop" | "pgrep" | "host" | "help" | "info" | "diff" | "cmp" | "jq" | "echo"
-        | "zipinfo" => true,
+        | "zipinfo" | "uniq" | "cut" | "column" => true,
+
+        // `cd` is a pure shell builtin with no side-effect-producing flags; it
+        // only changes the working directory and never writes/execs => always
+        // read-only. (Issue 10.1 — code-level allow, not a fail-open glob.)
+        "cd" => true,
+
+        // `sort` is read-only unless it writes its output to a file via
+        // `-o`/`--output` (Issue 10.1).
+        "sort" => sort_is_read_only(args),
 
         // `env` / `set` are read-only only with no trailing program. Any
         // non-assignment operand (a program, `-x`, ...) => reject.
@@ -603,6 +612,15 @@ fn ifconfig_is_read_only(args: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// sort: read-only unless it redirects output to a file via `-o`/`--output`
+/// (in attached `-oFILE` / `--output=FILE` or separated `-o FILE` forms).
+/// Default-deny on the write flag in any form (Issue 10.1).
+fn sort_is_read_only(args: &[String]) -> bool {
+    !args
+        .iter()
+        .any(|a| a == "-o" || a == "--output" || a.starts_with("-o") || a.starts_with("--output="))
 }
 
 /// tree: deny output-to-file flags.
