@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn fallback_on_primary_503_succeeds() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn fallback_not_used_on_terminal_error() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn cooldown_skips_primary_after_failure() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -314,7 +314,7 @@ mod tests {
     // Kills a mutant that drops the embed fallback (would surface the 503)
     // or that forwards to the primary a second time.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn embed_falls_back_on_primary_transient() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -353,7 +353,7 @@ mod tests {
     // Branch: embed() primary terminal (401) error -> NO fallback, error surfaces.
     // Kills a mutant that treats every embed error as transient and falls back.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn embed_terminal_error_does_not_fall_back() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -388,7 +388,7 @@ mod tests {
     // model arg. Kills a mutant that hard-codes the fallback model to None or
     // drops the `.or(caller)` fallback in `fb_model`.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn fallback_uses_caller_model_when_no_override() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -437,7 +437,7 @@ mod tests {
     // the primary entirely. Before the fix the cooldown lived only in an
     // in-process Mutex, so a new process always re-hit the dead primary.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn cross_process_recorded_failure_skips_primary() {
         allow_local();
         let base = temp_health_base("recent");
@@ -485,7 +485,7 @@ mod tests {
     // FIX-7: an ABSENT cross-process marker must NOT short-circuit; the primary
     // is contacted normally.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn absent_cross_process_marker_uses_primary() {
         allow_local();
         let base = temp_health_base("absent");
@@ -528,7 +528,7 @@ mod tests {
 
     // FIX-7: an EXPIRED marker (older than COOLDOWN) must NOT short-circuit.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn expired_cross_process_marker_uses_primary() {
         allow_local();
         let base = temp_health_base("expired");
@@ -579,7 +579,7 @@ mod tests {
     // Kills a mutant that flips the `||` to `&&` (would require both up) or one
     // that always returns false.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn is_available_true_when_primary_healthy() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -606,7 +606,7 @@ mod tests {
     // Branch: is_available() falls through to the FALLBACK when primary is down.
     // Kills a mutant that only checks the primary (would return false here).
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn is_available_true_when_only_fallback_healthy() {
         allow_local();
         let primary_mock = MockServer::start().await;
@@ -635,7 +635,7 @@ mod tests {
     // Branch: is_available() returns false only when BOTH backends are down.
     // Kills a mutant that returns true unconditionally.
     #[tokio::test]
-    #[serial(env_azure_hosts_fallback)]
+    #[serial(env_azure_hosts)]
     async fn is_available_false_when_both_down() {
         allow_local();
         let primary_mock = MockServer::start().await;
