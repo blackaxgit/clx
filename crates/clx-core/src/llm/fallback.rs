@@ -157,7 +157,14 @@ impl LocalLlmBackend for FallbackClient {
     }
 
     async fn is_available(&self) -> bool {
-        // Either backend healthy means "fallback path is alive."
+        // Either backend healthy means "fallback path is alive." When the
+        // cross-process cooldown is active (a recent primary failure), probe the
+        // fallback FIRST so a one-shot hook process does not pay the dead
+        // primary's probe latency before checking the live fallback.
+        if self.use_fallback_directly() {
+            return Box::pin(self.fallback.is_available()).await
+                || Box::pin(self.primary.is_available()).await;
+        }
         Box::pin(self.primary.is_available()).await || Box::pin(self.fallback.is_available()).await
     }
 }
