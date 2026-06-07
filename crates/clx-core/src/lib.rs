@@ -11,6 +11,7 @@ pub mod config;
 pub mod credentials;
 pub mod embeddings;
 pub mod error;
+pub mod learned_pattern;
 pub mod llm;
 pub mod llm_health;
 pub mod paths;
