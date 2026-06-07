@@ -162,6 +162,23 @@ pub(crate) trait Host: Send + Sync {
 /// ignored (fall through to envelope detection).
 pub const HOST_OVERRIDE_ENV_VAR: &str = "CLX_HOOK_HOST";
 
+/// Env var Claude Code sets in its own spawned processes. When truthy it forces
+/// `HostId::Claude` (after the explicit `CLX_HOOK_HOST` override, before the
+/// envelope sniff).
+pub const CLAUDECODE_ENV_VAR: &str = "CLAUDECODE";
+
+/// Return `true` when an env value is *truthy*: present, non-empty after
+/// trimming, and not a falsy literal (`0`, `false`/`FALSE`/`False`).
+fn is_truthy_env(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
+            let t = v.trim();
+            !t.is_empty() && !matches!(t, "0" | "false" | "FALSE" | "False")
+        }
+        None => false,
+    }
+}
+
 /// Detect the host for a raw stdin envelope.
 ///
 /// Resolution order (per spec §1):
@@ -173,23 +190,36 @@ pub const HOST_OVERRIDE_ENV_VAR: &str = "CLX_HOOK_HOST";
 /// orchestration edge so the rest of the pipeline is pure.
 pub(crate) fn detect_host(raw: &str) -> Box<dyn Host> {
     let override_var = std::env::var(HOST_OVERRIDE_ENV_VAR).ok();
-    detect_host_with_override(raw, override_var.as_deref())
+    let claudecode = is_truthy_env(std::env::var(CLAUDECODE_ENV_VAR).ok().as_deref());
+    detect_host_with_override(raw, override_var.as_deref(), claudecode)
 }
 
-/// Pure host-detection core: takes the explicit override value so it can be
-/// unit-tested without touching the environment.
-pub(crate) fn detect_host_with_override(raw: &str, override_value: Option<&str>) -> Box<dyn Host> {
-    match host_id_for(raw, override_value) {
+/// Pure host-detection core: takes the explicit override value and the resolved
+/// `CLAUDECODE` truthiness so it can be unit-tested without touching the
+/// environment.
+pub(crate) fn detect_host_with_override(
+    raw: &str,
+    override_value: Option<&str>,
+    claudecode: bool,
+) -> Box<dyn Host> {
+    match host_id_for(raw, override_value, claudecode) {
         HostId::Claude => Box::new(ClaudeHost),
         HostId::Codex => Box::new(CodexHost),
         HostId::Cursor => Box::new(CursorHost),
     }
 }
 
-/// Pure decision: which `HostId` does this envelope + override resolve to.
-fn host_id_for(raw: &str, override_value: Option<&str>) -> HostId {
+/// Pure decision: which `HostId` does this envelope + override + `CLAUDECODE`
+/// signal resolve to.
+///
+/// Precedence: explicit `CLX_HOOK_HOST` override > truthy `CLAUDECODE` >
+/// envelope `turn_id`/shape sniff > Claude default.
+fn host_id_for(raw: &str, override_value: Option<&str>, claudecode: bool) -> HostId {
     if let Some(forced) = override_value.and_then(parse_host_override) {
         return forced;
+    }
+    if claudecode {
+        return HostId::Claude;
     }
     sniff_envelope(raw)
 }
@@ -259,7 +289,7 @@ mod tests {
 
     #[test]
     fn explicit_claude_envelope_resolves_to_claude() {
-        assert_eq!(host_id_for(&claude_envelope(), None), HostId::Claude);
+        assert_eq!(host_id_for(&claude_envelope(), None, false), HostId::Claude);
     }
 
     /// Regression: a Claude Code envelope carrying a top-level `permission_mode`
@@ -278,7 +308,7 @@ mod tests {
             "tool_input": { "command": "git rm -r --cached .claude/" }
         })
         .to_string();
-        assert_eq!(host_id_for(&env, None), HostId::Claude);
+        assert_eq!(host_id_for(&env, None, false), HostId::Claude);
     }
 
     /// A genuine Codex envelope (carries `turn_id`) still resolves to Codex.
@@ -293,7 +323,7 @@ mod tests {
             "tool_input": { "command": "echo hi" }
         })
         .to_string();
-        assert_eq!(host_id_for(&env, None), HostId::Codex);
+        assert_eq!(host_id_for(&env, None, false), HostId::Codex);
     }
 
     #[test]
@@ -308,7 +338,7 @@ mod tests {
             "tool_input": { "command": "ls" }
         })
         .to_string();
-        assert_eq!(host_id_for(&env, None), HostId::Codex);
+        assert_eq!(host_id_for(&env, None, false), HostId::Codex);
     }
 
     #[test]
@@ -320,13 +350,13 @@ mod tests {
             "command": "ls"
         })
         .to_string();
-        assert_eq!(host_id_for(&env, None), HostId::Cursor);
+        assert_eq!(host_id_for(&env, None, false), HostId::Cursor);
     }
 
     #[test]
     fn env_override_forces_codex_even_for_claude_envelope() {
         assert_eq!(
-            host_id_for(&claude_envelope(), Some("codex")),
+            host_id_for(&claude_envelope(), Some("codex"), false),
             HostId::Codex
         );
     }
@@ -334,7 +364,7 @@ mod tests {
     #[test]
     fn env_override_forces_cursor() {
         assert_eq!(
-            host_id_for(&claude_envelope(), Some("CURSOR")),
+            host_id_for(&claude_envelope(), Some("CURSOR"), false),
             HostId::Cursor
         );
     }
@@ -342,7 +372,7 @@ mod tests {
     #[test]
     fn env_override_is_case_insensitive_and_trimmed() {
         assert_eq!(
-            host_id_for(&claude_envelope(), Some("  Claude ")),
+            host_id_for(&claude_envelope(), Some("  Claude "), false),
             HostId::Claude
         );
     }
@@ -357,28 +387,90 @@ mod tests {
             "turn_id": "t"
         })
         .to_string();
-        assert_eq!(host_id_for(&env, Some("bogus")), HostId::Codex);
+        assert_eq!(host_id_for(&env, Some("bogus"), false), HostId::Codex);
     }
 
     #[test]
     fn ambiguous_envelope_defaults_to_claude() {
-        assert_eq!(host_id_for("not json at all", None), HostId::Claude);
-        assert_eq!(host_id_for("{}", None), HostId::Claude);
+        assert_eq!(host_id_for("not json at all", None, false), HostId::Claude);
+        assert_eq!(host_id_for("{}", None, false), HostId::Claude);
     }
 
     #[test]
     fn detect_host_builds_matching_impl() {
         assert_eq!(
-            detect_host_with_override(&claude_envelope(), None).host_id(),
+            detect_host_with_override(&claude_envelope(), None, false).host_id(),
             HostId::Claude
         );
         assert_eq!(
-            detect_host_with_override(&claude_envelope(), Some("codex")).host_id(),
+            detect_host_with_override(&claude_envelope(), Some("codex"), false).host_id(),
             HostId::Codex
         );
         assert_eq!(
-            detect_host_with_override(&claude_envelope(), Some("cursor")).host_id(),
+            detect_host_with_override(&claude_envelope(), Some("cursor"), false).host_id(),
             HostId::Cursor
         );
+    }
+
+    fn codex_turn_id_envelope() -> String {
+        serde_json::json!({
+            "session_id": "sess-cc",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "turn_id": "turn-cc",
+            "tool_input": { "command": "ls" }
+        })
+        .to_string()
+    }
+
+    /// AC2.1: truthy `CLAUDECODE` + a `turn_id` envelope -> Claude (CLAUDECODE
+    /// wins over the envelope sniff).
+    #[test]
+    fn claudecode_truthy_overrides_turn_id_sniff() {
+        assert_eq!(
+            host_id_for(&codex_turn_id_envelope(), None, true),
+            HostId::Claude
+        );
+    }
+
+    /// AC2.2: explicit `CLX_HOOK_HOST=codex` still wins over truthy `CLAUDECODE`.
+    #[test]
+    fn explicit_override_beats_claudecode() {
+        assert_eq!(
+            host_id_for(&claude_envelope(), Some("codex"), true),
+            HostId::Codex
+        );
+    }
+
+    /// AC2.3: `CLAUDECODE` falsy/unset + a `turn_id` envelope -> Codex
+    /// (unchanged sniff behaviour).
+    #[test]
+    fn claudecode_falsy_keeps_turn_id_sniff() {
+        assert_eq!(
+            host_id_for(&codex_turn_id_envelope(), None, false),
+            HostId::Codex
+        );
+    }
+
+    /// AC2.4: no envelope signal and no `CLAUDECODE` -> Claude default.
+    #[test]
+    fn no_signals_defaults_to_claude() {
+        assert_eq!(host_id_for("{}", None, false), HostId::Claude);
+    }
+
+    /// The truthy-env helper: present + non-empty(trim) + not a falsy literal.
+    #[test]
+    fn is_truthy_env_matrix() {
+        assert!(is_truthy_env(Some("1")));
+        assert!(is_truthy_env(Some("true")));
+        assert!(is_truthy_env(Some(" yes ")));
+        assert!(!is_truthy_env(None));
+        assert!(!is_truthy_env(Some("")));
+        assert!(!is_truthy_env(Some("   ")));
+        assert!(!is_truthy_env(Some("0")));
+        assert!(!is_truthy_env(Some("false")));
+        assert!(!is_truthy_env(Some("FALSE")));
+        assert!(!is_truthy_env(Some("False")));
     }
 }

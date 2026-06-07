@@ -419,8 +419,9 @@ fn read_only_classification_examples() {
 
 #[test]
 fn cache_key_is_full_string_cwd_and_command() {
+    // FIX-3: NUL separator (illegal in paths/commands) makes the key injective.
     let k = compute_cache_key("rm -rf /tmp/x", "/work/dir");
-    assert_eq!(k, "/work/dir:rm -rf /tmp/x", "no hashing, no collisions");
+    assert_eq!(k, "/work/dir\0rm -rf /tmp/x", "no hashing, no collisions");
 }
 
 #[test]

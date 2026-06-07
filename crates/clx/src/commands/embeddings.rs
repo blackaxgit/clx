@@ -5,7 +5,7 @@ use clap::Subcommand;
 use colored::Colorize;
 use std::io::{self, Write};
 
-use clx_core::config::{Capability, Config, OllamaConfig};
+use clx_core::config::{Capability, Config, OllamaConfig, effective_embedding_dimension};
 use clx_core::embeddings::EmbeddingStore;
 use clx_core::llm::{LlmBackend, LlmClient, LlmError};
 use clx_core::redaction::redact_secrets;
@@ -248,28 +248,32 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
 
     match action {
         EmbeddingsAction::Status => {
-            let emb_store =
-                Storage::create_embedding_store_with_dimension(&db_path, ollama_cfg.embedding_dim)
-                    .context("Failed to open embedding store. Run 'clx install' first.")?;
-
-            let dim = ollama_cfg.embedding_dim;
-            let vec_enabled = emb_store.is_vector_search_enabled();
-            let count = emb_store.count_embeddings().unwrap_or(0);
-
             // Resolve the active embeddings route (provider + model) the same
             // way rebuild/backfill do, falling back to legacy ollama defaults
             // when no routing section is present. The configured model is what
             // the active route WILL use; the stored model is what produced the
-            // vectors currently in the index.
-            let (configured_model, provider_name) =
+            // vectors currently in the index. The route also carries the
+            // effective dimension so the store opens — and migration is judged
+            // — at the dimension the active route actually uses (Issue 6).
+            let (configured_model, provider_name, dim) =
                 match config.capability_route(Capability::Embeddings) {
-                    Ok(r) => (r.model.clone(), r.provider.clone()),
+                    Ok(r) => {
+                        let dim = effective_embedding_dimension(r, ollama_cfg.embedding_dim);
+                        (r.model.clone(), r.provider.clone(), dim)
+                    }
                     Err(_) => (
                         ollama_cfg.embedding_model.clone(),
                         "ollama-local".to_owned(),
+                        ollama_cfg.embedding_dim,
                     ),
                 };
             let active_ident = make_model_ident(&provider_name, &configured_model);
+
+            let emb_store = Storage::create_embedding_store_with_dimension(&db_path, dim)
+                .context("Failed to open embedding store. Run 'clx install' first.")?;
+
+            let vec_enabled = emb_store.is_vector_search_enabled();
+            let count = emb_store.count_embeddings().unwrap_or(0);
 
             // The model actually stored in the index (per-snapshot provenance).
             // `None` means an empty index or only pre-migration sentinel rows.
@@ -347,28 +351,32 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
             }
         }
         EmbeddingsAction::Rebuild { dry_run } => {
-            let mut emb_store =
-                Storage::create_embedding_store_with_dimension(&db_path, ollama_cfg.embedding_dim)
-                    .context("Failed to open embedding store. Run 'clx install' first.")?;
-
-            // Resolve provider + model before anything else so dry-run can show them.
-            // Fall back to legacy ollama defaults when no routing section is present.
-            let (embed_model, provider_name) = match config.capability_route(Capability::Embeddings)
-            {
-                Ok(r) => (r.model.clone(), r.provider.clone()),
-                Err(_) => (
-                    ollama_cfg.embedding_model.clone(),
-                    "ollama-local".to_owned(),
-                ),
-            };
+            // Resolve provider + model + effective dimension before anything
+            // else so dry-run can show them and the store opens / rebuilds at
+            // the route-derived dimension (Issue 6). Fall back to legacy ollama
+            // defaults when no routing section is present.
+            let (embed_model, provider_name, dim) =
+                match config.capability_route(Capability::Embeddings) {
+                    Ok(r) => {
+                        let dim = effective_embedding_dimension(r, ollama_cfg.embedding_dim);
+                        (r.model.clone(), r.provider.clone(), dim)
+                    }
+                    Err(_) => (
+                        ollama_cfg.embedding_model.clone(),
+                        "ollama-local".to_owned(),
+                        ollama_cfg.embedding_dim,
+                    ),
+                };
             let model_ident = make_model_ident(&provider_name, &embed_model);
+
+            let mut emb_store = Storage::create_embedding_store_with_dimension(&db_path, dim)
+                .context("Failed to open embedding store. Run 'clx install' first.")?;
 
             // Snapshot list comes from the embedding store itself (uses its connection).
             let snapshots = emb_store
                 .iter_snapshots_for_rebuild()
                 .context("Failed to read snapshots")?;
 
-            let dim = ollama_cfg.embedding_dim;
             let needs_migration = emb_store.needs_dimension_migration(dim);
             let existing_count = emb_store.count_embeddings().unwrap_or(0);
 
@@ -556,22 +564,28 @@ pub async fn cmd_embeddings(cli: &Cli, action: &EmbeddingsAction) -> Result<()> 
 pub async fn cmd_embed_backfill(cli: &Cli, dry_run: bool) -> Result<()> {
     let db_path = clx_core::paths::database_path();
 
-    // Open embedding store
-    let emb_store = Storage::create_embedding_store(&db_path)
-        .context("Failed to open embedding store. Run 'clx install' first.")?;
-
-    // Load config and resolve provider/model.
+    // Load config and resolve provider/model + effective dimension first, so the
+    // store opens at the route-derived dimension — consistent with status and
+    // rebuild (Issue 6).
     let config = Config::load().context("Failed to load configuration")?;
     let backfill_defaults = OllamaConfig::default();
     let backfill_cfg = config.ollama.as_ref().unwrap_or(&backfill_defaults);
-    let (embed_model, provider_name) = match config.capability_route(Capability::Embeddings) {
-        Ok(r) => (r.model.clone(), r.provider.clone()),
+    let (embed_model, provider_name, dim) = match config.capability_route(Capability::Embeddings) {
+        Ok(r) => {
+            let dim = effective_embedding_dimension(r, backfill_cfg.embedding_dim);
+            (r.model.clone(), r.provider.clone(), dim)
+        }
         Err(_) => (
             backfill_cfg.embedding_model.clone(),
             "ollama-local".to_owned(),
+            backfill_cfg.embedding_dim,
         ),
     };
     let model_ident = make_model_ident(&provider_name, &embed_model);
+
+    // Open embedding store at the effective dimension.
+    let emb_store = Storage::create_embedding_store_with_dimension(&db_path, dim)
+        .context("Failed to open embedding store. Run 'clx install' first.")?;
 
     let client = match config.create_llm_client(Capability::Embeddings) {
         Ok(c) => c,

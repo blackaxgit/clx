@@ -847,7 +847,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "clx"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "clx-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "age",
  "anyhow",
@@ -907,10 +907,12 @@ dependencies = [
  "serde_yml",
  "serial_test",
  "sha2",
+ "shlex",
  "sqlite-vec",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "trait-variant",
  "url",
@@ -919,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "clx-hook"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -944,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "clx-mcp"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",

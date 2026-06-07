@@ -226,7 +226,17 @@ async fn do_recall(
     if let Some(reranker) = reranker.as_ref() {
         engine = engine.with_reranker(reranker);
     }
-    let hits = engine.query(prompt, &recall_config).await;
+    let result = engine.query(prompt, &recall_config).await;
+    // FIX-6: log a degraded store but never inject an outage/error string into
+    // the prompt `additionalContext`; only real hits are ever injected.
+    if result.degraded {
+        warn!(
+            "Auto-recall degraded: a candidate-generation stage errored; \
+             injecting only the hits that succeeded ({} hit(s))",
+            result.hits.len()
+        );
+    }
+    let hits = result.hits;
 
     let pinned_block = build_pinned_block(&storage, session_id, &config.auto_recall);
 

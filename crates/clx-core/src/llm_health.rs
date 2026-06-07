@@ -61,6 +61,73 @@ fn write_health_to(path: &Path, available: bool) {
     let _ = fs::write(path, if available { "ok" } else { "down" });
 }
 
+// --- Cross-process primary-LLM failure cooldown (FIX-7) -----------------
+//
+// The `FallbackClient` cooldown was previously an in-process `Mutex` only.
+// CLX hooks run one-process-per-event, so the in-process state resets every
+// invocation and a sustained primary outage repeatedly pays the dead-primary
+// latency. These helpers persist the last primary-failure instant to a small
+// file so a recent failure recorded by a prior process can short-circuit to
+// the fallback. Read/write are best-effort, non-blocking, and bounded (a
+// single small file op).
+
+/// Name of the cross-process primary-LLM failure marker file.
+const PRIMARY_FAILURE_FILE: &str = "primary_llm_failure";
+
+/// Resolve the primary-failure marker path under the given data dir.
+fn primary_failure_path_in(base: &Path) -> PathBuf {
+    base.join(PRIMARY_FAILURE_FILE)
+}
+
+/// Returns `true` if the marker at `path` records a failure newer than
+/// `cooldown`. A missing/unreadable/expired marker returns `false`.
+fn primary_failure_active_at(path: &Path, cooldown: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let age = SystemTime::now()
+        .duration_since(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+        .unwrap_or(Duration::from_secs(u64::MAX));
+    age < cooldown
+}
+
+/// Record a primary-LLM failure at `path` (best-effort; touch the file so its
+/// mtime marks "now").
+fn record_primary_failure_at(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"down");
+}
+
+/// Returns `true` if a primary-LLM failure was recorded (by this or any prior
+/// process) within `cooldown`, using the default CLX data dir.
+///
+/// Best-effort and non-blocking: any IO error reads as "no recent failure".
+#[must_use]
+pub fn primary_failure_active(cooldown: Duration) -> bool {
+    primary_failure_active_at(&primary_failure_path_in(&data_dir()), cooldown)
+}
+
+/// Like [`primary_failure_active`] but against a caller-supplied base dir
+/// (used by tests to isolate the marker from the real data dir).
+#[must_use]
+pub(crate) fn primary_failure_active_in(base: &Path, cooldown: Duration) -> bool {
+    primary_failure_active_at(&primary_failure_path_in(base), cooldown)
+}
+
+/// Record a primary-LLM failure (cross-process) at the default CLX data dir.
+///
+/// Best-effort: silently ignores write failures.
+pub fn record_primary_failure() {
+    record_primary_failure_at(&primary_failure_path_in(&data_dir()));
+}
+
+/// Like [`record_primary_failure`] but against a caller-supplied base dir.
+pub(crate) fn record_primary_failure_in(base: &Path) {
+    record_primary_failure_at(&primary_failure_path_in(base));
+}
+
 /// Read the cached Ollama health status from disk.
 ///
 /// Returns [`HealthStatus::Unknown`] if the file is missing, stale (older

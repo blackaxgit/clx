@@ -447,30 +447,25 @@ async fn router_handle_event_unknown_event_is_ok() {
     })
     .to_string();
     let mut out = Vec::<u8>::new();
-    // HookDeps cannot be constructed externally (for_test is cfg(test)); the
-    // router's from_process_defaults reads the real FS, so we assert the
-    // dispatch contract via the binary-independent error paths instead.
-    // Unknown-event dispatch needs deps; use the documented public builder.
-    if let Some(deps) = clx_hook::HookDeps::from_process_defaults() {
-        let exit = handle_event(raw.as_bytes(), &mut out, deps).await;
-        assert_eq!(exit, HookExit::Ok, "unknown event must dispatch to Ok");
-    }
+    // The router no longer takes injected deps: each handler resolves its own
+    // config/storage. `handle_event` can therefore be driven directly with
+    // in-memory IO; unknown events dispatch to the safe allow fallback.
+    let exit = handle_event(raw.as_bytes(), &mut out).await;
+    assert_eq!(exit, HookExit::Ok, "unknown event must dispatch to Ok");
 }
 
-/// `handle_event` rejects oversize input with a block decision regardless of
-/// deps availability (router fallback contract; in-memory writer).
+/// `handle_event` rejects oversize input with a block decision (router
+/// fallback contract; in-memory writer).
 #[tokio::test]
 async fn router_handle_event_oversize_blocks() {
     use clx_hook::{HookExit, handle_event};
-    if let Some(deps) = clx_hook::HookDeps::from_process_defaults() {
-        let big = vec![b'a'; 5 * 1024 * 1024];
-        let mut out = Vec::<u8>::new();
-        let exit = handle_event(&big[..], &mut out, deps).await;
-        assert_eq!(exit, HookExit::InputTooLarge);
-        let s = String::from_utf8_lossy(&out);
-        let v: serde_json::Value = serde_json::from_str(s.trim()).expect("JSON");
-        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "block");
-    }
+    let big = vec![b'a'; 5 * 1024 * 1024];
+    let mut out = Vec::<u8>::new();
+    let exit = handle_event(&big[..], &mut out).await;
+    assert_eq!(exit, HookExit::InputTooLarge);
+    let s = String::from_utf8_lossy(&out);
+    let v: serde_json::Value = serde_json::from_str(s.trim()).expect("JSON");
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "block");
 }
 
 /// RISK M-R6 (pin-accepted, latency): `do_recall` opens `Storage` +

@@ -86,6 +86,15 @@ impl PolicyDecision {
 }
 
 /// Type of policy rule
+///
+/// `Graylist` is a HIDDEN / INTERNAL builtin-only tier (Issue 3). It is used
+/// for over-broad-but-not-always-malicious constructs (shell escapes, default
+/// expansions, destructive interpreter one-liners) that should prompt the user
+/// (`Ask`) rather than hard-deny. It is NEVER written to the `learned_rules`
+/// database: the DB uses the separate two-valued [`crate::types::RuleType`]
+/// (`Allow`/`Deny`) which has no graylist representation, so a graylist rule
+/// can never round-trip to disk and `RuleType::parse` can never receive
+/// `"graylist"` (which would `unwrap_or_default()` to `Allow` = fail-open).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyRuleType {
@@ -93,6 +102,11 @@ pub enum PolicyRuleType {
     Whitelist,
     /// Blacklist rule - command is blocked
     Blacklist,
+    /// Graylist rule - command requires user confirmation (`Ask`).
+    ///
+    /// Hidden/internal builtin-only tier; never persisted to the DB.
+    #[serde(rename = "graylist")]
+    Graylist,
 }
 
 /// Source of a policy rule
@@ -147,6 +161,20 @@ impl PolicyRule {
         Self {
             pattern: pattern.into(),
             rule_type: PolicyRuleType::Blacklist,
+            source: RuleSource::Builtin,
+            description: None,
+            project_path: None,
+        }
+    }
+
+    /// Create a new graylist rule (hidden/internal builtin-only `Ask` tier).
+    ///
+    /// Graylist rules are never persisted to the learned-rules DB; they exist
+    /// only in the in-memory builtin set, so the source is always `Builtin`.
+    pub fn graylist(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            rule_type: PolicyRuleType::Graylist,
             source: RuleSource::Builtin,
             description: None,
             project_path: None,

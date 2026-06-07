@@ -20,25 +20,6 @@ use clx_core::types::ToolOutcome;
 
 use crate::host::Host;
 
-/// Claude file-mutator tool names, used as the host-less fallback.
-///
-/// The host-aware path (`should_aggregate` / `is_text_mutator`, which take a
-/// `&dyn Host`) is authoritative: it consults [`Host::is_mutator_tool`] so each
-/// host's own mutator set (Codex `apply_patch`, Cursor `edit_file`, ...) is
-/// respected. This const is retained only for the host-less fallback callers
-/// ([`should_aggregate_claude`] / [`is_text_mutator_claude`]) that have no
-/// `Host` in scope; it is the historical Claude set, byte-for-byte.
-///
-/// `Bash` is handled separately via [`is_mutator_bash`] because most Bash
-/// calls are reads (`ls`, `grep`, ...) and only a small mutator subset
-/// should be aggregated.
-///
-/// `#[allow(dead_code)]`: the host-aware path is the only production caller
-/// today (`post_tool_use`). This const and its fallback helpers exist for any
-/// future host-less context; they are exercised by the unit tests below.
-#[allow(dead_code)]
-pub const CLAUDE_MUTATOR_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
-
 /// Maximum length (in chars, not bytes) of a generated summary line.
 const SUMMARY_MAX_CHARS: usize = 160;
 
@@ -54,40 +35,12 @@ pub fn is_text_mutator(tool: &str, host: &dyn Host) -> bool {
     host.is_mutator_tool(tool)
 }
 
-/// Host-less fallback for [`is_text_mutator`]: the historical Claude set.
-///
-/// Used only where no `Host` is in scope. Prefer the host-aware
-/// [`is_text_mutator`] at any call site that has a `&dyn Host`.
-#[allow(dead_code)]
-#[must_use]
-pub fn is_text_mutator_claude(tool: &str) -> bool {
-    CLAUDE_MUTATOR_TOOLS.contains(&tool)
-}
-
 /// Return `true` if `tool` should be aggregated for `host` (text mutator or
 /// mutator Bash). Host-aware: the text-mutator check routes through
 /// [`Host::is_mutator_tool`].
 #[must_use]
 pub fn should_aggregate(tool: &str, input: &Value, host: &dyn Host) -> bool {
     if is_text_mutator(tool, host) {
-        return true;
-    }
-    if tool == "Bash"
-        && let Some(cmd) = input.get("command").and_then(Value::as_str)
-    {
-        return is_mutator_bash(cmd);
-    }
-    false
-}
-
-/// Host-less fallback for [`should_aggregate`]: uses the Claude mutator set.
-///
-/// Retained for any host-less context (no `&dyn Host` available). The
-/// host-aware [`should_aggregate`] is authoritative wherever a host is known.
-#[allow(dead_code)]
-#[must_use]
-pub fn should_aggregate_claude(tool: &str, input: &Value) -> bool {
-    if is_text_mutator_claude(tool) {
         return true;
     }
     if tool == "Bash"
@@ -295,10 +248,6 @@ mod tests {
         let host = ClaudeHost;
         for t in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
             assert!(is_text_mutator(t, &host), "{t} should be a mutator");
-            assert!(
-                is_text_mutator_claude(t),
-                "{t} (host-less) should be a mutator"
-            );
         }
     }
 
@@ -307,7 +256,6 @@ mod tests {
         let host = ClaudeHost;
         for t in ["Read", "Grep", "Glob", "LS", "WebFetch", "Bash"] {
             assert!(!is_text_mutator(t, &host));
-            assert!(!is_text_mutator_claude(t));
         }
     }
 
@@ -324,13 +272,21 @@ mod tests {
     }
 
     #[test]
-    fn mutator_set_contains_all_four_text_mutators() {
-        let set: std::collections::HashSet<_> = CLAUDE_MUTATOR_TOOLS.iter().copied().collect();
-        assert!(set.contains("Edit"));
-        assert!(set.contains("Write"));
-        assert!(set.contains("MultiEdit"));
-        assert!(set.contains("NotebookEdit"));
-        assert_eq!(set.len(), 4);
+    fn claude_host_mutator_set_is_exactly_the_four_text_mutators() {
+        // The Claude mutator set (formerly the host-less `CLAUDE_MUTATOR_TOOLS`
+        // const, now removed) is exercised through the authoritative host-aware
+        // path: ClaudeHost::is_mutator_tool must accept exactly the four text
+        // mutators and reject everything else.
+        let host = ClaudeHost;
+        for t in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            assert!(is_text_mutator(t, &host), "{t} must be a Claude mutator");
+        }
+        for t in ["Read", "Grep", "Glob", "LS", "WebFetch", "Bash", "Task"] {
+            assert!(
+                !is_text_mutator(t, &host),
+                "{t} must NOT be a Claude text mutator"
+            );
+        }
     }
 
     // --- should_aggregate (host-aware) ---
@@ -343,10 +299,6 @@ mod tests {
             &json!({"file_path": "a.rs"}),
             &host
         ));
-        assert!(should_aggregate_claude(
-            "Edit",
-            &json!({"file_path": "a.rs"})
-        ));
     }
 
     #[test]
@@ -356,10 +308,6 @@ mod tests {
             "Read",
             &json!({"file_path": "a.rs"}),
             &host
-        ));
-        assert!(!should_aggregate_claude(
-            "Read",
-            &json!({"file_path": "a.rs"})
         ));
     }
 

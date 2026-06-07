@@ -42,6 +42,7 @@ pub use types::*;
 
 use matching::parse_pattern;
 use rate_limiter::RateLimiter;
+use read_only::split_segments_quote_aware;
 
 use tracing::debug;
 
@@ -55,6 +56,14 @@ pub struct PolicyEngine {
 
     /// Blacklist rules (checked first)
     blacklist: Vec<PolicyRule>,
+
+    /// Graylist rules (hidden/internal builtin-only `Ask` tier, Issue 3).
+    ///
+    /// Checked after the blacklist and before the whitelist. These rules are
+    /// NEVER loaded from or written to the learned-rules DB — they are populated
+    /// only by `load_builtin_rules`, so a graylist verdict can never be learned
+    /// or persisted.
+    graylist: Vec<PolicyRule>,
 
     /// Current project path (for filtering project-specific rules)
     project_path: Option<String>,
@@ -76,6 +85,7 @@ impl PolicyEngine {
         let mut engine = Self {
             whitelist: Vec::new(),
             blacklist: Vec::new(),
+            graylist: Vec::new(),
             project_path: None,
             rate_limiter: RateLimiter::new(30),
         };
@@ -89,6 +99,7 @@ impl PolicyEngine {
         Self {
             whitelist: Vec::new(),
             blacklist: Vec::new(),
+            graylist: Vec::new(),
             project_path: None,
             rate_limiter: RateLimiter::new(30),
         }
@@ -121,18 +132,44 @@ impl PolicyEngine {
         &self.blacklist
     }
 
-    /// Evaluate a command against policies
+    /// Get all graylist rules (hidden/internal builtin-only `Ask` tier).
+    pub fn graylist_rules(&self) -> &[PolicyRule] {
+        &self.graylist
+    }
+
+    /// Evaluate a command against policies (Issue 3 — ASYMMETRIC compound
+    /// matching).
     ///
-    /// Evaluation order:
-    /// 1. Check blacklist rules (deny if matched)
-    /// 2. Check whitelist rules (allow if matched)
-    /// 3. Return Ask (unknown command, needs L1 evaluation)
+    /// Evaluation order is blacklist → graylist → whitelist → fallthrough Ask,
+    /// but compound (multi-segment) handling is deliberately asymmetric so that
+    /// a single dangerous segment can never be "hidden" behind a safe one:
     ///
-    /// Returns the decision and optionally the matching rule.
+    /// 1. **Deny (blacklist):** deny if the WHOLE command matches a blacklist
+    ///    rule OR if ANY individual segment matches a blacklist rule. So
+    ///    `ls && rm -rf /` denies on the `rm -rf /` segment, and
+    ///    `git diff && rm -rf /` denies on segment 2 (it is NOT allowed just
+    ///    because `git diff` is whitelisted).
+    /// 2. **Ask (graylist):** after the deny check, return Ask if — splitting
+    ///    into segments and stripping a single leading literal `cd <one-token>`
+    ///    segment — ANY remaining segment matches a graylist rule.
+    /// 3. **Allow (whitelist):** allow ONLY if, after the same split + cd-strip,
+    ///    EVERY remaining segment individually matches a whitelist rule. Never
+    ///    "allow if any segment".
+    /// 4. **Fallthrough:** Ask (unknown command, needs Layer 1).
     pub fn evaluate(&self, tool_name: &str, command: &str) -> PolicyDecision {
-        // Check blacklist first (deny takes priority)
+        // Split into segments once (quote-aware). On unbalanced quotes the
+        // splitter returns None; we then fall back to treating the whole
+        // command as a single segment (the whole-command checks below still
+        // apply, and an unparseable command fails through to Ask).
+        let segments = split_segments_quote_aware(command).unwrap_or_default();
+
+        // 1. DENY — whole command OR any segment matches a blacklist rule.
         for rule in &self.blacklist {
-            if self.matches_rule(tool_name, command, rule) {
+            let matched_whole = self.matches_rule(tool_name, command, rule);
+            let matched_segment = segments
+                .iter()
+                .any(|seg| self.matches_rule(tool_name, seg, rule));
+            if matched_whole || matched_segment {
                 let reason = rule
                     .description
                     .clone()
@@ -145,21 +182,53 @@ impl PolicyEngine {
             }
         }
 
-        // Check whitelist (allow if matched)
-        for rule in &self.whitelist {
-            if self.matches_rule(tool_name, command, rule) {
+        // Segments to consider for graylist/whitelist matching: drop a single
+        // leading literal `cd <one-token>` segment so that `cd /repo && git diff`
+        // is judged on `git diff` alone.
+        let effective: Vec<&str> = strip_leading_cd(&segments);
+
+        // 2. ASK — any effective segment matches a graylist rule (after the deny
+        //    check has already ruled out a blacklist hit).
+        for rule in &self.graylist {
+            let matched_whole = self.matches_rule(tool_name, command, rule);
+            let matched_segment = effective
+                .iter()
+                .any(|seg| self.matches_rule(tool_name, seg, rule));
+            if matched_whole || matched_segment {
+                let reason = rule
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Matched graylist pattern: {}", rule.pattern));
                 debug!(
-                    "Whitelist match: command='{}' pattern='{}'",
+                    "Graylist match: command='{}' pattern='{}'",
                     command, rule.pattern
                 );
-                return PolicyDecision::Allow;
+                return PolicyDecision::Ask { reason };
             }
         }
 
-        // Unknown command - needs Layer 1 evaluation
+        // 3. ALLOW — every effective segment must individually match a whitelist
+        //    rule. A single non-whitelisted segment => not allowed.
+        if !effective.is_empty()
+            && effective
+                .iter()
+                .all(|seg| self.matches_any_whitelist(tool_name, seg))
+        {
+            debug!("Whitelist match (all segments): command='{}'", command);
+            return PolicyDecision::Allow;
+        }
+
+        // 4. Unknown command - needs Layer 1 evaluation.
         PolicyDecision::Ask {
             reason: "Unknown command, requires review".to_string(),
         }
+    }
+
+    /// True if `segment` matches any whitelist rule for `tool_name`.
+    fn matches_any_whitelist(&self, tool_name: &str, segment: &str) -> bool {
+        self.whitelist
+            .iter()
+            .any(|rule| self.matches_rule(tool_name, segment, rule))
     }
 
     /// Check if a command matches a rule pattern
@@ -188,6 +257,46 @@ impl PolicyEngine {
             glob_match(pattern, command)
         }
     }
+}
+
+/// Strip a single leading literal `cd <one-token>` segment from `segments`,
+/// returning the remaining segments as string slices (Issue 3).
+///
+/// The strip applies ONLY when the first segment is exactly `cd` followed by
+/// exactly ONE token that contains no shell metacharacters. So `cd /repo` is
+/// stripped, but `cd $(evil)`, `cd a b` (two tokens), and a bare `cd` are NOT
+/// stripped (they are kept so the dangerous/ambiguous form is still evaluated).
+fn strip_leading_cd(segments: &[String]) -> Vec<&str> {
+    if let Some((first, rest)) = segments.split_first()
+        && is_simple_cd_segment(first)
+        && !rest.is_empty()
+    {
+        return rest.iter().map(String::as_str).collect();
+    }
+    segments.iter().map(String::as_str).collect()
+}
+
+/// True if `segment` is a literal `cd` followed by exactly one metachar-free
+/// token (e.g. `cd /repo`, `cd src`). `cd`, `cd a b`, and `cd $(x)` are not.
+fn is_simple_cd_segment(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    let Some(arg) = trimmed.strip_prefix("cd ") else {
+        return false;
+    };
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return false;
+    }
+    // Exactly one token: no internal whitespace.
+    if arg.split_whitespace().count() != 1 {
+        return false;
+    }
+    // No shell metacharacters that could smuggle execution or expansion.
+    const METACHARS: &[char] = &[
+        '$', '`', '(', ')', '<', '>', '|', '&', ';', '*', '?', '{', '}', '[', ']', '~', '!', '\\',
+        '"', '\'',
+    ];
+    !arg.contains(METACHARS)
 }
 
 #[cfg(test)]

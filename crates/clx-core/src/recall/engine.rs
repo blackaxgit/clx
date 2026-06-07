@@ -5,13 +5,40 @@
 //! `LlmClient`, or `EmbeddingStore`; those are wired in at the call site
 //! through the adapters in `storage::recall_repo` and `recall::adapters`.
 
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::ports::{QueryEmbedder, SnapshotRepo};
 use super::{
-    RecallHit, RecallQueryConfig, RecallSearchType, decay, hybrid_merge, rerank, rrf,
-    score_from_distance,
+    RecallHit, RecallQueryConfig, RecallQueryResult, RecallSearchType, decay, hybrid_merge, rerank,
+    rrf, score_from_distance,
 };
+
+/// Outcome of a single candidate-generation stage.
+///
+/// Distinguishes "the stage ran and found nothing" (`errored == false`) from
+/// "the stage failed" (`errored == true`) so the engine can mark the overall
+/// result degraded rather than folding both into an empty vec. See
+/// [`RecallQueryResult`].
+struct StageOutcome {
+    hits: Vec<RecallHit>,
+    errored: bool,
+}
+
+impl StageOutcome {
+    fn ok(hits: Vec<RecallHit>) -> Self {
+        Self {
+            hits,
+            errored: false,
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            hits: Vec::new(),
+            errored: true,
+        }
+    }
+}
 
 /// Engine that performs hybrid search across stored snapshots.
 ///
@@ -97,25 +124,56 @@ impl<'a> RecallEngine<'a> {
     ///
     /// FTS5 runs first because it completes in <10ms, guaranteeing baseline
     /// results even if the embedding call consumes most of the timeout.
-    pub async fn query(&self, query: &str, config: &RecallQueryConfig) -> Vec<RecallHit> {
+    ///
+    /// Returns a [`RecallQueryResult`] whose `degraded` flag is set when any
+    /// candidate-generation stage (semantic embedding, vector search, FTS5,
+    /// session listing) errored. A degraded result with hits still carries
+    /// those hits (partial failure); a degraded result with no hits is
+    /// distinct from a healthy empty result — callers must not present it as
+    /// "no relevant context". When *every* attempted generator fails a single
+    /// distinct `error!` is emitted.
+    pub async fn query(&self, query: &str, config: &RecallQueryConfig) -> RecallQueryResult {
         let mut fts_hits = Vec::new();
         let mut semantic_hits = Vec::new();
+        // Track candidate-generation health: how many stages we attempted and
+        // how many of those errored. `degraded` is true when any attempted
+        // stage errored; ALL-failed (count == errored, count > 0) escalates to
+        // a distinct error! below.
+        let mut stages_attempted = 0usize;
+        let mut stages_errored = 0usize;
 
         // FTS5 first — always fast (<10ms), provides baseline results
         if config.fallback_to_fts {
-            fts_hits = self.try_fts(query, config);
+            let outcome = self.try_fts(query, config);
+            stages_attempted += 1;
+            stages_errored += usize::from(outcome.errored);
+            fts_hits = outcome.hits;
         }
 
         // Then try semantic search (may be slow due to remote embedding call)
         if let Some(embedder) = self.embedder
             && self.repo.semantic_enabled()
         {
-            semantic_hits = self.try_semantic(query, embedder, config).await;
+            let outcome = self.try_semantic(query, embedder, config).await;
+            stages_attempted += 1;
+            stages_errored += usize::from(outcome.errored);
+            semantic_hits = outcome.hits;
         }
 
         // If FTS5 was skipped and semantic found nothing, try FTS5 as last resort
         if !config.fallback_to_fts && semantic_hits.is_empty() {
-            fts_hits = self.try_fts(query, config);
+            let outcome = self.try_fts(query, config);
+            stages_attempted += 1;
+            stages_errored += usize::from(outcome.errored);
+            fts_hits = outcome.hits;
+        }
+
+        let degraded = stages_errored > 0;
+        if stages_attempted > 0 && stages_errored == stages_attempted {
+            error!(
+                "Recall degraded: all {stages_attempted} candidate-generation stage(s) failed; \
+                 results are unavailable (distinct from an empty match set)"
+            );
         }
 
         let mut fused = if config.rrf_enabled {
@@ -148,23 +206,28 @@ impl<'a> RecallEngine<'a> {
             fused = decay::apply_percentile_gate(fused, config.percentile_gate);
         }
 
-        fused
+        RecallQueryResult {
+            hits: fused,
+            degraded,
+        }
     }
 
     /// Attempt embedding-based semantic search.
     ///
-    /// Returns an empty vec on any error (logged as warning).
+    /// Returns a [`StageOutcome`] whose `errored` flag is set when the
+    /// embedding call or the vector search failed (each logged as a warning).
+    /// A successful call that simply found nothing returns `errored == false`.
     async fn try_semantic(
         &self,
         query: &str,
         embedder: &dyn QueryEmbedder,
         config: &RecallQueryConfig,
-    ) -> Vec<RecallHit> {
+    ) -> StageOutcome {
         let embedding = match embedder.embed_query(query).await {
             Ok(emb) => emb,
             Err(e) => {
                 warn!("Recall semantic embedding failed: {e}");
-                return Vec::new();
+                return StageOutcome::failed();
             }
         };
 
@@ -179,13 +242,13 @@ impl<'a> RecallEngine<'a> {
             Ok(results) => results,
             Err(e) => {
                 warn!("Recall vector search failed: {e}");
-                return Vec::new();
+                return StageOutcome::failed();
             }
         };
 
         if similar.is_empty() {
             debug!("No similar embeddings found for recall");
-            return Vec::new();
+            return StageOutcome::ok(Vec::new());
         }
 
         debug!("Found {} similar embeddings for recall", similar.len());
@@ -224,18 +287,23 @@ impl<'a> RecallEngine<'a> {
             }
         }
 
-        hits
+        StageOutcome::ok(hits)
     }
 
     /// Attempt FTS5 search with substring fallback.
-    fn try_fts(&self, query: &str, config: &RecallQueryConfig) -> Vec<RecallHit> {
+    ///
+    /// Returns a [`StageOutcome`]. The stage is marked `errored` only when the
+    /// underlying candidate generators fail: an FTS5 error that then falls
+    /// through to a *successful* substring scan is not degraded (we recovered),
+    /// but an FTS5 error followed by a session-list error is.
+    fn try_fts(&self, query: &str, config: &RecallQueryConfig) -> StageOutcome {
         let fetch_limit = config.max_results * 2;
 
         // Try FTS5 first
-        match self.repo.search_fts(query, fetch_limit) {
+        let fts_errored = match self.repo.search_fts(query, fetch_limit) {
             Ok(fts_results) if !fts_results.is_empty() => {
                 debug!("FTS5 recall returned {} results", fts_results.len());
-                return fts_results
+                let hits = fts_results
                     .into_iter()
                     .filter_map(|(snapshot, bm25_score)| {
                         let snapshot_id = snapshot.id?;
@@ -250,21 +318,33 @@ impl<'a> RecallEngine<'a> {
                         })
                     })
                     .collect();
+                return StageOutcome::ok(hits);
             }
             Ok(_) => {
                 debug!("FTS5 recall returned no results, trying substring fallback");
+                false
             }
             Err(e) => {
                 warn!("FTS5 recall failed, trying substring fallback: {e}");
+                true
             }
-        }
+        };
 
-        // Substring fallback
-        self.try_substring_fallback(query, fetch_limit)
+        // Substring fallback. If FTS5 itself errored, the stage is degraded even
+        // when the cruder fallback finds hits — the caller must learn the primary
+        // lexical index failed, not silently accept a lower-quality result.
+        let mut outcome = self.try_substring_fallback(query, fetch_limit);
+        if fts_errored {
+            outcome.errored = true;
+        }
+        outcome
     }
 
     /// Fallback substring search across active sessions.
-    fn try_substring_fallback(&self, query: &str, limit: usize) -> Vec<RecallHit> {
+    ///
+    /// Returns a [`StageOutcome`] marked `errored` when the session listing
+    /// fails (the last candidate source for this stage).
+    fn try_substring_fallback(&self, query: &str, limit: usize) -> StageOutcome {
         let query_lower = query.chars().take(500).collect::<String>().to_lowercase();
         let mut hits = Vec::new();
 
@@ -272,7 +352,7 @@ impl<'a> RecallEngine<'a> {
             Ok(s) => s,
             Err(e) => {
                 warn!("Failed to list sessions for substring recall: {e}");
-                return Vec::new();
+                return StageOutcome::failed();
             }
         };
 
@@ -303,12 +383,12 @@ impl<'a> RecallEngine<'a> {
                     }
 
                     if hits.len() >= limit {
-                        return hits;
+                        return StageOutcome::ok(hits);
                     }
                 }
             }
         }
 
-        hits
+        StageOutcome::ok(hits)
     }
 }

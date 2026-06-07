@@ -317,7 +317,7 @@ async fn evaluate(
             .filter_map(|logical| seeded.id_map.get(logical).copied())
             .collect();
 
-        let hits = engine.query(&pair.query, config).await;
+        let hits = engine.query(&pair.query, config).await.hits;
         let retrieved: HashSet<i64> = hits.iter().map(|h| h.snapshot_id).collect();
 
         let inter = retrieved.intersection(&expected_actual).count() as f64;

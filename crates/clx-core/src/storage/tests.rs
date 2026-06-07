@@ -927,10 +927,10 @@ fn test_analytics_with_project_filter() {
 // =========================================================================
 
 #[test]
-fn test_schema_version_is_8() {
+fn test_schema_version_is_9() {
     let storage = create_test_storage();
     let version = storage.schema_version().unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]

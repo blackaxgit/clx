@@ -33,7 +33,7 @@ pub(crate) mod types;
 mod tests;
 
 pub use router::{
-    CLAUDE_PROVENANCE_ENV_VARS, HookDeps, HookExit, Provenance, classify_provenance, handle_event,
+    CLAUDE_PROVENANCE_ENV_VARS, HookExit, Provenance, classify_provenance, handle_event,
 };
 
 /// Test-only seam exposing the P7 canonical tool-name adapter to integration

@@ -139,7 +139,7 @@ async fn rrf_enabled_returns_ranked_fts_results() {
         rrf_enabled: true,
         ..cfg()
     };
-    let hits = engine.query("authentication", &config).await;
+    let hits = engine.query("authentication", &config).await.hits;
     assert!(!hits.is_empty(), "RRF path must find the seeded snapshot");
     assert_eq!(hits[0].session_id, "sess-recall-1");
 }
@@ -161,7 +161,8 @@ async fn legacy_linear_merge_returns_results_for_rollback_contract() {
                 ..cfg()
             },
         )
-        .await;
+        .await
+        .hits;
     let legacy_hits = engine
         .query(
             "redis",
@@ -170,7 +171,8 @@ async fn legacy_linear_merge_returns_results_for_rollback_contract() {
                 ..cfg()
             },
         )
-        .await;
+        .await
+        .hits;
 
     assert!(!rrf_hits.is_empty(), "rrf path returns the hit");
     assert!(
@@ -260,7 +262,7 @@ async fn engine_skips_reranker_when_disabled_in_config() {
         reranker_enabled: false,
         ..cfg()
     };
-    let hits = engine.query("graphql", &config).await;
+    let hits = engine.query("graphql", &config).await.hits;
     assert!(!hits.is_empty());
     assert_eq!(
         *backend.calls.lock().unwrap(),
@@ -284,7 +286,7 @@ async fn percentile_gate_zero_is_passthrough() {
         percentile_gate: 0,
         ..cfg()
     };
-    let hits = engine.query("pipeline", &config).await;
+    let hits = engine.query("pipeline", &config).await.hits;
     assert!(
         !hits.is_empty(),
         "percentile=0 must not drop the only matching hit"
@@ -302,7 +304,7 @@ async fn percentile_gate_single_hit_passthrough() {
         percentile_gate: 90,
         ..cfg()
     };
-    let hits = engine.query("migration", &config).await;
+    let hits = engine.query("migration", &config).await.hits;
     assert_eq!(hits.len(), 1, "single hit must survive the p90 gate");
 }
 
@@ -322,7 +324,8 @@ async fn time_decay_does_not_amplify_fresh_snapshot() {
                 ..cfg()
             },
         )
-        .await;
+        .await
+        .hits;
     let with_decay = engine
         .query(
             "tokio",
@@ -331,7 +334,8 @@ async fn time_decay_does_not_amplify_fresh_snapshot() {
                 ..cfg()
             },
         )
-        .await;
+        .await
+        .hits;
     assert_eq!(no_decay.len(), 1);
     assert_eq!(with_decay.len(), 1);
     assert!(
@@ -352,7 +356,7 @@ async fn empty_store_returns_no_hits() {
     let storage = Storage::open_in_memory().unwrap();
     let repo = StorageSnapshotRepo::new(&storage, None);
     let engine = RecallEngine::new(&repo);
-    let hits = engine.query("anything", &cfg()).await;
+    let hits = engine.query("anything", &cfg()).await.hits;
     assert!(hits.is_empty(), "empty store must yield zero hits");
 }
 
@@ -364,7 +368,7 @@ async fn no_embeddings_provider_falls_back_to_fts_only() {
     let repo = StorageSnapshotRepo::new(&storage, None);
     // No embedder attached at all.
     let engine = RecallEngine::new(&repo);
-    let hits = engine.query("kubernetes", &cfg()).await;
+    let hits = engine.query("kubernetes", &cfg()).await.hits;
     assert!(!hits.is_empty(), "FTS5-only path must still return results");
     assert!(
         matches!(
@@ -466,7 +470,7 @@ async fn semantic_path_runs_via_llm_query_embedder_adapter() {
         fallback_to_fts: false,
         ..cfg()
     };
-    let hits = engine.query("vector search", &config).await;
+    let hits = engine.query("vector search", &config).await.hits;
     assert!(
         hits.iter().any(|h| h.snapshot_id == snapshot_id),
         "semantic adapter path must surface the embedded snapshot"
@@ -493,7 +497,7 @@ async fn risk_m_r2_recall_default_is_rrf_not_legacy_linear() {
         "RISK M-R2: domain default must be RRF (rrf_enabled=true), \
          confirming the stale 0.6/0.4 doc comment is drift, not behavior"
     );
-    let hits = engine.query("risk", &default_cfg).await;
+    let hits = engine.query("risk", &default_cfg).await.hits;
     assert!(!hits.is_empty(), "default (RRF) recall returns the hit");
 }
 
@@ -517,6 +521,14 @@ struct FakeRepo {
     snapshots: std::collections::HashMap<i64, Snapshot>,
     stored_model: Option<String>,
     model_errors: bool,
+    /// Force `search_fts` to error (drives the FTS5 candidate-stage failure
+    /// path for FIX-6 degraded-signal tests).
+    fts_errors: bool,
+    /// Force `semantic_similar` to error (drives the vector-search failure).
+    semantic_errors: bool,
+    /// Force `list_active_sessions` to error (drives the substring-fallback
+    /// failure that makes the FTS stage report degraded).
+    sessions_errors: bool,
 }
 
 impl FakeRepo {
@@ -531,6 +543,9 @@ impl FakeRepo {
 
 impl SnapshotRepo for FakeRepo {
     fn search_fts(&self, _q: &str, _limit: usize) -> clx_core::Result<Vec<(Snapshot, f64)>> {
+        if self.fts_errors {
+            return Err(clx_core::Error::ContextNotFound("forced fts error".into()));
+        }
         Ok(Vec::new())
     }
     fn recent_session_summaries(
@@ -541,6 +556,11 @@ impl SnapshotRepo for FakeRepo {
         Ok(Vec::new())
     }
     fn semantic_similar(&self, _emb: &[f32], _limit: usize) -> clx_core::Result<Vec<(i64, f32)>> {
+        if self.semantic_errors {
+            return Err(clx_core::Error::ContextNotFound(
+                "forced vector search error".into(),
+            ));
+        }
         Ok(self.similar.clone())
     }
     fn semantic_enabled(&self) -> bool {
@@ -550,6 +570,11 @@ impl SnapshotRepo for FakeRepo {
         Ok(self.snapshots.get(&id).cloned())
     }
     fn list_active_sessions(&self) -> clx_core::Result<Vec<Session>> {
+        if self.sessions_errors {
+            return Err(clx_core::Error::ContextNotFound(
+                "forced session-list error".into(),
+            ));
+        }
         Ok(Vec::new())
     }
     fn snapshots_by_session(&self, _session_id: &str) -> clx_core::Result<Vec<Snapshot>> {
@@ -606,7 +631,7 @@ async fn semantic_distance_threshold_filters_far_candidates() {
         ..cfg()
     };
 
-    let hits = engine.query("q", &config).await;
+    let hits = engine.query("q", &config).await.hits;
     let ids: Vec<i64> = hits.iter().map(|h| h.snapshot_id).collect();
     assert!(ids.contains(&1), "near candidate (d=0.5) must be kept");
     assert!(
@@ -636,7 +661,7 @@ async fn semantic_skips_candidate_with_missing_snapshot() {
         ..cfg()
     };
 
-    let hits = engine.query("q", &config).await;
+    let hits = engine.query("q", &config).await.hits;
     let ids: Vec<i64> = hits.iter().map(|h| h.snapshot_id).collect();
     assert_eq!(ids, vec![1], "dangling candidate id 99 must be skipped");
 }
@@ -660,10 +685,153 @@ async fn semantic_embed_error_degrades_gracefully() {
         ..cfg()
     };
 
-    let hits = engine.query("q", &config).await;
+    let result = engine.query("q", &config).await;
     assert!(
-        hits.is_empty(),
-        "embed failure must yield no semantic hits (graceful degrade), got {hits:?}"
+        result.hits.is_empty(),
+        "embed failure must yield no semantic hits (graceful degrade), got {:?}",
+        result.hits
+    );
+    assert!(
+        result.degraded,
+        "embed failure is a candidate-stage error and must mark the result degraded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX-6: degraded vs healthy-empty signal (REL-03)
+// ---------------------------------------------------------------------------
+
+/// FIX-6 regression — ALL candidate-generation stages erroring must return a
+/// *degraded* result with empty hits, NOT a silent healthy-empty result.
+///
+/// Fails-before: the old `query` returned a bare `Vec<RecallHit>` and folded
+/// every stage error to an empty vec, so this state was indistinguishable from
+/// a genuine no-match. There was no `degraded` field to assert. Passes-after:
+/// `RecallQueryResult.degraded` is `true` because both the FTS stage (FTS5 err
+/// then session-list err) and the semantic stage (vector-search err) failed.
+#[tokio::test]
+async fn fix6_all_stages_error_marks_degraded_not_empty() {
+    let repo = FakeRepo {
+        semantic_on: true,
+        fts_errors: true,
+        sessions_errors: true,
+        semantic_errors: true,
+        ..Default::default()
+    };
+    let embedder = FakeEmbedder { fail: false };
+    let engine = RecallEngine::new(&repo).with_embedder(&embedder);
+    let config = RecallQueryConfig {
+        fallback_to_fts: true,
+        ..cfg()
+    };
+
+    let result = engine.query("q", &config).await;
+    assert!(
+        result.hits.is_empty(),
+        "a broken store yields no hits, got {:?}",
+        result.hits
+    );
+    assert!(
+        result.degraded,
+        "all candidate stages errored — result MUST be degraded (broken store), \
+         distinct from a healthy empty query"
+    );
+}
+
+/// FIX-6 regression — the healthy contrast: a working store with no matching
+/// content returns `degraded == false`. This is the value the degraded flag
+/// must distinguish from the broken-store case above.
+///
+/// Fails-before: there was no `degraded` field, so degraded-empty and
+/// healthy-empty were the same `Vec`. Passes-after: no stage errors, so
+/// `degraded` stays `false`.
+#[tokio::test]
+async fn fix6_healthy_empty_is_not_degraded() {
+    let repo = FakeRepo {
+        semantic_on: true,
+        similar: Vec::new(), // no candidates, but the call succeeds
+        ..Default::default()
+    };
+    let embedder = FakeEmbedder { fail: false };
+    let engine = RecallEngine::new(&repo).with_embedder(&embedder);
+    let config = RecallQueryConfig {
+        fallback_to_fts: true,
+        ..cfg()
+    };
+
+    let result = engine.query("q", &config).await;
+    assert!(result.hits.is_empty(), "no content seeded — expect empty");
+    assert!(
+        !result.degraded,
+        "a healthy store with no matches must NOT be degraded"
+    );
+}
+
+/// FIX-6 regression — partial failure: one stage errors, the other returns
+/// hits. The hits survive AND the result is marked degraded.
+///
+/// Fails-before: no degraded field; a caller could not tell the result was
+/// partial. Passes-after: semantic stage errors (degraded), FTS stage returns
+/// a hit (survives).
+#[tokio::test]
+async fn fix6_partial_failure_returns_hits_but_degraded() {
+    struct FtsHitRepo {
+        inner: FakeRepo,
+    }
+    impl SnapshotRepo for FtsHitRepo {
+        fn search_fts(&self, _q: &str, _l: usize) -> clx_core::Result<Vec<(Snapshot, f64)>> {
+            Ok(vec![(FakeRepo::snap(7, "surviving fts hit"), 0.9)])
+        }
+        fn recent_session_summaries(
+            &self,
+            n: usize,
+            x: Option<&str>,
+        ) -> clx_core::Result<Vec<SessionSummary>> {
+            self.inner.recent_session_summaries(n, x)
+        }
+        fn semantic_similar(&self, e: &[f32], l: usize) -> clx_core::Result<Vec<(i64, f32)>> {
+            self.inner.semantic_similar(e, l)
+        }
+        fn semantic_enabled(&self) -> bool {
+            self.inner.semantic_enabled()
+        }
+        fn snapshot_by_id(&self, id: i64) -> clx_core::Result<Option<Snapshot>> {
+            self.inner.snapshot_by_id(id)
+        }
+        fn list_active_sessions(&self) -> clx_core::Result<Vec<Session>> {
+            self.inner.list_active_sessions()
+        }
+        fn snapshots_by_session(&self, s: &str) -> clx_core::Result<Vec<Snapshot>> {
+            self.inner.snapshots_by_session(s)
+        }
+        fn current_embedding_model(&self) -> clx_core::Result<Option<String>> {
+            self.inner.current_embedding_model()
+        }
+    }
+
+    let repo = FtsHitRepo {
+        inner: FakeRepo {
+            semantic_on: true,
+            semantic_errors: true, // vector search fails
+            ..Default::default()
+        },
+    };
+    let embedder = FakeEmbedder { fail: false };
+    let engine = RecallEngine::new(&repo).with_embedder(&embedder);
+    let config = RecallQueryConfig {
+        fallback_to_fts: true,
+        ..cfg()
+    };
+
+    let result = engine.query("q", &config).await;
+    assert!(
+        result.hits.iter().any(|h| h.snapshot_id == 7),
+        "the surviving FTS hit must still be returned on partial failure, got {:?}",
+        result.hits
+    );
+    assert!(
+        result.degraded,
+        "the failed semantic stage must mark the partial result degraded"
     );
 }
 

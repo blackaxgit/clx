@@ -820,11 +820,13 @@ mod render_snapshots {
                 provider: "local-ollama".to_string(),
                 model: "qwen3:1.7b".to_string(),
                 fallback: None,
+                dimension: None,
             },
             embeddings: clx_core::config::CapabilityRoute {
                 provider: "local-ollama".to_string(),
                 model: "qwen3-embedding:0.6b".to_string(),
                 fallback: None,
+                dimension: None,
             },
         });
         app.settings_editing_config = Some(cfg.clone());

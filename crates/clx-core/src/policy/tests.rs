@@ -99,6 +99,22 @@ fn test_glob_command_colon_format() {
 }
 
 #[test]
+fn test_glob_colon_symmetry() {
+    // FIX-4: `:` is normalized to space in BOTH pattern and text, so a
+    // literal-colon command is matched by a literal-colon pattern (e.g. an
+    // npm script name with a `:` in it).
+    assert!(
+        glob_match("npm run build:prod", "npm run build:prod"),
+        "colon-bearing pattern must match colon-bearing command"
+    );
+    // Wildcards still compose with the colon normalization.
+    assert!(
+        glob_match("npm run build:*", "npm run build:prod"),
+        "wildcard after a colon segment must still match"
+    );
+}
+
+#[test]
 fn test_glob_empty_patterns() {
     assert!(glob_match("", ""));
     assert!(!glob_match("", "text"));
@@ -1152,59 +1168,53 @@ fn test_is_read_only_composite_commands() {
 // =========================================================================
 
 #[test]
-fn test_shell_escape_blacklist() {
+fn test_shell_escape_graylist_and_blacklist() {
+    // Issue 3 reclassification: over-broad shell-escape / expansion constructs
+    // (backtick, process substitution, `${:-}`, source/eval/exec) are now the
+    // builtin GRAYLIST tier => Ask (not Deny). Genuinely destructive forms
+    // (xargs rm, destructive python/perl one-liners) stay hard Deny.
     let engine = PolicyEngine::new();
 
-    // Backtick command substitution
+    // Backtick command substitution => Ask (was Deny).
     let result = engine.evaluate("Bash", "ls `whoami`");
     assert!(
-        matches!(result, PolicyDecision::Deny { .. }),
-        "Backtick command substitution should be denied"
+        matches!(result, PolicyDecision::Ask { .. }),
+        "Backtick command substitution should now Ask (graylist), got {result:?}"
     );
 
-    // Process substitution - already caught by is_read_only_command
-    // These are detected in Layer 0 logic, not by blacklist patterns
-
-    // Eval command
+    // Eval command => Ask (was Deny).
     let result = engine.evaluate("Bash", "eval dangerous_command");
     assert!(
-        matches!(result, PolicyDecision::Deny { .. }),
-        "Eval command should be denied"
+        matches!(result, PolicyDecision::Ask { .. }),
+        "Eval command should now Ask (graylist), got {result:?}"
     );
 
-    // Exec command
+    // Exec command => Ask (was Deny).
     let result = engine.evaluate("Bash", "exec malicious_script");
     assert!(
-        matches!(result, PolicyDecision::Deny { .. }),
-        "Exec command should be denied"
+        matches!(result, PolicyDecision::Ask { .. }),
+        "Exec command should now Ask (graylist), got {result:?}"
     );
 
-    // Source command
+    // Source command => Ask (was Deny).
     let result = engine.evaluate("Bash", "source malicious.sh");
     assert!(
-        matches!(result, PolicyDecision::Deny { .. }),
-        "Source command should be denied"
+        matches!(result, PolicyDecision::Ask { .. }),
+        "Source command should now Ask (graylist), got {result:?}"
     );
 
-    // Xargs with rm
+    // Xargs with rm stays Deny (hard blacklist).
     let result = engine.evaluate("Bash", "find . | xargs rm");
     assert!(
         matches!(result, PolicyDecision::Deny { .. }),
-        "Xargs with rm should be denied"
+        "Xargs with rm should be denied, got {result:?}"
     );
 
-    // Python one-liner with os module
-    let result = engine.evaluate("Bash", "python -c 'import os; print(1)'");
-    assert!(
-        matches!(result, PolicyDecision::Deny { .. }),
-        "Python one-liner with os module should be denied"
-    );
-
-    // Perl one-liner with system keyword
+    // Perl one-liner with system keyword stays Deny.
     let result = engine.evaluate("Bash", "perl -e 'system ls'");
     assert!(
         matches!(result, PolicyDecision::Deny { .. }),
-        "Perl one-liner with system should be denied"
+        "Perl one-liner with system should be denied, got {result:?}"
     );
 }
 
@@ -2456,4 +2466,316 @@ fn test_cache_periodic_cleanup_prunes_on_hundredth_access() {
         0,
         "the 100th-access periodic sweep must have pruned the expired entry"
     );
+}
+
+// =========================================================================
+// Issue 3 — graylist tier + asymmetric compound matching
+// =========================================================================
+
+// AC3.1: `cd /repo && git diff` is allowed (the leading literal `cd <token>`
+// segment is stripped, and the remaining `git diff` segment is whitelisted).
+#[test]
+fn ac3_1_cd_then_git_diff_is_allowed() {
+    let engine = PolicyEngine::new();
+    assert_eq!(
+        engine.evaluate("Bash", "cd /repo && git diff"),
+        PolicyDecision::Allow,
+        "cd <token> && <whitelisted> must be allowed"
+    );
+}
+
+// AC3.2: a reclassified construct (backtick) is now Ask, not Deny.
+#[test]
+fn ac3_2_backtick_is_ask_not_deny() {
+    let engine = PolicyEngine::new();
+    let result = engine.evaluate("Bash", "ls `whoami`");
+    assert!(
+        matches!(result, PolicyDecision::Ask { .. }),
+        "backtick is graylist => Ask, got {result:?}"
+    );
+}
+
+// AC3.3: `ls && rm -rf /` denies via the per-segment blacklist match on the
+// `rm -rf /` segment (the whole-command glob alone would miss it).
+#[test]
+fn ac3_3_per_segment_blacklist_denies() {
+    let engine = PolicyEngine::new();
+    let result = engine.evaluate("Bash", "ls && rm -rf /");
+    assert!(
+        matches!(result, PolicyDecision::Deny { .. }),
+        "per-segment blacklist must deny rm -rf / segment, got {result:?}"
+    );
+}
+
+// AC3.3 (companion): `git diff && rm -rf /` is DENY, NOT Allow — the whitelist
+// must not fire on a "safe first segment", and the dangerous segment denies.
+#[test]
+fn ac3_3_whitelisted_first_segment_does_not_allow_dangerous_second() {
+    let engine = PolicyEngine::new();
+    let result = engine.evaluate("Bash", "git diff && rm -rf /");
+    assert!(
+        matches!(result, PolicyDecision::Deny { .. }),
+        "must NOT allow on safe first segment; must deny on rm -rf /, got {result:?}"
+    );
+    assert_ne!(
+        engine.evaluate("Bash", "git diff && rm -rf /"),
+        PolicyDecision::Allow,
+        "git diff && rm -rf / must never be Allow"
+    );
+}
+
+// AC3.3 (companion): a non-whitelisted-but-safe trailing segment is not denied
+// and not allowed — it falls through to Ask (every-segment-whitelisted fails).
+#[test]
+fn ac3_3_partial_whitelist_falls_through_to_ask() {
+    let engine = PolicyEngine::new();
+    // `git diff` is whitelisted; `some_unknown_cmd` is neither listed.
+    let result = engine.evaluate("Bash", "git diff && some_unknown_cmd");
+    assert!(
+        matches!(result, PolicyDecision::Ask { .. }),
+        "a non-whitelisted safe segment must prevent Allow => Ask, got {result:?}"
+    );
+}
+
+// AC3.4: `${VAR:-x}` default-expansion is no longer hard-denied (graylist =>
+// Ask), and a benign `python -c 'import os; print(...)'` is not denied.
+#[test]
+fn ac3_4_default_expansion_and_bare_import_os_not_denied() {
+    let engine = PolicyEngine::new();
+
+    let result = engine.evaluate("Bash", "echo ${VAR:-default}");
+    assert!(
+        !matches!(result, PolicyDecision::Deny { .. }),
+        "${{VAR:-x}} must not be hard-denied, got {result:?}"
+    );
+
+    let result = engine.evaluate("Bash", "python -c 'import os; print(os.getcwd())'");
+    assert!(
+        !matches!(result, PolicyDecision::Deny { .. }),
+        "bare `import os` python one-liner must not be denied, got {result:?}"
+    );
+}
+
+// AC3.4 (companion): genuinely destructive python one-liners stay Deny.
+#[test]
+fn ac3_4_destructive_python_one_liners_still_deny() {
+    let engine = PolicyEngine::new();
+    for cmd in [
+        "python -c 'import os; os.system(\"rm -rf /\")'",
+        "python -c 'import os; os.remove(\"/etc/passwd\")'",
+        "python -c 'import shutil; shutil.rmtree(\"/\")'",
+        "python -c 'import subprocess; subprocess.run([\"rm\"])'",
+    ] {
+        let result = engine.evaluate("Bash", cmd);
+        assert!(
+            matches!(result, PolicyDecision::Deny { .. }),
+            "destructive python one-liner must deny: {cmd} => {result:?}"
+        );
+    }
+}
+
+// AC3.5: a `cd` with a command-substitution argument is NOT stripped, so the
+// `cd $(evil)` segment remains and the command does not get allowed via the
+// trailing safe segment.
+#[test]
+fn ac3_5_cd_with_substitution_not_stripped() {
+    let engine = PolicyEngine::new();
+    // `cd $(evil)` is not a simple cd, so it is NOT stripped; it remains an
+    // effective segment. `$(evil)` is not whitelisted, so the all-segments
+    // whitelist check fails => not Allow. (And the `$(` is not a graylist
+    // construct here, so the result is Ask via fallthrough.)
+    let result = engine.evaluate("Bash", "cd $(evil) && git diff");
+    assert_ne!(
+        result,
+        PolicyDecision::Allow,
+        "cd $(evil) must not be stripped; must not Allow, got {result:?}"
+    );
+}
+
+// AC3.5 (helper unit): the cd-strip predicate only strips literal `cd <token>`.
+#[test]
+fn ac3_5_is_simple_cd_segment_predicate() {
+    assert!(super::is_simple_cd_segment("cd /repo"));
+    assert!(super::is_simple_cd_segment("cd src"));
+    assert!(!super::is_simple_cd_segment("cd")); // bare cd, no token
+    assert!(!super::is_simple_cd_segment("cd a b")); // two tokens
+    assert!(!super::is_simple_cd_segment("cd $(x)")); // substitution
+    assert!(!super::is_simple_cd_segment("cd ~")); // metachar
+    assert!(!super::is_simple_cd_segment("cda")); // not the cd builtin
+}
+
+// Graylist is hidden/internal builtin-only: a graylist rule string must never
+// be representable in the DB RuleType, and load_learned_rules must never
+// produce a graylist rule. `RuleType::parse("graylist")` fails open to Allow,
+// which is exactly why graylist must never be written to the DB.
+#[test]
+fn graylist_never_round_trips_through_learned_rules_ruletype() {
+    use crate::storage::Storage;
+    use crate::types::{LearnedRule, RuleType};
+
+    // The DB rule type has no graylist variant; parsing "graylist" yields the
+    // default (Allow), proving why a graylist string must never be persisted.
+    assert_eq!(RuleType::parse("graylist"), RuleType::Allow);
+    assert_eq!(RuleType::Allow.as_str(), "allow");
+    assert_eq!(RuleType::Deny.as_str(), "deny");
+
+    // Even if a "graylist"-looking pattern is somehow stored, load only ever
+    // produces whitelist/blacklist rules — never a graylist rule.
+    let storage = Storage::open_in_memory().unwrap();
+    storage
+        .add_rule(&LearnedRule::new(
+            "graylist-shaped:*".to_string(),
+            RuleType::Allow,
+            "user_decision".to_string(),
+        ))
+        .unwrap();
+
+    let mut engine = PolicyEngine::empty();
+    engine.load_learned_rules(&storage).unwrap();
+    assert!(
+        engine.graylist_rules().is_empty(),
+        "load_learned_rules must never populate the graylist tier"
+    );
+}
+
+// The builtin graylist tier is populated by the builtin loader and the
+// reclassified constructs live there (not the blacklist).
+#[test]
+fn builtin_graylist_is_populated_and_reclassified() {
+    let engine = PolicyEngine::new();
+    assert!(
+        !engine.graylist_rules().is_empty(),
+        "builtin graylist must be populated"
+    );
+    // eval/backtick are graylist, not blacklist.
+    assert!(
+        engine
+            .blacklist_rules()
+            .iter()
+            .all(|r| !r.pattern.contains("eval ")),
+        "eval must no longer be a blacklist rule"
+    );
+}
+
+// =========================================================================
+// Issue 4 — redirection deny + narrowed dot-claude rule (policy layer)
+// =========================================================================
+
+// AC4.1: redirects / writes into protected config dirs are denied.
+#[test]
+fn ac4_1_redirects_into_protected_dirs_deny() {
+    let engine = PolicyEngine::new();
+    let clx = concat!(".", "clx");
+    let codex = concat!(".", "codex");
+    let cursor = concat!(".", "cursor");
+    let claude = concat!(".", "claude");
+    for cmd in [
+        format!("echo evil > /home/u/{clx}/config.yaml"),
+        format!("echo evil >> /home/u/{clx}/config.yaml"),
+        format!("echo x >/home/u/{codex}/config.toml"),
+        format!("cat src | tee /home/u/{cursor}/hooks.json"),
+        format!("cp evil.sh /home/u/{claude}/hooks/h.sh"),
+        format!("mv evil.sh /home/u/{codex}/x"),
+        format!("dd if=/dev/zero of=/home/u/{clx}/db.sqlite"),
+    ] {
+        let result = engine.evaluate("Bash", &cmd);
+        assert!(
+            matches!(result, PolicyDecision::Deny { .. }),
+            "redirect/write into protected dir must deny: {cmd} => {result:?}"
+        );
+    }
+}
+
+// AC4.4: an ordinary redirect into /tmp is unaffected (not denied by the
+// protected-dir rules). It is not read-only so it is not Allow; it falls
+// through to Ask.
+#[test]
+fn ac4_4_redirect_into_tmp_not_denied() {
+    let engine = PolicyEngine::new();
+    let result = engine.evaluate("Bash", "echo x > /tmp/y");
+    assert!(
+        !matches!(result, PolicyDecision::Deny { .. }),
+        "redirect into /tmp must not be denied, got {result:?}"
+    );
+}
+
+// AC4.3: FileEdit into the sensitive dot-claude targets is still denied.
+#[test]
+fn ac4_3_fileedit_sensitive_dot_claude_targets_deny() {
+    let engine = PolicyEngine::new();
+    let claude = concat!("/.", "claude/");
+    for path in [
+        format!("/home/u/{claude}settings.json"),
+        format!("/home/u/{claude}settings.local.json"),
+        format!("/home/u/{claude}hooks/pre.sh"),
+    ] {
+        let result = engine.evaluate("FileEdit", &path);
+        assert!(
+            matches!(result, PolicyDecision::Deny { .. }),
+            "FileEdit into sensitive dot-claude target must deny: {path} => {result:?}"
+        );
+    }
+}
+
+// AC4.2 (policy-layer slice): a non-sensitive dot-claude path (CLAUDE.md) is
+// NOT denied by the narrowed policy rule. (The authoritative ALLOW assertion
+// lives in the hook-guard batch.)
+#[test]
+fn ac4_2_fileedit_ordinary_dot_claude_not_denied_by_policy() {
+    let engine = PolicyEngine::new();
+    let claude = concat!("/.", "claude/");
+    let result = engine.evaluate("FileEdit", &format!("/home/u/{claude}CLAUDE.md"));
+    assert!(
+        !matches!(result, PolicyDecision::Deny { .. }),
+        "FileEdit into dot-claude CLAUDE.md must NOT be denied by the narrowed policy rule, got {result:?}"
+    );
+}
+
+// AC4.2 (Bash-redirect slice): a redirect into a non-sensitive dot-claude path
+// (memory) must NOT be denied, while a redirect into a sensitive target IS
+// denied — the redirection rules mirror the narrowed FileEdit guard.
+#[test]
+fn ac4_2_bash_redirect_into_dot_claude_memory_not_denied() {
+    let engine = PolicyEngine::new();
+    let claude = concat!("/.", "claude/");
+    // Memory write must be allowed (not denied) by the narrowed redirection rules.
+    let memory = engine.evaluate("Bash", &format!("echo note > /home/u/{claude}CLAUDE.md"));
+    assert!(
+        !matches!(memory, PolicyDecision::Deny { .. }),
+        "redirect into dot-claude memory must NOT be denied, got {memory:?}"
+    );
+    // Sensitive targets must still be denied.
+    for cmd in [
+        format!("echo x > /home/u/{claude}settings.json"),
+        format!("echo x >> /home/u/{claude}settings.local.json"),
+        format!("cat s | tee /home/u/{claude}hooks/h.sh"),
+    ] {
+        let r = engine.evaluate("Bash", &cmd);
+        assert!(
+            matches!(r, PolicyDecision::Deny { .. }),
+            "redirect into sensitive dot-claude target must deny: {cmd} => {r:?}"
+        );
+    }
+}
+
+// =========================================================================
+// Issue 10.1 — extend the read-only allow-set
+// =========================================================================
+
+#[test]
+fn ac10_1_new_read_only_tools() {
+    assert!(is_read_only_command("cd /x"));
+    assert!(is_read_only_command("cd src"));
+    assert!(is_read_only_command("sort file.txt"));
+    assert!(is_read_only_command("uniq file.txt"));
+    assert!(is_read_only_command("cut -f1 file.txt"));
+    assert!(is_read_only_command("column -t file.txt"));
+}
+
+#[test]
+fn ac10_1_sort_output_flag_not_read_only() {
+    // -o / --output write to a file => NOT read-only, in any form.
+    assert!(!is_read_only_command("sort -o out.txt in.txt"));
+    assert!(!is_read_only_command("sort --output=out.txt in.txt"));
+    assert!(!is_read_only_command("sort -oout.txt in.txt"));
 }

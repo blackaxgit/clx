@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 8;
+pub(super) const SCHEMA_VERSION: i32 = 9;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -96,6 +96,10 @@ impl Storage {
                 self.migrate_to_v8()?;
             }
 
+            if current_version < 9 {
+                self.migrate_to_v9()?;
+            }
+
             self.conn.execute(
                 "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
                 [SCHEMA_VERSION],
@@ -149,7 +153,12 @@ impl Storage {
     }
 
     /// Migrate to schema version 1
+    ///
+    /// Wrapped in a transaction so the whole base-schema step commits
+    /// atomically, matching v2-v8. `IF NOT EXISTS` keeps it idempotent.
     pub(super) fn migrate_to_v1(&self) -> crate::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
         self.conn.execute_batch(
             "
             -- Sessions table
@@ -252,6 +261,7 @@ impl Storage {
             ",
         )?;
 
+        tx.commit()?;
         info!("Completed migration to schema version 1");
         Ok(())
     }
@@ -476,6 +486,69 @@ impl Storage {
         info!("Completed migration to schema version 8 (per-row agent host column)");
         Ok(())
     }
+
+    /// Migrate to schema version 9 - purge secret-bearing and malformed
+    /// learned rules (Issue 1).
+    ///
+    /// Earlier CLX builds could persist a `learned_rules` row whose `pattern`
+    /// embedded a credential (e.g. `Bash(SSHPASS=...:*)`) or was otherwise
+    /// malformed/over-broad (e.g. `Bash(true;:*)`). The hook now gates these at
+    /// write time, but existing databases may already carry such rows. This
+    /// migration scrubs them retroactively, of ANY source (a manually-added
+    /// `source="cli"` secret rule SHOULD also be purged). Well-formed wildcard
+    /// or path rules (e.g. `Bash(npm run build*)`) survive because
+    /// `is_well_formed_pattern` allows `*` and `/`.
+    ///
+    /// Approach: open a transaction; guard that `learned_rules` exists (a
+    /// malformed/partial DB without it is a no-op); SELECT and COLLECT all rows
+    /// FIRST (so we are not iterating a result set we mutate), then DELETE each
+    /// offending row by id. Each purged pattern is logged at `info!` REDACTED
+    /// via [`crate::redaction::redact_secrets`]. Idempotent: a clean DB deletes
+    /// nothing.
+    pub(super) fn migrate_to_v9(&self) -> crate::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Fail-safe against a malformed / partially-built database.
+        if !self.table_exists("learned_rules") {
+            tx.commit()?;
+            info!("Completed migration to schema version 9 (no learned_rules table, no-op)");
+            return Ok(());
+        }
+
+        // Collect all rows FIRST so we are not mutating a live result set.
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, pattern FROM learned_rules")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in mapped {
+                out.push(r?);
+            }
+            out
+        };
+
+        let mut purged = 0usize;
+        for (id, pattern) in rows {
+            let offending = crate::learned_pattern::pattern_contains_secret(&pattern)
+                || !crate::learned_pattern::is_well_formed_pattern(&pattern);
+            if offending {
+                self.conn
+                    .execute("DELETE FROM learned_rules WHERE id = ?1", [id])?;
+                purged += 1;
+                info!(
+                    "Purged learned rule (id={id}): {}",
+                    crate::redaction::redact_secrets(&pattern)
+                );
+            }
+        }
+
+        tx.commit()?;
+        info!(
+            "Completed migration to schema version 9 (purged {purged} secret/malformed learned rule(s))"
+        );
+        Ok(())
+    }
 }
 
 /// Valid table names for `ALTER TABLE` migrations.
@@ -565,6 +638,46 @@ mod tests {
             fresh.schema_version().expect("schema version"),
             SCHEMA_VERSION
         );
+    }
+
+    /// FIX-10: a fresh DB migrates through the v1 base-schema step (now wrapped
+    /// in an explicit transaction + commit, matching v2-v8) all the way to the
+    /// latest schema. The v1 base tables must exist and be committed, and the
+    /// recorded schema version must be the latest. A regression where the v1
+    /// transaction did not commit (or left the base schema half-applied) would
+    /// surface here as a missing table or a wrong version.
+    #[test]
+    fn fresh_db_commits_v1_base_schema_and_reaches_latest() {
+        let storage = Storage::open_in_memory().expect("fresh db opens and migrates");
+
+        // Reached the latest schema version.
+        assert_eq!(
+            storage.schema_version().expect("schema version"),
+            SCHEMA_VERSION,
+            "a fresh DB must migrate to the latest schema version"
+        );
+
+        // All v1 base tables were committed by the v1 step.
+        for table in [
+            "sessions",
+            "snapshots",
+            "events",
+            "audit_log",
+            "learned_rules",
+            "analytics",
+        ] {
+            assert!(
+                storage.table_exists(table),
+                "v1 base table `{table}` must exist after a committed v1 migration"
+            );
+        }
+
+        // v1 remains idempotent (IF NOT EXISTS): re-running it is a no-op, not
+        // a transaction/commit error.
+        storage
+            .migrate_to_v1()
+            .expect("second v1 migration must be a committed no-op");
+        assert!(storage.table_exists("sessions"));
     }
 
     /// v8 (D6): a freshly-migrated database carries the `host` column on both

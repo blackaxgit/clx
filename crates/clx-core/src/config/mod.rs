@@ -45,6 +45,7 @@
 //! - `CLX_AUTO_RECALL_INCLUDE_KEY_FACTS`
 //! - `CLX_AUTO_RECALL_MIN_PROMPT_LEN` (1-500)
 
+pub mod codex_trust;
 pub(crate) mod project;
 pub mod trust;
 
@@ -582,7 +583,12 @@ pub struct ValidatorConfig {
 
     /// Enable layer 0 (deterministic-policy / rule-based) validation.
     /// When `false`, the static L0 allow/deny ruleset is skipped and every
-    /// command falls through to L1 (and `default_decision` if L1 is also off).
+    /// command falls through to L1. If L1 is ALSO deliberately disabled
+    /// (`layer1_enabled = false`), the command is forced to `ask` — NOT
+    /// `default_decision`. `default_decision` applies only when L1 is enabled
+    /// but its outcome is inconclusive at runtime (see that field); a
+    /// deliberately disabled L1 is "unavailable on purpose", which fails to
+    /// `ask` rather than to the configured default.
     /// Disabling weakens security posture; treated as a weakening override
     /// (WARN at startup, audit-chain fingerprint per hook invocation).
     #[serde(default = "default_true")]
@@ -596,7 +602,17 @@ pub struct ValidatorConfig {
     #[serde(default = "default_layer1_timeout")]
     pub layer1_timeout_ms: u64,
 
-    /// Default decision when validation is inconclusive
+    /// Default decision applied when an ENABLED layer 1 (LLM) validation
+    /// fails or is inconclusive at runtime — i.e. provider init error,
+    /// provider unavailable, request timeout, or generation failure. It is the
+    /// fail-mode for a layer that is supposed to run but could not produce a
+    /// verdict.
+    ///
+    /// This does NOT apply when L1 is deliberately turned off
+    /// (`layer1_enabled = false`): a disabled layer is "unavailable on purpose"
+    /// and forces `ask` (disabled != unavailable). So `default_decision` only
+    /// governs runtime L1 failure/inconclusive outcomes, never the
+    /// configuration choice to disable L1.
     #[serde(default)]
     pub default_decision: DefaultDecision,
 
@@ -1114,6 +1130,52 @@ pub struct CapabilityRoute {
     /// share model names (e.g. `gpt-5.4-mini` only exists on Azure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Box<CapabilityRoute>>,
+
+    /// Explicit embedding dimension override for this route.
+    ///
+    /// Only meaningful for the embeddings capability. When `Some`, it wins over
+    /// the model→dimension registry and the legacy ollama `embedding_dim`. When
+    /// `None` (the default; existing configs deserialize unchanged), the
+    /// effective dimension is resolved via [`effective_embedding_dimension`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<usize>,
+}
+
+/// Map a known embedding model name to its CLX-effective output dimension.
+///
+/// Returns `None` for unknown models so the caller can fall back to the legacy
+/// ollama `embedding_dim`. Note `text-embedding-3-small` is mapped to 1024 (the
+/// dimension CLX requests via the `OpenAI` `dimensions` parameter, NOT its
+/// native 1536).
+#[must_use]
+pub fn embedding_dimension_for_model(model: &str) -> Option<usize> {
+    match model {
+        "text-embedding-3-small" => Some(1024),
+        "text-embedding-3-large" => Some(3072),
+        "qwen3-embedding:0.6b" => Some(1024),
+        _ => None,
+    }
+}
+
+/// Resolve the effective embedding dimension for an embeddings route.
+///
+/// Precedence (highest first):
+/// 1. `route.dimension` — an explicit per-route override.
+/// 2. The model→dimension registry ([`embedding_dimension_for_model`]) if the
+///    route's model is known.
+/// 3. The legacy `ollama_embedding_dim` (the historical default, e.g. 1024).
+///
+/// Batch C (the `crates/clx` embeddings status/rebuild/backfill paths) calls
+/// this so every store opens at the same effective dimension.
+#[must_use]
+pub fn effective_embedding_dimension(
+    route: &CapabilityRoute,
+    ollama_embedding_dim: usize,
+) -> usize {
+    route
+        .dimension
+        .or_else(|| embedding_dimension_for_model(&route.model))
+        .unwrap_or(ollama_embedding_dim)
 }
 
 /// Which LLM capability to route.
@@ -1781,11 +1843,14 @@ impl Config {
                 provider: "ollama-local".into(),
                 model: legacy.model.clone(),
                 fallback: None,
+                dimension: None,
             },
             embeddings: CapabilityRoute {
                 provider: "ollama-local".into(),
                 model: legacy.embedding_model.clone(),
                 fallback: None,
+                // Preserve the legacy ollama embedding dimension exactly.
+                dimension: Some(legacy.embedding_dim),
             },
         });
     }
@@ -1849,6 +1914,32 @@ impl Config {
         self.build_client_for_provider(name)
     }
 
+    /// Resolve the embedding dimension to request from an Azure provider built
+    /// by `name`.
+    ///
+    /// Azure backends are constructed by provider name (not capability), so the
+    /// dimension is taken from the embeddings route when that route targets this
+    /// provider. Otherwise (e.g. a chat-only Azure provider, or no `llm:`
+    /// routing) the sensible default of 1024 is used. The result is clamped into
+    /// `u32` for the `OpenAI` `dimensions` parameter.
+    fn azure_embedding_dimension_for_provider(&self, name: &str) -> u32 {
+        let legacy_dim = self
+            .ollama
+            .as_ref()
+            .map_or_else(default_embedding_dim, |o| o.embedding_dim);
+
+        let resolved = self
+            .llm
+            .as_ref()
+            .map(|llm| &llm.embeddings)
+            .filter(|route| route.provider == name)
+            .map_or(1024, |route| {
+                effective_embedding_dimension(route, legacy_dim)
+            });
+
+        u32::try_from(resolved).unwrap_or(1024)
+    }
+
     fn build_client_for_provider(
         &self,
         name: &str,
@@ -1870,8 +1961,10 @@ impl Config {
                     .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
                 let secret = resolve_azure_credential(name, c, kind)
                     .map_err(LlmConfigError::ProviderInit)?;
-                let backend = crate::llm::AzureOpenAIBackend::new(c, secret)
-                    .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                let dimension = self.azure_embedding_dimension_for_provider(name);
+                let backend =
+                    crate::llm::AzureOpenAIBackend::with_embedding_dimension(c, secret, dimension)
+                        .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
                 Ok(crate::llm::LlmClient::Azure(backend))
             }
         }
@@ -1883,6 +1976,13 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 /// Errors returned by `Config::create_llm_client` and related factory methods.
+///
+/// Convention: clx-core uses the crate-wide typed [`crate::Error`] everywhere,
+/// with `anyhow` reserved for the binaries. `LlmConfigError` is the one
+/// deliberate exception — a focused error for the LLM-client factory so callers
+/// (the hook's L1 path) can exhaustively match each misconfiguration
+/// (`MissingLlmRouting`, unknown provider, ...) without stringly matching. It is
+/// intentionally NOT folded into `crate::Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmConfigError {
     #[error("config has no `llm:` routing section and no legacy `ollama:` block")]
@@ -3796,12 +3896,79 @@ fallback:
             provider: "p".into(),
             model: "m".into(),
             fallback: None,
+            dimension: None,
         };
         let yaml = serde_yml::to_string(&route).unwrap();
         assert!(
             !yaml.contains("fallback"),
             "skip_serializing_if not respected: {yaml}"
         );
+        assert!(
+            !yaml.contains("dimension"),
+            "dimension must be omitted when None: {yaml}"
+        );
+    }
+
+    /// AC6.5: the effective-dimension resolver honors precedence
+    /// route override > model registry > legacy ollama dim.
+    #[test]
+    fn effective_embedding_dimension_precedence() {
+        // 1. Explicit route override wins over everything (even a known model).
+        let overridden = CapabilityRoute {
+            provider: "p".into(),
+            model: "text-embedding-3-large".into(),
+            fallback: None,
+            dimension: Some(256),
+        };
+        assert_eq!(
+            effective_embedding_dimension(&overridden, 999),
+            256,
+            "explicit route dimension must win"
+        );
+
+        // 2. No override but a known model => registry value (NOT the legacy dim).
+        let known = CapabilityRoute {
+            provider: "p".into(),
+            model: "text-embedding-3-large".into(),
+            fallback: None,
+            dimension: None,
+        };
+        assert_eq!(
+            effective_embedding_dimension(&known, 999),
+            3072,
+            "known model must resolve via the registry"
+        );
+
+        // text-embedding-3-small maps to 1024 (CLX-requested, not native 1536).
+        let small = CapabilityRoute {
+            provider: "p".into(),
+            model: "text-embedding-3-small".into(),
+            fallback: None,
+            dimension: None,
+        };
+        assert_eq!(effective_embedding_dimension(&small, 999), 1024);
+        assert_eq!(
+            embedding_dimension_for_model("text-embedding-3-small"),
+            Some(1024)
+        );
+        assert_eq!(
+            embedding_dimension_for_model("qwen3-embedding:0.6b"),
+            Some(1024)
+        );
+
+        // 3. No override and an unknown model => legacy ollama dim.
+        let unknown = CapabilityRoute {
+            provider: "p".into(),
+            model: "some-unlisted-model".into(),
+            fallback: None,
+            dimension: None,
+        };
+        assert_eq!(
+            effective_embedding_dimension(&unknown, 768),
+            768,
+            "unknown model falls back to the legacy ollama dimension"
+        );
+        assert_eq!(embedding_dimension_for_model("some-unlisted-model"), None);
     }
 
     // ---- Tasks 6+7: per-project config discovery integration tests ----
