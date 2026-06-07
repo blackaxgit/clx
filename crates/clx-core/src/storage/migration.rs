@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 8;
+pub(super) const SCHEMA_VERSION: i32 = 9;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -94,6 +94,10 @@ impl Storage {
 
             if current_version < 8 {
                 self.migrate_to_v8()?;
+            }
+
+            if current_version < 9 {
+                self.migrate_to_v9()?;
             }
 
             self.conn.execute(
@@ -480,6 +484,69 @@ impl Storage {
 
         tx.commit()?;
         info!("Completed migration to schema version 8 (per-row agent host column)");
+        Ok(())
+    }
+
+    /// Migrate to schema version 9 - purge secret-bearing and malformed
+    /// learned rules (Issue 1).
+    ///
+    /// Earlier CLX builds could persist a `learned_rules` row whose `pattern`
+    /// embedded a credential (e.g. `Bash(SSHPASS=...:*)`) or was otherwise
+    /// malformed/over-broad (e.g. `Bash(true;:*)`). The hook now gates these at
+    /// write time, but existing databases may already carry such rows. This
+    /// migration scrubs them retroactively, of ANY source (a manually-added
+    /// `source="cli"` secret rule SHOULD also be purged). Well-formed wildcard
+    /// or path rules (e.g. `Bash(npm run build*)`) survive because
+    /// `is_well_formed_pattern` allows `*` and `/`.
+    ///
+    /// Approach: open a transaction; guard that `learned_rules` exists (a
+    /// malformed/partial DB without it is a no-op); SELECT and COLLECT all rows
+    /// FIRST (so we are not iterating a result set we mutate), then DELETE each
+    /// offending row by id. Each purged pattern is logged at `info!` REDACTED
+    /// via [`crate::redaction::redact_secrets`]. Idempotent: a clean DB deletes
+    /// nothing.
+    pub(super) fn migrate_to_v9(&self) -> crate::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Fail-safe against a malformed / partially-built database.
+        if !self.table_exists("learned_rules") {
+            tx.commit()?;
+            info!("Completed migration to schema version 9 (no learned_rules table, no-op)");
+            return Ok(());
+        }
+
+        // Collect all rows FIRST so we are not mutating a live result set.
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, pattern FROM learned_rules")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in mapped {
+                out.push(r?);
+            }
+            out
+        };
+
+        let mut purged = 0usize;
+        for (id, pattern) in rows {
+            let offending = crate::learned_pattern::pattern_contains_secret(&pattern)
+                || !crate::learned_pattern::is_well_formed_pattern(&pattern);
+            if offending {
+                self.conn
+                    .execute("DELETE FROM learned_rules WHERE id = ?1", [id])?;
+                purged += 1;
+                info!(
+                    "Purged learned rule (id={id}): {}",
+                    crate::redaction::redact_secrets(&pattern)
+                );
+            }
+        }
+
+        tx.commit()?;
+        info!(
+            "Completed migration to schema version 9 (purged {purged} secret/malformed learned rule(s))"
+        );
         Ok(())
     }
 }
