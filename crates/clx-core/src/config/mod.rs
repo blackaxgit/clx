@@ -1884,6 +1884,13 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 /// Errors returned by `Config::create_llm_client` and related factory methods.
+///
+/// Convention: clx-core uses the crate-wide typed [`crate::Error`] everywhere,
+/// with `anyhow` reserved for the binaries. `LlmConfigError` is the one
+/// deliberate exception — a focused error for the LLM-client factory so callers
+/// (the hook's L1 path) can exhaustively match each misconfiguration
+/// (`MissingLlmRouting`, unknown provider, ...) without stringly matching. It is
+/// intentionally NOT folded into `crate::Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmConfigError {
     #[error("config has no `llm:` routing section and no legacy `ollama:` block")]
