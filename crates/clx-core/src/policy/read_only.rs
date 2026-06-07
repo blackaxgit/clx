@@ -105,10 +105,7 @@ fn is_redirection_token(token: &str) -> bool {
     {
         rest = &rest[close + 1..];
     }
-    rest.starts_with('>')
-        || rest.starts_with('<')
-        || token.ends_with('>')
-        || token.ends_with('<')
+    rest.starts_with('>') || rest.starts_with('<') || token.ends_with('>') || token.ends_with('<')
 }
 
 /// Quote-aware split of a raw command into segments on unquoted control
@@ -212,10 +209,10 @@ fn segment_is_read_only(tokens: &[String]) -> bool {
     match argv0 {
         // b. argv0 must be in the scrubbed read-only allow-set.
         "cat" | "less" | "more" | "head" | "tail" | "bat" | "ls" | "dir" | "exa" | "eza"
-        | "file" | "stat" | "wc" | "du" | "df" | "ag" | "ack" | "locate" | "which"
-        | "whereis" | "type" | "pwd" | "whoami" | "uname" | "uptime" | "cal" | "printenv"
-        | "ps" | "top" | "htop" | "pgrep" | "host" | "help" | "info" | "diff" | "cmp" | "jq"
-        | "echo" | "zipinfo" => true,
+        | "file" | "stat" | "wc" | "du" | "df" | "ag" | "ack" | "locate" | "which" | "whereis"
+        | "type" | "pwd" | "whoami" | "uname" | "uptime" | "cal" | "printenv" | "ps" | "top"
+        | "htop" | "pgrep" | "host" | "help" | "info" | "diff" | "cmp" | "jq" | "echo"
+        | "zipinfo" => true,
 
         // `env` / `set` are read-only only with no trailing program. Any
         // non-assignment operand (a program, `-x`, ...) => reject.
@@ -351,9 +348,8 @@ fn sed_script_is_dangerous(script: &str) -> bool {
         // Substitution `s<D>pat<D>repl<D>flags`: parse to the flag region.
         if ch == b's' && i + 1 < len {
             let delim = bytes[i + 1];
-            let delim_ok = !delim.is_ascii_alphanumeric()
-                && !delim.is_ascii_whitespace()
-                && delim != b'\\';
+            let delim_ok =
+                !delim.is_ascii_alphanumeric() && !delim.is_ascii_whitespace() && delim != b'\\';
             if delim_ok {
                 // Walk to just past the third delimiter (end of replacement),
                 // honoring backslash escapes.
@@ -390,8 +386,7 @@ fn sed_script_is_dangerous(script: &str) -> bool {
 /// find: deny tokens that execute or write.
 fn find_is_read_only(args: &[String]) -> bool {
     const DENY: &[&str] = &[
-        "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
-        "-fls",
+        "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls",
     ];
     !args.iter().any(|a| DENY.contains(&a.as_str()))
 }
@@ -424,8 +419,14 @@ fn tar_is_read_only(args: &[String]) -> bool {
         // Long-form write modes.
         if matches!(
             a.as_str(),
-            "--create" | "--extract" | "--get" | "--append" | "--update" | "--catenate"
-                | "--concatenate" | "--delete"
+            "--create"
+                | "--extract"
+                | "--get"
+                | "--append"
+                | "--update"
+                | "--catenate"
+                | "--concatenate"
+                | "--delete"
         ) {
             return false;
         }
@@ -533,9 +534,9 @@ fn git_subcommand_is_read_only(subcommand: &str, rest: &[String]) -> bool {
         "remote" => {
             // Bare, or read forms only.
             rest.is_empty()
-                || rest.iter().all(|a| {
-                    a == "-v" || a == "show" || a == "get-url"
-                })
+                || rest
+                    .iter()
+                    .all(|a| a == "-v" || a == "show" || a == "get-url")
         }
         _ => READ_SUBCOMMANDS.contains(&subcommand),
     }
@@ -549,10 +550,30 @@ fn git_subcommand_is_read_only(subcommand: &str, rest: &[String]) -> bool {
 /// allowed; value-separated forms leave the value as a positional => denied.
 fn is_git_branch_tag_read_flag(arg: &str) -> bool {
     const READ_FLAGS: &[&str] = &[
-        "-l", "--list", "-v", "-vv", "--verbose", "-a", "--all", "-r", "--remotes", "-n",
-        "--color", "--no-color", "--column", "--no-column", "--merged", "--no-merged",
-        "--contains", "--no-contains", "--points-at", "--sort", "--format", "-i",
-        "--ignore-case", "--omit-empty",
+        "-l",
+        "--list",
+        "-v",
+        "-vv",
+        "--verbose",
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "-n",
+        "--color",
+        "--no-color",
+        "--column",
+        "--no-column",
+        "--merged",
+        "--no-merged",
+        "--contains",
+        "--no-contains",
+        "--points-at",
+        "--sort",
+        "--format",
+        "-i",
+        "--ignore-case",
+        "--omit-empty",
     ];
     if !arg.starts_with('-') {
         return false; // positional operand (e.g. a new branch/tag name)

@@ -320,10 +320,7 @@ impl AgeFileBackend {
     /// surfaces the same corruption error as before — so a real truncation is
     /// not masked, and the WRITE path's fail-closed no-overwrite behaviour is
     /// untouched (writes never call this).
-    fn load_map_read(
-        &self,
-        identity: &age::x25519::Identity,
-    ) -> Result<BTreeMap<String, String>> {
+    fn load_map_read(&self, identity: &age::x25519::Identity) -> Result<BTreeMap<String, String>> {
         let mut attempt = 0u32;
         loop {
             // Distinguish a zero-byte file (retryable) from any other error

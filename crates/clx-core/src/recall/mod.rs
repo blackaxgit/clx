@@ -683,7 +683,10 @@ mod tests {
             ..Default::default()
         };
 
-        let hits = engine.query("xyzzy_nonexistent_topic_qqq", &config).await.hits;
+        let hits = engine
+            .query("xyzzy_nonexistent_topic_qqq", &config)
+            .await
+            .hits;
         assert!(
             hits.is_empty(),
             "query for gibberish should return no results, got {} hits",

@@ -472,8 +472,7 @@ mod tests {
         #[tokio::test]
         async fn malformed_json_is_parse_error() {
             let mut out = Vec::<u8>::new();
-            let exit =
-                handle_event(b"not json at all" as &[u8], &mut out).await;
+            let exit = handle_event(b"not json at all" as &[u8], &mut out).await;
             assert_eq!(exit, HookExit::ParseError);
         }
 
