@@ -17,8 +17,11 @@ const MUST_BE_FALSE: &[&str] = &[
     // Verification round (Codex): arbitrary-fd redirection write targets.
     "ls 3>/tmp/o",
     "ls 2>>/tmp/o",
-    // Verification round (Codex): GNU sed combined flags hiding `e` (execute).
+    "ls {fd}>/tmp/o",
+    // Verification round (Codex): GNU sed exec/write flags in any order/delimiter.
     "sed 's/.*/id/ep' f",
+    "sed 's/.*/id/pe' f",
+    "sed 's#.*#id#e' f",
     "LD_PRELOAD=./pwn.so ls",
     "NODE_OPTIONS='--require ./pwn.js' node --version",
     "RUBYOPT=-r./pwn ruby -v",
@@ -84,6 +87,9 @@ const MUST_BE_TRUE: &[&str] = &[
     "git show HEAD",
     "rg pattern src/",
     "grep 'a|b' file",
+    "sed 's/foo/bar/' f",
+    "sed 's/a/b/g' f",
+    "sed 's/e/x/' f",
     "cargo --version",
     "python --version",
     "node -v",

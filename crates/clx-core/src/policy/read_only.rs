@@ -98,7 +98,13 @@ fn contains_dangerous_metachar(command: &str) -> bool {
 /// optional leading fd number or `&` before checking for a leading `>`/`<`, so
 /// `3>/tmp/o` is caught as a write target (fail-closed).
 fn is_redirection_token(token: &str) -> bool {
-    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    let mut rest = token.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    // Bash named file descriptor: `{varname}>file`.
+    if rest.starts_with('{')
+        && let Some(close) = rest.find('}')
+    {
+        rest = &rest[close + 1..];
+    }
     rest.starts_with('>')
         || rest.starts_with('<')
         || token.ends_with('>')
@@ -317,38 +323,66 @@ fn sed_is_read_only(args: &[String]) -> bool {
 /// Heuristic: is a sed *script* token a file-writing/executing command?
 ///
 /// Flags the `w`/`W` (write file), `r`/`R` (read file), and `e` (execute)
-/// commands and the `s///w` / `s///e` substitution flags, without false-firing
-/// on substitution *content* (e.g. the `r` in `s/foo/bar/`). A command letter
-/// counts only when it is followed by whitespace (its filename/command argument)
-/// or appears immediately after a `/` delimiter at the end of / a flag position.
-/// Conservative: ambiguous cases lean toward "dangerous" (fail-closed).
+/// commands and the substitution write/execute flags (`s/././w`, `s/././e`, in
+/// any flag order and with any delimiter), without false-firing on substitution
+/// *content* (e.g. the `r` in `s/foo/bar/`).
+///
+/// It parses each `s` substitution to locate its real flag region (after the
+/// third unescaped delimiter) so `s/.*/id/ep`, `s/.*/id/pe`, and `s#.*#id#e` are
+/// all caught, while `s/e/x/` (where `e` is pattern content) is not. Standalone
+/// `w`/`r`/`e` commands are flagged when they sit at a command position and take
+/// an argument. Conservative: ambiguous cases lean dangerous (fail-closed).
 fn sed_script_is_dangerous(script: &str) -> bool {
-    let b = script.as_bytes();
-    for i in 0..b.len() {
-        if !matches!(b[i], b'w' | b'W' | b'r' | b'R' | b'e') {
-            continue;
-        }
-        // Command letter followed by whitespace => takes a filename/command arg.
-        if i + 1 < b.len() && (b[i + 1] == b' ' || b[i + 1] == b'\t') {
+    let bytes = script.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let ch = bytes[i];
+
+        // Standalone file/exec command (`w file`, `r file`, `e cmd`, ...): a
+        // command-position w/W/r/R/e that is at end-of-script or takes an arg.
+        if matches!(ch, b'w' | b'W' | b'r' | b'R' | b'e')
+            && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'}' | b'\n'))
+            && (i + 1 >= len || matches!(bytes[i + 1], b' ' | b'\t'))
+        {
             return true;
         }
-        // Substitution flag (`s///w`, `s///e`, combined like `s///ep`): right
-        // after a `/` delimiter and at end-of-script, followed by a separator, or
-        // followed by another flag character (a sed substitution flag letter or a
-        // count) — but NOT followed by more pattern text like `s/e/x/` where the
-        // next char is the `/` delimiter.
-        if i > 0 && b[i - 1] == b'/' {
-            let at_end = i + 1 >= b.len();
-            let next_is_sep_or_flag = i + 1 < b.len()
-                && matches!(
-                    b[i + 1],
-                    b' ' | b'\t' | b';' | b'g' | b'p' | b'i' | b'I' | b'm' | b'M'
-                        | b'e' | b'w' | b'0'..=b'9'
-                );
-            if at_end || next_is_sep_or_flag {
-                return true;
+
+        // Substitution `s<D>pat<D>repl<D>flags`: parse to the flag region.
+        if ch == b's' && i + 1 < len {
+            let delim = bytes[i + 1];
+            let delim_ok = !delim.is_ascii_alphanumeric()
+                && !delim.is_ascii_whitespace()
+                && delim != b'\\';
+            if delim_ok {
+                // Walk to just past the third delimiter (end of replacement),
+                // honoring backslash escapes.
+                let mut j = i + 2;
+                let mut seen = 0u8;
+                while j < len && seen < 2 {
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == delim {
+                        seen += 1;
+                    }
+                    j += 1;
+                }
+                // Read flag characters; a write/execute flag anywhere => danger.
+                while j < len {
+                    match bytes[j] {
+                        b'e' | b'w' | b'W' => return true,
+                        b'g' | b'p' | b'i' | b'I' | b'm' | b'M' | b'0'..=b'9' => j += 1,
+                        _ => break,
+                    }
+                }
+                i = j;
+                continue;
             }
         }
+
+        i += 1;
     }
     false
 }
