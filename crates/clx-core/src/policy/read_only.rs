@@ -93,15 +93,16 @@ fn contains_dangerous_metachar(command: &str) -> bool {
     false
 }
 
-/// True if `token` is, starts with, or ends with a redirection operator.
+/// True if `token` is, starts with, or ends with a redirection operator —
+/// including arbitrary file descriptors (`3>`, `4>>`) and `&>`/`&>>`. Strips an
+/// optional leading fd number or `&` before checking for a leading `>`/`<`, so
+/// `3>/tmp/o` is caught as a write target (fail-closed).
 fn is_redirection_token(token: &str) -> bool {
-    const REDIRS: &[&str] = &[">", ">>", "<", "1>", "2>", "&>"];
-    if REDIRS.contains(&token) {
-        return true;
-    }
-    REDIRS
-        .iter()
-        .any(|op| token.starts_with(op) || token.ends_with(op))
+    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    rest.starts_with('>')
+        || rest.starts_with('<')
+        || token.ends_with('>')
+        || token.ends_with('<')
 }
 
 /// Quote-aware split of a raw command into segments on unquoted control
@@ -331,12 +332,20 @@ fn sed_script_is_dangerous(script: &str) -> bool {
         if i + 1 < b.len() && (b[i + 1] == b' ' || b[i + 1] == b'\t') {
             return true;
         }
-        // Substitution flag (`s///w`, `s///e`): right after a `/` delimiter and
-        // at end-of-script or followed by a separator (not more substitution text).
+        // Substitution flag (`s///w`, `s///e`, combined like `s///ep`): right
+        // after a `/` delimiter and at end-of-script, followed by a separator, or
+        // followed by another flag character (a sed substitution flag letter or a
+        // count) — but NOT followed by more pattern text like `s/e/x/` where the
+        // next char is the `/` delimiter.
         if i > 0 && b[i - 1] == b'/' {
             let at_end = i + 1 >= b.len();
-            let terminated = i + 1 < b.len() && matches!(b[i + 1], b' ' | b'\t' | b';');
-            if at_end || terminated {
+            let next_is_sep_or_flag = i + 1 < b.len()
+                && matches!(
+                    b[i + 1],
+                    b' ' | b'\t' | b';' | b'g' | b'p' | b'i' | b'I' | b'm' | b'M'
+                        | b'e' | b'w' | b'0'..=b'9'
+                );
+            if at_end || next_is_sep_or_flag {
                 return true;
             }
         }

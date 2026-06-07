@@ -14,6 +14,11 @@ use clx_core::policy::is_read_only_command;
 const MUST_BE_FALSE: &[&str] = &[
     // Tampered-environment exec.
     "env X=1 rm -rf /tmp/x",
+    // Verification round (Codex): arbitrary-fd redirection write targets.
+    "ls 3>/tmp/o",
+    "ls 2>>/tmp/o",
+    // Verification round (Codex): GNU sed combined flags hiding `e` (execute).
+    "sed 's/.*/id/ep' f",
     "LD_PRELOAD=./pwn.so ls",
     "NODE_OPTIONS='--require ./pwn.js' node --version",
     "RUBYOPT=-r./pwn ruby -v",
