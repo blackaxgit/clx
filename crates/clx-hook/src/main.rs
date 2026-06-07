@@ -6,7 +6,7 @@
 //! protocol; the router detects the host from the envelope. All real work
 //! lives in the `clx_hook` library (see `src/lib.rs` + `src/router.rs`). This
 //! binary owns only process-level concerns: argument parsing, tracing setup,
-//! sqlite-vec init, and constructing `HookDeps` for the router.
+//! and sqlite-vec init. Handlers resolve their own config/storage.
 //!
 //! Hook handlers (in the library): the eight Claude events `PreToolUse`,
 //! `PostToolUse`, `PreCompact`, `SessionStart`, `SessionEnd`, `SubagentStart`,
@@ -16,9 +16,7 @@
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
-use clx_hook::{
-    CLAUDE_PROVENANCE_ENV_VARS, HookDeps, Provenance, classify_provenance, handle_event,
-};
+use clx_hook::{CLAUDE_PROVENANCE_ENV_VARS, Provenance, classify_provenance, handle_event};
 use tracing::warn;
 
 fn print_usage() {
@@ -58,13 +56,9 @@ async fn main() -> ExitCode {
     clx_core::init_sqlite_vec();
     init_tracing();
 
-    // Build router deps. If the storage layer cannot be opened we still want
-    // Claude Code to see a clean exit (treating any non-zero as hook failure
-    // noise); the router itself does the safe "allow" fallback when handlers
-    // cannot do real work.
-    let Some(deps) = HookDeps::from_process_defaults() else {
-        return ExitCode::SUCCESS;
-    };
+    // Each handler resolves its own `Config`/`Storage` at its own call site
+    // (with its own failure handling), so the router takes no injected deps;
+    // a handler that cannot open storage performs its own safe fallback.
 
     // F7: best-effort hook-envelope provenance check at the orchestration
     // boundary (before any dispatch), NOT inside router::handle_event, so
@@ -98,7 +92,7 @@ async fn main() -> ExitCode {
     // fallback JSON (oversize input / parse error) to stdout, and returns a
     // HookExit. Every variant maps to SUCCESS so Claude Code never sees
     // hook stderr noise.
-    let _exit = handle_event(io::stdin(), io::stdout(), deps).await;
+    let _exit = handle_event(io::stdin(), io::stdout()).await;
     ExitCode::SUCCESS
 }
 

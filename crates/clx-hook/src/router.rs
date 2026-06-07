@@ -7,10 +7,11 @@
 //!
 //! Layering:
 //! - Orchestration: `handle_event` (this file)
-//! - Domain: `HookDeps`, `HookExit` (this file)
-//! - Infrastructure: handlers under `crate::hooks::*` (re-use `Config::load`
-//!   and `Storage::open_default` internally; that plumbing is owned by them
-//!   and is not changed in this refactor)
+//! - Domain: `HookExit` (this file)
+//! - Infrastructure: handlers under `crate::hooks::*` (each loads `Config::load`
+//!   and `Storage::open_default` internally; that plumbing is owned by them).
+//!   Each handler resolves its own config/storage at its own call site with
+//!   its own failure handling, so the router does not inject shared deps.
 //! - Mapping: `crate::output::*`
 //!
 //! Known limitation: `output::output_decision` / `output::output_generic`
@@ -21,9 +22,7 @@
 
 use std::io::{Read, Write};
 
-use clx_core::config::Config;
 use clx_core::redaction::{redact_json_value, redact_secrets};
-use clx_core::storage::Storage;
 use tracing::{debug, error, warn};
 
 use crate::hooks::{
@@ -34,42 +33,6 @@ use crate::hooks::{
 use crate::host::{Host, detect_host};
 use crate::output::output_decision;
 use crate::types::{HostNeutralInput, MAX_INPUT_SIZE};
-
-/// Dependencies the router needs to dispatch a hook event.
-///
-/// Today the downstream handlers re-load `Config` and `Storage` internally,
-/// so `HookDeps` is constructed in `main()` and held by the router but not
-/// yet threaded through to every handler. The struct still exists so that
-/// (a) we have a single chokepoint where future handler signatures will
-/// accept injected deps, and (b) integration tests can build a
-/// `HookDeps::for_test()` value without standing up the real filesystem.
-pub struct HookDeps {
-    /// Loaded CLX config (or default if loading failed).
-    pub config: Config,
-    /// Open storage handle (default location, or in-memory for tests).
-    pub storage: Storage,
-}
-
-impl HookDeps {
-    /// Build deps using process defaults. Falls back to a default config and
-    /// the default sqlite path. Returns `None` if storage cannot be opened.
-    #[must_use]
-    pub fn from_process_defaults() -> Option<Self> {
-        let config = Config::load().unwrap_or_default();
-        let storage = Storage::open_default().ok()?;
-        Some(Self { config, storage })
-    }
-
-    /// Build deps suitable for tests: default config, in-memory storage.
-    #[cfg(test)]
-    #[must_use]
-    pub fn for_test() -> Self {
-        Self {
-            config: Config::default(),
-            storage: Storage::open_in_memory().expect("in-memory sqlite for test deps"),
-        }
-    }
-}
 
 /// Best-effort provenance verdict for the hook invocation (finding F7).
 ///
@@ -168,20 +131,6 @@ pub(crate) enum ReadOutcome {
     ReadFailed,
 }
 
-/// Parse a raw JSON string into `HostNeutralInput` via the detected host.
-///
-/// For Claude this is the historical `serde_json::from_str` path (lossless
-/// lift); other hosts map their envelope to the host-neutral shape. The
-/// returned `serde_json::Error` keeps the existing error-handling contract.
-///
-/// `handle_event` uses `parse_input_with_host` (it has already detected the
-/// host); this convenience wrapper is retained for the parse-error unit tests
-/// and as the public single-arg parse entry point.
-#[allow(dead_code)]
-pub(crate) fn parse_input(raw: &str) -> Result<HostNeutralInput, serde_json::Error> {
-    parse_input_with_host(&*detect_host(raw), raw)
-}
-
 /// Host-explicit parse, used by `handle_event` (which has already detected
 /// the host) and by tests that want a deterministic host.
 pub(crate) fn parse_input_with_host(
@@ -236,7 +185,10 @@ pub(crate) async fn dispatch(input: HostNeutralInput, host: &dyn Host) -> anyhow
 /// `writer` is reserved for the fallback paths (oversize input, read
 /// failure). Handlers themselves still write through `crate::output::*`,
 /// which currently uses `println!` on the process stdout.
-pub async fn handle_event<R, W>(reader: R, mut writer: W, _deps: HookDeps) -> HookExit
+///
+/// Each handler resolves its own `Config`/`Storage` at its own call site (with
+/// its own failure handling), so the router does not inject shared deps.
+pub async fn handle_event<R, W>(reader: R, mut writer: W) -> HookExit
 where
     R: Read,
     W: Write,
@@ -310,6 +262,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only single-arg parse: detect the host from `raw`, then parse.
+    ///
+    /// `handle_event` uses `parse_input_with_host` directly (it has already
+    /// detected the host once from the raw envelope). This convenience wrapper
+    /// exists solely for the parse-error unit tests below, so it lives under
+    /// `#[cfg(test)]` rather than carrying a production `#[allow(dead_code)]`.
+    fn parse_input(raw: &str) -> Result<HostNeutralInput, serde_json::Error> {
+        parse_input_with_host(&*detect_host(raw), raw)
+    }
 
     fn pre_tool_use_envelope() -> String {
         serde_json::json!({
@@ -410,7 +372,7 @@ mod tests {
     async fn handle_event_oversize_emits_block_to_writer() {
         let big = vec![b'a'; (MAX_INPUT_SIZE as usize) + 1];
         let mut out = Vec::<u8>::new();
-        let exit = handle_event(&big[..], &mut out, HookDeps::for_test()).await;
+        let exit = handle_event(&big[..], &mut out).await;
         assert_eq!(exit, HookExit::InputTooLarge);
         let s = String::from_utf8_lossy(&out);
         let parsed: serde_json::Value = serde_json::from_str(s.trim()).expect("valid json");
@@ -422,7 +384,7 @@ mod tests {
     async fn handle_event_malformed_json_returns_parse_error() {
         let bytes = b"definitely not json";
         let mut out = Vec::<u8>::new();
-        let exit = handle_event(&bytes[..], &mut out, HookDeps::for_test()).await;
+        let exit = handle_event(&bytes[..], &mut out).await;
         assert_eq!(exit, HookExit::ParseError);
     }
 
@@ -435,7 +397,7 @@ mod tests {
         })
         .to_string();
         let mut out = Vec::<u8>::new();
-        let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+        let exit = handle_event(raw.as_bytes(), &mut out).await;
         // dispatch returns Ok for unknown events (after emitting allow on stdout)
         assert_eq!(exit, HookExit::Ok);
     }
@@ -444,7 +406,7 @@ mod tests {
     async fn handle_event_happy_pre_tool_use() {
         let raw = pre_tool_use_envelope();
         let mut out = Vec::<u8>::new();
-        let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+        let exit = handle_event(raw.as_bytes(), &mut out).await;
         // Handlers may return Ok or HandlerError depending on filesystem
         // state in the test environment. Both are acceptable here: this
         // test just ensures handle_event reaches dispatch without panic.
@@ -459,11 +421,10 @@ mod tests {
     //
     // These live here (not in `tests/hooks_router_e2e.rs`) because the
     // workspace lint forbids `unsafe` `std::env::set_var`, so an external
-    // integration test cannot redirect `HOME` to build real `HookDeps`
-    // without touching the real `~/.clx`. `HookDeps::for_test()` is
-    // `#[cfg(test)]`-only (in-memory sqlite, zero real-env / network /
-    // keychain), so the safe place for the in-memory `Read`/`Write`
-    // contract is this in-crate module. Anchored to
+    // integration test cannot redirect `HOME` to drive the handlers'
+    // self-loaded config/storage without touching the real CLX home dir.
+    // This in-crate module uses in-memory `Read`/`Write` buffers, so it is
+    // the safe place for the in-memory router contract. Anchored to
     // `specs/_prerelease/04-integration.md` 3.1 + the edge/failure matrix.
     // =====================================================================
     mod wave1_integration_behavior {
@@ -487,7 +448,7 @@ mod tests {
         async fn oversize_writes_block_json_to_injected_writer() {
             let big = vec![b'a'; (MAX_INPUT_SIZE as usize) + 1];
             let mut out = Vec::<u8>::new();
-            let exit = handle_event(&big[..], &mut out, HookDeps::for_test()).await;
+            let exit = handle_event(&big[..], &mut out).await;
             assert_eq!(exit, HookExit::InputTooLarge);
             let v: serde_json::Value =
                 serde_json::from_str(String::from_utf8_lossy(&out).trim()).expect("block json");
@@ -504,7 +465,7 @@ mod tests {
             // Documented boundary `n >= MAX_INPUT_SIZE` (router.rs read_input).
             let at_cap = vec![b'a'; MAX_INPUT_SIZE as usize];
             let mut out = Vec::<u8>::new();
-            let exit = handle_event(&at_cap[..], &mut out, HookDeps::for_test()).await;
+            let exit = handle_event(&at_cap[..], &mut out).await;
             assert_eq!(exit, HookExit::InputTooLarge);
         }
 
@@ -512,14 +473,14 @@ mod tests {
         async fn malformed_json_is_parse_error() {
             let mut out = Vec::<u8>::new();
             let exit =
-                handle_event(b"not json at all" as &[u8], &mut out, HookDeps::for_test()).await;
+                handle_event(b"not json at all" as &[u8], &mut out).await;
             assert_eq!(exit, HookExit::ParseError);
         }
 
         #[tokio::test]
         async fn empty_stdin_is_parse_error() {
             let mut out = Vec::<u8>::new();
-            let exit = handle_event(b"" as &[u8], &mut out, HookDeps::for_test()).await;
+            let exit = handle_event(b"" as &[u8], &mut out).await;
             assert_eq!(exit, HookExit::ParseError);
         }
 
@@ -527,7 +488,7 @@ mod tests {
         async fn missing_required_field_is_parse_error() {
             let raw = serde_json::json!({ "hook_event_name": "PreToolUse" }).to_string();
             let mut out = Vec::<u8>::new();
-            let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+            let exit = handle_event(raw.as_bytes(), &mut out).await;
             assert_eq!(exit, HookExit::ParseError);
         }
 
@@ -535,7 +496,7 @@ mod tests {
         async fn unknown_event_is_allowed_ok() {
             let raw = envelope("SomeFutureEvent2027", &serde_json::json!({}));
             let mut out = Vec::<u8>::new();
-            let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+            let exit = handle_event(raw.as_bytes(), &mut out).await;
             assert_eq!(exit, HookExit::Ok);
         }
 
@@ -565,7 +526,7 @@ mod tests {
             for (event, extra) in cases {
                 let raw = envelope(event, &extra);
                 let mut out = Vec::<u8>::new();
-                let exit = handle_event(raw.as_bytes(), &mut out, HookDeps::for_test()).await;
+                let exit = handle_event(raw.as_bytes(), &mut out).await;
                 assert!(
                     matches!(exit, HookExit::Ok | HookExit::HandlerError),
                     "event {event} should reach dispatch, got {exit:?}"

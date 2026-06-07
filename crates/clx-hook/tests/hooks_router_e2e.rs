@@ -14,8 +14,8 @@
 //! (in-memory `Read`/`Write`, `HookExit`, oversize block JSON on the
 //! injectable writer, parse/read-error fallbacks) is therefore covered by a
 //! sibling marked module `wave1_integration_behavior` inside
-//! `crates/clx-hook/src/router.rs`, which can use the `#[cfg(test)]`-only
-//! `HookDeps::for_test()` (in-memory sqlite, no real-env touch).
+//! `crates/clx-hook/src/router.rs`, which drives `handle_event` directly with
+//! in-memory buffers (handlers self-load config/storage; no real-env touch).
 //!
 //! The real `~/.clx` / `~/.claude` are never touched. No network, no
 //! keychain, no model download.
