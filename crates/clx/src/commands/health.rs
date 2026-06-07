@@ -465,6 +465,21 @@ fn remote_route_pass(label: &str, provider: &str, start: Instant) -> CheckResult
     }
 }
 
+/// Build a WARN result for a capability whose route is `Unresolved` while the
+/// config DOES declare providers (Issue 7). This is a misconfigured-routing
+/// posture — providers exist but no `llm:` route resolves to one — so probing
+/// the legacy hardcoded Ollama model would be a false FAIL. We surface a WARN
+/// pointing at the migration command instead.
+fn unresolved_route_warn(label: &str, start: Instant) -> CheckResult {
+    CheckResult {
+        name: label.into(),
+        status: CheckStatus::Warn,
+        detail: "route not configured; run clx config migrate".into(),
+        hint: Some("Configure routing: clx config migrate".into()),
+        duration: start.elapsed(),
+    }
+}
+
 async fn check_validator_model(config: Option<&clx_core::config::Config>) -> CheckResult {
     let start = Instant::now();
 
@@ -491,6 +506,13 @@ async fn check_validator_model(config: Option<&clx_core::config::Config>) -> Che
             }
             RouteProbe::Remote { provider } => {
                 return remote_route_pass("Validator model", &provider, start);
+            }
+            // Issue 7: the route is Unresolved but providers ARE declared — this
+            // is a migration/routing gap, not a missing Ollama model. WARN
+            // instead of FAIL-probing the hardcoded literal. When NO providers
+            // are declared (legacy pure-Ollama) fall through to the legacy probe.
+            RouteProbe::Unresolved if !c.providers.is_empty() => {
+                return unresolved_route_warn("Validator model", start);
             }
             RouteProbe::Unresolved => {}
         }
@@ -528,21 +550,34 @@ async fn check_embedding_model(config: Option<&clx_core::config::Config>) -> Che
             RouteProbe::Remote { provider } => {
                 return remote_route_pass("Embedding model", &provider, start);
             }
+            // Issue 7: Unresolved route but providers ARE declared -> WARN
+            // (routing gap), not FAIL. Legacy pure-Ollama (no providers) falls
+            // through to the probe below.
+            RouteProbe::Unresolved if !c.providers.is_empty() => {
+                return unresolved_route_warn("Embedding model", start);
+            }
             RouteProbe::Unresolved => {}
         }
     }
 
     // Fallback: legacy ollama defaults (also covers config == None). A
-    // genuinely-missing local model still reports as FAIL.
+    // genuinely-missing local model still reports as FAIL. Issue 7: the model
+    // fallback is the real configured default (`config.context.embedding_model`),
+    // not the stale hardcoded `nomic-embed-text` literal.
     let (host, model) = match config {
         Some(c) => {
             let ollama = c.ollama.as_ref();
             let host = ollama.map_or_else(|| "http://127.0.0.1:11434".into(), |o| o.host.clone());
-            let model =
-                ollama.map_or_else(|| "nomic-embed-text".into(), |o| o.embedding_model.clone());
+            let model = ollama.map_or_else(
+                || c.context.embedding_model.clone(),
+                |o| o.embedding_model.clone(),
+            );
             (host, model)
         }
-        None => ("http://127.0.0.1:11434".into(), "nomic-embed-text".into()),
+        None => (
+            "http://127.0.0.1:11434".into(),
+            clx_core::config::default_embedding_model(),
+        ),
     };
 
     check_model_available(&host, &model, "Embedding model", start).await
@@ -1262,7 +1297,7 @@ mod tests {
             providers: vec![],
             routing: RoutingSummary {
                 chat: "ollama-local/qwen3:1.7b".into(),
-                embeddings: "ollama-local/nomic-embed-text".into(),
+                embeddings: "ollama-local/qwen3-embedding:0.6b".into(),
             },
             warnings: vec![],
         };
@@ -1693,6 +1728,126 @@ llm:
             !result.detail.contains("not found") && !result.detail.contains("qwen3"),
             "must not report the ollama validator literal as missing; got: {}",
             result.detail
+        );
+    }
+
+    // ── Issue 7: Unresolved-route WARN + config-default embedding model ──
+
+    /// AC7.1: an Unresolved route (providers present but no `llm:` routing
+    /// resolves) with a NON-EMPTY `config.providers` must WARN, not FAIL-probe
+    /// the hardcoded Ollama model. Covers both the validator and embedding
+    /// checks.
+    #[tokio::test]
+    async fn ac7_1_unresolved_route_with_providers_warns_not_fails() {
+        // `providers` is declared but there is no `llm:` block, so
+        // `capability_route` is Err -> RouteProbe::Unresolved while providers
+        // is non-empty.
+        let mut cfg = config_from_yaml(
+            r#"
+providers:
+  azure:
+    kind: azure_openai
+    endpoint: "https://synthetic.example.invalid"
+"#,
+        );
+        cfg.validator.enabled = true;
+
+        let v = check_validator_model(Some(&cfg)).await;
+        assert_eq!(
+            v.status,
+            CheckStatus::Warn,
+            "Unresolved route + providers must WARN for validator; got: {v:?}"
+        );
+        assert!(
+            v.detail.contains("route not configured") && v.detail.contains("clx config migrate"),
+            "validator WARN must point at migration; got: {}",
+            v.detail
+        );
+
+        let e = check_embedding_model(Some(&cfg)).await;
+        assert_eq!(
+            e.status,
+            CheckStatus::Warn,
+            "Unresolved route + providers must WARN for embeddings; got: {e:?}"
+        );
+        assert!(
+            e.detail.contains("route not configured"),
+            "embedding WARN must explain the routing gap; got: {}",
+            e.detail
+        );
+    }
+
+    /// AC7.2: with NO providers (legacy pure-Ollama) and no `llm:` routing, the
+    /// embedding check falls back to the configured default model
+    /// (`config.context.embedding_model`) and never the hardcoded
+    /// `nomic-embed-text` literal. The probe FAILs (no Ollama in tests) but the
+    /// detail must name the config default, proving the literal is gone.
+    #[tokio::test]
+    async fn ac7_2_embedding_fallback_uses_config_default_not_nomic() {
+        let mut cfg = Config::default();
+        // Pin a recognizable non-default model on the legacy context field and
+        // drop any ollama/providers so the Unresolved fallback path runs.
+        cfg.context.embedding_model = "synthetic-default-embed".to_owned();
+        cfg.ollama = None;
+        cfg.providers.clear();
+        cfg.llm = None;
+
+        let e = check_embedding_model(Some(&cfg)).await;
+        assert!(
+            !e.detail.contains("nomic-embed-text"),
+            "must not reference the hardcoded nomic literal; got: {}",
+            e.detail
+        );
+        assert!(
+            e.detail.contains("synthetic-default-embed"),
+            "must probe the config.context.embedding_model default; got: {}",
+            e.detail
+        );
+    }
+
+    /// AC7.3: a fully resolved Ollama route is unchanged — the genuinely-absent
+    /// model still FAILs and probes the REAL routed model (no WARN-hiding).
+    #[tokio::test]
+    async fn ac7_3_resolved_ollama_route_unchanged() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = config_from_yaml(&format!(
+            r#"
+providers:
+  local:
+    kind: ollama
+    host: "{uri}"
+llm:
+  chat:
+    provider: local
+    model: synthetic-chat-model
+  embeddings:
+    provider: local
+    model: synthetic-embed-model
+"#,
+            uri = server.uri(),
+        ));
+
+        let e = check_embedding_model(Some(&cfg)).await;
+        assert_eq!(
+            e.status,
+            CheckStatus::Fail,
+            "resolved-but-absent ollama embedding model must still FAIL; got: {e:?}"
+        );
+        assert!(
+            e.detail.contains("synthetic-embed-model"),
+            "must probe the REAL routed model; got: {}",
+            e.detail
         );
     }
 
