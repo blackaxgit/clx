@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-07
+
+A large hardening + features release: a security fix campaign followed by a
+10-issue source-improvement program. Includes a one-time schema migration
+(v8 → v9); older binaries will refuse a v9 database.
+
+### Security
+
+- **Read-only command classifier rewritten (token-parse + default-deny).** The
+  previous allow-by-name + substring heuristic auto-allowed many command-executing
+  or file-writing commands under `auto_allow_reads`. The classifier now tokenizes
+  (quote-aware), screens shell metacharacters, segments compound commands, and
+  fails closed — closing bypasses via env-prefixed execution, `awk` `system()`,
+  `find`/`fd` exec, interpreter `-e`/verbose flags, `git config`/`branch`/`tag`/
+  `remote`, `tar`/`zip`, `sed` exec/write flags, arbitrary-fd redirection, and
+  shell-metacharacter evasion.
+- **Learned-rules database no longer ingests secrets or malformed patterns.**
+  Leading `ENV=VALUE` assignments are stripped before pattern extraction; raw
+  secret-bearing and compound/substitution commands are rejected before any rule
+  is stored; a v9 migration purges pre-existing secret/malformed rows (logged
+  redacted).
+- **L0 now denies shell redirection/`tee`/`cp`/`mv`/`dd` writes into protected
+  config directories** (CLX, Codex, Cursor, and sensitive agent-config targets).
+- **Auto-blacklist no longer learns from automated LLM denials** — only genuine
+  user rejections create deny rules, so an explicit allow can't be overridden by
+  the validator's own caution.
+- **L1 verdict cache key is now injective** (NUL separator), preventing reuse of a
+  cached decision for a different command/cwd.
+- **`clx rules import` strictly validates rule types** (unknown/`graylist` values
+  are rejected, never coerced to allow).
+- Additional hardening: single-source Codex trust reader, bounded credential read
+  retry, glob-match colon symmetry, and removal of dead security-path code.
+
+### Added
+
+- **Graylist (ask) policy tier** with asymmetric compound-command matching: a
+  compound is denied if any segment is blacklisted and allowed only if every
+  non-`cd` segment is whitelisted.
+- **`clx config get` / `clx config set`** for dotted-key configuration tuning
+  (global scope, validate-or-restore on write).
+- **`clx rules export` / `clx rules import`** (validated + redacted on import) and
+  scope-aware **`clx rules reset --learned-only` (default) / `--all`**.
+- **CLAUDECODE-based host detection** so interactive Claude Code is not mistaken
+  for Codex (which would turn an `ask` into a hard block).
+- **Route-derived embedding dimension** (`CapabilityRoute.dimension` + model
+  registry) with stored-vs-route drift detection; the Azure embed request now
+  sends the configured dimension.
+- Expanded read-only allow-set (`cd`, `sort`, `uniq`, `cut`, `column`, guarded).
+
+### Fixed
+
+- **`clx health`** warns on unresolved/legacy routes instead of failing against
+  hardcoded Ollama models, and uses the configured embedding model.
+- Agent memory files are writable again while settings/hooks remain protected.
+- MCP JSON-RPC line reads decode UTF-8 once, fixing multibyte corruption at buffer
+  boundaries.
+- Recall reports a degraded signal instead of masking a broken store as "no
+  results".
+- Azure health probe bounded by a 2s timeout; the LLM fallback cooldown now
+  survives across one-shot hook processes; the v1 storage migration is
+  transactional.
+
+### Changed
+
+- **Schema version 8 → 9** (one-time purge migration; older binaries refuse a v9
+  database).
+- Documentation: clarified that disabling L1 (`layer1_enabled=false`) forces
+  `ask`; `default_decision` governs runtime L1 failure/inconclusive outcomes only.
+
 ## [0.10.1] - 2026-05-30
 
 ### Security
