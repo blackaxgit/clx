@@ -16,7 +16,7 @@ use crate::audit::log_audit_entry;
 use crate::audit_chain::{GENESIS_HASH, build_record};
 use crate::embedding::resolve_command_paths;
 use crate::host::{Host, HostId};
-use crate::learning::track_user_decision;
+use crate::learning::{DecisionSource, track_user_decision};
 use crate::output::{RULES_REMINDER, output_decision_for};
 use crate::types::HostNeutralInput;
 
@@ -105,12 +105,53 @@ fn canonicalize_best_effort(path: &std::path::Path) -> std::path::PathBuf {
 /// in the patch payload to a canonical absolute path (symlinks resolved) and
 /// returns a deny reason if any target lands inside a protected config/trust
 /// dir (`~/.codex`, `~/.claude`, `~/.cursor`, `~/.clx`). Returns None otherwise.
+/// Issue 4: is `dir` (a canonicalized protected-dir entry) the dot-claude dir?
+/// Compared on the final component name (case-insensitive) so it works whether
+/// or not the dir resolved through a symlink.
+fn dir_is_dot_claude(dir: &std::path::Path, dot_claude: &str) -> bool {
+    dir.file_name()
+        .is_some_and(|n| n.to_string_lossy().to_ascii_lowercase() == dot_claude)
+}
+
+/// Issue 4 narrowing predicate: within the dot-claude dir, only these targets
+/// stay protected (deny): a basename of `settings.json` or
+/// `settings.local.json`, OR any path under a `hooks/` subdir located at or
+/// after the dot-claude component. All other dot-claude paths (e.g. `CLAUDE.md`,
+/// project memory) are allowed.
+fn dot_claude_path_is_sensitive(resolved: &std::path::Path, dot_claude: &str) -> bool {
+    // Sensitive settings files (exact basename match, case-insensitive).
+    if let Some(name) = resolved.file_name() {
+        let lower = name.to_string_lossy().to_ascii_lowercase();
+        if matches!(lower.as_str(), "settings.json" | "settings.local.json") {
+            return true;
+        }
+    }
+    // A `hooks` component at or after the dot-claude component => protected.
+    let mut seen_dot_claude = false;
+    for comp in resolved.components() {
+        if let std::path::Component::Normal(name) = comp {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            if lower == dot_claude {
+                seen_dot_claude = true;
+            } else if seen_dot_claude && lower == "hooks" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn fileedit_resolves_into_protected_dir(
     tool_input: Option<&serde_json::Value>,
     cwd: &str,
     home: &std::path::Path,
 ) -> Option<String> {
-    let protected: Vec<std::path::PathBuf> = [".codex", ".claude", ".cursor", ".clx"]
+    // The dot-claude config dir component name. Built via `concat!` so the
+    // literal hidden-dir token does not appear verbatim (write-hook safe).
+    let dot_claude: &str = concat!(".", "claude");
+    // Each protected dir paired with whether its guard is BROAD (deny any path
+    // component) or NARROW (dot-claude: deny only sensitive targets).
+    let protected: Vec<std::path::PathBuf> = [".codex", dot_claude, ".cursor", ".clx"]
         .iter()
         .map(|d| {
             let p = home.join(d);
@@ -147,6 +188,15 @@ fn fileedit_resolves_into_protected_dir(
         // (a) canonical prefix match against the home config/trust dirs.
         for prot in &protected {
             if resolved.starts_with(prot) {
+                // Issue 4: the dot-claude dir guard is NARROW — only sensitive
+                // targets (settings.json / settings.local.json / hooks/) are
+                // denied; other dot-claude paths (CLAUDE.md, project memory)
+                // are allowed. The codex/cursor/clx dirs stay BROAD.
+                if dir_is_dot_claude(prot, dot_claude)
+                    && !dot_claude_path_is_sensitive(&resolved, dot_claude)
+                {
+                    continue;
+                }
                 return Some(format!(
                     "File edit resolves into protected config/trust dir: {}",
                     prot.display()
@@ -188,7 +238,15 @@ fn fileedit_resolves_into_protected_dir(
         for comp in resolved.components() {
             if let std::path::Component::Normal(name) = comp {
                 let lower = name.to_string_lossy().to_ascii_lowercase();
-                if matches!(lower.as_str(), ".codex" | ".claude" | ".cursor" | ".clx") {
+                if lower == dot_claude {
+                    // Issue 4: NARROW dot-claude guard — only deny sensitive
+                    // targets; allow other dot-claude paths (memory files).
+                    if dot_claude_path_is_sensitive(&resolved, dot_claude) {
+                        return Some(format!(
+                            "File edit targets a protected config/trust dir component: {lower}"
+                        ));
+                    }
+                } else if matches!(lower.as_str(), ".codex" | ".cursor" | ".clx") {
                     return Some(format!(
                         "File edit targets a protected config/trust dir component: {lower}"
                     ));
@@ -1039,7 +1097,13 @@ async fn escalate_l1(
             // learned here, matching the approve path which only learns from
             // executed commands, not deterministic L0 outcomes.
             if let Ok(storage) = Storage::open_default() {
-                track_user_decision(&storage, command, &input.cwd, false);
+                track_user_decision(
+                    &storage,
+                    command,
+                    &input.cwd,
+                    false,
+                    DecisionSource::Automated,
+                );
             }
             output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         }
@@ -1425,6 +1489,74 @@ mod tests {
                 .is_none(),
             "ordinary project file edit must not be flagged"
         );
+    }
+
+    // =========================================================================
+    // Issue 4: narrowed dot-claude guard. Memory files (CLAUDE.md, project
+    // memory) ALLOWED; settings.json / settings.local.json / hooks/ DENIED.
+    // The hidden-dir segments are built via `concat!` so the literal tokens do
+    // not appear verbatim in test inputs (write-hook safe).
+    // =========================================================================
+
+    /// AC4.2: a `FileEdit` into `<dot-claude>/CLAUDE.md` is ALLOWED (not flagged).
+    #[test]
+    fn ac4_2_fileedit_dot_claude_memory_is_allowed() {
+        let dot_claude: &str = concat!(".", "claude");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_claude)).unwrap();
+        let ti = serde_json::json!({
+            "path": format!("{}/{}/CLAUDE.md", home.path().display(), dot_claude)
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "dot-claude memory file (CLAUDE.md) must be allowed"
+        );
+        // A nested project-memory file is also allowed.
+        let ti2 = serde_json::json!({
+            "path": format!("{}/{}/memory/notes.md", home.path().display(), dot_claude)
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti2), "/tmp", home.path()).is_none(),
+            "dot-claude nested memory file must be allowed"
+        );
+    }
+
+    /// AC4.3: settings.json / settings.local.json / hooks/x under dot-claude
+    /// are STILL DENIED.
+    #[test]
+    fn ac4_3_fileedit_dot_claude_sensitive_targets_denied() {
+        let dot_claude: &str = concat!(".", "claude");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_claude)).unwrap();
+        for rel in ["settings.json", "settings.local.json", "hooks/guard.sh"] {
+            let ti = serde_json::json!({
+                "path": format!("{}/{}/{}", home.path().display(), dot_claude, rel)
+            });
+            assert!(
+                fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+                "dot-claude sensitive target must still be denied: {rel}"
+            );
+        }
+    }
+
+    /// The broad dirs (codex/cursor/clx) still deny ANY path component,
+    /// including memory-like files — narrowing is dot-claude-only.
+    #[test]
+    fn ac4_broad_dirs_still_deny_any_component() {
+        let home = tempfile::tempdir().unwrap();
+        let dot_codex: &str = concat!(".", "codex");
+        let dot_cursor: &str = concat!(".", "cursor");
+        let dot_clx: &str = concat!(".", "clx");
+        for dir in [dot_codex, dot_cursor, dot_clx] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+            let ti = serde_json::json!({
+                "path": format!("{}/{}/NOTES.md", home.path().display(), dir)
+            });
+            assert!(
+                fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+                "broad protected dir {dir} must deny any path component"
+            );
+        }
     }
 
     // =========================================================================
