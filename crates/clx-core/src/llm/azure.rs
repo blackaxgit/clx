@@ -74,6 +74,10 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Default embedding dimension requested when no config-derived dimension is
+/// supplied (matches CLX's historical hardcoded value).
+const DEFAULT_EMBEDDING_DIMENSION: u32 = 1024;
+
 #[derive(Debug, Clone)]
 pub struct AzureOpenAIBackend {
     endpoint: Url,
@@ -81,12 +85,33 @@ pub struct AzureOpenAIBackend {
     api_version: Option<String>,
     retry: RetryConfig,
     http: reqwest::Client,
+    /// Output dimension requested on the `embeddings` call via the `OpenAI`
+    /// `dimensions` parameter. Resolved from config at construction (route
+    /// override → model registry → legacy ollama dim → default 1024).
+    embedding_dimension: u32,
 }
 
 const ALLOWED_HOST_SUFFIXES: &[&str] = &[".openai.azure.com", ".azure-api.net"];
 
 impl AzureOpenAIBackend {
+    /// Construct a backend using the default embedding dimension (1024).
+    ///
+    /// Prefer [`AzureOpenAIBackend::with_embedding_dimension`] when a
+    /// config-derived dimension is available.
     pub fn new(cfg: &AzureOpenAIConfig, api_key: SecretString) -> Result<Self, LlmError> {
+        Self::with_embedding_dimension(cfg, api_key, DEFAULT_EMBEDDING_DIMENSION)
+    }
+
+    /// Construct a backend with an explicit embedding output dimension.
+    ///
+    /// The dimension is sent as the `OpenAI` `dimensions` parameter on every
+    /// `embed` request, so all rows produced by this backend share a single
+    /// stored dimension.
+    pub fn with_embedding_dimension(
+        cfg: &AzureOpenAIConfig,
+        api_key: SecretString,
+        embedding_dimension: u32,
+    ) -> Result<Self, LlmError> {
         let endpoint = Url::parse(&cfg.endpoint)
             .map_err(|e| LlmError::Connection(format!("invalid endpoint URL: {e}")))?;
         Self::validate_host(&endpoint)?;
@@ -102,6 +127,7 @@ impl AzureOpenAIBackend {
             api_version: cfg.api_version.clone().filter(|s| !s.is_empty()),
             retry: cfg.retry,
             http,
+            embedding_dimension,
         })
     }
 
@@ -368,7 +394,7 @@ impl LocalLlmBackend for AzureOpenAIBackend {
         let body = EmbedRequest {
             model: deployment,
             input: text,
-            dimensions: Some(1024),
+            dimensions: Some(self.embedding_dimension),
         };
         let resp = with_backoff(
             self.retry,
@@ -459,8 +485,15 @@ mod tests {
     async fn embed_happy_path() {
         allow_local();
         let mock = MockServer::start().await;
+        // AC6.4: assert the request body carries the configured `dimensions`.
+        // The backend is constructed with the default dimension (1024), so the
+        // request body must send `dimensions: 1024` and the mock response is
+        // consistent with that.
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/openai/v1/embeddings"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "dimensions": 1024 }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [{ "embedding": vec![0.1f32; 1024] }]
             })))
@@ -476,6 +509,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v.len(), 1024);
+    }
+
+    /// AC6.4: the configured embedding dimension is sent verbatim in the request
+    /// body. A backend built with `with_embedding_dimension(3072)` must request
+    /// `dimensions: 3072` — the mock only matches that body, so a regression to
+    /// the old hardcoded 1024 would fail to match and the request would 404/hang.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn embed_sends_configured_dimension() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/embeddings"))
+            .and(matchers::body_partial_json(
+                serde_json::json!({ "dimensions": 3072 }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": vec![0.2f32; 3072] }]
+            })))
+            .mount(&mock)
+            .await;
+        let backend = AzureOpenAIBackend::with_embedding_dimension(
+            &cfg(mock.uri()),
+            SecretString::new("test-key".to_string().into()),
+            3072,
+        )
+        .unwrap();
+        let v = backend
+            .embed("text", Some("text-embedding-3-large"))
+            .await
+            .unwrap();
+        assert_eq!(v.len(), 3072, "response dimension must match configured");
     }
 
     #[tokio::test]

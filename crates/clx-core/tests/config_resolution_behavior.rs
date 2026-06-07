@@ -693,12 +693,15 @@ fn route_with_fallback_yields_fallback_client_wrapper(// E16 wiring
                 provider: "local".to_string(),
                 model: "qwen3:1.7b".to_string(),
                 fallback: None,
+                dimension: None,
             })),
+            dimension: None,
         },
         embeddings: CapabilityRoute {
             provider: "local".to_string(),
             model: "qwen3-embedding:0.6b".to_string(),
             fallback: None,
+            dimension: None,
         },
     });
 
@@ -751,12 +754,15 @@ fn fallback_provider_credential_resolved_independently() {
                 provider: "az-fallback".to_string(),
                 model: "m2".to_string(),
                 fallback: None,
+                dimension: None,
             })),
+            dimension: None,
         },
         embeddings: CapabilityRoute {
             provider: "az-primary".to_string(),
             model: "m1".to_string(),
             fallback: None,
+            dimension: None,
         },
     });
 
