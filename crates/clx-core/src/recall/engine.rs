@@ -300,7 +300,7 @@ impl<'a> RecallEngine<'a> {
         let fetch_limit = config.max_results * 2;
 
         // Try FTS5 first
-        match self.repo.search_fts(query, fetch_limit) {
+        let fts_errored = match self.repo.search_fts(query, fetch_limit) {
             Ok(fts_results) if !fts_results.is_empty() => {
                 debug!("FTS5 recall returned {} results", fts_results.len());
                 let hits = fts_results
@@ -322,14 +322,22 @@ impl<'a> RecallEngine<'a> {
             }
             Ok(_) => {
                 debug!("FTS5 recall returned no results, trying substring fallback");
+                false
             }
             Err(e) => {
                 warn!("FTS5 recall failed, trying substring fallback: {e}");
+                true
             }
-        }
+        };
 
-        // Substring fallback
-        self.try_substring_fallback(query, fetch_limit)
+        // Substring fallback. If FTS5 itself errored, the stage is degraded even
+        // when the cruder fallback finds hits — the caller must learn the primary
+        // lexical index failed, not silently accept a lower-quality result.
+        let mut outcome = self.try_substring_fallback(query, fetch_limit);
+        if fts_errored {
+            outcome.errored = true;
+        }
+        outcome
     }
 
     /// Fallback substring search across active sessions.
