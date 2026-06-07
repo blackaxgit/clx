@@ -2731,6 +2731,33 @@ fn ac4_2_fileedit_ordinary_dot_claude_not_denied_by_policy() {
     );
 }
 
+// AC4.2 (Bash-redirect slice): a redirect into a non-sensitive dot-claude path
+// (memory) must NOT be denied, while a redirect into a sensitive target IS
+// denied — the redirection rules mirror the narrowed FileEdit guard.
+#[test]
+fn ac4_2_bash_redirect_into_dot_claude_memory_not_denied() {
+    let engine = PolicyEngine::new();
+    let claude = concat!("/.", "claude/");
+    // Memory write must be allowed (not denied) by the narrowed redirection rules.
+    let memory = engine.evaluate("Bash", &format!("echo note > /home/u/{claude}CLAUDE.md"));
+    assert!(
+        !matches!(memory, PolicyDecision::Deny { .. }),
+        "redirect into dot-claude memory must NOT be denied, got {memory:?}"
+    );
+    // Sensitive targets must still be denied.
+    for cmd in [
+        format!("echo x > /home/u/{claude}settings.json"),
+        format!("echo x >> /home/u/{claude}settings.local.json"),
+        format!("cat s | tee /home/u/{claude}hooks/h.sh"),
+    ] {
+        let r = engine.evaluate("Bash", &cmd);
+        assert!(
+            matches!(r, PolicyDecision::Deny { .. }),
+            "redirect into sensitive dot-claude target must deny: {cmd} => {r:?}"
+        );
+    }
+}
+
 // =========================================================================
 // Issue 10.1 — extend the read-only allow-set
 // =========================================================================

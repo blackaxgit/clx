@@ -259,30 +259,50 @@ impl PolicyEngine {
         // leading `*` is required (and a `/tmp` redirect does not false-match a
         // protected segment). Dir names assembled via `concat!` (write-hook
         // compatibility).
-        let protected_segments: [&str; 4] = [
+        // The agent dot-claude dir is NOT broadly protected here: memory writes
+        // (CLAUDE.md, project memory) must be allowed. It is handled with
+        // narrowed sensitive targets below, mirroring the FileEdit guard.
+        let protected_segments: [&str; 3] = [
             concat!(".", "clx"),
-            concat!(".", "claude"),
             concat!(".", "codex"),
             concat!(".", "cursor"),
         ];
-        for seg in protected_segments {
+        let redir_templates = |target: &str| {
             // Templates cover `>`/`>>` (spaced + unspaced), `tee`, `cp`, `mv`,
-            // and `dd of=` writes whose target path contains the protected
-            // segment as a directory component.
-            for pattern in [
-                format!("Bash(*> *{seg}/*)"),
-                format!("Bash(*>*{seg}/*)"),
-                format!("Bash(*>> *{seg}/*)"),
-                format!("Bash(*>>*{seg}/*)"),
-                format!("Bash(*tee*{seg}/*)"),
-                format!("Bash(*cp *{seg}/*)"),
-                format!("Bash(*mv *{seg}/*)"),
-                format!("Bash(*dd *of=*{seg}/*)"),
-            ] {
+            // and `dd of=` writes whose target path contains `target`.
+            [
+                format!("Bash(*> *{target}*)"),
+                format!("Bash(*>*{target}*)"),
+                format!("Bash(*>> *{target}*)"),
+                format!("Bash(*>>*{target}*)"),
+                format!("Bash(*tee*{target}*)"),
+                format!("Bash(*cp *{target}*)"),
+                format!("Bash(*mv *{target}*)"),
+                format!("Bash(*dd *of=*{target}*)"),
+            ]
+        };
+        for seg in protected_segments {
+            for pattern in redir_templates(&format!("{seg}/")) {
                 self.blacklist.push(
                     PolicyRule::blacklist(pattern)
                         .with_description("Redirection/write into a protected config dir"),
                 );
+            }
+        }
+        // Narrowed dot-claude redirection guard: only the sensitive targets
+        // (settings.json, settings.local.json, hooks/) are denied; CLAUDE.md and
+        // other memory paths are allowed (consistent with the FileEdit guard).
+        let dc = concat!("/.", "claude/");
+        for sensitive in [
+            format!("{dc}settings.json"),
+            format!("{dc}settings.local.json"),
+            format!("{dc}hooks/"),
+        ] {
+            for pattern in redir_templates(&sensitive) {
+                self.blacklist
+                    .push(PolicyRule::blacklist(pattern).with_description(
+                        "Redirection/write into a protected agent-config target",
+                    ));
             }
         }
 
