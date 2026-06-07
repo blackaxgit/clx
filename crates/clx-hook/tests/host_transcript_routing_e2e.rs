@@ -71,7 +71,13 @@ fn run(host: Option<&str>, envelope_bytes: &[u8]) -> HookRun {
     std::fs::write(clx_dir.join("config.yaml"), CONFIG_L0_ON_L1_OFF).expect("write config");
 
     let mut command = Command::new(binary);
-    let cmd = harden_command(&mut command, temp.path()).env("CLX_CREDENTIALS_BACKEND", "age");
+    let cmd = harden_command(&mut command, temp.path())
+        .env("CLX_CREDENTIALS_BACKEND", "age")
+        // Issue 2: a truthy CLAUDECODE forces HostId::Claude (precedence above
+        // envelope sniffing). The envelope-sniff routing tests must be hermetic,
+        // so clear any ambient CLAUDECODE inherited from a Claude Code test
+        // runner; the dedicated CLAUDECODE-precedence tests live in host.rs.
+        .env_remove("CLAUDECODE");
     if let Some(h) = host {
         cmd.env("CLX_HOOK_HOST", h);
     }
