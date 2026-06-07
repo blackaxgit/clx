@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::hooks::aggregator;
 use crate::host::Host;
-use crate::learning::track_user_decision;
+use crate::learning::{DecisionSource, track_user_decision};
 use crate::types::HostNeutralInput;
 
 /// Handle `PostToolUse` hook - log events and track user decisions
@@ -115,7 +115,7 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
     if let Some(ref command) = extracted_command {
         let was_executed = input.tool_response.is_some();
         if was_executed {
-            track_user_decision(&storage, command, &input.cwd, true);
+            track_user_decision(&storage, command, &input.cwd, true, DecisionSource::User);
         }
     }
 
