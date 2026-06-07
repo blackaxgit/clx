@@ -70,7 +70,25 @@ impl McpServer {
             reranker_timeout_ms: auto_recall.reranker_timeout_ms,
         };
 
-        let hits = self.runtime.block_on(engine.query(&query, &config));
+        let result = self.runtime.block_on(engine.query(&query, &config));
+        let degraded = result.degraded;
+        let hits = result.hits;
+
+        // FIX-6: a degraded result with no hits means the candidate-generation
+        // stages errored (broken/unavailable store), which is distinct from a
+        // healthy store that simply has no matching context. Surface that to
+        // the agent honestly rather than implying "nothing relevant exists".
+        if degraded && hits.is_empty() {
+            debug!("Recall degraded with no hits; reporting temporary unavailability");
+            return Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Recall temporarily unavailable: the context store could not be \
+                             queried right now (this is a recall error, not an empty result). \
+                             Proceed without recalled context and retry later."
+                }]
+            }));
+        }
 
         let has_semantic = hits.iter().any(|h| {
             matches!(
@@ -116,10 +134,19 @@ impl McpServer {
             } else {
                 "fts5"
             };
+            // FIX-6: hits exist but a candidate stage errored — return the
+            // hits we have, with a note so the agent knows results may be
+            // partial (one search path was unavailable).
+            let degraded_note = if degraded {
+                " [partial: one search path was unavailable]"
+            } else {
+                ""
+            };
             let header = format!(
-                "Found {} results (search method: {})\n\n",
+                "Found {} results (search method: {}){}\n\n",
                 results.len(),
-                search_method
+                search_method,
+                degraded_note
             );
             header + &serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string())
         };

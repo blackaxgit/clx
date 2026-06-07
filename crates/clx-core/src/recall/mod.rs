@@ -60,6 +60,22 @@ pub struct RecallHit {
     pub search_type: RecallSearchType,
 }
 
+/// Result of a recall query, carrying the hits plus a degraded-health signal.
+///
+/// `degraded` is `true` when any candidate-generation stage (semantic
+/// embedding, vector search, FTS5, or session listing) errored during the
+/// query. This lets callers distinguish a *broken* store (degraded, possibly
+/// empty) from a healthy store that simply has no matching context
+/// (`degraded == false`, empty `hits`). Partial failures still return the
+/// hits that succeeded while flagging `degraded`.
+#[derive(Debug, Clone)]
+pub struct RecallQueryResult {
+    /// The ranked recall hits (possibly empty).
+    pub hits: Vec<RecallHit>,
+    /// Whether any candidate-generation stage errored during this query.
+    pub degraded: bool,
+}
+
 /// How a recall hit was found.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -639,7 +655,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hits = engine.query("authentication", &config).await;
+        let hits = engine.query("authentication", &config).await.hits;
         assert!(
             !hits.is_empty(),
             "FTS query for 'authentication' should find the snapshot"
@@ -667,7 +683,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hits = engine.query("xyzzy_nonexistent_topic_qqq", &config).await;
+        let hits = engine.query("xyzzy_nonexistent_topic_qqq", &config).await.hits;
         assert!(
             hits.is_empty(),
             "query for gibberish should return no results, got {} hits",
@@ -696,7 +712,7 @@ mod tests {
 
         // semantic_hits will be empty (no ollama/embedding_store),
         // so the code at line 105-107 should trigger FTS as last resort
-        let hits = engine.query("Redis", &config).await;
+        let hits = engine.query("Redis", &config).await.hits;
         assert!(
             !hits.is_empty(),
             "fallback path should still find results via FTS last-resort"
@@ -764,7 +780,7 @@ mod tests {
         };
 
         // Act
-        let hits = engine.query("tokio async", &config).await;
+        let hits = engine.query("tokio async", &config).await.hits;
 
         // Assert: at least one semantic hit should be returned
         assert!(
@@ -797,7 +813,7 @@ mod tests {
         };
 
         // Act — "pipeline" appears in the seeded summary
-        let hits = engine.query("pipeline", &config).await;
+        let hits = engine.query("pipeline", &config).await.hits;
 
         // Assert: substring/FTS fallback must find the seeded snapshot
         assert!(
@@ -829,7 +845,7 @@ mod tests {
         };
 
         // Act
-        let hits = engine.query("anything", &config).await;
+        let hits = engine.query("anything", &config).await.hits;
 
         // Assert
         assert!(
@@ -857,7 +873,7 @@ mod tests {
         };
 
         // Act — this term does not appear anywhere in the seeded data
-        let hits = engine.query("xyzzy_no_match_qqqqqq", &config).await;
+        let hits = engine.query("xyzzy_no_match_qqqqqq", &config).await.hits;
 
         // Assert
         assert!(
