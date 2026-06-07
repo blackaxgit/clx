@@ -1248,6 +1248,53 @@ fn test_read_bounded_line_over_limit_returns_error() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
+#[test]
+fn test_read_bounded_line_utf8_split_across_chunk_boundary() {
+    // FIX-9 regression. A small-capacity BufReader hands out the line in
+    // multiple `fill_buf` chunks; the 4-byte emoji and the 3-byte CJK char are
+    // deliberately split across those chunk boundaries.
+    //
+    // Fails-before: the old impl called `String::from_utf8_lossy` on each chunk
+    // independently, so a multi-byte char straddling a boundary decoded to one
+    // or more `U+FFFD` replacement chars — the line came back corrupted.
+    // Passes-after: bytes are accumulated and decoded once, so the line is
+    // intact with no replacement chars.
+    let line = "héllo🦀世界\n"; // mix of 1/2/4/3-byte UTF-8 scalars
+    // Capacity 4 forces fill_buf to return small chunks that will not align
+    // with the multi-byte char boundaries.
+    let mut reader = BufReader::with_capacity(4, line.as_bytes());
+    let mut buf = String::new();
+
+    let result = McpServer::read_bounded_line(&mut reader, &mut buf);
+
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_some());
+    assert_eq!(
+        buf, "héllo🦀世界",
+        "multi-byte chars split across chunk boundaries must decode intact"
+    );
+    assert!(
+        !buf.contains('\u{FFFD}'),
+        "no U+FFFD replacement char must appear (no boundary corruption)"
+    );
+}
+
+#[test]
+fn test_read_bounded_line_over_limit_still_bounded_with_small_chunks() {
+    // FIX-9: the byte bound must still reject oversize input even when the
+    // reader delivers the line in many tiny chunks (the refactor accumulates
+    // across chunks, so the bound is checked against the running total).
+    let mut data = vec![b'x'; McpServer::MAX_LINE_SIZE + 1];
+    data.push(b'\n');
+    let mut reader = BufReader::with_capacity(8, data.as_slice());
+    let mut buf = String::new();
+
+    let result = McpServer::read_bounded_line(&mut reader, &mut buf);
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+}
+
 // =========================================================================
 // tool_remember — auto session-creation branches (remember.rs lines 23-44)
 // =========================================================================

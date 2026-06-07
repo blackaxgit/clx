@@ -361,24 +361,33 @@ impl McpServer {
     ///
     /// Returns `Ok(None)` on EOF. Returns a JSON-RPC error response if the
     /// line exceeds `MAX_LINE_SIZE` bytes.
+    ///
+    /// FIX-9: raw bytes are accumulated to the newline delimiter and decoded
+    /// once at the end with `String::from_utf8_lossy`. Decoding each `fill_buf`
+    /// chunk independently would corrupt a multi-byte UTF-8 character split
+    /// across a chunk boundary (each fragment decodes to `U+FFFD`); `fill_buf`
+    /// makes no guarantee that chunks end on a character boundary.
     pub fn read_bounded_line(
         reader: &mut impl io::BufRead,
         buf: &mut String,
     ) -> io::Result<Option<()>> {
         buf.clear();
-        let mut total = 0usize;
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             let available = reader.fill_buf()?;
             if available.is_empty() {
                 // EOF
-                return if total == 0 { Ok(None) } else { Ok(Some(())) };
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                return Ok(Some(()));
             }
 
             if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
-                // Found newline — consume up to and including it
+                // Found newline — accumulate up to (not including) it.
                 let chunk = &available[..newline_pos];
-                total += chunk.len();
-                if total > Self::MAX_LINE_SIZE {
+                if bytes.len() + chunk.len() > Self::MAX_LINE_SIZE {
                     // Consume the rest of the line so we can continue
                     let consume_len = newline_pos + 1;
                     reader.consume(consume_len);
@@ -387,24 +396,24 @@ impl McpServer {
                         format!("Line exceeds maximum size of {} bytes", Self::MAX_LINE_SIZE),
                     ));
                 }
-                // Safe: fill_buf returns valid UTF-8 boundaries per BufRead on stdin
-                buf.push_str(&String::from_utf8_lossy(chunk));
+                bytes.extend_from_slice(chunk);
                 let consume_len = newline_pos + 1; // +1 to skip the newline
                 reader.consume(consume_len);
+                // Decode once, on a complete line — respects UTF-8 boundaries.
+                buf.push_str(&String::from_utf8_lossy(&bytes));
                 return Ok(Some(()));
             }
 
-            // No newline yet — consume entire buffer
+            // No newline yet — accumulate the entire buffer as raw bytes.
             let len = available.len();
-            total += len;
-            if total > Self::MAX_LINE_SIZE {
+            if bytes.len() + len > Self::MAX_LINE_SIZE {
                 reader.consume(len);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Line exceeds maximum size of {} bytes", Self::MAX_LINE_SIZE),
                 ));
             }
-            buf.push_str(&String::from_utf8_lossy(available));
+            bytes.extend_from_slice(available);
             reader.consume(len);
         }
     }
