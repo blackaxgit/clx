@@ -15,8 +15,6 @@
 //! requires Codex to be present (the writers only touch `~/.codex`), but
 //! `--target codex`/`auto` use detection to decide whether to write.
 
-pub mod trust;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
