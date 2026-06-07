@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clx_core::config::DefaultDecision;
+use clx_core::config::codex_trust::{ProjectTrust, read_project_trust};
 use clx_core::config::{Capability, Config};
 use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
@@ -18,65 +19,6 @@ use crate::host::{Host, HostId};
 use crate::learning::track_user_decision;
 use crate::output::{RULES_REMINDER, output_decision_for};
 use crate::types::HostNeutralInput;
-
-/// Codex project-trust state, replicated from `clx::codex::trust` (P6).
-///
-/// The canonical reader lives in the `clx` binary crate, which `clx-hook`
-/// must NOT depend on (a hook binary linking the whole CLI binary crate is a
-/// layering inversion). The trust-read logic is therefore replicated here as
-/// a small, self-contained helper. The SECURITY INVARIANT is identical and
-/// load-bearing: trust is read ONLY from the user-owned `~/.codex/config.toml`,
-/// NEVER from a repo-local `.codex/config.toml`, so a hostile repository can
-/// never self-declare as trusted (RGP surface #1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectTrust {
-    /// `trust_level = "trusted"` in `~/.codex/config.toml [projects.<path>]`.
-    Trusted,
-    /// `trust_level = "untrusted"` in `~/.codex/config.toml`.
-    Untrusted,
-    /// Path absent, file missing, or unparseable. Treated as untrusted.
-    NotSeen,
-}
-
-/// Read the trust level for `repo` from the user-global `~/.codex/config.toml`.
-///
-/// Mirrors `clx::codex::trust::read_project_trust` exactly (P6): reads ONLY
-/// `home/.codex/config.toml`, canonicalizes `repo` as the lookup key, and
-/// returns [`ProjectTrust::NotSeen`] on any read/parse error (safe default).
-/// It deliberately never reads `repo/.codex/config.toml`.
-pub(crate) fn read_project_trust(home: &std::path::Path, repo: &std::path::Path) -> ProjectTrust {
-    let config_path = home.join(".codex").join("config.toml");
-
-    // Missing file -> NotSeen (safe default).
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return ProjectTrust::NotSeen;
-    };
-
-    // Unparseable -> NotSeen (safe default).
-    let Ok(doc): Result<toml::Value, _> = toml::from_str(&raw) else {
-        return ProjectTrust::NotSeen;
-    };
-
-    // Canonicalize the repo path; failure is non-fatal (use original string).
-    let canonical_key: String = std::fs::canonicalize(repo)
-        .unwrap_or_else(|_| std::path::PathBuf::from(repo))
-        .display()
-        .to_string();
-
-    let trust_level = doc
-        .get("projects")
-        .and_then(toml::Value::as_table)
-        .and_then(|projects| projects.get(&canonical_key))
-        .and_then(toml::Value::as_table)
-        .and_then(|entry| entry.get("trust_level"))
-        .and_then(toml::Value::as_str);
-
-    match trust_level {
-        Some("trusted") => ProjectTrust::Trusted,
-        Some("untrusted") => ProjectTrust::Untrusted,
-        _ => ProjectTrust::NotSeen,
-    }
-}
 
 /// Build a policy engine for `input.cwd`, applying the Codex trust gate (P6).
 ///
@@ -336,366 +278,299 @@ fn fileedit_candidate_paths(tool_input: Option<&serde_json::Value>) -> Vec<Strin
     out
 }
 
-/// Handle `PreToolUse` hook - validate commands before execution
-pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
-    let raw_tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
+/// Signal from a pre-tool-use phase: whether it already emitted a decision
+/// (and the orchestrator must return) or evaluation should continue.
+enum Phase {
+    /// The phase emitted a decision via `output_decision_for` and the hook
+    /// must return immediately.
+    Handled,
+    /// No decision emitted; continue to the next phase.
+    Continue,
+}
 
-    // P7 input canonicalization: collapse host-specific tool names to their
-    // canonical CLX class BEFORE policy evaluation so L0 rules match a single
-    // vocabulary across hosts (e.g. Cursor `run_terminal_cmd` -> `Bash`,
-    // Codex/Cursor file-edit tools -> `FileEdit`). For Claude this is the
-    // identity map, so the Claude path is byte-identical.
-    let canonical_tool = host.canonical_tool_name(raw_tool_name);
-    let tool_name = canonical_tool.as_str();
+/// Map a decision string (`"allow"`/`"deny"`/anything else) to its audit shape.
+fn audit_decision_from_str(decision: &str) -> AuditDecision {
+    match decision {
+        "allow" => AuditDecision::Allowed,
+        "deny" => AuditDecision::Blocked,
+        _ => AuditDecision::Prompted,
+    }
+}
 
-    // Load configuration early (needed for MCP tool routing)
-    let config = Config::load().unwrap_or_default();
+/// F7 fail-closed posture: a command reaching an LLM-unavailable / timeout /
+/// generation-failure arm received ZERO L1 scrutiny. Honoring
+/// `default_decision=allow` there would silently pass it, so `allow` is forced
+/// to `ask`; `deny` and `ask` are already fail-closed and pass through. The
+/// distinct per-arm WARN is emitted by the caller (only on the `allow` path) so
+/// the log message stays specific to the arm.
+fn force_ask_if_allow(configured: &DefaultDecision) -> &'static str {
+    if *configured == DefaultDecision::Allow {
+        "ask"
+    } else {
+        configured.as_str()
+    }
+}
 
-    // B5-4-audit: emit a structured, hash-chained audit record whenever any
-    // security-weakening environment variable is active. This is additive
-    // (never changes the validation outcome) and zero-overhead on the normal
-    // hot path (empty Vec → no write, no hash computation).
-    //
+/// B5-4-audit: emit a hash-chained SECURITY-ENV audit record when any
+/// security-weakening environment override is active. Additive only: never
+/// changes the validation outcome, zero-overhead when no override is active.
+fn audit_security_env_overrides(config: &Config, host: &dyn Host, input: &HostNeutralInput) {
     // Only the env-var NAME(s) are recorded — never values, argv, or cwd.
     // The head hash is emitted to tracing::warn! so it can be anchored in
     // an external append-only sink (log aggregator, syslog) that the process
     // itself cannot rewrite. The chain lives entirely within clx-hook.
-    {
-        let active_overrides = config.security_env_overrides_active();
-        if !active_overrides.is_empty() {
-            // Collect only the env-var names; values are never recorded.
-            let key_names: Vec<&str> = active_overrides.iter().map(|(k, _)| *k).collect();
-            let trigger_keys = key_names.join(", ");
-
-            let timestamp = chrono::Utc::now().to_rfc3339();
-            // This hook process is short-lived; seq=1 per invocation is
-            // acceptable (the hook is spawned per-event, not a daemon).
-            let record = build_record(1, &timestamp, &trigger_keys, GENESIS_HASH);
-
-            // Emit the per-event integrity fingerprint as WARN to an external
-            // anchor sink (log aggregator, syslog). An external observer can
-            // re-verify this specific event by recomputing:
-            //   build_record(1, timestamp, trigger_keys, GENESIS_HASH).entry_hash
-            // and comparing to the captured fingerprint. This is a per-event
-            // integrity guarantee, not a cross-invocation chain (each new
-            // hook process starts from seq=1 and GENESIS_HASH).
-            warn!(
-                event_fingerprint = %record.entry_hash,
-                trigger_keys = %trigger_keys,
-                "SECURITY-ENV: security-weakening env override(s) active; \
-                 per-event integrity fingerprint anchored in external sink"
-            );
-
-            // Persist a structured audit row (SECURITY-ENV layer).
-            // The reasoning field carries the env-var names (not values) and
-            // the per-event fingerprint. redact_secrets in log_audit_entry
-            // (B6-3) is a no-op over bare env-var names and hex hashes.
-            let reasoning = format!(
-                "security-weakening env override(s) active: {trigger_keys}; \
-                 event_fingerprint={}",
-                record.entry_hash
-            );
-            log_audit_entry(
-                host.host_id(),
-                &input.session_id,
-                "<env-override>",
-                &input.cwd,
-                "SECURITY-ENV",
-                AuditDecision::Prompted,
-                None,
-                Some(&reasoning),
-            );
-        }
+    let active_overrides = config.security_env_overrides_active();
+    if active_overrides.is_empty() {
+        return;
     }
+    // Collect only the env-var names; values are never recorded.
+    let key_names: Vec<&str> = active_overrides.iter().map(|(k, _)| *k).collect();
+    let trigger_keys = key_names.join(", ");
 
-    // B5-4-extended (config-driven audit chain): emit a SECURITY-CFG audit-chain
-    // fingerprint whenever layer0_enabled or layer1_enabled is false in the
-    // *effective* config (not just when driven by env var). This closes the gap
-    // where a user sets validator.layer0_enabled: false in ~/.clx/config.yaml
-    // without any env var — the env-only path above would not fire, but this
-    // config-driven path will. Fires once per hook process invocation, mirroring
-    // the env-override per-event semantics. Trigger key strings are intentionally
-    // human-readable config paths so log aggregators can distinguish env vs config
-    // source without a second lookup.
-    {
-        let mut cfg_triggers: Vec<&'static str> = Vec::new();
-        if !config.validator.layer0_enabled {
-            cfg_triggers.push("validator.layer0_enabled=false");
-        }
-        if !config.validator.layer1_enabled {
-            cfg_triggers.push("validator.layer1_enabled=false");
-        }
-        if !cfg_triggers.is_empty() {
-            let trigger_keys = cfg_triggers.join(", ");
-            let timestamp = chrono::Utc::now().to_rfc3339();
-            let record = build_record(1, &timestamp, &trigger_keys, GENESIS_HASH);
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    // This hook process is short-lived; seq=1 per invocation is
+    // acceptable (the hook is spawned per-event, not a daemon).
+    let record = build_record(1, &timestamp, &trigger_keys, GENESIS_HASH);
 
-            warn!(
-                event_fingerprint = %record.entry_hash,
-                trigger_keys = %trigger_keys,
-                "SECURITY-CFG: config-driven layer-disable active; \
-                 per-event integrity fingerprint anchored in external sink"
-            );
+    // Emit the per-event integrity fingerprint as WARN to an external
+    // anchor sink (log aggregator, syslog). An external observer can
+    // re-verify this specific event by recomputing:
+    //   build_record(1, timestamp, trigger_keys, GENESIS_HASH).entry_hash
+    // and comparing to the captured fingerprint. This is a per-event
+    // integrity guarantee, not a cross-invocation chain (each new
+    // hook process starts from seq=1 and GENESIS_HASH).
+    warn!(
+        event_fingerprint = %record.entry_hash,
+        trigger_keys = %trigger_keys,
+        "SECURITY-ENV: security-weakening env override(s) active; \
+         per-event integrity fingerprint anchored in external sink"
+    );
 
-            let reasoning = format!(
-                "config-driven layer-disable: {trigger_keys}; \
-                 event_fingerprint={}",
-                record.entry_hash
-            );
-            log_audit_entry(
-                host.host_id(),
-                &input.session_id,
-                "<cfg-layer-disable>",
-                &input.cwd,
-                "SECURITY-CFG",
-                AuditDecision::Prompted,
-                None,
-                Some(&reasoning),
-            );
-        }
+    // Persist a structured audit row (SECURITY-ENV layer).
+    // The reasoning field carries the env-var names (not values) and
+    // the per-event fingerprint. redact_secrets in log_audit_entry
+    // (B6-3) is a no-op over bare env-var names and hex hashes.
+    let reasoning = format!(
+        "security-weakening env override(s) active: {trigger_keys}; \
+         event_fingerprint={}",
+        record.entry_hash
+    );
+    log_audit_entry(
+        host.host_id(),
+        &input.session_id,
+        "<env-override>",
+        &input.cwd,
+        "SECURITY-ENV",
+        AuditDecision::Prompted,
+        None,
+        Some(&reasoning),
+    );
+}
+
+/// B5-4-extended: emit a SECURITY-CFG audit-chain fingerprint whenever
+/// `layer0_enabled` or `layer1_enabled` is false in the *effective* config (not
+/// just when driven by an env var). This closes the gap where a user disables a
+/// layer directly in config without any env override. Fires once per hook
+/// invocation; additive only.
+fn audit_config_layer_disable(config: &Config, host: &dyn Host, input: &HostNeutralInput) {
+    // Trigger key strings are intentionally human-readable config paths so log
+    // aggregators can distinguish env vs config source without a second lookup.
+    let mut cfg_triggers: Vec<&'static str> = Vec::new();
+    if !config.validator.layer0_enabled {
+        cfg_triggers.push("validator.layer0_enabled=false");
     }
+    if !config.validator.layer1_enabled {
+        cfg_triggers.push("validator.layer1_enabled=false");
+    }
+    if cfg_triggers.is_empty() {
+        return;
+    }
+    let trigger_keys = cfg_triggers.join(", ");
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let record = build_record(1, &timestamp, &trigger_keys, GENESIS_HASH);
 
-    // P4 FileEdit branch (Codex `apply_patch`, Cursor `edit_file`): these
-    // canonicalize to "FileEdit". They are not shell commands, so they do NOT
-    // enter the Bash L0+L1 pipeline. Instead we run a trust-gated L0 evaluation
-    // against the canonical FileEdit class: a FileEdit deny rule blocks the
-    // edit; otherwise the edit is allowed (parity with Claude, which auto-allows
-    // its Write/Edit file tools). This keeps "evaluated as FileEdit" honest
-    // without fail-closing benign patches under Codex.
-    if tool_name == "FileEdit" {
-        let summary = apply_patch_summary(input.tool_input.as_ref());
-        // R1-F2 canonical guard (runs first, symlink/alias-resistant): deny any
-        // file-edit whose target resolves into a protected config/trust dir,
-        // regardless of how the path string is written.
-        if config.validator.enabled
-            && config.validator.layer0_enabled
-            && let Some(home) = dirs::home_dir()
-            && let Some(reason) =
-                fileedit_resolves_into_protected_dir(input.tool_input.as_ref(), &input.cwd, &home)
-        {
-            debug!("FileEdit L0 (canonical guard): denied: {}", reason);
-            log_audit_entry(
-                host.host_id(),
-                &input.session_id,
-                &summary,
-                &input.cwd,
-                "L0",
-                AuditDecision::Blocked,
-                None,
-                Some(&reason),
-            );
-            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
-            return Ok(());
-        }
-        let engine = build_trust_gated_engine(host, &input.cwd);
-        if config.validator.enabled
-            && config.validator.layer0_enabled
-            && let PolicyDecision::Deny { reason } = engine.evaluate("FileEdit", &summary)
-        {
-            debug!("FileEdit L0: denied '{}': {}", summary, reason);
-            log_audit_entry(
-                host.host_id(),
-                &input.session_id,
-                &summary,
-                &input.cwd,
-                "L0",
-                AuditDecision::Blocked,
-                None,
-                Some(&reason),
-            );
-            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
-            return Ok(());
-        }
+    warn!(
+        event_fingerprint = %record.entry_hash,
+        trigger_keys = %trigger_keys,
+        "SECURITY-CFG: config-driven layer-disable active; \
+         per-event integrity fingerprint anchored in external sink"
+    );
+
+    let reasoning = format!(
+        "config-driven layer-disable: {trigger_keys}; \
+         event_fingerprint={}",
+        record.entry_hash
+    );
+    log_audit_entry(
+        host.host_id(),
+        &input.session_id,
+        "<cfg-layer-disable>",
+        &input.cwd,
+        "SECURITY-CFG",
+        AuditDecision::Prompted,
+        None,
+        Some(&reasoning),
+    );
+}
+
+/// P4 `FileEdit` branch (Codex `apply_patch`, Cursor `edit_file`): canonical
+/// `FileEdit` tools are not shell commands, so they do NOT enter the Bash
+/// L0+L1 pipeline. A trust-gated L0 evaluation runs against the `FileEdit`
+/// class: a deny rule (or the symlink/alias-resistant protected-dir guard,
+/// which runs FIRST) blocks the edit; otherwise the edit is allowed (parity
+/// with Claude, which auto-allows its Write/Edit file tools).
+///
+/// Returns [`Phase::Handled`] once it emits a decision (the caller must return).
+fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutralInput) -> Phase {
+    let summary = apply_patch_summary(input.tool_input.as_ref());
+    // R1-F2 canonical guard (runs first, symlink/alias-resistant): deny any
+    // file-edit whose target resolves into a protected config/trust dir,
+    // regardless of how the path string is written.
+    if config.validator.enabled
+        && config.validator.layer0_enabled
+        && let Some(home) = dirs::home_dir()
+        && let Some(reason) =
+            fileedit_resolves_into_protected_dir(input.tool_input.as_ref(), &input.cwd, &home)
+    {
+        debug!("FileEdit L0 (canonical guard): denied: {}", reason);
         log_audit_entry(
             host.host_id(),
             &input.session_id,
             &summary,
             &input.cwd,
-            "L0-FILEEDIT",
-            AuditDecision::Allowed,
+            "L0",
+            AuditDecision::Blocked,
             None,
-            Some("File edit allowed (no FileEdit deny rule matched)"),
+            Some(&reason),
         );
-        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-        return Ok(());
+        output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
+        return Phase::Handled;
     }
-
-    // Route by tool type to extract the command to validate.
-    // MCP command tools are evaluated through the same PolicyEngine as Bash.
-    // A `direct_command` (Cursor `beforeShellExecution.command`) is treated as
-    // a Bash command even though the canonical tool name is not "Bash" (Cursor
-    // shell events carry no tool_name).
-    let command_raw = if let Some(direct) = input.direct_command.as_deref() {
-        // Host-surfaced top-level command (Cursor shell): evaluate as Bash.
-        direct.to_string()
-    } else if tool_name == "Bash" {
-        // Bash: extract from tool_input.command
-        input
-            .tool_input
-            .as_ref()
-            .and_then(|v| v.get("command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else if tool_name.starts_with("mcp__") && config.mcp_tools.enabled {
-        // MCP tool: check if it carries an executable command
-        let tool_input = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
-        match extract_mcp_command(tool_name, &tool_input, &config.mcp_tools.command_tools) {
-            McpExtraction::Command(cmd) => cmd,
-            McpExtraction::NotCommandTool => {
-                // Not a command-bearing MCP tool — use configured default decision
-                let decision = config.mcp_tools.default_decision.as_str();
-                output_decision_for(host, decision, None, Some(RULES_REMINDER), None);
-                return Ok(());
-            }
-        }
-    } else if let Some(cmd) = input
-        .tool_input
-        .as_ref()
-        .and_then(|v| v.get("command"))
-        .and_then(|v| v.as_str())
-        .filter(|c| !c.is_empty())
+    let engine = build_trust_gated_engine(host, &input.cwd);
+    if config.validator.enabled
+        && config.validator.layer0_enabled
+        && let PolicyDecision::Deny { reason } = engine.evaluate("FileEdit", &summary)
     {
-        // R2-F1 (fail-closed): an unknown/unexpected tool name that nonetheless
-        // carries a `command` string (e.g. a shell-bearing envelope misrouted to
-        // the wrong host adapter) must NOT silently auto-allow. Validate the
-        // command through the same pipeline as Bash rather than fail open.
-        warn!(
-            "Tool '{}' is not Bash/MCP but carries a command; validating it rather than auto-allowing",
-            tool_name
+        debug!("FileEdit L0: denied '{}': {}", summary, reason);
+        log_audit_entry(
+            host.host_id(),
+            &input.session_id,
+            &summary,
+            &input.cwd,
+            "L0",
+            AuditDecision::Blocked,
+            None,
+            Some(&reason),
         );
-        cmd.to_string()
-    } else {
-        // Non-Bash, non-MCP tools with no command (Read, Write, etc.) → auto-allow
-        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-        return Ok(());
-    };
-
-    if command_raw.is_empty() {
-        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-        return Ok(());
+        output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
+        return Phase::Handled;
     }
-
-    debug!(
-        "PreToolUse: validating [{}] command '{}' in '{}'",
-        tool_name, command_raw, input.cwd
+    log_audit_entry(
+        host.host_id(),
+        &input.session_id,
+        &summary,
+        &input.cwd,
+        "L0-FILEEDIT",
+        AuditDecision::Allowed,
+        None,
+        Some("File edit allowed (no FileEdit deny rule matched)"),
     );
+    output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
+    Phase::Handled
+}
 
-    // Skip validation if disabled
-    if !config.validator.enabled {
-        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-        return Ok(());
-    }
+/// Trust mode: a valid (unexpired, session-matching) signed JSON `TrustToken` is
+/// the ONLY way trust mode auto-allows. On a valid token this returns
+/// [`Phase::Handled`] (the caller returns). Every other case (expired, session
+/// mismatch, non-JSON token, unreadable file) removes the stale token file and
+/// returns [`Phase::Continue`] so normal validation runs.
+fn try_trust_mode(
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    tool_name: &str,
+    command_raw: &str,
+) -> Phase {
+    let trust_token_path = clx_core::paths::clx_dir().join(".trust_mode_token");
 
-    // Trust mode: auto-allow ALL commands via JSON token (but still log for audit)
-    if config.validator.trust_mode {
-        let trust_token_path = clx_core::paths::clx_dir().join(".trust_mode_token");
+    // A valid (unexpired, session-matching) signed JSON TrustToken is the
+    // ONLY way trust mode auto-allows; it returns immediately below. Every
+    // other case (expired, session mismatch, non-JSON token, unreadable
+    // file) falls through to the expired/invalid path. FIX-13: the former
+    // `if trust_valid { ... legacy token ... }` allow block that followed
+    // this computation was unreachable dead code — `trust_valid` could
+    // only be `true` on a path that already returned — and was removed.
+    if let Ok(content) = std::fs::read_to_string(&trust_token_path)
+        // Try JSON token first.
+        && let Ok(token) = serde_json::from_str::<clx_core::types::TrustToken>(&content)
+    {
+        let now = chrono::Utc::now();
+        let expires_valid = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
+            .ok()
+            .is_some_and(|exp| now < exp.with_timezone(&chrono::Utc));
 
-        let trust_valid = if let Ok(content) = std::fs::read_to_string(&trust_token_path) {
-            // Try JSON token first
-            if let Ok(token) = serde_json::from_str::<clx_core::types::TrustToken>(&content) {
-                let now = chrono::Utc::now();
-                let expires_valid = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
-                    .ok()
-                    .is_some_and(|exp| now < exp.with_timezone(&chrono::Utc));
+        let session_valid = token
+            .session_id
+            .as_ref()
+            .is_none_or(|tok_sid| input.session_id.as_str() == tok_sid);
 
-                let session_valid = token
-                    .session_id
-                    .as_ref()
-                    .is_none_or(|tok_sid| input.session_id.as_str() == tok_sid);
-
-                if expires_valid && session_valid {
-                    let remaining = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
-                        .ok()
-                        .map(|exp| (exp.with_timezone(&chrono::Utc) - now).num_seconds().max(0));
-                    let reason = remaining.map_or_else(
-                        || "Trust mode enabled".to_string(),
-                        |r| format!("Trust mode ({r}s remaining)"),
-                    );
-                    debug!(
-                        "Trust mode: auto-allowing [{}] command '{}' ({})",
-                        tool_name, command_raw, reason
-                    );
-                    log_audit_entry(
-                        host.host_id(),
-                        &input.session_id,
-                        &command_raw,
-                        &input.cwd,
-                        "TRUST",
-                        AuditDecision::Allowed,
-                        None,
-                        Some(&reason),
-                    );
-                    output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-                    return Ok(());
-                }
-                // Expired or session mismatch
-                false
-            } else {
-                // B1-10: mtime-only legacy plain-text trust-token fallback removed.
-                // mtime is not authentication — touching a file (same-uid) granted
-                // 1h global auto-allow of all commands, which is a security downgrade.
-                // Only the signed JSON TrustToken (expiry + session binding) grants
-                // trust. A non-JSON token file → trust_valid = false → falls through
-                // to normal validation (fail-safe: more prompting, never more allowing).
-                // Migration: run `clx trust` to write a proper JSON token.
-                false
-            }
-        } else {
-            false
-        };
-
-        if trust_valid {
+        if expires_valid && session_valid {
+            let remaining = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
+                .ok()
+                .map(|exp| (exp.with_timezone(&chrono::Utc) - now).num_seconds().max(0));
+            let reason = remaining.map_or_else(
+                || "Trust mode enabled".to_string(),
+                |r| format!("Trust mode ({r}s remaining)"),
+            );
             debug!(
-                "Trust mode: auto-allowing [{}] command '{}' (legacy token)",
-                tool_name, command_raw
+                "Trust mode: auto-allowing [{}] command '{}' ({})",
+                tool_name, command_raw, reason
             );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
-                &command_raw,
+                command_raw,
                 &input.cwd,
                 "TRUST",
                 AuditDecision::Allowed,
                 None,
-                Some("Trust mode enabled (legacy token)"),
+                Some(&reason),
             );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-            return Ok(());
+            return Phase::Handled;
         }
-
-        warn!("Trust mode token expired or invalid. Falling back to validation.");
-        let _ = std::fs::remove_file(&trust_token_path);
-        // Fall through to normal validation
+        // Expired or session mismatch: fall through to normal validation.
+        //
+        // B1-10: a non-JSON token file (caught by the `else` of the JSON
+        // parse above) likewise never grants trust. mtime is not
+        // authentication — touching a file (same-uid) once granted a 1h
+        // global auto-allow of all commands, a security downgrade. Only the
+        // signed JSON TrustToken (expiry + session binding) grants trust;
+        // any other token shape falls through (fail-safe: more prompting,
+        // never more allowing). Migration: run `clx trust` to write a
+        // proper JSON token.
     }
 
-    // Resolve symlinks in command paths for TOCTOU mitigation
-    let resolved_command = resolve_command_paths(&command_raw);
-    let command = resolved_command.as_str();
+    warn!("Trust mode token expired or invalid. Falling back to validation.");
+    let _ = std::fs::remove_file(&trust_token_path);
+    // Fall through to normal validation.
+    Phase::Continue
+}
 
-    // Check if this is a read-only command (used later to skip confirmation dialog)
-    let is_read_only = config.validator.auto_allow_reads && is_read_only_command(command);
-
-    // Initialize policy engine (P6 Codex trust gate applied here: untrusted /
-    // not-seen Codex projects get project-local config dropped; Claude/Cursor
-    // and trusted Codex keep their project path - Claude path unchanged).
-    let mut policy_engine = build_trust_gated_engine(host, &input.cwd);
-
-    // T2: Load learned rules ONLY when L1 is enabled. When `layer1_enabled=false`
-    // the L0→Ask path falls through to the "L1-DISABLED → ask" branch
-    // unconditionally; loading learned rules in that path is a maintenance
-    // hazard — a single overbroad learned-allow row (B1-4 carry-over) would
-    // silently suppress the L1-DISABLED ask prompt. Gating the load behind
-    // `layer1_enabled` honors the "L1 disabled = engine doesn't consult learned
-    // whitelist" property and removes a pre-gate I/O side effect (recon T2).
-    if config.validator.layer1_enabled
-        && let Ok(storage) = Storage::open_default()
-        && let Err(e) = policy_engine.load_learned_rules(&storage)
-    {
-        warn!("Failed to load learned rules: {}", e);
-    }
-
-    // Layer 0: Deterministic rules evaluation (if enabled)
+/// Layer 0: deterministic ruleset evaluation (and the L0-disabled audit path).
+///
+/// Invariant order (Codex FIX-12): L0 deny/allow take precedence; read-only
+/// auto-allow happens ONLY after an L0 `Ask` (or, when L0 is disabled, after
+/// the L0-DISABLED audit row). When L0 is enabled and returns `Ask` for a
+/// non-read-only command, or L0 is disabled for a non-read-only command, this
+/// returns [`Phase::Continue`] so the cache/L1 pipeline runs.
+fn evaluate_bash_l0(
+    policy_engine: &PolicyEngine,
+    config: &Config,
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    command: &str,
+    is_read_only: bool,
+) -> Phase {
     // Always evaluate as "Bash" so all Bash(...) rules apply universally
     // (MCP command tools have their commands extracted and validated identically)
     if config.validator.layer0_enabled {
@@ -715,7 +590,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                     None,
                 );
                 output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-                return Ok(());
+                Phase::Handled
             }
             PolicyDecision::Deny { reason } => {
                 debug!("L0: Denied command '{}': {}", command, reason);
@@ -730,7 +605,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                     Some(&reason),
                 );
                 output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
-                return Ok(());
+                Phase::Handled
             }
             PolicyDecision::Ask { .. } => {
                 // For read-only commands: auto-allow without confirmation dialog
@@ -748,10 +623,11 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                         Some("Read-only command auto-allowed"),
                     );
                     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-                    return Ok(());
+                    return Phase::Handled;
                 }
                 debug!("L0: Unknown command '{}', checking L1", command);
                 // Continue to Layer 1
+                Phase::Continue
             }
         }
     } else {
@@ -789,12 +665,29 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 Some("Read-only command auto-allowed (L0 disabled)"),
             );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
-            return Ok(());
+            return Phase::Handled;
         }
         // else: fall through to cache lookup + L1 (which may itself be off,
         // in which case the L1-disabled branch below handles forced-ask).
+        Phase::Continue
     }
+}
 
+/// Layer 1: `SQLite` cache lookup + LLM-based validation (and every fail-closed
+/// fallback arm). Called only after L0 escalated a non-read-only command (or L0
+/// was disabled for one). Always emits exactly one decision.
+///
+/// Invariant order (Codex FIX-12): the cache is consulted ONLY when BOTH
+/// `layer0_enabled` and `layer1_enabled` are true; L1-disabled forces an ask;
+/// and every LLM-unavailable / timeout / generation-failure arm forces `ask`
+/// when `default_decision=allow` (fail-closed).
+async fn escalate_l1(
+    policy_engine: &PolicyEngine,
+    config: &Config,
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    command: &str,
+) -> Result<()> {
     // T9.1 (cache-bypass): consult the SQLite decision cache ONLY when BOTH
     // `layer0_enabled` and `layer1_enabled` are true. The cache is populated
     // EXCLUSIVELY by L1 verdicts (see `cache_decision` calls in the L1 match
@@ -817,11 +710,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
 
             if let Ok(Some(cached)) = storage.get_cached_decision(&cache_key) {
                 debug!("L1-CACHE hit for command: {}", command);
-                let audit_decision = match cached.decision.as_str() {
-                    "allow" => AuditDecision::Allowed,
-                    "deny" => AuditDecision::Blocked,
-                    _ => AuditDecision::Prompted,
-                };
+                let audit_decision = audit_decision_from_str(&cached.decision);
                 log_audit_entry(
                     host.host_id(),
                     &input.session_id,
@@ -891,17 +780,15 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             // toggle re-enables. Force `effective_decision="ask"` so the user
             // makes the decision. `deny` and `ask` pass through unchanged
             // (both are already fail-closed / safe).
-            let configured = config.validator.default_decision;
-            let effective_decision = if configured == DefaultDecision::Allow {
+            let configured = &config.validator.default_decision;
+            if *configured == DefaultDecision::Allow {
                 warn!(
                     "LLM client error with default_decision=allow — \
                      forcing ask (F7 posture: silent allow refused when an \
                      L0-unknown command falls through to an unreachable L1)"
                 );
-                "ask"
-            } else {
-                configured.as_str()
-            };
+            }
+            let effective_decision = force_ask_if_allow(configured);
             let reason = format!("LLM unavailable — fallback: {effective_decision}");
             log_audit_entry(
                 host.host_id(),
@@ -909,11 +796,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
                 command,
                 &input.cwd,
                 "L1",
-                match effective_decision {
-                    "allow" => AuditDecision::Allowed,
-                    "deny" => AuditDecision::Blocked,
-                    _ => AuditDecision::Prompted,
-                },
+                audit_decision_from_str(effective_decision),
                 None,
                 Some(&format!(
                     "Ollama client error: {e} — effective_decision: \
@@ -961,17 +844,15 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         // unreviewed command (identical blast radius to `layer1_enabled=false`
         // with allow as default — but without the loud L1-DISABLED ask gate).
         // Force `effective_decision="ask"` so the user makes the decision.
-        let configured = config.validator.default_decision;
-        let effective_decision = if configured == DefaultDecision::Allow {
+        let configured = &config.validator.default_decision;
+        if *configured == DefaultDecision::Allow {
             warn!(
                 "Ollama unavailable with default_decision=allow — \
                  forcing ask (F7 posture: silent allow refused when an \
                  L0-unknown command falls through to an unreachable L1)"
             );
-            "ask"
-        } else {
-            configured.as_str()
-        };
+        }
+        let effective_decision = force_ask_if_allow(configured);
         let reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -979,11 +860,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             command,
             &input.cwd,
             "L1",
-            match effective_decision {
-                "allow" => AuditDecision::Allowed,
-                "deny" => AuditDecision::Blocked,
-                _ => AuditDecision::Prompted,
-            },
+            audit_decision_from_str(effective_decision),
             None,
             Some(&format!(
                 "Ollama unavailable — effective_decision: {effective_decision} \
@@ -1030,16 +907,14 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         // `default_decision=allow` the command received zero L1 scrutiny;
         // force `effective_decision="ask"` so the user makes the decision.
         // `deny` and `ask` already fail-closed and pass through.
-        let configured = config.validator.default_decision;
-        let effective_decision = if configured == DefaultDecision::Allow {
+        let configured = &config.validator.default_decision;
+        if *configured == DefaultDecision::Allow {
             warn!(
                 "L1 timeout with default_decision=allow — \
                  forcing ask (F7 posture: silent allow refused on a hung L1)"
             );
-            "ask"
-        } else {
-            configured.as_str()
-        };
+        }
+        let effective_decision = force_ask_if_allow(configured);
         let fallback_reason = format!("LLM timeout — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -1047,11 +922,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             command,
             &input.cwd,
             "L1",
-            match effective_decision {
-                "allow" => AuditDecision::Allowed,
-                "deny" => AuditDecision::Blocked,
-                _ => AuditDecision::Prompted,
-            },
+            audit_decision_from_str(effective_decision),
             None,
             Some(&format!(
                 "L1 timeout after {}ms — effective_decision: \
@@ -1081,16 +952,14 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         // accepted the request but generation failed). Silent allow here
         // is the same silent-allow class; force ask when
         // `default_decision=allow`.
-        let configured = config.validator.default_decision;
-        let effective_decision = if configured == DefaultDecision::Allow {
+        let configured = &config.validator.default_decision;
+        if *configured == DefaultDecision::Allow {
             warn!(
                 "LLM generation failed with default_decision=allow — \
                  forcing ask (F7 posture: silent allow refused on gen failure)"
             );
-            "ask"
-        } else {
-            configured.as_str()
-        };
+        }
+        let effective_decision = force_ask_if_allow(configured);
         let fallback_reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -1098,11 +967,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             command,
             &input.cwd,
             "L1",
-            match effective_decision {
-                "allow" => AuditDecision::Allowed,
-                "deny" => AuditDecision::Blocked,
-                _ => AuditDecision::Prompted,
-            },
+            audit_decision_from_str(effective_decision),
             None,
             Some(&format!(
                 "LLM generation failed — effective_decision: \
@@ -1215,6 +1080,153 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     }
 
     Ok(())
+}
+
+/// Handle `PreToolUse` hook - validate commands before execution.
+///
+/// Thin orchestrator (FIX-12): canonicalize the tool name, emit the additive
+/// security-audit rows, then run the phases in their load-bearing order —
+/// `FileEdit` guard, command extraction, trust mode, L0, then L1. Each phase
+/// owns one slice of the policy and emits at most one decision; see the
+/// per-phase docs for the preserved invariants.
+pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
+    let raw_tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
+
+    // P7 input canonicalization: collapse host-specific tool names to their
+    // canonical CLX class BEFORE policy evaluation so L0 rules match a single
+    // vocabulary across hosts (e.g. Cursor `run_terminal_cmd` -> `Bash`,
+    // Codex/Cursor file-edit tools -> `FileEdit`). For Claude this is the
+    // identity map, so the Claude path is byte-identical.
+    let canonical_tool = host.canonical_tool_name(raw_tool_name);
+    let tool_name = canonical_tool.as_str();
+
+    // Load configuration early (needed for MCP tool routing)
+    let config = Config::load().unwrap_or_default();
+
+    // Additive security-audit rows (never change the validation outcome):
+    // env-override and config-driven layer-disable fingerprints.
+    audit_security_env_overrides(&config, host, &input);
+    audit_config_layer_disable(&config, host, &input);
+
+    // P4 FileEdit branch: FileEdit tools never enter the Bash L0+L1 pipeline.
+    if tool_name == "FileEdit" {
+        match evaluate_fileedit_guard(&config, host, &input) {
+            Phase::Handled => return Ok(()),
+            Phase::Continue => {}
+        }
+    }
+
+    // Route by tool type to extract the command to validate.
+    // MCP command tools are evaluated through the same PolicyEngine as Bash.
+    // A `direct_command` (Cursor `beforeShellExecution.command`) is treated as
+    // a Bash command even though the canonical tool name is not "Bash" (Cursor
+    // shell events carry no tool_name).
+    let command_raw = if let Some(direct) = input.direct_command.as_deref() {
+        // Host-surfaced top-level command (Cursor shell): evaluate as Bash.
+        direct.to_string()
+    } else if tool_name == "Bash" {
+        // Bash: extract from tool_input.command
+        input
+            .tool_input
+            .as_ref()
+            .and_then(|v| v.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else if tool_name.starts_with("mcp__") && config.mcp_tools.enabled {
+        // MCP tool: check if it carries an executable command
+        let tool_input = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
+        match extract_mcp_command(tool_name, &tool_input, &config.mcp_tools.command_tools) {
+            McpExtraction::Command(cmd) => cmd,
+            McpExtraction::NotCommandTool => {
+                // Not a command-bearing MCP tool — use configured default decision
+                let decision = config.mcp_tools.default_decision.as_str();
+                output_decision_for(host, decision, None, Some(RULES_REMINDER), None);
+                return Ok(());
+            }
+        }
+    } else if let Some(cmd) = input
+        .tool_input
+        .as_ref()
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.is_empty())
+    {
+        // R2-F1 (fail-closed): an unknown/unexpected tool name that nonetheless
+        // carries a `command` string (e.g. a shell-bearing envelope misrouted to
+        // the wrong host adapter) must NOT silently auto-allow. Validate the
+        // command through the same pipeline as Bash rather than fail open.
+        warn!(
+            "Tool '{}' is not Bash/MCP but carries a command; validating it rather than auto-allowing",
+            tool_name
+        );
+        cmd.to_string()
+    } else {
+        // Non-Bash, non-MCP tools with no command (Read, Write, etc.) → auto-allow
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
+        return Ok(());
+    };
+
+    if command_raw.is_empty() {
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
+        return Ok(());
+    }
+
+    debug!(
+        "PreToolUse: validating [{}] command '{}' in '{}'",
+        tool_name, command_raw, input.cwd
+    );
+
+    // Skip validation if disabled
+    if !config.validator.enabled {
+        output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
+        return Ok(());
+    }
+
+    // Trust mode: auto-allow ALL commands via JSON token (but still log for audit)
+    if config.validator.trust_mode {
+        match try_trust_mode(host, &input, tool_name, &command_raw) {
+            Phase::Handled => return Ok(()),
+            Phase::Continue => {}
+        }
+    }
+
+    // Resolve symlinks in command paths for TOCTOU mitigation
+    let resolved_command = resolve_command_paths(&command_raw);
+    let command = resolved_command.as_str();
+
+    // Check if this is a read-only command (used later to skip confirmation dialog)
+    let is_read_only = config.validator.auto_allow_reads && is_read_only_command(command);
+
+    // Initialize policy engine (P6 Codex trust gate applied here: untrusted /
+    // not-seen Codex projects get project-local config dropped; Claude/Cursor
+    // and trusted Codex keep their project path - Claude path unchanged).
+    let mut policy_engine = build_trust_gated_engine(host, &input.cwd);
+
+    // T2: Load learned rules ONLY when L1 is enabled. When `layer1_enabled=false`
+    // the L0→Ask path falls through to the "L1-DISABLED → ask" branch
+    // unconditionally; loading learned rules in that path is a maintenance
+    // hazard — a single overbroad learned-allow row (B1-4 carry-over) would
+    // silently suppress the L1-DISABLED ask prompt. Gating the load behind
+    // `layer1_enabled` honors the "L1 disabled = engine doesn't consult learned
+    // whitelist" property and removes a pre-gate I/O side effect (recon T2).
+    if config.validator.layer1_enabled
+        && let Ok(storage) = Storage::open_default()
+        && let Err(e) = policy_engine.load_learned_rules(&storage)
+    {
+        warn!("Failed to load learned rules: {}", e);
+    }
+
+    // Layer 0: deterministic ruleset (and the L0-disabled audit path). On an
+    // L0 deny/allow, or a read-only auto-allow, this emits the decision and we
+    // return; otherwise we escalate to the cache + L1 pipeline.
+    match evaluate_bash_l0(&policy_engine, &config, host, &input, command, is_read_only) {
+        Phase::Handled => return Ok(()),
+        Phase::Continue => {}
+    }
+
+    // Layer 1: cache lookup + LLM validation + every fail-closed fallback arm.
+    escalate_l1(&policy_engine, &config, host, &input, command).await
 }
 
 /// Probabilistic cleanup trigger (~5% of invocations).
