@@ -160,6 +160,41 @@ fn import_accepts_wildcard_pattern() {
     );
 }
 
+/// Security regression: an import entry with an unknown/unsupported `rule_type`
+/// (e.g. "graylist" or a typo) must be REJECTED, never silently coerced into an
+/// allow rule (fail-open via RuleType default).
+#[test]
+fn import_rejects_unknown_rule_type_no_fail_open() {
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+
+    let file = t.path().join("badtype.json");
+    let body = serde_json::json!({
+        "version": 1,
+        "rules": [
+            { "pattern": "Bash(rm -rf /)", "rule_type": "graylist" },
+            { "pattern": "Bash(whatever)", "rule_type": "totally-bogus" },
+            { "pattern": "Bash(cargo test)", "rule_type": "allow" }
+        ]
+    });
+    std::fs::write(&file, serde_json::to_string(&body).unwrap()).unwrap();
+
+    clx(&t)
+        .args(["--json", "rules", "import", &file.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"imported\":1"))
+        .stdout(predicate::str::contains("\"rejected\":2"));
+
+    // Only the valid allow rule landed; the bogus-typed entries did NOT.
+    let after = learned_patterns(&t);
+    assert_eq!(after, vec!["Bash(cargo test)".to_owned()], "{after:?}");
+    assert!(
+        !after.contains(&"Bash(rm -rf /)".to_owned()),
+        "unknown rule_type must not import as an allow rule"
+    );
+}
+
 /// AC10.4: reset default (`--learned-only`) preserves explicit global allows;
 /// `--all` removes them.
 #[test]

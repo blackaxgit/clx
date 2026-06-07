@@ -464,7 +464,18 @@ fn cmd_rules_import(cli: &Cli, file: &str) -> Result<()> {
             continue;
         }
 
-        let rule_type = RuleType::parse(&entry.rule_type);
+        // Strictly parse the rule type: an unknown/unsupported value (e.g.
+        // "graylist" or a typo) must be REJECTED, never silently defaulted to
+        // an allow rule (fail-open). Only "allow"/"deny" are accepted.
+        let Ok(rule_type) = entry.rule_type.parse::<RuleType>() else {
+            rejected += 1;
+            tracing::warn!(
+                rule_type = %entry.rule_type,
+                pattern = %redact_secrets(&entry.pattern),
+                "rejected rule on import (unknown rule type)"
+            );
+            continue;
+        };
         let mut rule = LearnedRule::new(entry.pattern, rule_type, "import".to_owned());
         rule.project_path = entry.project_path;
         storage
