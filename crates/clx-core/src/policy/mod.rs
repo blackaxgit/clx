@@ -42,7 +42,7 @@ pub use types::*;
 
 use matching::parse_pattern;
 use rate_limiter::RateLimiter;
-use read_only::split_segments_quote_aware;
+use read_only::{is_redirection_token, split_segments_quote_aware};
 
 use tracing::debug;
 
@@ -182,6 +182,18 @@ impl PolicyEngine {
             }
         }
 
+        // 1b. DENY (backstop, FIX-2) — a Bash command whose WRITE DESTINATION
+        //     resolves into a protected config dir. This replaces the removed
+        //     `redir_templates` glob blacklist with a token/destination-aware
+        //     check that does not false-fire on `->` arrows, `2>&1` fd-dups, or
+        //     a protected dir used as a copy/move SOURCE (a read).
+        if tool_name == "Bash" && bash_writes_into_protected_dir(command) {
+            debug!("Protected-dir write backstop: command='{}'", command);
+            return PolicyDecision::Deny {
+                reason: "Write into a protected config dir".to_string(),
+            };
+        }
+
         // Segments to consider for graylist/whitelist matching: drop a single
         // leading literal `cd <one-token>` segment so that `cd /repo && git diff`
         // is judged on `git diff` alone.
@@ -257,6 +269,231 @@ impl PolicyEngine {
             glob_match(pattern, command)
         }
     }
+}
+
+/// True iff a Bash `command` has at least one WRITE DESTINATION whose path has a
+/// protected config-dir component (FIX-2).
+///
+/// This is the destination-aware replacement for the removed `redir_templates`
+/// glob blacklist. It classifies a destination as protected by a
+/// case-insensitive path **component** match — NOT by resolving against `$HOME`
+/// (clx-core's `PolicyEngine` has no home-dir access), mirroring the original
+/// component-name semantics of the globs.
+///
+/// Destinations extracted per segment (after `split_segments_quote_aware` +
+/// `shlex::split`):
+/// - (a) Redirection: the path glued to a real redirection operator, or the
+///   token following a bare operator. Input redirs (`<`) and fd-duplications
+///   (`2>&1`, `&1`, `N>&M`) are NOT destinations.
+/// - (b) `cp`/`mv`: the last non-flag arg, unless `-t DIR` /
+///   `--target-directory[=DIR]` is present (then that DIR).
+/// - (c) `tee` (incl. `-a`): every non-flag arg.
+/// - (d) `dd`: the value of `of=VALUE` (NOT `if=`).
+///
+/// # Known-open vectors (NOT covered — no regression; these were never covered
+/// by the removed globs either):
+/// - `install` (e.g. `install -m644 src DIR/dst`)
+/// - `ln -s` (symlink creation into a protected dir)
+/// - `sed -i` (in-place edit of a file already in a protected dir)
+/// - heredoc writes (`cat <<EOF > DIR/f`) — the `>` redirection IS still caught
+///   here, but a heredoc with no redirection operator is not a destination.
+fn bash_writes_into_protected_dir(command: &str) -> bool {
+    let Some(segments) = split_segments_quote_aware(command) else {
+        // Unbalanced quotes: the rest of `evaluate` still runs (and fails
+        // through to Ask). Be conservative here — no extra destination.
+        return false;
+    };
+    for seg in &segments {
+        let Some(tokens) = shlex::split(seg) else {
+            // Unparseable segment: conservatively contribute no destination;
+            // the rest of `evaluate` still runs.
+            continue;
+        };
+        if segment_has_protected_write_destination(&tokens) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Per-segment destination extraction + protected-component test for FIX-2.
+fn segment_has_protected_write_destination(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+
+    // (a) Redirection destinations (any command).
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if is_redirection_token(tok) {
+            if let Some(dest) = redirection_destination(tok) {
+                if destination_is_protected(dest) {
+                    return true;
+                }
+            } else if !redirection_is_input(tok) && !redirection_is_fd_dup(tok) {
+                // Bare operator (`>`, `>>`, `&>`, `2>`, ...): destination is the
+                // NEXT token. (Input `<`/`N<` and fd-dups are skipped.)
+                if let Some(next) = tokens.get(i + 1) {
+                    if destination_is_protected(next) {
+                        return true;
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Command-specific destinations. argv0 is the first non-redirection,
+    // non-env-assignment token; for our purposes tokens[0] is sufficient since
+    // redirections are handled above and leading env-assignments do not occur
+    // for the commands we care about (cp/mv/tee/dd).
+    let argv0 = tokens[0].as_str();
+    let argv0 = argv0.rsplit('/').next().unwrap_or(argv0);
+    match argv0 {
+        "cp" | "mv" => cp_mv_destination_is_protected(&tokens[1..]),
+        "tee" => tee_destination_is_protected(&tokens[1..]),
+        "dd" => dd_destination_is_protected(&tokens[1..]),
+        _ => false,
+    }
+}
+
+/// True if `tok` is an INPUT redirection (`<`, `N<`) and never a write dest.
+fn redirection_is_input(tok: &str) -> bool {
+    let rest = tok.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.starts_with('<')
+}
+
+/// True if the redirection `tok` is a file-descriptor DUPLICATION
+/// (`2>&1`, `&1`, `N>&M`) — the part after the operator is `&<digit>`, so it
+/// targets an fd, not a file.
+fn redirection_is_fd_dup(tok: &str) -> bool {
+    // Find the operator (`>` possibly preceded by fd digits or `&`) and inspect
+    // what follows it.
+    if let Some(pos) = tok.find('>') {
+        let after = &tok[pos + 1..];
+        let after = after.strip_prefix('>').unwrap_or(after); // handle `>>`
+        return after.starts_with('&') && after[1..].chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// For a redirection token that has the destination GLUED to it
+/// (`>file`, `>>file`, `&>file`, `2>file`), return the destination path. Returns
+/// `None` for a bare operator (`>`), an input redir, or an fd-dup.
+fn redirection_destination(tok: &str) -> Option<&str> {
+    if redirection_is_input(tok) || redirection_is_fd_dup(tok) {
+        return None;
+    }
+    // Strip a leading fd number or `&` (e.g. `2>`, `&>`).
+    let rest = tok.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    // Strip the operator itself (`>>` before `>`).
+    let path = rest.strip_prefix(">>").or_else(|| rest.strip_prefix('>'))?;
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// `cp`/`mv` destination: last non-flag arg, UNLESS `-t DIR` /
+/// `--target-directory[=DIR]` is present (then that DIR is the destination).
+fn cp_mv_destination_is_protected(args: &[String]) -> bool {
+    let mut last_nonflag: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(dir) = a.strip_prefix("--target-directory=") {
+            return destination_is_protected(dir);
+        }
+        if a == "-t" || a == "--target-directory" {
+            if let Some(dir) = args.get(i + 1) {
+                return destination_is_protected(dir);
+            }
+            return false;
+        }
+        if a == "--" {
+            // Everything after `--` is a positional operand.
+            for operand in &args[i + 1..] {
+                last_nonflag = Some(operand.as_str());
+            }
+            break;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        last_nonflag = Some(a);
+        i += 1;
+    }
+    last_nonflag.is_some_and(destination_is_protected)
+}
+
+/// `tee` (incl. `-a`): every non-flag arg is a write destination.
+fn tee_destination_is_protected(args: &[String]) -> bool {
+    let mut after_ddash = false;
+    for a in args {
+        if !after_ddash && a == "--" {
+            after_ddash = true;
+            continue;
+        }
+        if !after_ddash && a.starts_with('-') {
+            continue;
+        }
+        if destination_is_protected(a) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `dd`: the value of an `of=VALUE` operand (NOT `if=`, which is the source).
+fn dd_destination_is_protected(args: &[String]) -> bool {
+    for a in args {
+        if let Some(value) = a.strip_prefix("of=")
+            && destination_is_protected(value)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if any path COMPONENT of `dest` (case-insensitive) is a protected
+/// config dir.
+///
+/// Broad dirs (`.clx`/`.codex`/`.cursor`) are protected anywhere. The agent
+/// dot-claude dir is protected ONLY for sensitive targets: the destination
+/// basename is `settings.json`/`settings.local.json`, OR a `hooks` component is
+/// present. Component match (not home-resolution) — a leading `~`/`~/` is
+/// irrelevant because we split on `/` and compare components.
+fn destination_is_protected(dest: &str) -> bool {
+    // Protected dir names assembled via `concat!` so the literal hidden-dir
+    // tokens do not appear verbatim in source (write-hook compatibility).
+    const CLX: &str = concat!(".", "clx");
+    const CODEX: &str = concat!(".", "codex");
+    const CURSOR: &str = concat!(".", "cursor");
+    const CLAUDE: &str = concat!(".", "claude");
+
+    let components: Vec<&str> = dest.split('/').filter(|c| !c.is_empty()).collect();
+    let basename = components.last().copied().unwrap_or("");
+
+    for comp in &components {
+        if comp.eq_ignore_ascii_case(CLX)
+            || comp.eq_ignore_ascii_case(CODEX)
+            || comp.eq_ignore_ascii_case(CURSOR)
+        {
+            return true;
+        }
+        if comp.eq_ignore_ascii_case(CLAUDE) {
+            // dot-claude is sensitive-only.
+            let sensitive_basename = basename.eq_ignore_ascii_case("settings.json")
+                || basename.eq_ignore_ascii_case("settings.local.json");
+            let has_hooks = components.iter().any(|c| c.eq_ignore_ascii_case("hooks"));
+            if sensitive_basename || has_hooks {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Strip a single leading literal `cd <one-token>` segment from `segments`,

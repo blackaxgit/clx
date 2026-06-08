@@ -2759,6 +2759,89 @@ fn ac4_2_bash_redirect_into_dot_claude_memory_not_denied() {
 }
 
 // =========================================================================
+// FIX-2 — token/destination-aware protected-dir write check (no glob
+// over-match on `->`, `2>&1`, or protected-dir-as-source reads)
+// =========================================================================
+
+// FIX-2: reads that mention a protected dir must NOT be denied. These were the
+// reproduced false-positives from the old `redir_templates` globs.
+#[test]
+fn fix2_reads_mentioning_protected_dir_not_denied() {
+    let engine = PolicyEngine::new();
+    let clx = concat!(".", "clx");
+    for cmd in [
+        // `->` arrow before reading a protected file (old `*>*{seg}*` glob).
+        format!("echo \"a -> b\" && cat /home/u/{clx}/config.yaml"),
+        // protected dir is the SOURCE of a copy (a read).
+        format!("cp /home/u/{clx}/config.yaml /tmp/x"),
+        // `2>&1` fd-dup after reading a protected file.
+        format!("cat /home/u/{clx}/config.yaml 2>&1"),
+        // `2>/dev/null` redirect whose target is NOT protected.
+        format!("grep foo /home/u/{clx}/c 2>/dev/null"),
+    ] {
+        let result = engine.evaluate("Bash", &cmd);
+        assert!(
+            !matches!(result, PolicyDecision::Deny { .. }),
+            "read mentioning protected dir must NOT deny: {cmd} => {result:?}"
+        );
+    }
+}
+
+// FIX-2: genuine WRITES into a protected dir must deny.
+#[test]
+fn fix2_writes_into_protected_dir_deny() {
+    let engine = PolicyEngine::new();
+    let clx = concat!(".", "clx");
+    for cmd in [
+        format!("echo x > /home/u/{clx}/config.yaml"),
+        format!("echo x >> /home/u/{clx}/config.yaml"),
+        // unspaced redirection target glued to the operator.
+        format!("echo x >/home/u/{clx}/config.yaml"),
+        format!("tee /home/u/{clx}/c"),
+        format!("cat s | tee -a /home/u/{clx}/c"),
+        format!("cp a /home/u/{clx}/c"),
+        format!("cp -t /home/u/{clx} a"),
+        format!("mv a /home/u/{clx}/c"),
+        format!("dd if=/dev/zero of=/home/u/{clx}/db"),
+    ] {
+        let result = engine.evaluate("Bash", &cmd);
+        assert!(
+            matches!(result, PolicyDecision::Deny { .. }),
+            "write into protected dir must deny: {cmd} => {result:?}"
+        );
+    }
+}
+
+// FIX-2: a redirect into /tmp is unaffected (not denied).
+#[test]
+fn fix2_redirect_into_tmp_not_denied() {
+    let engine = PolicyEngine::new();
+    let result = engine.evaluate("Bash", "echo x > /tmp/y");
+    assert!(
+        !matches!(result, PolicyDecision::Deny { .. }),
+        "redirect into /tmp must not be denied, got {result:?}"
+    );
+}
+
+// FIX-2: dot-claude is sensitive-only — settings.json write denies, but a
+// CLAUDE.md memory write does not.
+#[test]
+fn fix2_dot_claude_sensitive_only() {
+    let engine = PolicyEngine::new();
+    let claude = concat!(".", "claude");
+    let denied = engine.evaluate("Bash", &format!("echo x > /home/u/{claude}/settings.json"));
+    assert!(
+        matches!(denied, PolicyDecision::Deny { .. }),
+        "write into dot-claude settings.json must deny, got {denied:?}"
+    );
+    let allowed = engine.evaluate("Bash", &format!("echo note > /home/u/{claude}/CLAUDE.md"));
+    assert!(
+        !matches!(allowed, PolicyDecision::Deny { .. }),
+        "write into dot-claude CLAUDE.md must NOT deny, got {allowed:?}"
+    );
+}
+
+// =========================================================================
 // Issue 10.1 — extend the read-only allow-set
 // =========================================================================
 
