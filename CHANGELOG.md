@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-06-07
+
+### Fixed
+
+- **Release build supply-chain gate.** `cargo deny` failed on the newly-published
+  RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time-only transitive
+  dependency of `age` via `i18n-embed-fl`, no safe upgrade), blocking the v0.11.0
+  release build. The advisory is enumerated in the existing unmaintained-advisory
+  ignore list so the gate passes. No runtime/library change. (The v0.11.0 tag's
+  build failed at this gate; 0.11.1 is the first published build of the 0.11 line.)
+
 ## [0.11.0] - 2026-06-07
 
 A large hardening + features release: a security fix campaign followed by a
