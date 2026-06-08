@@ -1,9 +1,9 @@
 //! `PreToolUse` hook handler - validate commands before execution.
 
 use anyhow::Result;
-use clx_core::config::DefaultDecision;
 use clx_core::config::codex_trust::{ProjectTrust, read_project_trust};
 use clx_core::config::{Capability, Config};
+use clx_core::config::{DefaultDecision, OnValidatorUnavailable};
 use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
     is_read_only_command,
@@ -259,7 +259,9 @@ fn fileedit_resolves_into_protected_dir(
     candidates.iter().find_map(|c| check(c))
 }
 
-/// Recursively collect every string value in a JSON value.
+/// Recursively collect every string value in a JSON value (key-agnostic).
+/// Used ONLY for the prefix-gated patch-HEADER extraction, which is safe over
+/// any string because it requires a `*** ... File:` / `+++ `/`--- ` marker.
 fn collect_json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
     match v {
         serde_json::Value::String(s) => out.push(s.clone()),
@@ -277,28 +279,90 @@ fn collect_json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// Extract whole candidate path strings from a `FileEdit` `tool_input`, preserving
-/// embedded spaces. Key-name-agnostic: EVERY string value anywhere in the payload
-/// is treated as a candidate path (so a host-specific key such as Cursor's
-/// `target_file`, or any future key, is covered without an allowlist), plus V4A
-/// patch markers (`*** Update File: <path>`) and unified-diff `+++`/`---` lines
-/// parsed out of any multi-line string value.
+/// FIX-6: keys whose string VALUE is file CONTENT, not a write target. A
+/// `content` blob may legitimately MENTION a protected-dir path (e.g. these
+/// very docs), which would split into a matching path component and cause a
+/// false deny. Such values are never treated as whole-path candidates.
+/// (Header extraction still runs over them — but that is prefix-gated.)
+const FILEEDIT_CONTENT_KEYS: &[&str] = &[
+    "content",
+    "new_string",
+    "old_string",
+    "new_str",
+    "old_str",
+    "new_content",
+    "old_content",
+];
+
+/// FIX-6: walk the JSON object key/value pairs collecting WHOLE-PATH candidates.
+/// A string value is a candidate ONLY IF it is single-line (no `\n`) AND its key
+/// is not a content key (see [`FILEEDIT_CONTENT_KEYS`]). This keeps the
+/// key-agnostic property (an arbitrary single-line path key such as Cursor's
+/// `target_file` is still caught) while a multi-line or content-keyed body is
+/// never mistaken for a path.
+///
+/// Nested arrays/objects recurse under the SAME content-key exclusion. Note
+/// `MultiEdit`'s `edits[]` entries hold `old_string`/`new_string` only — those
+/// keys are excluded, so no path is extracted from them; the `MultiEdit` target
+/// is the top-level `file_path`.
+fn collect_whole_path_candidates(v: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => {
+            // A content-keyed value is never a whole-path candidate.
+            if key.is_some_and(|k| FILEEDIT_CONTENT_KEYS.contains(&k)) {
+                return;
+            }
+            // Multi-line values are bodies, not paths.
+            if s.contains('\n') {
+                return;
+            }
+            let t = s.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+        serde_json::Value::Array(a) => {
+            // Arrays carry no key of their own; recurse with the inherited key
+            // so a content-keyed array (defensive) stays excluded.
+            for e in a {
+                collect_whole_path_candidates(e, key, out);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for (k, vv) in m {
+                collect_whole_path_candidates(vv, Some(k.as_str()), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract whole candidate path strings from a `FileEdit` `tool_input`,
+/// preserving embedded spaces. Two sources:
+///
+/// 1. Whole-path candidacy (FIX-6): single-line, non-content-keyed string
+///    values only (via [`collect_whole_path_candidates`]). This catches
+///    `file_path`/`path`/`notebook_path`/`target_file`/any single-line path key
+///    while excluding `content`/`new_string`/… bodies that merely MENTION a
+///    protected path.
+/// 2. Patch HEADER lines (key-agnostic, prefix-gated and safe): V4A markers
+///    (`*** Update File: <path>`, Add/Delete/Move) and unified-diff `+++`/`---`
+///    lines parsed out of ANY string value. `apply_patch` carries its V4A body
+///    under the `command` field, so this pass must remain key-agnostic.
 fn fileedit_candidate_paths(tool_input: Option<&serde_json::Value>) -> Vec<String> {
     let Some(v) = tool_input else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
-    // Every string value, any key, any nesting: the whole value is a candidate
-    // path (preserves embedded spaces; non-path strings simply will not resolve
-    // into a protected dir, so there is no false-positive risk).
+
+    // (1) Whole-path candidacy: key-aware, content-keys excluded, single-line.
+    collect_whole_path_candidates(v, None, &mut out);
+
+    // (2) Patch-header extraction: key-agnostic over all string values (the
+    // markers are prefix-gated, so a content body that does not contain a
+    // marker contributes nothing here).
     let mut texts: Vec<String> = Vec::new();
     collect_json_strings(v, &mut texts);
-    for s in &texts {
-        let t = s.trim();
-        if !t.is_empty() {
-            out.push(t.to_string());
-        }
-    }
     for text in texts {
         for line in text.lines() {
             let l = line.trim();
@@ -355,17 +419,41 @@ fn audit_decision_from_str(decision: &str) -> AuditDecision {
     }
 }
 
-/// F7 fail-closed posture: a command reaching an LLM-unavailable / timeout /
-/// generation-failure arm received ZERO L1 scrutiny. Honoring
-/// `default_decision=allow` there would silently pass it, so `allow` is forced
-/// to `ask`; `deny` and `ask` are already fail-closed and pass through. The
-/// distinct per-arm WARN is emitted by the caller (only on the `allow` path) so
-/// the log message stays specific to the arm.
-fn force_ask_if_allow(configured: &DefaultDecision) -> &'static str {
-    if *configured == DefaultDecision::Allow {
-        "ask"
-    } else {
-        configured.as_str()
+/// FIX-1: resolve the effective decision for the FOUR validator-UNREACHABLE
+/// arms (LLM client error, provider unavailable, L1 timeout, generation
+/// failure) from the `on_validator_unavailable` knob.
+///
+/// - `Ask` (default): preserve the historical F7 fail-closed posture exactly —
+///   `allow` is upgraded to `ask` (a command that reached an unreachable L1
+///   received ZERO scrutiny, so silent-allow is refused), while `deny` and
+///   `ask` already fail-closed and pass through unchanged. This is byte-for-byte
+///   the old `force_ask_if_allow(default_decision)` behavior, so the default
+///   knob value preserves existing behavior.
+/// - `Deny`: hard-deny on an unreachable validator (strictest, ignores
+///   `default_decision`).
+/// - `HonorDefault`: opt in to honoring `default_decision` (allow/deny/ask)
+///   verbatim when the validator cannot be reached. May fail OPEN if
+///   `default_decision = allow`; this knob is trust-gated (the whole
+///   `validator` subtree is stripped from untrusted project config).
+///
+/// This governs the UNAVAILABLE case only; it never affects the deliberate
+/// `layer1_enabled = false` arm (disabled != unavailable).
+fn resolve_unavailable(
+    knob: &OnValidatorUnavailable,
+    default_decision: &DefaultDecision,
+) -> &'static str {
+    match knob {
+        // Preserve current behavior: only `allow` is upgraded to `ask`;
+        // `deny`/`ask` pass through (both already fail-closed).
+        OnValidatorUnavailable::Ask => {
+            if *default_decision == DefaultDecision::Allow {
+                "ask"
+            } else {
+                default_decision.as_str()
+            }
+        }
+        OnValidatorUnavailable::Deny => "deny",
+        OnValidatorUnavailable::HonorDefault => default_decision.as_str(),
     }
 }
 
@@ -842,11 +930,13 @@ async fn escalate_l1(
             if *configured == DefaultDecision::Allow {
                 warn!(
                     "LLM client error with default_decision=allow — \
-                     forcing ask (F7 posture: silent allow refused when an \
-                     L0-unknown command falls through to an unreachable L1)"
+                     applying on_validator_unavailable policy (default: forcing \
+                     ask; F7 posture refuses silent allow when an L0-unknown \
+                     command falls through to an unreachable L1)"
                 );
             }
-            let effective_decision = force_ask_if_allow(configured);
+            let effective_decision =
+                resolve_unavailable(&config.validator.on_validator_unavailable, configured);
             let reason = format!("LLM unavailable — fallback: {effective_decision}");
             log_audit_entry(
                 host.host_id(),
@@ -906,11 +996,13 @@ async fn escalate_l1(
         if *configured == DefaultDecision::Allow {
             warn!(
                 "Ollama unavailable with default_decision=allow — \
-                 forcing ask (F7 posture: silent allow refused when an \
-                 L0-unknown command falls through to an unreachable L1)"
+                 applying on_validator_unavailable policy (default: forcing \
+                 ask; F7 posture refuses silent allow when an L0-unknown \
+                 command falls through to an unreachable L1)"
             );
         }
-        let effective_decision = force_ask_if_allow(configured);
+        let effective_decision =
+            resolve_unavailable(&config.validator.on_validator_unavailable, configured);
         let reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -969,10 +1061,12 @@ async fn escalate_l1(
         if *configured == DefaultDecision::Allow {
             warn!(
                 "L1 timeout with default_decision=allow — \
-                 forcing ask (F7 posture: silent allow refused on a hung L1)"
+                 applying on_validator_unavailable policy (default: forcing \
+                 ask; F7 posture refuses silent allow on a hung L1)"
             );
         }
-        let effective_decision = force_ask_if_allow(configured);
+        let effective_decision =
+            resolve_unavailable(&config.validator.on_validator_unavailable, configured);
         let fallback_reason = format!("LLM timeout — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -1014,10 +1108,12 @@ async fn escalate_l1(
         if *configured == DefaultDecision::Allow {
             warn!(
                 "LLM generation failed with default_decision=allow — \
-                 forcing ask (F7 posture: silent allow refused on gen failure)"
+                 applying on_validator_unavailable policy (default: forcing \
+                 ask; F7 posture refuses silent allow on gen failure)"
             );
         }
-        let effective_decision = force_ask_if_allow(configured);
+        let effective_decision =
+            resolve_unavailable(&config.validator.on_validator_unavailable, configured);
         let fallback_reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -1555,6 +1651,198 @@ mod tests {
             assert!(
                 fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
                 "broad protected dir {dir} must deny any path component"
+            );
+        }
+    }
+
+    // =========================================================================
+    // FIX-6: write TARGET extraction, not file CONTENT. A `content`/`new_string`
+    // body that MENTIONS a protected-dir path must NOT be treated as a target.
+    // Protected-dir tokens are built via `concat!` so the literal never appears
+    // verbatim in the test input (write-hook safe).
+    // =========================================================================
+
+    /// FIX-6 (a): a Write with a safe `file_path` and a `content` blob that
+    /// merely MENTIONS a protected-dir path must NOT be denied.
+    #[test]
+    fn fileedit_content_mentioning_protected_path_is_not_denied() {
+        let dot_clx: &str = concat!(".", "clx");
+        let dot_codex: &str = concat!(".", "codex");
+        let home = tempfile::tempdir().unwrap();
+        // Multi-line content that references protected dirs (like these docs).
+        let body = format!(
+            "see ~/{dot_clx}/config.yaml and {}/{dot_codex}/config.toml for trust\nsecond line\n",
+            home.path().display()
+        );
+        let ti = serde_json::json!({
+            "file_path": "/tmp/x",
+            "content": body,
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "content mentioning a protected path must not be treated as a target"
+        );
+    }
+
+    /// FIX-6 (a'): same exclusion for the edit content keys (`new_string`/
+    /// `old_string`), including a MultiEdit-style `edits[]` array whose entries
+    /// hold old/new strings — no path must be extracted from them.
+    #[test]
+    fn fileedit_edit_strings_mentioning_protected_path_not_denied() {
+        let dot_clx: &str = concat!(".", "clx");
+        let home = tempfile::tempdir().unwrap();
+        let mention = format!("~/{dot_clx}/config.yaml");
+        let ti = serde_json::json!({
+            "file_path": "/tmp/safe.rs",
+            "edits": [
+                { "old_string": mention.clone(), "new_string": format!("{mention} updated") }
+            ],
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "MultiEdit old/new strings mentioning a protected path must not be a target"
+        );
+    }
+
+    /// FIX-6 (b): a `file_path` that genuinely points INTO a protected dir is
+    /// still denied (the target, not the content, is what matters).
+    #[test]
+    fn fileedit_file_path_into_protected_dir_still_denied() {
+        let dot_clx: &str = concat!(".", "clx");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_clx)).unwrap();
+        let ti = serde_json::json!({
+            "file_path": format!("{}/{}/config.yaml", home.path().display(), dot_clx),
+            "content": "anything",
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "file_path INTO a protected dir must still be denied"
+        );
+    }
+
+    /// FIX-6 (c): `apply_patch` `command` carrying a V4A `*** Update File:` header
+    /// targeting a protected dir is still denied (key-agnostic header pass).
+    #[test]
+    fn fileedit_apply_patch_command_header_into_protected_dir_denied() {
+        let dot_codex: &str = concat!(".", "codex");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_codex)).unwrap();
+        let ti = serde_json::json!({
+            "command": format!(
+                "*** Begin Patch\n*** Update File: {}/{}/config.toml\n@@\n-x\n+y\n*** End Patch\n",
+                home.path().display(),
+                dot_codex
+            )
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "apply_patch header targeting a protected dir must be denied"
+        );
+    }
+
+    /// FIX-6 (d): an arbitrary single-line key holding a protected path is still
+    /// caught (key-agnostic whole-path candidacy for non-content keys).
+    #[test]
+    fn fileedit_arbitrary_single_line_key_into_protected_dir_denied() {
+        let dot_cursor: &str = concat!(".", "cursor");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_cursor)).unwrap();
+        let ti = serde_json::json!({
+            "some_future_path_key": format!("{}/{}/mcp.json", home.path().display(), dot_cursor)
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "arbitrary single-line path key into a protected dir must be denied"
+        );
+    }
+
+    /// FIX-6 (e): a CLAUDEDIR memory file (dot-claude/CLAUDE.md) target stays
+    /// allowed (narrow dot-claude guard unchanged), even when content mentions
+    /// protected paths.
+    #[test]
+    fn fileedit_claude_memory_file_with_mentioning_content_allowed() {
+        let dot_claude: &str = concat!(".", "claude");
+        let dot_clx: &str = concat!(".", "clx");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_claude)).unwrap();
+        let ti = serde_json::json!({
+            "file_path": format!("{}/{}/CLAUDE.md", home.path().display(), dot_claude),
+            "content": format!("notes about ~/{dot_clx}/config.yaml\n"),
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "dot-claude memory file target must stay allowed"
+        );
+    }
+
+    // =========================================================================
+    // FIX-1: resolve_unavailable — the validator-UNREACHABLE arm policy.
+    // =========================================================================
+
+    /// FIX-1 (a): `HonorDefault` + `default_decision=allow` resolves to "allow"
+    /// (the opt-in fail-open path for an unreachable validator).
+    #[test]
+    fn resolve_unavailable_honor_default_allow_resolves_allow() {
+        assert_eq!(
+            resolve_unavailable(
+                &OnValidatorUnavailable::HonorDefault,
+                &DefaultDecision::Allow
+            ),
+            "allow"
+        );
+        // HonorDefault mirrors deny/ask defaults too.
+        assert_eq!(
+            resolve_unavailable(
+                &OnValidatorUnavailable::HonorDefault,
+                &DefaultDecision::Deny
+            ),
+            "deny"
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::HonorDefault, &DefaultDecision::Ask),
+            "ask"
+        );
+    }
+
+    /// FIX-1 (b): the default knob (Ask) preserves the historical
+    /// `force_ask_if_allow` posture EXACTLY — `allow` upgrades to `ask`, while
+    /// `deny`/`ask` (already fail-closed) pass through unchanged. This is what
+    /// keeps existing behavior (and existing e2e tests) green.
+    #[test]
+    fn resolve_unavailable_default_ask_upgrades_only_allow() {
+        assert_eq!(
+            OnValidatorUnavailable::default(),
+            OnValidatorUnavailable::Ask
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::Ask, &DefaultDecision::Allow),
+            "ask",
+            "Ask knob upgrades allow -> ask"
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::Ask, &DefaultDecision::Deny),
+            "deny",
+            "Ask knob passes deny through (already fail-closed)"
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::Ask, &DefaultDecision::Ask),
+            "ask",
+            "Ask knob passes ask through"
+        );
+    }
+
+    /// FIX-1: the Deny knob hard-denies regardless of `default_decision`.
+    #[test]
+    fn resolve_unavailable_deny_forces_deny() {
+        for dd in [
+            DefaultDecision::Allow,
+            DefaultDecision::Deny,
+            DefaultDecision::Ask,
+        ] {
+            assert_eq!(
+                resolve_unavailable(&OnValidatorUnavailable::Deny, &dd),
+                "deny"
             );
         }
     }
