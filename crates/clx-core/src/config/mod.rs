@@ -199,6 +199,36 @@ impl FromStr for DefaultDecision {
     }
 }
 
+/// Policy applied to the FOUR runtime arms where an *enabled* layer 1 (LLM)
+/// validation is UNREACHABLE — provider init error, provider unavailable,
+/// request timeout, or generation failure.
+///
+/// This governs the validator-UNAVAILABLE case ONLY. It is distinct from
+/// `layer1_enabled = false` (a *deliberately disabled* layer, which is
+/// "unavailable on purpose" and unconditionally forces `ask`): disabled is not
+/// the same as unavailable, and this knob never relaxes the disabled-L1 arm.
+///
+/// - `Ask` (default): force a user prompt regardless of `default_decision`
+///   (the historical F7 fail-closed posture — `allow` is upgraded to `ask`).
+/// - `Deny`: hard-deny on an unreachable validator (strictest).
+/// - `HonorDefault`: opt in to honoring `default_decision` (allow/deny/ask)
+///   when the validator cannot be reached. This can fail OPEN if
+///   `default_decision = allow`, so it is security-relevant and lives under the
+///   trust-gated `validator` subtree (stripped from untrusted project config).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OnValidatorUnavailable {
+    /// Force a user prompt regardless of `default_decision` (fail-closed
+    /// default — preserves the historical F7 posture).
+    #[default]
+    Ask,
+    /// Hard-deny when the validator is unreachable (strictest).
+    Deny,
+    /// Honor `default_decision` (allow/deny/ask) when the validator is
+    /// unreachable. May fail open if `default_decision = allow`.
+    HonorDefault,
+}
+
 /// CLX configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Config {
@@ -616,6 +646,18 @@ pub struct ValidatorConfig {
     #[serde(default)]
     pub default_decision: DefaultDecision,
 
+    /// Policy for the validator-UNREACHABLE case (provider init error,
+    /// provider unavailable, request timeout, generation failure). Default
+    /// `Ask` preserves the historical F7 fail-closed posture (an unreachable
+    /// validator upgrades `allow` to `ask`). Set to `honordefault` to instead
+    /// honor `default_decision` on those arms, or `deny` to hard-deny.
+    ///
+    /// NOTE: this is distinct from `layer1_enabled = false` (a deliberately
+    /// DISABLED layer, which always forces `ask`); disabled != unavailable, and
+    /// this knob never affects the disabled-L1 arm.
+    #[serde(default)]
+    pub on_validator_unavailable: OnValidatorUnavailable,
+
     /// Trust mode - auto-allow ALL commands without validation
     /// Still logs commands for audit. Use with caution!
     /// Can only be enabled via config file (~/.clx/config.yaml) for security.
@@ -963,6 +1005,7 @@ impl Default for ValidatorConfig {
             layer1_enabled: default_true(),
             layer1_timeout_ms: default_layer1_timeout(),
             default_decision: DefaultDecision::Ask,
+            on_validator_unavailable: OnValidatorUnavailable::default(),
             trust_mode: false,
             auto_allow_reads: default_true(),
             cache_enabled: default_true(),
@@ -2302,6 +2345,27 @@ fn apply_string_override(val: &str, var_name: &str, target: &mut String) {
 mod tests {
     use super::*;
     use std::env;
+
+    /// FIX-1 config-trust regression: the new `on_validator_unavailable` key
+    /// lives under the `validator` subtree, which `NON_INERT_KEY_PATTERNS`
+    /// strips wholesale from an UNTRUSTED project config. An untrusted repo
+    /// must NOT be able to set `validator.on_validator_unavailable=honordefault`
+    /// (which, paired with `default_decision=allow`, would fail open). Reuses
+    /// the existing untrusted-validator-subtree strip path.
+    #[test]
+    fn on_validator_unavailable_stripped_from_untrusted_config() {
+        let raw = "validator:\n  on_validator_unavailable: honordefault\n  \
+                   default_decision: allow\n";
+        let out = crate::config::project::filter_inert_only(raw);
+        assert!(
+            !out.contains("on_validator_unavailable"),
+            "validator.on_validator_unavailable must be stripped from untrusted config; got: {out}"
+        );
+        assert!(
+            !out.contains("default_decision"),
+            "validator.default_decision must also be stripped; got: {out}"
+        );
+    }
 
     /// RAII guard that saves env var values on creation and restores them on drop.
     /// Guarantees cleanup even if the test panics.
