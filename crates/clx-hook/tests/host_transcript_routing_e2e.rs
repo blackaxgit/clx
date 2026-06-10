@@ -77,7 +77,12 @@ fn run(host: Option<&str>, envelope_bytes: &[u8]) -> HookRun {
         // envelope sniffing). The envelope-sniff routing tests must be hermetic,
         // so clear any ambient CLAUDECODE inherited from a Claude Code test
         // runner; the dedicated CLAUDECODE-precedence tests live in host.rs.
-        .env_remove("CLAUDECODE");
+        .env_remove("CLAUDECODE")
+        // A truthy CLX_HOOK_HOST override (precedence above envelope sniffing)
+        // would likewise pin the host and defeat the envelope-sniff routing
+        // tests; clear any value inherited from the ambient environment so the
+        // `sniff_*` tests are deterministic regardless of how they are run.
+        .env_remove("CLX_HOOK_HOST");
     if let Some(h) = host {
         cmd.env("CLX_HOOK_HOST", h);
     }

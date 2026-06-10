@@ -822,6 +822,319 @@ impl AnalyticsEntry {
     }
 }
 
+// =====================================================================
+// Learning / debug mode (opt-in firehose)
+// =====================================================================
+
+/// Site-assigned origin of a final `PreToolUse` decision.
+///
+/// `PolicyDecision` is a flat enum with no origin, so the origin is recorded
+/// EXPLICITLY at each emit site (it is not derived after the fact). The origin
+/// is what [`classify_divergence`] uses to decide whether an `ask`/`deny` was a
+/// deterministic safety call (not diverged) or an LLM/fallthrough prompt the
+/// user did not intend (diverged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionOrigin {
+    /// A builtin/learned blacklist hard-deny.
+    Blacklist,
+    /// A protected-directory / write-destination guard.
+    ProtectedGuard,
+    /// A builtin/learned whitelist allow.
+    Whitelist,
+    /// A read-only command auto-allow.
+    ReadOnly,
+    /// A deterministic graylist (dangerous-rule) caution prompt.
+    GraylistAsk,
+    /// An L1 (LLM) caution prompt.
+    L1Caution,
+    /// An L1 (LLM) allow.
+    L1Allow,
+    /// An L1-unavailable forced decision (provider error/timeout/etc.).
+    L1Unavailable,
+    /// The unknown-command fallthrough.
+    UnknownFallthrough,
+    /// A cached decision replayed from `validation_cache` (origin unknown).
+    CacheReplay,
+    /// The validator is disabled (allow).
+    ValidatorDisabled,
+    /// No command present (allow).
+    MissingCommand,
+    /// An MCP command-tool default allow.
+    McpDefault,
+    /// A `FileEdit` allow.
+    FileEditAllow,
+    /// A trust-mode token allow.
+    TrustGate,
+}
+
+impl DecisionOrigin {
+    /// Stable string label for storage / reporting.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Blacklist => "blacklist",
+            Self::ProtectedGuard => "protected_guard",
+            Self::Whitelist => "whitelist",
+            Self::ReadOnly => "read_only",
+            Self::GraylistAsk => "graylist_ask",
+            Self::L1Caution => "l1_caution",
+            Self::L1Allow => "l1_allow",
+            Self::L1Unavailable => "l1_unavailable",
+            Self::UnknownFallthrough => "unknown_fallthrough",
+            Self::CacheReplay => "cache_replay",
+            Self::ValidatorDisabled => "validator_disabled",
+            Self::MissingCommand => "missing_command",
+            Self::McpDefault => "mcp_default",
+            Self::FileEditAllow => "file_edit_allow",
+            Self::TrustGate => "trust_gate",
+        }
+    }
+}
+
+/// The kind of learning event captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LearningKind {
+    /// A normal final decision (allow/ask/deny).
+    Decision,
+    /// An error arm (e.g. LLM client/init error, generation failure).
+    Error,
+    /// A degraded arm (e.g. provider unavailable, timeout, recall-degraded).
+    Degraded,
+}
+
+impl LearningKind {
+    /// Stable string label for storage / reporting.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Error => "error",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+impl FromStr for LearningKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "decision" => Ok(Self::Decision),
+            "error" => Ok(Self::Error),
+            "degraded" => Ok(Self::Degraded),
+            _ => Err(format!("Unknown learning kind: '{s}'")),
+        }
+    }
+}
+
+/// A redacted snapshot of the decision-relevant config fields.
+///
+/// **Contract:** this struct serializes to EXACTLY six keys. It deliberately
+/// contains ONLY enum/bool/string policy knobs — never a provider URL, key, or
+/// any secret-bearing field. The capture path additionally routes the serialized
+/// snapshot through `redact_json_value` as defense-in-depth against a future
+/// widening that accidentally introduces a secret-bearing field (cf. the v0.9.0
+/// tenant-URL leak). The fingerprint is a stable hash of this snapshot so the
+/// CLI can aggregate suggestions per effective policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EffectiveConfig {
+    /// `validator.default_decision` (ask/allow/deny).
+    pub default_decision: String,
+    /// `validator.prompt_sensitivity` (high/standard/low/custom).
+    pub prompt_sensitivity: String,
+    /// `validator.auto_allow_reads`.
+    pub auto_allow_reads: bool,
+    /// `validator.layer0_enabled`.
+    pub layer0_enabled: bool,
+    /// `validator.layer1_enabled`.
+    pub layer1_enabled: bool,
+    /// `validator.on_validator_unavailable` (ask/deny/honordefault).
+    pub on_validator_unavailable: String,
+}
+
+impl EffectiveConfig {
+    /// Compute a stable `sha256:`-prefixed fingerprint of this snapshot.
+    ///
+    /// Reuses the same SHA-256 + hex encoding used by the config-trust file
+    /// hash (`config::trust::compute_file_hash`). Deterministic: identical
+    /// snapshots produce identical fingerprints.
+    ///
+    /// # Panics
+    /// Never in practice — the snapshot is a fixed-shape struct of primitive
+    /// fields that always serializes; the `expect` documents that invariant.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let json = serde_json::to_string(self)
+            .expect("EffectiveConfig is a fixed primitive struct and always serializes");
+        let digest = Sha256::digest(json.as_bytes());
+        format!("sha256:{}", hex::encode(digest))
+    }
+}
+
+/// A single captured learning/debug event row.
+///
+/// All free-text fields (`reason`, `command`, `matched_rule`,
+/// `effective_config`) are redacted at the `build_learning_row` choke-point in
+/// the storage layer BEFORE insert; callers pass raw values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningEvent {
+    /// ISO-8601 timestamp.
+    pub ts: String,
+    /// Originating session id, if known.
+    pub session_id: Option<String>,
+    /// Tool name (e.g. `Bash`, `FileEdit`, an MCP tool).
+    pub tool: String,
+    /// Originating agent host (`claude`/`codex`/`cursor`).
+    pub host: String,
+    /// Final decision string (`allow`/`ask`/`deny`).
+    pub decision: String,
+    /// Policy layer label (`l0`/`l1`/`guard`/`trust`/`fallback`).
+    pub layer: String,
+    /// Event kind.
+    pub kind: LearningKind,
+    /// Matched rule/pattern, if any.
+    pub matched_rule: Option<String>,
+    /// Human-readable reason (redacted before insert).
+    pub reason: String,
+    /// Raw command (redacted before insert), if applicable.
+    pub command: Option<String>,
+    /// Effective-config snapshot as JSON (redacted before insert).
+    pub effective_config: String,
+    /// Whether the decision diverged from the user's configured intent.
+    pub diverged: bool,
+    /// Why it diverged, if it did.
+    pub divergence_reason: Option<String>,
+    /// Decision latency in milliseconds, if measured.
+    pub latency_ms: Option<i64>,
+    /// Fingerprint of the effective config at capture time.
+    pub policy_fingerprint: String,
+}
+
+/// Pure divergence classifier.
+///
+/// A decision is *diverged* when it is `ask` or `deny` AND its origin is one of
+/// the non-deterministic prompt sources (`L1Caution`, `L1Unavailable`,
+/// `UnknownFallthrough`). Deterministic safety calls — `Blacklist`,
+/// `ProtectedGuard`, `GraylistAsk` — and replayed cache rows (`CacheReplay`)
+/// are NOT diverged. Returns `Some(reason)` when diverged, else `None`.
+#[must_use]
+pub fn classify_divergence(decision: &str, origin: DecisionOrigin) -> Option<String> {
+    if decision != "ask" && decision != "deny" {
+        return None;
+    }
+    match origin {
+        DecisionOrigin::L1Caution => {
+            Some("L1 (LLM) caution prompt on a non-blacklisted command".to_string())
+        }
+        DecisionOrigin::L1Unavailable => {
+            Some("validator unavailable forced this decision (fail-closed)".to_string())
+        }
+        DecisionOrigin::UnknownFallthrough => {
+            Some("unknown-command fallthrough prompted this decision".to_string())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod learning_tests {
+    use super::*;
+
+    #[test]
+    fn effective_config_serializes_exactly_six_keys() {
+        let ec = EffectiveConfig {
+            default_decision: "ask".to_string(),
+            prompt_sensitivity: "standard".to_string(),
+            auto_allow_reads: true,
+            layer0_enabled: true,
+            layer1_enabled: true,
+            on_validator_unavailable: "ask".to_string(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ec).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert_eq!(
+            obj.len(),
+            6,
+            "EffectiveConfig must serialize to exactly 6 keys"
+        );
+        for key in [
+            "default_decision",
+            "prompt_sensitivity",
+            "auto_allow_reads",
+            "layer0_enabled",
+            "layer1_enabled",
+            "on_validator_unavailable",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_sensitive() {
+        let ec = EffectiveConfig {
+            default_decision: "ask".to_string(),
+            prompt_sensitivity: "standard".to_string(),
+            auto_allow_reads: true,
+            layer0_enabled: true,
+            layer1_enabled: true,
+            on_validator_unavailable: "ask".to_string(),
+        };
+        let a = ec.fingerprint();
+        let b = ec.fingerprint();
+        assert_eq!(a, b, "fingerprint must be deterministic");
+        assert!(a.starts_with("sha256:"));
+        assert_eq!(a.len(), "sha256:".len() + 64);
+
+        let mut ec2 = ec.clone();
+        ec2.default_decision = "allow".to_string();
+        assert_ne!(
+            a,
+            ec2.fingerprint(),
+            "a different effective config must produce a different fingerprint"
+        );
+    }
+
+    #[test]
+    fn learning_kind_roundtrips() {
+        for k in [
+            LearningKind::Decision,
+            LearningKind::Error,
+            LearningKind::Degraded,
+        ] {
+            assert_eq!(LearningKind::from_str(k.as_str()).expect("parse"), k);
+        }
+        assert!(LearningKind::from_str("nonsense").is_err());
+    }
+
+    #[test]
+    fn classify_divergence_matrix() {
+        // allow is never diverged regardless of origin.
+        assert_eq!(classify_divergence("allow", DecisionOrigin::L1Allow), None);
+        // Deterministic safety calls: not diverged.
+        assert_eq!(classify_divergence("deny", DecisionOrigin::Blacklist), None);
+        assert_eq!(
+            classify_divergence("deny", DecisionOrigin::ProtectedGuard),
+            None
+        );
+        assert_eq!(
+            classify_divergence("ask", DecisionOrigin::GraylistAsk),
+            None
+        );
+        // Cache replay carries no origin → never diverged.
+        assert_eq!(
+            classify_divergence("ask", DecisionOrigin::CacheReplay),
+            None
+        );
+        // Non-deterministic prompts: diverged with a reason.
+        assert!(classify_divergence("ask", DecisionOrigin::L1Caution).is_some());
+        assert!(classify_divergence("ask", DecisionOrigin::L1Unavailable).is_some());
+        assert!(classify_divergence("deny", DecisionOrigin::L1Unavailable).is_some());
+        assert!(classify_divergence("ask", DecisionOrigin::UnknownFallthrough).is_some());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

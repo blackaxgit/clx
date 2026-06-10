@@ -34,8 +34,8 @@ use std::process;
 use tracing_subscriber::EnvFilter;
 
 use commands::{
-    ConfigAction, ConfigTrustAction, CredentialsAction, EmbeddingsAction, MaintenanceAction,
-    ModelAction, RulesAction, TrustAction,
+    ConfigAction, ConfigTrustAction, CredentialsAction, EmbeddingsAction, LearningAction,
+    MaintenanceAction, ModelAction, RulesAction, TrustAction,
 };
 
 /// CLX - Coding-Agent Extension Layer
@@ -175,6 +175,12 @@ enum Commands {
         #[command(subcommand)]
         action: ModelAction,
     },
+
+    /// Inspect opt-in learning-mode events (report, list, export, clear)
+    Learning {
+        #[command(subcommand)]
+        action: LearningAction,
+    },
 }
 
 #[tokio::main]
@@ -236,6 +242,7 @@ async fn run_command(cli: &Cli) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Dashboard error: {e}")),
         Some(Commands::Maintenance { action }) => commands::cmd_maintenance(cli, action).await,
         Some(Commands::Model { action }) => commands::cmd_model(cli, action).await,
+        Some(Commands::Learning { action }) => commands::cmd_learning(cli, action),
         None => commands::cmd_default(cli),
     }
 }

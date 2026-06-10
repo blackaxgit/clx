@@ -2759,6 +2759,89 @@ fn ac4_2_bash_redirect_into_dot_claude_memory_not_denied() {
 }
 
 // =========================================================================
+// FIX-2 — token/destination-aware protected-dir write check (no glob
+// over-match on `->`, `2>&1`, or protected-dir-as-source reads)
+// =========================================================================
+
+// FIX-2: reads that mention a protected dir must NOT be denied. These were the
+// reproduced false-positives from the old `redir_templates` globs.
+#[test]
+fn fix2_reads_mentioning_protected_dir_not_denied() {
+    let engine = PolicyEngine::new();
+    let clx = concat!(".", "clx");
+    for cmd in [
+        // `->` arrow before reading a protected file (old `*>*{seg}*` glob).
+        format!("echo \"a -> b\" && cat /home/u/{clx}/config.yaml"),
+        // protected dir is the SOURCE of a copy (a read).
+        format!("cp /home/u/{clx}/config.yaml /tmp/x"),
+        // `2>&1` fd-dup after reading a protected file.
+        format!("cat /home/u/{clx}/config.yaml 2>&1"),
+        // `2>/dev/null` redirect whose target is NOT protected.
+        format!("grep foo /home/u/{clx}/c 2>/dev/null"),
+    ] {
+        let result = engine.evaluate("Bash", &cmd);
+        assert!(
+            !matches!(result, PolicyDecision::Deny { .. }),
+            "read mentioning protected dir must NOT deny: {cmd} => {result:?}"
+        );
+    }
+}
+
+// FIX-2: genuine WRITES into a protected dir must deny.
+#[test]
+fn fix2_writes_into_protected_dir_deny() {
+    let engine = PolicyEngine::new();
+    let clx = concat!(".", "clx");
+    for cmd in [
+        format!("echo x > /home/u/{clx}/config.yaml"),
+        format!("echo x >> /home/u/{clx}/config.yaml"),
+        // unspaced redirection target glued to the operator.
+        format!("echo x >/home/u/{clx}/config.yaml"),
+        format!("tee /home/u/{clx}/c"),
+        format!("cat s | tee -a /home/u/{clx}/c"),
+        format!("cp a /home/u/{clx}/c"),
+        format!("cp -t /home/u/{clx} a"),
+        format!("mv a /home/u/{clx}/c"),
+        format!("dd if=/dev/zero of=/home/u/{clx}/db"),
+    ] {
+        let result = engine.evaluate("Bash", &cmd);
+        assert!(
+            matches!(result, PolicyDecision::Deny { .. }),
+            "write into protected dir must deny: {cmd} => {result:?}"
+        );
+    }
+}
+
+// FIX-2: a redirect into /tmp is unaffected (not denied).
+#[test]
+fn fix2_redirect_into_tmp_not_denied() {
+    let engine = PolicyEngine::new();
+    let result = engine.evaluate("Bash", "echo x > /tmp/y");
+    assert!(
+        !matches!(result, PolicyDecision::Deny { .. }),
+        "redirect into /tmp must not be denied, got {result:?}"
+    );
+}
+
+// FIX-2: dot-claude is sensitive-only — settings.json write denies, but a
+// CLAUDE.md memory write does not.
+#[test]
+fn fix2_dot_claude_sensitive_only() {
+    let engine = PolicyEngine::new();
+    let claude = concat!(".", "claude");
+    let denied = engine.evaluate("Bash", &format!("echo x > /home/u/{claude}/settings.json"));
+    assert!(
+        matches!(denied, PolicyDecision::Deny { .. }),
+        "write into dot-claude settings.json must deny, got {denied:?}"
+    );
+    let allowed = engine.evaluate("Bash", &format!("echo note > /home/u/{claude}/CLAUDE.md"));
+    assert!(
+        !matches!(allowed, PolicyDecision::Deny { .. }),
+        "write into dot-claude CLAUDE.md must NOT deny, got {allowed:?}"
+    );
+}
+
+// =========================================================================
 // Issue 10.1 — extend the read-only allow-set
 // =========================================================================
 
@@ -2778,4 +2861,114 @@ fn ac10_1_sort_output_flag_not_read_only() {
     assert!(!is_read_only_command("sort -o out.txt in.txt"));
     assert!(!is_read_only_command("sort --output=out.txt in.txt"));
     assert!(!is_read_only_command("sort -oout.txt in.txt"));
+}
+
+// =========================================================================
+// FIX-1 — whitelist ALLOW path screens output file redirection
+// =========================================================================
+
+#[test]
+fn fix1_whitelisted_read_redirecting_to_file_is_not_allowed() {
+    let engine = PolicyEngine::new();
+    // Each is a whitelisted read command (echo/cat/git diff) whose output is
+    // redirected to a real FILE => must NOT be Allow; falls through to Ask.
+    let bashrc = concat!("/home/u/.", "bashrc");
+    let zshrc = concat!("/home/u/.", "zshrc");
+    assert!(
+        matches!(
+            engine.evaluate("Bash", &format!("echo x > {bashrc}")),
+            PolicyDecision::Ask { .. }
+        ),
+        "echo > .bashrc must Ask, not Allow"
+    );
+    assert!(
+        matches!(
+            engine.evaluate("Bash", "cat p > /tmp/leak"),
+            PolicyDecision::Ask { .. }
+        ),
+        "cat > /tmp/leak must Ask, not Allow"
+    );
+    assert!(
+        matches!(
+            engine.evaluate("Bash", &format!("git diff >> {zshrc}")),
+            PolicyDecision::Ask { .. }
+        ),
+        "git diff >> .zshrc must Ask, not Allow"
+    );
+    assert!(
+        matches!(
+            engine.evaluate("Bash", "cat p 2>/tmp/log"),
+            PolicyDecision::Ask { .. }
+        ),
+        "cmd 2>/tmp/log (stderr to file) must Ask, not Allow"
+    );
+}
+
+#[test]
+fn fix1_whitelisted_reads_without_file_redirection_still_allow() {
+    let mut engine = PolicyEngine::new();
+    // grep is not a builtin whitelist entry; add it so the quoted `a>b` case
+    // exercises the redirection screen rather than the unknown-command path.
+    engine.add_whitelist("Bash(grep:*)");
+
+    assert_eq!(engine.evaluate("Bash", "cat x"), PolicyDecision::Allow);
+    assert_eq!(engine.evaluate("Bash", "git diff"), PolicyDecision::Allow);
+    // Quoted metachar is NOT a redirection operator.
+    assert_eq!(
+        engine.evaluate("Bash", "grep 'a>b' f"),
+        PolicyDecision::Allow,
+        "quoted '>' is not a redirection"
+    );
+    // Device target /dev/null is excluded from the screen (no `&`, single
+    // segment, whitelisted `ls`, redirect to a device => stays Allow).
+    assert_eq!(
+        engine.evaluate("Bash", "ls 2>/dev/null"),
+        PolicyDecision::Allow,
+        "redirect to /dev/null must stay Allow"
+    );
+    // NOTE: `cat x 2>&1` is NOT asserted Allow here. `split_segments_quote_aware`
+    // treats `&` as a control-operator separator, so `cat x 2>&1` splits into
+    // `["cat x 2>", "1"]`; the `1` segment is not whitelisted and the command
+    // is Ask *independent of FIX-1* (pre-existing splitter behavior). The fd-dup
+    // exclusion itself is covered by the unit test below
+    // (`command_has_output_file_redirection("cat x 2>&1") == false`).
+}
+
+#[test]
+fn fix1_command_has_output_file_redirection_unit() {
+    assert!(command_has_output_file_redirection("echo x > f"));
+    assert!(command_has_output_file_redirection("echo x >> f"));
+    assert!(command_has_output_file_redirection("cat p 2>/tmp/log"));
+    assert!(command_has_output_file_redirection("echo x >f"));
+    // Excluded: input, fd-dup, device targets, quoted metachar.
+    assert!(!command_has_output_file_redirection("cat < in"));
+    assert!(!command_has_output_file_redirection("cat x 2>&1"));
+    assert!(!command_has_output_file_redirection("ls > /dev/null"));
+    assert!(!command_has_output_file_redirection("cat x > /dev/stdout"));
+    assert!(!command_has_output_file_redirection("cat x > /dev/fd/3"));
+    assert!(!command_has_output_file_redirection("grep 'a>b' f"));
+}
+
+// =========================================================================
+// FIX-4-core — bash_write_destinations extractor (pure, FS-free)
+// =========================================================================
+
+#[test]
+fn fix4_bash_write_destinations_extracts_expected_set() {
+    assert_eq!(bash_write_destinations("echo x > a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("tee -a a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("cp s a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("cp -t a/b s"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("mv s a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("dd of=a/b"), vec!["a/b"]);
+}
+
+#[test]
+fn fix4_bash_write_destinations_excludes_fd_dup_and_input() {
+    // fd-dup is not a destination.
+    assert!(bash_write_destinations("cat x 2>&1").is_empty());
+    // input redirection is not a destination.
+    assert!(bash_write_destinations("cat < in").is_empty());
+    // a plain read has no destinations.
+    assert!(bash_write_destinations("cat x").is_empty());
 }

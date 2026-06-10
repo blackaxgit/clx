@@ -109,6 +109,26 @@ pub fn set_field_value(
         (0, 3) => {
             config.validator.layer1_timeout_ms = validate_u64(raw, 100, 300_000)?;
         }
+        (0, 7) => {
+            let v = validate_u64(raw, 300, 86_400)?;
+            if v > config.validator.trust_mode_max_duration {
+                return Err(format!(
+                    "Default ({v}s) cannot exceed max ({}s)",
+                    config.validator.trust_mode_max_duration
+                ));
+            }
+            config.validator.trust_mode_default_duration = v;
+        }
+        (0, 8) => {
+            let v = validate_u64(raw, 300, 604_800)?;
+            if v < config.validator.trust_mode_default_duration {
+                return Err(format!(
+                    "Max ({v}s) cannot be below default ({}s)",
+                    config.validator.trust_mode_default_duration
+                ));
+            }
+            config.validator.trust_mode_max_duration = v;
+        }
 
         // Section 1: Context
         (1, 2) => {
@@ -244,6 +264,13 @@ pub fn reset_field_to_default(config: &mut Config, section: usize, field: usize)
         (0, 4) => config.validator.default_decision = defaults.validator.default_decision,
         (0, 5) => config.validator.trust_mode = defaults.validator.trust_mode,
         (0, 6) => config.validator.auto_allow_reads = defaults.validator.auto_allow_reads,
+        (0, 7) => {
+            config.validator.trust_mode_default_duration =
+                defaults.validator.trust_mode_default_duration;
+        }
+        (0, 8) => {
+            config.validator.trust_mode_max_duration = defaults.validator.trust_mode_max_duration;
+        }
 
         // Section 1: Context
         (1, 0) => config.context.enabled = defaults.context.enabled,
@@ -365,6 +392,8 @@ pub fn get_field_value(config: &Config, section: usize, field: usize) -> String 
         (0, 4) => config.validator.default_decision.to_string(),
         (0, 5) => config.validator.trust_mode.to_string(),
         (0, 6) => config.validator.auto_allow_reads.to_string(),
+        (0, 7) => config.validator.trust_mode_default_duration.to_string(),
+        (0, 8) => config.validator.trust_mode_max_duration.to_string(),
 
         // Section 1: Context
         (1, 0) => config.context.enabled.to_string(),
@@ -622,6 +651,8 @@ mod tests {
         assert_eq!(get_field_value(&config, 0, 3), "30000");
         assert_eq!(get_field_value(&config, 0, 4), "ask");
         assert_eq!(get_field_value(&config, 0, 5), "false");
+        assert_eq!(get_field_value(&config, 0, 7), "3600"); // trust_mode_default_duration
+        assert_eq!(get_field_value(&config, 0, 8), "86400"); // trust_mode_max_duration
 
         // Ollama
         assert_eq!(get_field_value(&config, 2, 0), "http://127.0.0.1:11434");
@@ -1010,6 +1041,8 @@ mod tests {
         let defaults = Config::default();
         let number_fields: &[(usize, usize)] = &[
             (0, 3), // layer1_timeout_ms
+            (0, 7), // trust_mode_default_duration
+            (0, 8), // trust_mode_max_duration
             (2, 3), // embedding_dim
             (2, 4), // timeout_ms
             (2, 5), // max_retries
@@ -1039,6 +1072,106 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    // Regression: trust-duration dashboard fields must enforce range AND default<=max cross-field validation (no silent persist of inconsistent durations).
+    // --- trust-mode duration tests ---
+
+    #[test]
+    fn test_set_trust_duration_roundtrip() {
+        let mut config = Config::default();
+        set_field_value(&mut config, 0, 7, "1800").unwrap();
+        assert_eq!(config.validator.trust_mode_default_duration, 1800);
+        assert_eq!(get_field_value(&config, 0, 7), "1800");
+
+        set_field_value(&mut config, 0, 8, "100000").unwrap();
+        assert_eq!(config.validator.trust_mode_max_duration, 100_000);
+        assert_eq!(get_field_value(&config, 0, 8), "100000");
+    }
+
+    #[test]
+    fn test_set_trust_default_rejects_out_of_range() {
+        let mut config = Config::default();
+        // Below min (300) — range error, no mutation.
+        assert!(set_field_value(&mut config, 0, 7, "100").is_err());
+        assert_eq!(config.validator.trust_mode_default_duration, 3600);
+        // Above max bound (86_400).
+        assert!(set_field_value(&mut config, 0, 7, "90000").is_err());
+        assert_eq!(config.validator.trust_mode_default_duration, 3600);
+    }
+
+    #[test]
+    fn test_set_trust_max_rejects_out_of_range() {
+        let mut config = Config::default();
+        assert!(set_field_value(&mut config, 0, 8, "100").is_err());
+        assert_eq!(config.validator.trust_mode_max_duration, 86400);
+        assert!(set_field_value(&mut config, 0, 8, "700000").is_err());
+        assert_eq!(config.validator.trust_mode_max_duration, 86400);
+    }
+
+    #[test]
+    fn test_set_trust_default_above_max_rejected() {
+        let mut config = Config::default();
+        // default(3600) max(86400); try to set default above current max.
+        let res = set_field_value(&mut config, 0, 7, "86400"); // == max: allowed
+        assert!(res.is_ok());
+        assert_eq!(config.validator.trust_mode_default_duration, 86400);
+
+        // Now push default strictly above max -> rejected, no mutation.
+        let res = set_field_value(&mut config, 0, 7, "86401");
+        // 86401 is also out-of-range (>86_400) so range error fires first; use
+        // a smaller max to isolate the cross-field path below.
+        assert!(res.is_err());
+        assert_eq!(config.validator.trust_mode_default_duration, 86400);
+    }
+
+    #[test]
+    fn test_set_trust_default_above_max_crossfield_only() {
+        let mut config = Config::default();
+        // Lower max to 1800 first (below current default 3600 is rejected),
+        // so set default low, then max low, then attempt cross-field.
+        set_field_value(&mut config, 0, 7, "600").unwrap(); // default = 600
+        set_field_value(&mut config, 0, 8, "1200").unwrap(); // max = 1200
+        // default(700) within range but cross-field ok (<=1200).
+        set_field_value(&mut config, 0, 7, "700").unwrap();
+        assert_eq!(config.validator.trust_mode_default_duration, 700);
+        // default 2000 in range (300..=86400) but > max 1200 -> cross-field err.
+        let res = set_field_value(&mut config, 0, 7, "2000");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("cannot exceed max"));
+        assert_eq!(config.validator.trust_mode_default_duration, 700);
+    }
+
+    #[test]
+    fn test_set_trust_max_below_default_rejected() {
+        let mut config = Config::default();
+        // default = 3600, max = 86400. Set max below default -> cross-field err.
+        let res = set_field_value(&mut config, 0, 8, "1800");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("cannot be below default"));
+        assert_eq!(config.validator.trust_mode_max_duration, 86400);
+    }
+
+    #[test]
+    fn test_set_trust_equality_allowed() {
+        let mut config = Config::default();
+        // Bring max down to equal default (3600) — equality allowed.
+        set_field_value(&mut config, 0, 8, "3600").unwrap();
+        assert_eq!(config.validator.trust_mode_max_duration, 3600);
+        // Set default == max — equality allowed.
+        set_field_value(&mut config, 0, 7, "3600").unwrap();
+        assert_eq!(config.validator.trust_mode_default_duration, 3600);
+    }
+
+    #[test]
+    fn test_reset_trust_durations() {
+        let mut config = Config::default();
+        config.validator.trust_mode_default_duration = 600;
+        config.validator.trust_mode_max_duration = 1200;
+        reset_field_to_default(&mut config, 0, 7);
+        reset_field_to_default(&mut config, 0, 8);
+        assert_eq!(config.validator.trust_mode_default_duration, 3600);
+        assert_eq!(config.validator.trust_mode_max_duration, 86400);
     }
 
     // --- Phase 3: reset_field_to_default tests ---

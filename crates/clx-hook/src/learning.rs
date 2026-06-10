@@ -2,7 +2,7 @@
 
 use clx_core::config::Config;
 use clx_core::learned_pattern::{
-    is_well_formed_pattern, pattern_contains_secret, strip_env_assignments,
+    is_never_auto_whitelist, is_well_formed_pattern, pattern_contains_secret, strip_env_assignments,
 };
 use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
@@ -36,41 +36,13 @@ fn raw_command_is_unsafe(command: &str) -> bool {
     pattern_contains_secret(command) || RAW_COMPOUND_METACHARS.iter().any(|m| command.contains(m))
 }
 
-/// Commands that should never be auto-whitelisted due to destructive potential.
-///
-/// Even if the user approves these commands repeatedly, they remain subject to
-/// manual confirmation. This prevents overly broad patterns (e.g. `Bash(rm:-i *)`)
-/// from silently whitelisting destructive variants (e.g. `rm -rf /`).
-const NEVER_AUTO_WHITELIST: &[&str] = &[
-    "rm",
-    "rmdir",
-    "dd",
-    "mkfs",
-    "fdisk",
-    "chmod",
-    "chown",
-    "chgrp",
-    "kill",
-    "killall",
-    "pkill",
-    "shutdown",
-    "reboot",
-    "halt",
-    "poweroff",
-    "iptables",
-    "ip6tables",
-    "mount",
-    "umount",
-    "systemctl",
-    "service",
-];
-
 /// Check whether the base command (first word) of a command string is restricted
 /// from auto-whitelisting.
+///
+/// Thin wrapper over the shared `clx-core` predicate so both the hook and the
+/// `clx` CLI share one `NEVER_AUTO_WHITELIST` source of truth.
 pub(crate) fn is_restricted_command(command: &str) -> bool {
-    let command = strip_env_assignments(command);
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    NEVER_AUTO_WHITELIST.contains(&base_cmd)
+    is_never_auto_whitelist(command)
 }
 
 /// Commands that should never be auto-blacklisted because they are critical

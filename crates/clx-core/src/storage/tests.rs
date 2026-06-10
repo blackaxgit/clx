@@ -927,10 +927,10 @@ fn test_analytics_with_project_filter() {
 // =========================================================================
 
 #[test]
-fn test_schema_version_is_9() {
+fn test_schema_version_is_10() {
     let storage = create_test_storage();
     let version = storage.schema_version().unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -2102,4 +2102,351 @@ fn recent_session_summaries_picks_latest_snapshot_per_session() {
         result[0].summary, "newer summary",
         "should pick the latest snapshot summary per session"
     );
+}
+
+// =========================================================================
+// FIX-2 — both snapshot INSERT sinks redact summary + key_facts
+// =========================================================================
+
+const FIX2_SECRET_SK: &str = "sk-livesecret0000000000";
+const FIX2_SECRET_BODY: &str = "livesecret0000000000";
+
+fn fix2_secret_snapshot(session: &str, trigger: SnapshotTrigger) -> Snapshot {
+    let mut snap = Snapshot::new(SessionId::new(session), trigger);
+    snap.summary = Some(format!("token is {FIX2_SECRET_SK} here"));
+    snap.key_facts = Some("auth header: Bearer abcdefghijklmnopqrstuvwxyz".to_string());
+    snap
+}
+
+fn fix2_assert_redacted(storage: &Storage, id: i64) {
+    let (summary, key_facts): (Option<String>, Option<String>) = storage
+        .conn
+        .query_row(
+            "SELECT summary, key_facts FROM snapshots WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read back snapshot row");
+    let summary = summary.expect("summary present");
+    let key_facts = key_facts.expect("key_facts present");
+
+    assert!(
+        summary.contains("***REDACTED***"),
+        "summary must be redacted: {summary}"
+    );
+    assert!(
+        !summary.contains(FIX2_SECRET_BODY),
+        "summary must NOT contain the secret body: {summary}"
+    );
+    assert!(
+        key_facts.contains("***REDACTED***"),
+        "key_facts must be redacted: {key_facts}"
+    );
+    assert!(
+        !key_facts.contains("abcdefghijklmnopqrstuvwxyz"),
+        "key_facts must NOT contain the bearer token: {key_facts}"
+    );
+}
+
+fn fix2_seed_session(storage: &Storage, id: &str) {
+    storage
+        .create_session(&Session::new(SessionId::new(id), "/tmp/proj".to_string()))
+        .unwrap();
+}
+
+#[test]
+fn fix2_create_snapshot_redacts_secrets_at_sink() {
+    let storage = create_test_storage();
+    fix2_seed_session(&storage, "sess-fix2a");
+    let id = storage
+        .create_snapshot(&fix2_secret_snapshot("sess-fix2a", SnapshotTrigger::Manual))
+        .unwrap();
+    fix2_assert_redacted(&storage, id);
+}
+
+#[test]
+fn fix2_create_snapshot_if_no_recent_auto_summary_redacts_secrets_at_sink() {
+    let storage = create_test_storage();
+    fix2_seed_session(&storage, "sess-fix2b");
+    let snap = fix2_secret_snapshot("sess-fix2b", SnapshotTrigger::AutoSummary);
+    let inserted = storage
+        .create_snapshot_if_no_recent_auto_summary(&snap, 60)
+        .unwrap();
+    assert!(inserted, "first guarded insert must write the row");
+
+    let id: i64 = storage
+        .conn
+        .query_row(
+            "SELECT id FROM snapshots WHERE session_id = 'sess-fix2b'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fix2_assert_redacted(&storage, id);
+}
+
+// =========================================================================
+// FIX-3 — strict RuleType read; unknown rows dropped (fail-safe)
+// =========================================================================
+
+/// Insert a raw `learned_rules` row, bypassing `add_rule` (which only emits
+/// valid `rule_type` strings), so we can seed a corrupt/unknown type.
+fn fix3_seed_raw_rule(storage: &Storage, pattern: &str, rule_type: &str) {
+    storage
+        .conn
+        .execute(
+            "INSERT INTO learned_rules (pattern, rule_type, learned_at, source) \
+             VALUES (?1, ?2, ?3, 'test')",
+            params![pattern, rule_type, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("seed raw learned_rules row");
+}
+
+#[test]
+fn fix3_get_rules_drops_unknown_type_keeps_valid() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(bogus:*)", "bogus");
+    fix3_seed_raw_rule(&storage, "Bash(valid:*)", "allow");
+
+    let rules = storage.get_rules().unwrap();
+    assert_eq!(rules.len(), 1, "only the valid rule must load");
+    assert_eq!(rules[0].pattern, "Bash(valid:*)");
+    assert_eq!(rules[0].rule_type, RuleType::Allow);
+    // The bogus row must NOT have fail-open-defaulted to Allow.
+    assert!(
+        !rules.iter().any(|r| r.pattern == "Bash(bogus:*)"),
+        "bogus-type row must be skipped, not loaded as Allow"
+    );
+}
+
+#[test]
+fn fix3_get_rules_for_project_drops_unknown_type() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(bogus2:*)", "weird");
+    fix3_seed_raw_rule(&storage, "Bash(valid2:*)", "deny");
+
+    let rules = storage.get_rules_for_project("/some/project").unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].pattern, "Bash(valid2:*)");
+    assert_eq!(rules[0].rule_type, RuleType::Deny);
+}
+
+#[test]
+fn fix3_get_rule_by_pattern_unknown_type_returns_none() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(corrupt:*)", "nonsense");
+
+    // Fail-safe: a corrupt single lookup yields None (no rule), not an Allow
+    // and not a hard error.
+    let got = storage.get_rule_by_pattern("Bash(corrupt:*)").unwrap();
+    assert!(got.is_none(), "unknown rule_type must map to None");
+}
+
+#[test]
+fn fix3_get_rule_by_pattern_valid_type_round_trips() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(ok:*)", "deny");
+    let got = storage.get_rule_by_pattern("Bash(ok:*)").unwrap();
+    let got = got.expect("valid rule must be found");
+    assert_eq!(got.rule_type, RuleType::Deny);
+}
+
+// =========================================================================
+// Learning events (opt-in firehose) storage tests
+// =========================================================================
+
+mod learning_events {
+    use super::create_test_storage;
+    use crate::storage::{LearningFilter, MAX_LEARNING_EVENTS};
+    use crate::types::{LearningEvent, LearningKind};
+
+    /// Build a minimal learning event with overridable fields.
+    fn ev(decision: &str, diverged: bool) -> LearningEvent {
+        LearningEvent {
+            ts: "2026-06-09T00:00:00Z".to_string(),
+            session_id: Some("s1".to_string()),
+            tool: "Bash".to_string(),
+            host: "claude".to_string(),
+            decision: decision.to_string(),
+            layer: "l1".to_string(),
+            kind: LearningKind::Decision,
+            matched_rule: None,
+            reason: "ok".to_string(),
+            command: Some("ls -la".to_string()),
+            effective_config: "{}".to_string(),
+            diverged,
+            divergence_reason: None,
+            latency_ms: Some(12),
+            policy_fingerprint: "sha256:fp".to_string(),
+        }
+    }
+
+    /// AC4: every free-text field is redacted at the choke-point. A secret in
+    /// the `reason`/`command`/`matched_rule`/`effective_config` must be stored
+    /// as `***REDACTED***`, never the raw secret.
+    #[test]
+    fn record_redacts_all_free_text_fields() {
+        let storage = create_test_storage();
+        let secret_key = "sk-livesecret0000000000";
+        let bearer = "Bearer abcdefghijklmnop";
+
+        let mut e = ev("ask", true);
+        e.reason = format!("denied because of {secret_key}");
+        e.command = Some(format!("curl -H 'Authorization: {bearer}' https://x"));
+        e.matched_rule = Some(format!("rule {secret_key}"));
+        e.effective_config = format!("{{\"token\":\"{secret_key}\",\"note\":\"{bearer}\"}}");
+
+        storage
+            .record_learning_event(&e)
+            .expect("record learning event");
+
+        let rows = storage
+            .list_learning_events(&LearningFilter::default())
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        for field in [
+            row.reason.as_str(),
+            row.command.as_deref().unwrap_or(""),
+            row.matched_rule.as_deref().unwrap_or(""),
+            row.effective_config.as_str(),
+        ] {
+            assert!(
+                !field.contains(secret_key),
+                "secret key leaked into stored field: {field}"
+            );
+            assert!(
+                !field.contains("abcdefghijklmnop"),
+                "bearer secret leaked into stored field: {field}"
+            );
+        }
+        assert!(
+            row.reason.contains("***REDACTED***"),
+            "reason must carry the redaction marker, got: {}",
+            row.reason
+        );
+        assert!(
+            row.effective_config.contains("***REDACTED***"),
+            "effective_config must carry the redaction marker, got: {}",
+            row.effective_config
+        );
+    }
+
+    /// AC6 / AC12: the COUNT-guard retention keeps the row count bounded. Insert
+    /// MAX + 200 rows; the count must never exceed MAX.
+    #[test]
+    fn retention_count_guard_caps_rows() {
+        let storage = create_test_storage();
+        // Insert beyond the cap. ts is recent so the TTL prune does not fire.
+        let total = MAX_LEARNING_EVENTS + 200;
+        for i in 0..total {
+            let mut e = ev("allow", false);
+            e.ts = "2099-01-01T00:00:00Z".to_string();
+            e.command = Some(format!("cmd-{i}"));
+            storage
+                .record_learning_event(&e)
+                .expect("record learning event");
+        }
+        let count = storage.count_learning_events().expect("count");
+        assert!(
+            count <= MAX_LEARNING_EVENTS,
+            "count {count} must stay <= cap {MAX_LEARNING_EVENTS}"
+        );
+        // The newest rows survive: the very last command must still be present.
+        let rows = storage
+            .list_learning_events(&LearningFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(
+            rows[0].command.as_deref(),
+            Some(format!("cmd-{}", total - 1)).as_deref()
+        );
+    }
+
+    /// TTL prune removes stale rows (older than the 30-day window).
+    #[test]
+    fn retention_ttl_prunes_stale_rows() {
+        let storage = create_test_storage();
+        let mut stale = ev("allow", false);
+        stale.ts = "2000-01-01T00:00:00Z".to_string();
+        storage.record_learning_event(&stale).expect("record stale");
+        // A fresh insert triggers retention, which TTL-prunes the stale row.
+        let mut fresh = ev("allow", false);
+        fresh.ts = "2099-01-01T00:00:00Z".to_string();
+        storage.record_learning_event(&fresh).expect("record fresh");
+
+        assert_eq!(
+            storage.count_learning_events().expect("count"),
+            1,
+            "the stale (>30d) row must be TTL-pruned"
+        );
+    }
+
+    /// Read API: filter by decision + diverged, count, and clear.
+    #[test]
+    fn filter_count_and_clear() {
+        let storage = create_test_storage();
+        storage.record_learning_event(&ev("allow", false)).unwrap();
+        storage.record_learning_event(&ev("ask", true)).unwrap();
+        storage.record_learning_event(&ev("deny", false)).unwrap();
+
+        assert_eq!(storage.count_learning_events().unwrap(), 3);
+
+        let asks = storage
+            .list_learning_events(&LearningFilter {
+                decision: Some("ask".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].decision, "ask");
+
+        let diverged = storage
+            .list_learning_events(&LearningFilter {
+                diverged: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(diverged.len(), 1);
+        assert!(diverged[0].diverged);
+
+        let removed = storage.clear_learning_events().unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(storage.count_learning_events().unwrap(), 0);
+    }
+
+    /// Suggestion aggregates: diverged asks grouped by command for the current
+    /// fingerprint only.
+    #[test]
+    fn pattern_aggregates_group_current_fingerprint_diverged_asks() {
+        let storage = create_test_storage();
+
+        let mut a = ev("ask", true);
+        a.command = Some("npm run deploy".to_string());
+        a.policy_fingerprint = "sha256:current".to_string();
+        storage.record_learning_event(&a).unwrap();
+        storage.record_learning_event(&a).unwrap();
+
+        // Different fingerprint: excluded.
+        let mut other = ev("ask", true);
+        other.command = Some("npm run deploy".to_string());
+        other.policy_fingerprint = "sha256:other".to_string();
+        storage.record_learning_event(&other).unwrap();
+
+        // Non-diverged ask: excluded.
+        let mut nondiv = ev("ask", false);
+        nondiv.command = Some("npm run deploy".to_string());
+        nondiv.policy_fingerprint = "sha256:current".to_string();
+        storage.record_learning_event(&nondiv).unwrap();
+
+        let aggs = storage
+            .learning_pattern_aggregates("sha256:current")
+            .expect("aggregates");
+        assert_eq!(aggs.len(), 1, "only the current-fingerprint diverged asks");
+        assert_eq!(aggs[0].0, "npm run deploy");
+        assert_eq!(aggs[0].1, 2);
+    }
 }

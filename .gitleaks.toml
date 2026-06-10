@@ -24,6 +24,7 @@ paths = [
   '''crates/clx-core/tests/.*_poc\.rs''',
   '''crates/clx-core/tests/redaction_scheme_floor_regression\.rs''',
   '''crates/clx-core/tests/security_fixed_vectors_regression\.rs''',
+  '''crates/clx-hook/tests/learning_mode_e2e\.rs''',
 ]
 # Named synthetic tokens, anchored and with a required tail.
 regexes = [

@@ -198,6 +198,53 @@ fn is_tool_segment_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
 }
 
+/// Commands that should never be auto-whitelisted due to destructive potential.
+///
+/// Even if the user approves these commands repeatedly, they remain subject to
+/// manual confirmation. This prevents overly broad patterns (e.g.
+/// `Bash(rm:-i *)`) from silently whitelisting destructive variants (e.g.
+/// `rm -rf /`).
+///
+/// Lives in `clx-core` (rather than `clx-hook`) so both the hook auto-learning
+/// path and the `clx` CLI suggestion filter share one source of truth; the CLI
+/// does not depend on `clx-hook`.
+pub const NEVER_AUTO_WHITELIST: &[&str] = &[
+    "rm",
+    "rmdir",
+    "dd",
+    "mkfs",
+    "fdisk",
+    "chmod",
+    "chown",
+    "chgrp",
+    "kill",
+    "killall",
+    "pkill",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "iptables",
+    "ip6tables",
+    "mount",
+    "umount",
+    "systemctl",
+    "service",
+];
+
+/// Check whether the base command (first word) of a command string is
+/// restricted from auto-whitelisting.
+///
+/// Leading `ENV=VALUE` assignments are stripped first (via
+/// [`strip_env_assignments`]) so a leading assignment cannot hide a restricted
+/// base command (e.g. `FOO=bar rm -rf /`).
+#[must_use]
+pub fn is_never_auto_whitelist(command: &str) -> bool {
+    let command = strip_env_assignments(command);
+    let base_cmd = command.split_whitespace().next().unwrap_or("");
+    NEVER_AUTO_WHITELIST.contains(&base_cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +300,21 @@ mod tests {
     #[case("Bash(<(x))", false)]
     fn is_well_formed_pattern_cases(#[case] input: &str, #[case] expected: bool) {
         assert_eq!(is_well_formed_pattern(input), expected);
+    }
+
+    #[rstest]
+    // Restricted destructive base commands.
+    #[case("rm -rf /", true)]
+    #[case("dd if=/dev/zero of=/dev/sda", true)]
+    #[case("systemctl restart nginx", true)]
+    // Env-prefixed restricted command: the assignment must be stripped first.
+    #[case("FOO=bar rm -rf /", true)]
+    // Non-restricted commands.
+    #[case("cargo build", false)]
+    #[case("git status", false)]
+    #[case("ls -la", false)]
+    #[case("", false)]
+    fn is_never_auto_whitelist_cases(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(is_never_auto_whitelist(input), expected);
     }
 }

@@ -809,4 +809,244 @@ mod tests {
         // Result must be valid UTF-8 (no panics from bad slicing)
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
     }
+
+    // =========================================================================
+    // Coverage-gap hardening (2026-06): last_n_turns filtering/windowing, role
+    // gating in token counts, unreadable-file degradation, invalid-UTF-8 line
+    // resilience, and the tool_use/unknown-type arms of build_transcript_text.
+    // =========================================================================
+
+    /// `last_n_turns` with `n = 0` returns empty WITHOUT opening the file
+    /// (a valid transcript is present; the window size alone gates it).
+    #[test]
+    fn last_n_turns_zero_window_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("turns.jsonl");
+        write_transcript(&path, &[r#"{"type":"user","message":"hello"}"#]);
+        assert!(
+            last_n_turns(path.to_str().unwrap(), 0).is_empty(),
+            "n == 0 must yield no turns even for a valid transcript"
+        );
+    }
+
+    /// `last_n_turns` must (a) skip blank lines, non-JSON lines, non-user/
+    /// assistant roles, and empty-content turns, and (b) keep only the
+    /// trailing `n` valid turns in chronological order.
+    #[test]
+    fn last_n_turns_filters_noise_and_keeps_trailing_window_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("noisy.jsonl");
+        // The noise rows sit INSIDE the trailing window region on purpose: a
+        // regression that stops filtering them would shift the window and
+        // change its contents (caught below), not just its prefix.
+        write_transcript(
+            &path,
+            &[
+                "",                 // blank: skipped
+                "this is not json", // bad JSON: skipped
+                r#"{"type":"user","message":"turn one"}"#,
+                r#"{"type":"assistant","message":"turn two"}"#,
+                r#"{"type":"user","message":"turn three"}"#,
+                r#"{"type":"system","message":"sys note"}"#, // role: skipped
+                r#"{"type":"user","message":""}"#,           // empty content: skipped
+                r#"{"type":"assistant","message":"turn four"}"#,
+            ],
+        );
+        let turns = last_n_turns(path.to_str().unwrap(), 3);
+        let expected = vec![
+            OwnedTurn {
+                role: "assistant".to_string(),
+                content: "turn two".to_string(),
+            },
+            OwnedTurn {
+                role: "user".to_string(),
+                content: "turn three".to_string(),
+            },
+            OwnedTurn {
+                role: "assistant".to_string(),
+                content: "turn four".to_string(),
+            },
+        ];
+        assert_eq!(
+            turns, expected,
+            "trailing window must keep the LAST 3 valid turns, oldest first, \
+             with noise lines and non-chat roles excluded"
+        );
+    }
+
+    /// `count_transcript_tokens` must count tokens ONLY for `user`/`assistant`
+    /// entries; a `system` entry parses (and bumps `message_count`) but must
+    /// contribute zero tokens to either side.
+    #[test]
+    fn count_tokens_counts_only_user_and_assistant_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("roles.jsonl");
+        write_transcript(
+            &path,
+            &[
+                // "system padding" = 14 chars => 4 tokens IF it were counted.
+                r#"{"type":"system","message":"system padding"}"#,
+                // "user msg" = 8 chars => (8+3)/4 = 2 tokens.
+                r#"{"type":"user","message":"user msg"}"#,
+            ],
+        );
+        let (input_tok, output_tok, msg_count) = count_transcript_tokens(path.to_str().unwrap());
+        assert_eq!(
+            input_tok, 2,
+            "only the user turn may contribute input tokens"
+        );
+        assert_eq!(
+            output_tok, 0,
+            "a system entry must NOT count as assistant output"
+        );
+        assert_eq!(
+            msg_count, 2,
+            "both valid JSONL entries are counted as messages"
+        );
+    }
+
+    /// An existing-but-unreadable transcript (mode 000) passes the metadata
+    /// gate but fails `File::open`; both sync readers must degrade to their
+    /// empty sentinels instead of erroring.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_transcript_degrades_to_empty_sentinels() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("locked.jsonl");
+        write_transcript(&path, &[r#"{"type":"user","message":"hello"}"#]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Running as root (CI edge): mode 000 is not enforceable; skip.
+            return;
+        }
+        assert!(
+            last_n_turns(path.to_str().unwrap(), 5).is_empty(),
+            "unreadable transcript must yield no turns"
+        );
+        assert_eq!(
+            count_transcript_tokens(path.to_str().unwrap()),
+            (0, 0, 0),
+            "unreadable transcript must yield zero token counts"
+        );
+    }
+
+    /// `process_transcript` on an unreadable file must return the all-`None`
+    /// result (open failure AFTER the path gate), not panic or hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_transcript_unreadable_file_returns_empty_result() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("locked2.jsonl");
+        write_transcript(&path, &[r#"{"type":"user","message":"hello"}"#]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // root: permission bits not enforced
+        }
+        let result = process_transcript(path.to_str().unwrap(), false).await;
+        assert!(
+            result.summary.is_none(),
+            "no summary for an unreadable file"
+        );
+        assert!(
+            result.message_count.is_none(),
+            "open-failure path reports message_count = None (vs Some(0) for an \
+             empty-but-readable transcript)"
+        );
+        assert_eq!((result.input_tokens, result.output_tokens), (0, 0));
+    }
+
+    /// A readable transcript with NO valid JSONL entries reports
+    /// `message_count = Some(0)` and no summary (the empty-entries early
+    /// return, distinct from the unreadable-file `None` shape).
+    #[tokio::test]
+    async fn process_transcript_no_valid_entries_reports_zero_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("garbage.jsonl");
+        write_transcript(&path, &["", "not json at all", "   "]);
+        let result = process_transcript(path.to_str().unwrap(), false).await;
+        assert_eq!(
+            result.message_count,
+            Some(0),
+            "empty-but-readable transcript must report Some(0) messages"
+        );
+        assert!(result.summary.is_none(), "no summary without entries");
+        assert_eq!((result.input_tokens, result.output_tokens), (0, 0));
+    }
+
+    /// An invalid-UTF-8 line must be skipped (the `lines()` Err arm) while the
+    /// remaining valid turns are still counted; a `system` entry is counted as
+    /// a message but contributes no tokens.
+    #[tokio::test]
+    async fn process_transcript_skips_invalid_utf8_and_counts_remaining_turns() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mixed.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"\xff\xfe\xfd not utf8\n").unwrap();
+        f.write_all(b"\n").unwrap(); // blank line: skipped
+        f.write_all(br#"{"type":"user","message":"hello world"}"#)
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        f.write_all(br#"{"type":"system","message":"sys"}"#)
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        f.write_all(br#"{"type":"assistant","message":"goodbye world"}"#)
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        drop(f);
+
+        // ollama_available = false: deterministic fast path, no network.
+        let result = process_transcript(path.to_str().unwrap(), false).await;
+        assert_eq!(
+            result.summary.as_deref(),
+            Some("Session with 3 messages"),
+            "fast-path summary must reflect the 3 parsed entries (bad-UTF-8 \
+             and blank lines skipped)"
+        );
+        assert_eq!(result.message_count, Some(3));
+        // "hello world" = 11 chars -> 3 tokens; "goodbye world" = 13 -> 4.
+        assert_eq!(result.input_tokens, 3, "user tokens");
+        assert_eq!(result.output_tokens, 4, "assistant tokens; system adds 0");
+    }
+
+    /// `build_transcript_text` renders `tool_use` entries as `[tool_use]: <tool>`,
+    /// truncates >500-char chat content with an ellipsis, and silently drops
+    /// unknown entry types.
+    #[test]
+    fn build_transcript_text_renders_tool_use_and_skips_unknown_types() {
+        let long = "a".repeat(600);
+        let entries = vec![
+            TranscriptEntry {
+                entry_type: Some("user".to_string()),
+                message: Some(TranscriptMessage::String(long.clone())),
+                tool: None,
+            },
+            TranscriptEntry {
+                entry_type: Some("tool_use".to_string()),
+                message: None,
+                tool: Some("Bash".to_string()),
+            },
+            TranscriptEntry {
+                entry_type: Some("system".to_string()),
+                message: Some(TranscriptMessage::String("UNIQUE-SYS-MARKER".to_string())),
+                tool: None,
+            },
+        ];
+        let text = build_transcript_text(&entries);
+        let expected_user_line = format!("[user]: {}...", &long[..500]);
+        assert!(
+            text.contains(&expected_user_line),
+            "over-500-char content must be truncated to exactly 500 chars + ellipsis; got: {text}"
+        );
+        assert!(
+            text.contains("[tool_use]: Bash"),
+            "tool_use entries must render the tool name; got: {text}"
+        );
+        assert!(
+            !text.contains("UNIQUE-SYS-MARKER"),
+            "unknown entry types must be dropped from the rendered transcript"
+        );
+    }
 }

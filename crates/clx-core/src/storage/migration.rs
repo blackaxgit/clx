@@ -7,7 +7,7 @@ use tracing::info;
 use super::Storage;
 
 /// Current schema version for migrations
-pub(super) const SCHEMA_VERSION: i32 = 9;
+pub(super) const SCHEMA_VERSION: i32 = 10;
 
 impl Storage {
     /// Configure `SQLite` pragmas for optimal performance
@@ -100,6 +100,10 @@ impl Storage {
                 self.migrate_to_v9()?;
             }
 
+            if current_version < 10 {
+                self.migrate_to_v10()?;
+            }
+
             self.conn.execute(
                 "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
                 [SCHEMA_VERSION],
@@ -123,6 +127,7 @@ impl Storage {
             "analytics",
             "snapshots_fts",
             "validation_cache",
+            "learning_events",
         ];
         if !VALID_TABLES.contains(&table) {
             return false;
@@ -549,6 +554,48 @@ impl Storage {
         );
         Ok(())
     }
+
+    /// Migrate to schema version 10 - add the `learning_events` table.
+    ///
+    /// Backs the opt-in learning/debug firehose: when `validator.learning_mode`
+    /// is enabled, every final `PreToolUse` decision (plus error/degraded arms) is
+    /// captured as a row here. The table is intentionally independent of
+    /// `audit_log` (own retention, own schema) and has NO foreign key to
+    /// `sessions` so a best-effort capture is never blocked by a missing
+    /// session row. Idempotent: `CREATE TABLE/INDEX IF NOT EXISTS`.
+    pub(super) fn migrate_to_v10(&self) -> crate::Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                session_id TEXT,
+                tool TEXT NOT NULL,
+                host TEXT NOT NULL DEFAULT 'claude',
+                decision TEXT NOT NULL,
+                layer TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                matched_rule TEXT,
+                reason TEXT NOT NULL,
+                command TEXT,
+                effective_config TEXT NOT NULL,
+                diverged INTEGER NOT NULL DEFAULT 0,
+                divergence_reason TEXT,
+                latency_ms INTEGER,
+                policy_fingerprint TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_learning_diverged_decision_tool
+                ON learning_events (diverged, decision, tool);
+
+            CREATE INDEX IF NOT EXISTS idx_learning_ts
+                ON learning_events (ts);
+            ",
+        )?;
+
+        info!("Completed migration to schema version 10 (learning_events table)");
+        Ok(())
+    }
 }
 
 /// Valid table names for `ALTER TABLE` migrations.
@@ -565,6 +612,7 @@ const VALID_MIGRATION_TABLES: &[&str] = &[
     "embeddings",
     "context_snapshots",
     "validation_cache",
+    "learning_events",
 ];
 
 /// Add a column to a table, validating table name against a whitelist.
@@ -775,5 +823,37 @@ mod tests {
             host, "codex",
             "existing non-claude host must survive re-migration"
         );
+    }
+
+    /// v10: a freshly-migrated database carries the `learning_events` table.
+    #[test]
+    fn v10_adds_learning_events_table() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+        assert!(
+            storage.table_exists("learning_events"),
+            "v10 must create the learning_events table"
+        );
+        // The table is recognized by the column-name allowlist guard.
+        assert!(
+            storage.column_exists("learning_events", "policy_fingerprint"),
+            "learning_events must carry the policy_fingerprint column"
+        );
+    }
+
+    /// v10 migration is idempotent: re-running it on an already-migrated
+    /// database is a committed no-op (`CREATE TABLE/INDEX IF NOT EXISTS`).
+    #[test]
+    fn v10_migration_is_idempotent() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+
+        // First run already happened during open. Run it again explicitly.
+        storage
+            .migrate_to_v10()
+            .expect("second v10 migration must be a no-op, not an error");
+        storage
+            .migrate_to_v10()
+            .expect("third v10 migration must be a no-op, not an error");
+
+        assert!(storage.table_exists("learning_events"));
     }
 }

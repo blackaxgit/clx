@@ -253,58 +253,16 @@ impl PolicyEngine {
                 .push(PolicyRule::blacklist(pattern).with_description(description));
         }
 
-        // Issue 4 (policy-layer part, sub-part A): baseline glob DENY rules for
-        // redirection / copy / move writes INTO a protected config dir. They
-        // back up the redirection-target check; `glob_match` is unanchored so a
-        // leading `*` is required (and a `/tmp` redirect does not false-match a
-        // protected segment). Dir names assembled via `concat!` (write-hook
-        // compatibility).
-        // The agent dot-claude dir is NOT broadly protected here: memory writes
-        // (CLAUDE.md, project memory) must be allowed. It is handled with
-        // narrowed sensitive targets below, mirroring the FileEdit guard.
-        let protected_segments: [&str; 3] = [
-            concat!(".", "clx"),
-            concat!(".", "codex"),
-            concat!(".", "cursor"),
-        ];
-        let redir_templates = |target: &str| {
-            // Templates cover `>`/`>>` (spaced + unspaced), `tee`, `cp`, `mv`,
-            // and `dd of=` writes whose target path contains `target`.
-            [
-                format!("Bash(*> *{target}*)"),
-                format!("Bash(*>*{target}*)"),
-                format!("Bash(*>> *{target}*)"),
-                format!("Bash(*>>*{target}*)"),
-                format!("Bash(*tee*{target}*)"),
-                format!("Bash(*cp *{target}*)"),
-                format!("Bash(*mv *{target}*)"),
-                format!("Bash(*dd *of=*{target}*)"),
-            ]
-        };
-        for seg in protected_segments {
-            for pattern in redir_templates(&format!("{seg}/")) {
-                self.blacklist.push(
-                    PolicyRule::blacklist(pattern)
-                        .with_description("Redirection/write into a protected config dir"),
-                );
-            }
-        }
-        // Narrowed dot-claude redirection guard: only the sensitive targets
-        // (settings.json, settings.local.json, hooks/) are denied; CLAUDE.md and
-        // other memory paths are allowed (consistent with the FileEdit guard).
-        let dc = concat!("/.", "claude/");
-        for sensitive in [
-            format!("{dc}settings.json"),
-            format!("{dc}settings.local.json"),
-            format!("{dc}hooks/"),
-        ] {
-            for pattern in redir_templates(&sensitive) {
-                self.blacklist
-                    .push(PolicyRule::blacklist(pattern).with_description(
-                        "Redirection/write into a protected agent-config target",
-                    ));
-            }
-        }
+        // Issue 4 / FIX-2: the glob-based redirection/copy/move blacklist that
+        // used to live here (`Bash(*>*{seg}*)`, `Bash(*cp *{seg}*)`, ...) has
+        // been REMOVED. Those globs over-matched: `*>*{seg}*` fired on `->`
+        // arrows and `2>&1` fd-dups, and `*cp *{seg}*`/`*mv *{seg}*` fired even
+        // when the protected dir was the SOURCE of a read. Writes INTO a
+        // protected config dir are now detected by `bash_writes_into_protected_dir`
+        // in `evaluate` (token/destination-aware), which preserves the broad
+        // (clx/codex/cursor) vs narrowed (dot-claude sensitive-only) distinction
+        // without false-positives on reads. The `FileEdit(...)` guards above are
+        // unaffected.
 
         // Issue 3: builtin GRAYLIST tier (hidden/internal, builtin-only, never
         // persisted to the DB). These over-broad shell-escape / expansion

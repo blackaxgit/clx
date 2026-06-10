@@ -1,20 +1,22 @@
 //! `PreToolUse` hook handler - validate commands before execution.
 
 use anyhow::Result;
-use clx_core::config::DefaultDecision;
 use clx_core::config::codex_trust::{ProjectTrust, read_project_trust};
 use clx_core::config::{Capability, Config};
+use clx_core::config::{DefaultDecision, OnValidatorUnavailable};
 use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
     is_read_only_command,
 };
 use clx_core::storage::Storage;
-use clx_core::types::AuditDecision;
+use clx_core::types::{AuditDecision, DecisionOrigin, LearningKind};
+use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::audit::log_audit_entry;
 use crate::audit_chain::{GENESIS_HASH, build_record};
 use crate::embedding::resolve_command_paths;
+use crate::hooks::learning_capture::capture;
 use crate::host::{Host, HostId};
 use crate::learning::{DecisionSource, track_user_decision};
 use crate::output::{RULES_REMINDER, output_decision_for};
@@ -141,10 +143,26 @@ fn dot_claude_path_is_sensitive(resolved: &std::path::Path, dot_claude: &str) ->
     false
 }
 
-fn fileedit_resolves_into_protected_dir(
-    tool_input: Option<&serde_json::Value>,
-    cwd: &str,
+/// ARCH-01 shared helper: given an ALREADY-resolved (`canonicalize_best_effort`)
+/// absolute path and the home dir, return a deny reason if the path lands inside
+/// a protected config/trust dir, else `None`. This is the single source of truth
+/// for the "resolved path lands in a protected dir" decision, used by BOTH the
+/// `FileEdit` guard and the Bash-write-destination guard so the two cannot
+/// diverge. The `kind` label ("File edit" / "Bash write") only flavors the
+/// returned reason string.
+///
+/// Checks (in order):
+///   (a)  canonical prefix match against `~/.codex`, `~/.claude`, `~/.cursor`,
+///        `~/.clx` (dot-claude is NARROW — only sensitive targets; the rest are
+///        BROAD).
+///   (a2) hardlink identity: the resolved target shares (dev, ino) with a known
+///        protected file even with no protected path component (unix only).
+///   (b)  component-name match (case-insensitive, any location): case variants,
+///        not-yet-existing-dir literals, and repo-local config dirs.
+fn path_resolves_into_protected_dir(
+    resolved: &std::path::Path,
     home: &std::path::Path,
+    kind: &str,
 ) -> Option<String> {
     // The dot-claude config dir component name. Built via `concat!` so the
     // literal hidden-dir token does not appear verbatim (write-hook safe).
@@ -158,6 +176,104 @@ fn fileedit_resolves_into_protected_dir(
             std::fs::canonicalize(&p).unwrap_or(p)
         })
         .collect();
+    // (a) canonical prefix match against the home config/trust dirs.
+    for prot in &protected {
+        if resolved.starts_with(prot) {
+            // Issue 4: the dot-claude dir guard is NARROW — only sensitive
+            // targets (settings.json / settings.local.json / hooks/) are
+            // denied; other dot-claude paths (CLAUDE.md, project memory)
+            // are allowed. The codex/cursor/clx dirs stay BROAD.
+            if dir_is_dot_claude(prot, dot_claude)
+                && !dot_claude_path_is_sensitive(resolved, dot_claude)
+            {
+                continue;
+            }
+            return Some(format!(
+                "{kind} resolves into protected config/trust dir: {}",
+                prot.display()
+            ));
+        }
+    }
+    // (a2) hardlink identity: a hardlink to a protected file shares its
+    // (device, inode) but carries no `.codex` path component and is not a
+    // symlink. Compare the resolved target's inode against the known host
+    // trust/config files when they exist. (TOCTOU between this check and the
+    // host's actual write remains an inherent limit of any pre-execution
+    // gate; see the best-effort caveat.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(t) = std::fs::metadata(resolved) {
+            let protected_files = [
+                home.join(".codex").join("config.toml"),
+                home.join(".claude").join("settings.json"),
+                home.join(".cursor").join("mcp.json"),
+                home.join(".cursor").join("hooks.json"),
+            ];
+            for pf in &protected_files {
+                if let Ok(m) = std::fs::metadata(pf)
+                    && m.dev() == t.dev()
+                    && m.ino() == t.ino()
+                {
+                    return Some(format!(
+                        "{kind} targets a hardlink to protected file: {}",
+                        pf.display()
+                    ));
+                }
+            }
+        }
+    }
+    // (b) component-name match (case-insensitive, any location): catches
+    // case variants (~/.CODEX), the not-yet-existing-dir literal fallback,
+    // and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
+    for comp in resolved.components() {
+        if let std::path::Component::Normal(name) = comp {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            if lower == dot_claude {
+                // Issue 4: NARROW dot-claude guard — only deny sensitive
+                // targets; allow other dot-claude paths (memory files).
+                if dot_claude_path_is_sensitive(resolved, dot_claude) {
+                    return Some(format!(
+                        "{kind} targets a protected config/trust dir component: {lower}"
+                    ));
+                }
+            } else if matches!(lower.as_str(), ".codex" | ".cursor" | ".clx") {
+                return Some(format!(
+                    "{kind} targets a protected config/trust dir component: {lower}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Expand a candidate path token into an absolute path: `~/`/`~` resolve against
+/// `home`, relative paths against `cwd`. Mirrors the `FileEdit` guard's historical
+/// inline expansion; shared so the Bash-write guard expands identically.
+fn expand_candidate_path(
+    tok: &str,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(rest) = tok.strip_prefix("~/") {
+        home.join(rest)
+    } else if tok == "~" {
+        home.to_path_buf()
+    } else {
+        let p = std::path::Path::new(tok);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    }
+}
+
+fn fileedit_resolves_into_protected_dir(
+    tool_input: Option<&serde_json::Value>,
+    cwd: &str,
+    home: &std::path::Path,
+) -> Option<String> {
     let cwd_path = std::path::Path::new(cwd);
     // Extract WHOLE candidate path strings (spaces preserved). Whitespace
     // tokenizing a path is unsafe: a target like "safe link/config.toml" (where
@@ -166,100 +282,23 @@ fn fileedit_resolves_into_protected_dir(
     // fields and the V4A/diff markers.
     let candidates = fileedit_candidate_paths(tool_input);
 
-    // Per-candidate resolution + the three protection checks.
+    // Per-candidate resolution + the shared protected-dir check.
     let check = |raw: &str| -> Option<String> {
         let tok = raw.trim();
         if tok.is_empty() {
             return None;
         }
-        let expanded = if let Some(rest) = tok.strip_prefix("~/") {
-            home.join(rest)
-        } else if tok == "~" {
-            home.to_path_buf()
-        } else {
-            let p = std::path::Path::new(tok);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd_path.join(p)
-            }
-        };
+        let expanded = expand_candidate_path(tok, cwd_path, home);
         let resolved = canonicalize_best_effort(&expanded);
-        // (a) canonical prefix match against the home config/trust dirs.
-        for prot in &protected {
-            if resolved.starts_with(prot) {
-                // Issue 4: the dot-claude dir guard is NARROW — only sensitive
-                // targets (settings.json / settings.local.json / hooks/) are
-                // denied; other dot-claude paths (CLAUDE.md, project memory)
-                // are allowed. The codex/cursor/clx dirs stay BROAD.
-                if dir_is_dot_claude(prot, dot_claude)
-                    && !dot_claude_path_is_sensitive(&resolved, dot_claude)
-                {
-                    continue;
-                }
-                return Some(format!(
-                    "File edit resolves into protected config/trust dir: {}",
-                    prot.display()
-                ));
-            }
-        }
-        // (a2) hardlink identity: a hardlink to a protected file shares its
-        // (device, inode) but carries no `.codex` path component and is not a
-        // symlink. Compare the resolved target's inode against the known host
-        // trust/config files when they exist. (TOCTOU between this check and the
-        // host's actual write remains an inherent limit of any pre-execution
-        // gate; see the best-effort caveat.)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(t) = std::fs::metadata(&resolved) {
-                let protected_files = [
-                    home.join(".codex").join("config.toml"),
-                    home.join(".claude").join("settings.json"),
-                    home.join(".cursor").join("mcp.json"),
-                    home.join(".cursor").join("hooks.json"),
-                ];
-                for pf in &protected_files {
-                    if let Ok(m) = std::fs::metadata(pf)
-                        && m.dev() == t.dev()
-                        && m.ino() == t.ino()
-                    {
-                        return Some(format!(
-                            "File edit targets a hardlink to protected file: {}",
-                            pf.display()
-                        ));
-                    }
-                }
-            }
-        }
-        // (b) component-name match (case-insensitive, any location): catches
-        // case variants (~/.CODEX), the not-yet-existing-dir literal fallback,
-        // and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
-        for comp in resolved.components() {
-            if let std::path::Component::Normal(name) = comp {
-                let lower = name.to_string_lossy().to_ascii_lowercase();
-                if lower == dot_claude {
-                    // Issue 4: NARROW dot-claude guard — only deny sensitive
-                    // targets; allow other dot-claude paths (memory files).
-                    if dot_claude_path_is_sensitive(&resolved, dot_claude) {
-                        return Some(format!(
-                            "File edit targets a protected config/trust dir component: {lower}"
-                        ));
-                    }
-                } else if matches!(lower.as_str(), ".codex" | ".cursor" | ".clx") {
-                    return Some(format!(
-                        "File edit targets a protected config/trust dir component: {lower}"
-                    ));
-                }
-            }
-        }
-        None
+        path_resolves_into_protected_dir(&resolved, home, "File edit")
     };
 
     candidates.iter().find_map(|c| check(c))
 }
 
-/// Recursively collect every string value in a JSON value.
+/// Recursively collect every string value in a JSON value (key-agnostic).
+/// Used ONLY for the prefix-gated patch-HEADER extraction, which is safe over
+/// any string because it requires a `*** ... File:` / `+++ `/`--- ` marker.
 fn collect_json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
     match v {
         serde_json::Value::String(s) => out.push(s.clone()),
@@ -277,28 +316,90 @@ fn collect_json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// Extract whole candidate path strings from a `FileEdit` `tool_input`, preserving
-/// embedded spaces. Key-name-agnostic: EVERY string value anywhere in the payload
-/// is treated as a candidate path (so a host-specific key such as Cursor's
-/// `target_file`, or any future key, is covered without an allowlist), plus V4A
-/// patch markers (`*** Update File: <path>`) and unified-diff `+++`/`---` lines
-/// parsed out of any multi-line string value.
+/// FIX-6: keys whose string VALUE is file CONTENT, not a write target. A
+/// `content` blob may legitimately MENTION a protected-dir path (e.g. these
+/// very docs), which would split into a matching path component and cause a
+/// false deny. Such values are never treated as whole-path candidates.
+/// (Header extraction still runs over them — but that is prefix-gated.)
+const FILEEDIT_CONTENT_KEYS: &[&str] = &[
+    "content",
+    "new_string",
+    "old_string",
+    "new_str",
+    "old_str",
+    "new_content",
+    "old_content",
+];
+
+/// FIX-6: walk the JSON object key/value pairs collecting WHOLE-PATH candidates.
+/// A string value is a candidate ONLY IF it is single-line (no `\n`) AND its key
+/// is not a content key (see [`FILEEDIT_CONTENT_KEYS`]). This keeps the
+/// key-agnostic property (an arbitrary single-line path key such as Cursor's
+/// `target_file` is still caught) while a multi-line or content-keyed body is
+/// never mistaken for a path.
+///
+/// Nested arrays/objects recurse under the SAME content-key exclusion. Note
+/// `MultiEdit`'s `edits[]` entries hold `old_string`/`new_string` only — those
+/// keys are excluded, so no path is extracted from them; the `MultiEdit` target
+/// is the top-level `file_path`.
+fn collect_whole_path_candidates(v: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => {
+            // A content-keyed value is never a whole-path candidate.
+            if key.is_some_and(|k| FILEEDIT_CONTENT_KEYS.contains(&k)) {
+                return;
+            }
+            // Multi-line values are bodies, not paths.
+            if s.contains('\n') {
+                return;
+            }
+            let t = s.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+        serde_json::Value::Array(a) => {
+            // Arrays carry no key of their own; recurse with the inherited key
+            // so a content-keyed array (defensive) stays excluded.
+            for e in a {
+                collect_whole_path_candidates(e, key, out);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for (k, vv) in m {
+                collect_whole_path_candidates(vv, Some(k.as_str()), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract whole candidate path strings from a `FileEdit` `tool_input`,
+/// preserving embedded spaces. Two sources:
+///
+/// 1. Whole-path candidacy (FIX-6): single-line, non-content-keyed string
+///    values only (via [`collect_whole_path_candidates`]). This catches
+///    `file_path`/`path`/`notebook_path`/`target_file`/any single-line path key
+///    while excluding `content`/`new_string`/… bodies that merely MENTION a
+///    protected path.
+/// 2. Patch HEADER lines (key-agnostic, prefix-gated and safe): V4A markers
+///    (`*** Update File: <path>`, Add/Delete/Move) and unified-diff `+++`/`---`
+///    lines parsed out of ANY string value. `apply_patch` carries its V4A body
+///    under the `command` field, so this pass must remain key-agnostic.
 fn fileedit_candidate_paths(tool_input: Option<&serde_json::Value>) -> Vec<String> {
     let Some(v) = tool_input else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
-    // Every string value, any key, any nesting: the whole value is a candidate
-    // path (preserves embedded spaces; non-path strings simply will not resolve
-    // into a protected dir, so there is no false-positive risk).
+
+    // (1) Whole-path candidacy: key-aware, content-keys excluded, single-line.
+    collect_whole_path_candidates(v, None, &mut out);
+
+    // (2) Patch-header extraction: key-agnostic over all string values (the
+    // markers are prefix-gated, so a content body that does not contain a
+    // marker contributes nothing here).
     let mut texts: Vec<String> = Vec::new();
     collect_json_strings(v, &mut texts);
-    for s in &texts {
-        let t = s.trim();
-        if !t.is_empty() {
-            out.push(t.to_string());
-        }
-    }
     for text in texts {
         for line in text.lines() {
             let l = line.trim();
@@ -355,17 +456,41 @@ fn audit_decision_from_str(decision: &str) -> AuditDecision {
     }
 }
 
-/// F7 fail-closed posture: a command reaching an LLM-unavailable / timeout /
-/// generation-failure arm received ZERO L1 scrutiny. Honoring
-/// `default_decision=allow` there would silently pass it, so `allow` is forced
-/// to `ask`; `deny` and `ask` are already fail-closed and pass through. The
-/// distinct per-arm WARN is emitted by the caller (only on the `allow` path) so
-/// the log message stays specific to the arm.
-fn force_ask_if_allow(configured: &DefaultDecision) -> &'static str {
-    if *configured == DefaultDecision::Allow {
-        "ask"
-    } else {
-        configured.as_str()
+/// FIX-1: resolve the effective decision for the FOUR validator-UNREACHABLE
+/// arms (LLM client error, provider unavailable, L1 timeout, generation
+/// failure) from the `on_validator_unavailable` knob.
+///
+/// - `Ask` (default): preserve the historical F7 fail-closed posture exactly —
+///   `allow` is upgraded to `ask` (a command that reached an unreachable L1
+///   received ZERO scrutiny, so silent-allow is refused), while `deny` and
+///   `ask` already fail-closed and pass through unchanged. This is byte-for-byte
+///   the old `force_ask_if_allow(default_decision)` behavior, so the default
+///   knob value preserves existing behavior.
+/// - `Deny`: hard-deny on an unreachable validator (strictest, ignores
+///   `default_decision`).
+/// - `HonorDefault`: opt in to honoring `default_decision` (allow/deny/ask)
+///   verbatim when the validator cannot be reached. May fail OPEN if
+///   `default_decision = allow`; this knob is trust-gated (the whole
+///   `validator` subtree is stripped from untrusted project config).
+///
+/// This governs the UNAVAILABLE case only; it never affects the deliberate
+/// `layer1_enabled = false` arm (disabled != unavailable).
+fn resolve_unavailable(
+    knob: &OnValidatorUnavailable,
+    default_decision: &DefaultDecision,
+) -> &'static str {
+    match knob {
+        // Preserve current behavior: only `allow` is upgraded to `ask`;
+        // `deny`/`ask` pass through (both already fail-closed).
+        OnValidatorUnavailable::Ask => {
+            if *default_decision == DefaultDecision::Allow {
+                "ask"
+            } else {
+                default_decision.as_str()
+            }
+        }
+        OnValidatorUnavailable::Deny => "deny",
+        OnValidatorUnavailable::HonorDefault => default_decision.as_str(),
     }
 }
 
@@ -479,7 +604,12 @@ fn audit_config_layer_disable(config: &Config, host: &dyn Host, input: &HostNeut
 /// with Claude, which auto-allows its Write/Edit file tools).
 ///
 /// Returns [`Phase::Handled`] once it emits a decision (the caller must return).
-fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutralInput) -> Phase {
+fn evaluate_fileedit_guard(
+    config: &Config,
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    started: Instant,
+) -> Phase {
     let summary = apply_patch_summary(input.tool_input.as_ref());
     // R1-F2 canonical guard (runs first, symlink/alias-resistant): deny any
     // file-edit whose target resolves into a protected config/trust dir,
@@ -501,6 +631,20 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
             None,
             Some(&reason),
         );
+        capture(
+            config,
+            host,
+            input,
+            "FileEdit",
+            "deny",
+            "guard",
+            LearningKind::Decision,
+            DecisionOrigin::ProtectedGuard,
+            None,
+            &reason,
+            None,
+            started,
+        );
         output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         return Phase::Handled;
     }
@@ -520,9 +664,24 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
             None,
             Some(&reason),
         );
+        capture(
+            config,
+            host,
+            input,
+            "FileEdit",
+            "deny",
+            "l0",
+            LearningKind::Decision,
+            DecisionOrigin::Blacklist,
+            None,
+            &reason,
+            None,
+            started,
+        );
         output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         return Phase::Handled;
     }
+    let allow_reason = "File edit allowed (no FileEdit deny rule matched)";
     log_audit_entry(
         host.host_id(),
         &input.session_id,
@@ -531,10 +690,100 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
         "L0-FILEEDIT",
         AuditDecision::Allowed,
         None,
-        Some("File edit allowed (no FileEdit deny rule matched)"),
+        Some(allow_reason),
+    );
+    capture(
+        config,
+        host,
+        input,
+        "FileEdit",
+        "allow",
+        "l0",
+        LearningKind::Decision,
+        DecisionOrigin::FileEditAllow,
+        None,
+        allow_reason,
+        None,
+        started,
     );
     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
     Phase::Handled
+}
+
+/// FIX-4 canonical Bash-write guard (symlink/alias-resistant): deny any Bash
+/// command whose write destination resolves into a protected config/trust dir,
+/// regardless of how the destination string is written (`~/` alias, relative
+/// path, or a symlink/alias whose name does not literally contain `.clx` etc).
+///
+/// Runs BEFORE `evaluate_bash_l0` so it denies before the L0 whitelist could
+/// allow. It ADDS canonicalization on top of clx-core's
+/// `bash_writes_into_protected_dir` component backstop (which stays in place for
+/// the pure string-pattern case).
+///
+/// Uses the ORIGINAL `command_raw` (not the `resolve_command_paths` rewrite) so
+/// the extracted destinations match what the user actually typed.
+///
+/// Fail-closed posture mirrors the `FileEdit` guard: if `home_dir()` is `None`
+/// this is a no-op (returns [`Phase::Continue`]); the component backstop in
+/// clx-core still applies downstream.
+///
+/// Returns [`Phase::Handled`] once it emits a Deny decision (the caller must
+/// return); otherwise [`Phase::Continue`].
+fn evaluate_bash_write_dest_guard(
+    config: &Config,
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    command_raw: &str,
+    started: Instant,
+) -> Phase {
+    if !config.validator.enabled || !config.validator.layer0_enabled {
+        return Phase::Continue;
+    }
+    let Some(home) = dirs::home_dir() else {
+        // Fail-closed parity with the FileEdit guard: no home => this canonical
+        // overlay is skipped; the clx-core component backstop still applies.
+        return Phase::Continue;
+    };
+    let cwd_path = std::path::Path::new(&input.cwd);
+    let dests = clx_core::policy::bash_write_destinations(command_raw);
+    for dest in &dests {
+        let tok = dest.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let expanded = expand_candidate_path(tok, cwd_path, &home);
+        let resolved = canonicalize_best_effort(&expanded);
+        if let Some(reason) = path_resolves_into_protected_dir(&resolved, &home, "Bash write") {
+            debug!("Bash L0 (canonical write guard): denied: {}", reason);
+            log_audit_entry(
+                host.host_id(),
+                &input.session_id,
+                command_raw,
+                &input.cwd,
+                "L0",
+                AuditDecision::Blocked,
+                None,
+                Some(&reason),
+            );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "deny",
+                "guard",
+                LearningKind::Decision,
+                DecisionOrigin::ProtectedGuard,
+                None,
+                &reason,
+                Some(command_raw),
+                started,
+            );
+            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
+            return Phase::Handled;
+        }
+    }
+    Phase::Continue
 }
 
 /// Trust mode: a valid (unexpired, session-matching) signed JSON `TrustToken` is
@@ -543,10 +792,12 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
 /// mismatch, non-JSON token, unreadable file) removes the stale token file and
 /// returns [`Phase::Continue`] so normal validation runs.
 fn try_trust_mode(
+    config: &Config,
     host: &dyn Host,
     input: &HostNeutralInput,
     tool_name: &str,
     command_raw: &str,
+    started: Instant,
 ) -> Phase {
     let trust_token_path = clx_core::paths::clx_dir().join(".trust_mode_token");
 
@@ -593,6 +844,20 @@ fn try_trust_mode(
                 None,
                 Some(&reason),
             );
+            capture(
+                config,
+                host,
+                input,
+                tool_name,
+                "allow",
+                "trust",
+                LearningKind::Decision,
+                DecisionOrigin::TrustGate,
+                None,
+                &reason,
+                Some(command_raw),
+                started,
+            );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             return Phase::Handled;
         }
@@ -628,6 +893,7 @@ fn evaluate_bash_l0(
     input: &HostNeutralInput,
     command: &str,
     is_read_only: bool,
+    started: Instant,
 ) -> Phase {
     // Always evaluate as "Bash" so all Bash(...) rules apply universally
     // (MCP command tools have their commands extracted and validated identically)
@@ -647,6 +913,20 @@ fn evaluate_bash_l0(
                     None,
                     None,
                 );
+                capture(
+                    config,
+                    host,
+                    input,
+                    "Bash",
+                    "allow",
+                    "l0",
+                    LearningKind::Decision,
+                    DecisionOrigin::Whitelist,
+                    None,
+                    "L0 whitelist allow",
+                    Some(command),
+                    started,
+                );
                 output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                 Phase::Handled
             }
@@ -661,6 +941,20 @@ fn evaluate_bash_l0(
                     AuditDecision::Blocked,
                     None,
                     Some(&reason),
+                );
+                capture(
+                    config,
+                    host,
+                    input,
+                    "Bash",
+                    "deny",
+                    "l0",
+                    LearningKind::Decision,
+                    DecisionOrigin::Blacklist,
+                    None,
+                    &reason,
+                    Some(command),
+                    started,
                 );
                 output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
                 Phase::Handled
@@ -679,6 +973,20 @@ fn evaluate_bash_l0(
                         AuditDecision::Allowed,
                         None,
                         Some("Read-only command auto-allowed"),
+                    );
+                    capture(
+                        config,
+                        host,
+                        input,
+                        "Bash",
+                        "allow",
+                        "l0",
+                        LearningKind::Decision,
+                        DecisionOrigin::ReadOnly,
+                        None,
+                        "Read-only command auto-allowed",
+                        Some(command),
+                        started,
                     );
                     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                     return Phase::Handled;
@@ -722,6 +1030,20 @@ fn evaluate_bash_l0(
                 None,
                 Some("Read-only command auto-allowed (L0 disabled)"),
             );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "allow",
+                "l0",
+                LearningKind::Decision,
+                DecisionOrigin::ReadOnly,
+                None,
+                "Read-only command auto-allowed (L0 disabled)",
+                Some(command),
+                started,
+            );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             return Phase::Handled;
         }
@@ -745,6 +1067,7 @@ async fn escalate_l1(
     host: &dyn Host,
     input: &HostNeutralInput,
     command: &str,
+    started: Instant,
 ) -> Result<()> {
     // T9.1 (cache-bypass): consult the SQLite decision cache ONLY when BOTH
     // `layer0_enabled` and `layer1_enabled` are true. The cache is populated
@@ -779,6 +1102,20 @@ async fn escalate_l1(
                     cached.risk_score.map(|s| s as i32),
                     cached.reason.as_deref(),
                 );
+                capture(
+                    config,
+                    host,
+                    input,
+                    "Bash",
+                    &cached.decision,
+                    "l1",
+                    LearningKind::Decision,
+                    DecisionOrigin::CacheReplay,
+                    None,
+                    cached.reason.as_deref().unwrap_or("cache replay"),
+                    Some(command),
+                    started,
+                );
                 output_decision_for(
                     host,
                     &cached.decision,
@@ -806,6 +1143,20 @@ async fn escalate_l1(
             AuditDecision::Prompted,
             None,
             Some("L1-DISABLED"),
+        );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            "ask",
+            "l0",
+            LearningKind::Decision,
+            DecisionOrigin::UnknownFallthrough,
+            None,
+            "Command requires review",
+            Some(command),
+            started,
         );
         output_decision_for(
             host,
@@ -842,11 +1193,13 @@ async fn escalate_l1(
             if *configured == DefaultDecision::Allow {
                 warn!(
                     "LLM client error with default_decision=allow — \
-                     forcing ask (F7 posture: silent allow refused when an \
-                     L0-unknown command falls through to an unreachable L1)"
+                     applying on_validator_unavailable policy (default: forcing \
+                     ask; F7 posture refuses silent allow when an L0-unknown \
+                     command falls through to an unreachable L1)"
                 );
             }
-            let effective_decision = force_ask_if_allow(configured);
+            let effective_decision =
+                resolve_unavailable(&config.validator.on_validator_unavailable, configured);
             let reason = format!("LLM unavailable — fallback: {effective_decision}");
             log_audit_entry(
                 host.host_id(),
@@ -860,6 +1213,20 @@ async fn escalate_l1(
                     "Ollama client error: {e} — effective_decision: \
                      {effective_decision} (configured: {configured})"
                 )),
+            );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                effective_decision,
+                "l1",
+                LearningKind::Error,
+                DecisionOrigin::L1Unavailable,
+                None,
+                &reason,
+                Some(command),
+                started,
             );
             output_decision_for(
                 host,
@@ -906,11 +1273,13 @@ async fn escalate_l1(
         if *configured == DefaultDecision::Allow {
             warn!(
                 "Ollama unavailable with default_decision=allow — \
-                 forcing ask (F7 posture: silent allow refused when an \
-                 L0-unknown command falls through to an unreachable L1)"
+                 applying on_validator_unavailable policy (default: forcing \
+                 ask; F7 posture refuses silent allow when an L0-unknown \
+                 command falls through to an unreachable L1)"
             );
         }
-        let effective_decision = force_ask_if_allow(configured);
+        let effective_decision =
+            resolve_unavailable(&config.validator.on_validator_unavailable, configured);
         let reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -924,6 +1293,20 @@ async fn escalate_l1(
                 "Ollama unavailable — effective_decision: {effective_decision} \
                  (configured: {configured})"
             )),
+        );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            effective_decision,
+            "l1",
+            LearningKind::Degraded,
+            DecisionOrigin::L1Unavailable,
+            None,
+            &reason,
+            Some(command),
+            started,
         );
         output_decision_for(
             host,
@@ -969,10 +1352,12 @@ async fn escalate_l1(
         if *configured == DefaultDecision::Allow {
             warn!(
                 "L1 timeout with default_decision=allow — \
-                 forcing ask (F7 posture: silent allow refused on a hung L1)"
+                 applying on_validator_unavailable policy (default: forcing \
+                 ask; F7 posture refuses silent allow on a hung L1)"
             );
         }
-        let effective_decision = force_ask_if_allow(configured);
+        let effective_decision =
+            resolve_unavailable(&config.validator.on_validator_unavailable, configured);
         let fallback_reason = format!("LLM timeout — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -987,6 +1372,20 @@ async fn escalate_l1(
                  {effective_decision} (configured: {configured})",
                 config.validator.layer1_timeout_ms
             )),
+        );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            effective_decision,
+            "l1",
+            LearningKind::Error,
+            DecisionOrigin::L1Unavailable,
+            None,
+            &fallback_reason,
+            Some(command),
+            started,
         );
         output_decision_for(
             host,
@@ -1014,10 +1413,12 @@ async fn escalate_l1(
         if *configured == DefaultDecision::Allow {
             warn!(
                 "LLM generation failed with default_decision=allow — \
-                 forcing ask (F7 posture: silent allow refused on gen failure)"
+                 applying on_validator_unavailable policy (default: forcing \
+                 ask; F7 posture refuses silent allow on gen failure)"
             );
         }
-        let effective_decision = force_ask_if_allow(configured);
+        let effective_decision =
+            resolve_unavailable(&config.validator.on_validator_unavailable, configured);
         let fallback_reason = format!("LLM unavailable — fallback: {effective_decision}");
         log_audit_entry(
             host.host_id(),
@@ -1031,6 +1432,20 @@ async fn escalate_l1(
                 "LLM generation failed — effective_decision: \
                  {effective_decision} (configured: {configured})"
             )),
+        );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            effective_decision,
+            "l1",
+            LearningKind::Error,
+            DecisionOrigin::L1Unavailable,
+            None,
+            &fallback_reason,
+            Some(command),
+            started,
         );
         output_decision_for(
             host,
@@ -1057,6 +1472,20 @@ async fn escalate_l1(
                 AuditDecision::Allowed,
                 Some(1),
                 None,
+            );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "allow",
+                "l1",
+                LearningKind::Decision,
+                DecisionOrigin::L1Allow,
+                None,
+                "L1 (LLM) allow",
+                Some(command),
+                started,
             );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             // Cache allow decision
@@ -1105,6 +1534,20 @@ async fn escalate_l1(
                     DecisionSource::Automated,
                 );
             }
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "deny",
+                "l1",
+                LearningKind::Decision,
+                DecisionOrigin::L1Caution,
+                None,
+                &reason,
+                Some(command),
+                started,
+            );
             output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         }
         PolicyDecision::Ask { reason } => {
@@ -1139,6 +1582,20 @@ async fn escalate_l1(
                     );
                 }
             }
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "ask",
+                "l1",
+                LearningKind::Decision,
+                DecisionOrigin::L1Caution,
+                None,
+                &reason,
+                Some(command),
+                started,
+            );
             output_decision_for(host, "ask", Some(reason), Some(RULES_REMINDER), None);
         }
     }
@@ -1154,6 +1611,10 @@ async fn escalate_l1(
 /// owns one slice of the policy and emits at most one decision; see the
 /// per-phase docs for the preserved invariants.
 pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
+    // Capture handler-entry time so every learning-capture site can report the
+    // end-to-end decision latency. Cheap (`Instant::now`) and unused when
+    // learning mode is off (the capture helper gates before reading it).
+    let started = Instant::now();
     let raw_tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
 
     // P7 input canonicalization: collapse host-specific tool names to their
@@ -1174,7 +1635,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
 
     // P4 FileEdit branch: FileEdit tools never enter the Bash L0+L1 pipeline.
     if tool_name == "FileEdit" {
-        match evaluate_fileedit_guard(&config, host, &input) {
+        match evaluate_fileedit_guard(&config, host, &input, started) {
             Phase::Handled => return Ok(()),
             Phase::Continue => {}
         }
@@ -1205,6 +1666,20 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             McpExtraction::NotCommandTool => {
                 // Not a command-bearing MCP tool — use configured default decision
                 let decision = config.mcp_tools.default_decision.as_str();
+                capture(
+                    &config,
+                    host,
+                    &input,
+                    tool_name,
+                    decision,
+                    "l0",
+                    LearningKind::Decision,
+                    DecisionOrigin::McpDefault,
+                    None,
+                    "MCP non-command tool default decision",
+                    None,
+                    started,
+                );
                 output_decision_for(host, decision, None, Some(RULES_REMINDER), None);
                 return Ok(());
             }
@@ -1227,11 +1702,39 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         cmd.to_string()
     } else {
         // Non-Bash, non-MCP tools with no command (Read, Write, etc.) → auto-allow
+        capture(
+            &config,
+            host,
+            &input,
+            tool_name,
+            "allow",
+            "fallback",
+            LearningKind::Decision,
+            DecisionOrigin::MissingCommand,
+            None,
+            "Non-command tool auto-allowed (no command present)",
+            None,
+            started,
+        );
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     };
 
     if command_raw.is_empty() {
+        capture(
+            &config,
+            host,
+            &input,
+            tool_name,
+            "allow",
+            "fallback",
+            LearningKind::Decision,
+            DecisionOrigin::MissingCommand,
+            None,
+            "Empty command auto-allowed",
+            None,
+            started,
+        );
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     }
@@ -1243,16 +1746,40 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
 
     // Skip validation if disabled
     if !config.validator.enabled {
+        capture(
+            &config,
+            host,
+            &input,
+            tool_name,
+            "allow",
+            "fallback",
+            LearningKind::Decision,
+            DecisionOrigin::ValidatorDisabled,
+            None,
+            "Validator disabled — command auto-allowed",
+            Some(&command_raw),
+            started,
+        );
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     }
 
     // Trust mode: auto-allow ALL commands via JSON token (but still log for audit)
     if config.validator.trust_mode {
-        match try_trust_mode(host, &input, tool_name, &command_raw) {
+        match try_trust_mode(&config, host, &input, tool_name, &command_raw, started) {
             Phase::Handled => return Ok(()),
             Phase::Continue => {}
         }
+    }
+
+    // FIX-4 canonical Bash-write guard (runs FIRST, symlink/alias-resistant):
+    // deny any command whose write destination resolves into a protected
+    // config/trust dir, before L0 could whitelist it. Uses the ORIGINAL
+    // `command_raw` (not the resolve_command_paths rewrite) so the extracted
+    // destinations match the user's literal command.
+    match evaluate_bash_write_dest_guard(&config, host, &input, &command_raw, started) {
+        Phase::Handled => return Ok(()),
+        Phase::Continue => {}
     }
 
     // Resolve symlinks in command paths for TOCTOU mitigation
@@ -1284,13 +1811,21 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     // Layer 0: deterministic ruleset (and the L0-disabled audit path). On an
     // L0 deny/allow, or a read-only auto-allow, this emits the decision and we
     // return; otherwise we escalate to the cache + L1 pipeline.
-    match evaluate_bash_l0(&policy_engine, &config, host, &input, command, is_read_only) {
+    match evaluate_bash_l0(
+        &policy_engine,
+        &config,
+        host,
+        &input,
+        command,
+        is_read_only,
+        started,
+    ) {
         Phase::Handled => return Ok(()),
         Phase::Continue => {}
     }
 
     // Layer 1: cache lookup + LLM validation + every fail-closed fallback arm.
-    escalate_l1(&policy_engine, &config, host, &input, command).await
+    escalate_l1(&policy_engine, &config, host, &input, command, started).await
 }
 
 /// Probabilistic cleanup trigger (~5% of invocations).
@@ -1492,6 +2027,204 @@ mod tests {
     }
 
     // =========================================================================
+    // FIX-4: canonical Bash-write-destination guard (symlink/alias-resistant).
+    // Exercised through the shared `path_resolves_into_protected_dir` helper
+    // (ARCH-01 dedup) plus `bash_write_destinations` extraction. The hidden-dir
+    // tokens are built via `concat!` so the literal tokens never appear verbatim
+    // (in-session write-hook safe).
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_write_via_symlink_into_protected_dir_resolves_protected() {
+        // A symlink `link -> ~/.clx` whose NAME does not contain the protected
+        // token. A redirect target `link/config.yaml` must resolve through the
+        // symlink into the protected dir and be flagged by the shared helper.
+        let home = tempfile::tempdir().unwrap();
+        let clx_home = home.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&clx_home).unwrap();
+        let link = home.path().join("alias");
+        std::os::unix::fs::symlink(&clx_home, &link).unwrap();
+
+        let command_raw = format!("echo trust > {}/config.yaml", link.display());
+        let dests = clx_core::policy::bash_write_destinations(&command_raw);
+        let flagged = dests.iter().any(|d| {
+            let expanded =
+                expand_candidate_path(d.trim(), std::path::Path::new("/tmp"), home.path());
+            let resolved = canonicalize_best_effort(&expanded);
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some()
+        });
+        assert!(
+            flagged,
+            "redirect through a symlink into the protected dir must be flagged: {dests:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_cp_via_symlink_into_protected_dir_resolves_protected() {
+        // Same bypass via `cp src link/config.yaml` (cp destination extraction).
+        let home = tempfile::tempdir().unwrap();
+        let clx_home = home.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&clx_home).unwrap();
+        let link = home.path().join("alias2");
+        std::os::unix::fs::symlink(&clx_home, &link).unwrap();
+
+        let command_raw = format!("cp /tmp/evil.yaml {}/config.yaml", link.display());
+        let dests = clx_core::policy::bash_write_destinations(&command_raw);
+        let flagged = dests.iter().any(|d| {
+            let expanded =
+                expand_candidate_path(d.trim(), std::path::Path::new("/tmp"), home.path());
+            let resolved = canonicalize_best_effort(&expanded);
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some()
+        });
+        assert!(
+            flagged,
+            "cp destination through a symlink into the protected dir must be flagged: {dests:?}"
+        );
+    }
+
+    #[test]
+    fn bash_write_to_tmp_is_not_flagged() {
+        // A write to an ordinary /tmp path must NOT be flagged.
+        let home = tempfile::tempdir().unwrap();
+        let command_raw = "echo hi > /tmp/x";
+        let dests = clx_core::policy::bash_write_destinations(command_raw);
+        let flagged = dests.iter().any(|d| {
+            let expanded =
+                expand_candidate_path(d.trim(), std::path::Path::new("/tmp"), home.path());
+            let resolved = canonicalize_best_effort(&expanded);
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some()
+        });
+        assert!(!flagged, "a write to /tmp/x must not be flagged: {dests:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolves_into_protected_dir_follows_symlink_directly() {
+        // Direct unit test of the shared helper: a path under a symlink that
+        // resolves into a protected dir must be flagged even if the literal
+        // string carries no protected token.
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let link = home.path().join("plain");
+        std::os::unix::fs::symlink(&codex, &link).unwrap();
+        let resolved = canonicalize_best_effort(&link.join("config.toml"));
+        assert!(
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some(),
+            "symlinked path resolving into ~/.codex must be flagged by the shared helper"
+        );
+    }
+
+    // =========================================================================
+    // FIX-4 WIRING: drive the REAL guard entry point
+    // `evaluate_bash_write_dest_guard` (not a re-composition of its internals).
+    // Proves destination extraction -> path expansion -> canonicalization ->
+    // protected-dir check -> deny emit are actually wired together and that the
+    // guard returns the Phase the orchestrator acts on. The protected-dir token
+    // is built via `concat!` so the literal never appears verbatim (in-session
+    // write-hook safe). The deny relies on the COMPONENT-NAME arm of
+    // `path_resolves_into_protected_dir` against a tempdir-local protected dir,
+    // so the test is hermetic w.r.t. the real `$HOME` (no env mutation); the
+    // symlink itself carries no protected token, so only real canonicalization
+    // inside the guard can flag it.
+    // =========================================================================
+
+    /// Minimal `PreToolUse` Bash envelope for the wiring tests. Built through
+    /// serde (the same boundary production inputs cross).
+    fn fix4_wiring_input(cwd: &str, command: &str) -> HostNeutralInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "clx-test-fix4-wiring",
+            "cwd": cwd,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command }
+        }))
+        .expect("minimal PreToolUse envelope must deserialize")
+    }
+
+    /// FIX-4 wiring (deny): a Bash redirect whose destination string contains
+    /// NO protected token but resolves through a temp symlink into a
+    /// protected-named dir must make the REAL guard emit a deny and return
+    /// `Phase::Handled`.
+    #[cfg(unix)]
+    #[test]
+    fn fix4_wiring_real_guard_denies_symlinked_bash_write_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&protected).unwrap();
+        let link = tmp.path().join("innocuous");
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
+
+        // Literal command carries only "innocuous/config.yaml" — without the
+        // guard's canonicalization the destination never matches a protected
+        // component, so a pass here proves the symlink was really resolved.
+        let command = format!("echo pwned > {}/config.yaml", link.display());
+        let input = fix4_wiring_input(tmp.path().to_str().unwrap(), &command);
+        let phase = evaluate_bash_write_dest_guard(
+            &Config::default(),
+            &crate::host::ClaudeHost,
+            &input,
+            &command,
+            Instant::now(),
+        );
+        assert!(
+            matches!(phase, Phase::Handled),
+            "real guard must deny (Phase::Handled) a Bash write reaching a \
+             protected dir via a symlink"
+        );
+    }
+
+    /// FIX-4 wiring (allow): an ordinary `/tmp` write must pass through the
+    /// REAL guard untouched (`Phase::Continue`, no deny emitted).
+    #[test]
+    fn fix4_wiring_real_guard_continues_for_tmp_write() {
+        let command = "echo hi > /tmp/clx-test-fix4-ok.txt";
+        let input = fix4_wiring_input("/tmp", command);
+        let phase = evaluate_bash_write_dest_guard(
+            &Config::default(),
+            &crate::host::ClaudeHost,
+            &input,
+            command,
+            Instant::now(),
+        );
+        assert!(
+            matches!(phase, Phase::Continue),
+            "a write to /tmp must not be denied by the canonical guard"
+        );
+    }
+
+    /// FIX-4 wiring (gate): with `layer0_enabled = false` the guard is a
+    /// no-op even for a symlinked protected destination — the config gate at
+    /// the top of the REAL function must short-circuit before any path work.
+    #[cfg(unix)]
+    #[test]
+    fn fix4_wiring_real_guard_respects_layer0_disabled_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&protected).unwrap();
+        let link = tmp.path().join("innocuous2");
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
+
+        let command = format!("echo pwned > {}/config.yaml", link.display());
+        let input = fix4_wiring_input(tmp.path().to_str().unwrap(), &command);
+        let mut config = Config::default();
+        config.validator.layer0_enabled = false;
+        let phase = evaluate_bash_write_dest_guard(
+            &config,
+            &crate::host::ClaudeHost,
+            &input,
+            &command,
+            Instant::now(),
+        );
+        assert!(
+            matches!(phase, Phase::Continue),
+            "guard must be inert when layer0 is disabled (config gate)"
+        );
+    }
+
+    // =========================================================================
     // Issue 4: narrowed dot-claude guard. Memory files (CLAUDE.md, project
     // memory) ALLOWED; settings.json / settings.local.json / hooks/ DENIED.
     // The hidden-dir segments are built via `concat!` so the literal tokens do
@@ -1555,6 +2288,198 @@ mod tests {
             assert!(
                 fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
                 "broad protected dir {dir} must deny any path component"
+            );
+        }
+    }
+
+    // =========================================================================
+    // FIX-6: write TARGET extraction, not file CONTENT. A `content`/`new_string`
+    // body that MENTIONS a protected-dir path must NOT be treated as a target.
+    // Protected-dir tokens are built via `concat!` so the literal never appears
+    // verbatim in the test input (write-hook safe).
+    // =========================================================================
+
+    /// FIX-6 (a): a Write with a safe `file_path` and a `content` blob that
+    /// merely MENTIONS a protected-dir path must NOT be denied.
+    #[test]
+    fn fileedit_content_mentioning_protected_path_is_not_denied() {
+        let dot_clx: &str = concat!(".", "clx");
+        let dot_codex: &str = concat!(".", "codex");
+        let home = tempfile::tempdir().unwrap();
+        // Multi-line content that references protected dirs (like these docs).
+        let body = format!(
+            "see ~/{dot_clx}/config.yaml and {}/{dot_codex}/config.toml for trust\nsecond line\n",
+            home.path().display()
+        );
+        let ti = serde_json::json!({
+            "file_path": "/tmp/x",
+            "content": body,
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "content mentioning a protected path must not be treated as a target"
+        );
+    }
+
+    /// FIX-6 (a'): same exclusion for the edit content keys (`new_string`/
+    /// `old_string`), including a MultiEdit-style `edits[]` array whose entries
+    /// hold old/new strings — no path must be extracted from them.
+    #[test]
+    fn fileedit_edit_strings_mentioning_protected_path_not_denied() {
+        let dot_clx: &str = concat!(".", "clx");
+        let home = tempfile::tempdir().unwrap();
+        let mention = format!("~/{dot_clx}/config.yaml");
+        let ti = serde_json::json!({
+            "file_path": "/tmp/safe.rs",
+            "edits": [
+                { "old_string": mention.clone(), "new_string": format!("{mention} updated") }
+            ],
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "MultiEdit old/new strings mentioning a protected path must not be a target"
+        );
+    }
+
+    /// FIX-6 (b): a `file_path` that genuinely points INTO a protected dir is
+    /// still denied (the target, not the content, is what matters).
+    #[test]
+    fn fileedit_file_path_into_protected_dir_still_denied() {
+        let dot_clx: &str = concat!(".", "clx");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_clx)).unwrap();
+        let ti = serde_json::json!({
+            "file_path": format!("{}/{}/config.yaml", home.path().display(), dot_clx),
+            "content": "anything",
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "file_path INTO a protected dir must still be denied"
+        );
+    }
+
+    /// FIX-6 (c): `apply_patch` `command` carrying a V4A `*** Update File:` header
+    /// targeting a protected dir is still denied (key-agnostic header pass).
+    #[test]
+    fn fileedit_apply_patch_command_header_into_protected_dir_denied() {
+        let dot_codex: &str = concat!(".", "codex");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_codex)).unwrap();
+        let ti = serde_json::json!({
+            "command": format!(
+                "*** Begin Patch\n*** Update File: {}/{}/config.toml\n@@\n-x\n+y\n*** End Patch\n",
+                home.path().display(),
+                dot_codex
+            )
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "apply_patch header targeting a protected dir must be denied"
+        );
+    }
+
+    /// FIX-6 (d): an arbitrary single-line key holding a protected path is still
+    /// caught (key-agnostic whole-path candidacy for non-content keys).
+    #[test]
+    fn fileedit_arbitrary_single_line_key_into_protected_dir_denied() {
+        let dot_cursor: &str = concat!(".", "cursor");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_cursor)).unwrap();
+        let ti = serde_json::json!({
+            "some_future_path_key": format!("{}/{}/mcp.json", home.path().display(), dot_cursor)
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_some(),
+            "arbitrary single-line path key into a protected dir must be denied"
+        );
+    }
+
+    /// FIX-6 (e): a CLAUDEDIR memory file (dot-claude/CLAUDE.md) target stays
+    /// allowed (narrow dot-claude guard unchanged), even when content mentions
+    /// protected paths.
+    #[test]
+    fn fileedit_claude_memory_file_with_mentioning_content_allowed() {
+        let dot_claude: &str = concat!(".", "claude");
+        let dot_clx: &str = concat!(".", "clx");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(dot_claude)).unwrap();
+        let ti = serde_json::json!({
+            "file_path": format!("{}/{}/CLAUDE.md", home.path().display(), dot_claude),
+            "content": format!("notes about ~/{dot_clx}/config.yaml\n"),
+        });
+        assert!(
+            fileedit_resolves_into_protected_dir(Some(&ti), "/tmp", home.path()).is_none(),
+            "dot-claude memory file target must stay allowed"
+        );
+    }
+
+    // =========================================================================
+    // FIX-1: resolve_unavailable — the validator-UNREACHABLE arm policy.
+    // =========================================================================
+
+    /// FIX-1 (a): `HonorDefault` + `default_decision=allow` resolves to "allow"
+    /// (the opt-in fail-open path for an unreachable validator).
+    #[test]
+    fn resolve_unavailable_honor_default_allow_resolves_allow() {
+        assert_eq!(
+            resolve_unavailable(
+                &OnValidatorUnavailable::HonorDefault,
+                &DefaultDecision::Allow
+            ),
+            "allow"
+        );
+        // HonorDefault mirrors deny/ask defaults too.
+        assert_eq!(
+            resolve_unavailable(
+                &OnValidatorUnavailable::HonorDefault,
+                &DefaultDecision::Deny
+            ),
+            "deny"
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::HonorDefault, &DefaultDecision::Ask),
+            "ask"
+        );
+    }
+
+    /// FIX-1 (b): the default knob (Ask) preserves the historical
+    /// `force_ask_if_allow` posture EXACTLY — `allow` upgrades to `ask`, while
+    /// `deny`/`ask` (already fail-closed) pass through unchanged. This is what
+    /// keeps existing behavior (and existing e2e tests) green.
+    #[test]
+    fn resolve_unavailable_default_ask_upgrades_only_allow() {
+        assert_eq!(
+            OnValidatorUnavailable::default(),
+            OnValidatorUnavailable::Ask
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::Ask, &DefaultDecision::Allow),
+            "ask",
+            "Ask knob upgrades allow -> ask"
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::Ask, &DefaultDecision::Deny),
+            "deny",
+            "Ask knob passes deny through (already fail-closed)"
+        );
+        assert_eq!(
+            resolve_unavailable(&OnValidatorUnavailable::Ask, &DefaultDecision::Ask),
+            "ask",
+            "Ask knob passes ask through"
+        );
+    }
+
+    /// FIX-1: the Deny knob hard-denies regardless of `default_decision`.
+    #[test]
+    fn resolve_unavailable_deny_forces_deny() {
+        for dd in [
+            DefaultDecision::Allow,
+            DefaultDecision::Deny,
+            DefaultDecision::Ask,
+        ] {
+            assert_eq!(
+                resolve_unavailable(&OnValidatorUnavailable::Deny, &dd),
+                "deny"
             );
         }
     }

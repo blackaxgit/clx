@@ -296,13 +296,13 @@ fn auto_summary_stale_does_not_block_new() {
 // ===========================================================================
 
 /// A freshly opened DB is at the highest schema version (spec 5: migration
-/// chain v1..v9 contiguous, `SCHEMA_VERSION` matches highest = 9).
+/// chain v1..v10 contiguous, `SCHEMA_VERSION` matches highest = 10).
 #[test]
-fn fresh_db_is_at_schema_version_9() {
+fn fresh_db_is_at_schema_version_10() {
     let s = mem();
     assert_eq!(
         s.schema_version().unwrap(),
-        9,
+        10,
         "fresh DB must be migrated to the highest schema version"
     );
 }
@@ -383,12 +383,12 @@ fn v5_state_db_upgrades_to_v8_without_data_loss() {
         .unwrap();
     }
 
-    // Re-open through the real Storage path: migrations v6..v9 must run.
+    // Re-open through the real Storage path: migrations v6..v10 must run.
     let s = Storage::open(&db).expect("upgrade open");
     assert_eq!(
         s.schema_version().unwrap(),
-        9,
-        "v5 DB must migrate forward to v9"
+        10,
+        "v5 DB must migrate forward to the latest version"
     );
 
     // No data loss: the legacy snapshot survived.
