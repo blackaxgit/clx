@@ -1,6 +1,7 @@
 //! Hook event handlers.
 
 pub(crate) mod aggregator;
+mod learning_capture;
 mod permission_request;
 mod post_compact;
 mod post_tool_use;

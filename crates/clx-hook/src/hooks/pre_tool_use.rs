@@ -9,12 +9,14 @@ use clx_core::policy::{
     is_read_only_command,
 };
 use clx_core::storage::Storage;
-use clx_core::types::AuditDecision;
+use clx_core::types::{AuditDecision, DecisionOrigin, LearningKind};
+use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::audit::log_audit_entry;
 use crate::audit_chain::{GENESIS_HASH, build_record};
 use crate::embedding::resolve_command_paths;
+use crate::hooks::learning_capture::capture;
 use crate::host::{Host, HostId};
 use crate::learning::{DecisionSource, track_user_decision};
 use crate::output::{RULES_REMINDER, output_decision_for};
@@ -602,7 +604,12 @@ fn audit_config_layer_disable(config: &Config, host: &dyn Host, input: &HostNeut
 /// with Claude, which auto-allows its Write/Edit file tools).
 ///
 /// Returns [`Phase::Handled`] once it emits a decision (the caller must return).
-fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutralInput) -> Phase {
+fn evaluate_fileedit_guard(
+    config: &Config,
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    started: Instant,
+) -> Phase {
     let summary = apply_patch_summary(input.tool_input.as_ref());
     // R1-F2 canonical guard (runs first, symlink/alias-resistant): deny any
     // file-edit whose target resolves into a protected config/trust dir,
@@ -624,6 +631,20 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
             None,
             Some(&reason),
         );
+        capture(
+            config,
+            host,
+            input,
+            "FileEdit",
+            "deny",
+            "guard",
+            LearningKind::Decision,
+            DecisionOrigin::ProtectedGuard,
+            None,
+            &reason,
+            None,
+            started,
+        );
         output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         return Phase::Handled;
     }
@@ -643,9 +664,24 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
             None,
             Some(&reason),
         );
+        capture(
+            config,
+            host,
+            input,
+            "FileEdit",
+            "deny",
+            "l0",
+            LearningKind::Decision,
+            DecisionOrigin::Blacklist,
+            None,
+            &reason,
+            None,
+            started,
+        );
         output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         return Phase::Handled;
     }
+    let allow_reason = "File edit allowed (no FileEdit deny rule matched)";
     log_audit_entry(
         host.host_id(),
         &input.session_id,
@@ -654,7 +690,21 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
         "L0-FILEEDIT",
         AuditDecision::Allowed,
         None,
-        Some("File edit allowed (no FileEdit deny rule matched)"),
+        Some(allow_reason),
+    );
+    capture(
+        config,
+        host,
+        input,
+        "FileEdit",
+        "allow",
+        "l0",
+        LearningKind::Decision,
+        DecisionOrigin::FileEditAllow,
+        None,
+        allow_reason,
+        None,
+        started,
     );
     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
     Phase::Handled
@@ -684,6 +734,7 @@ fn evaluate_bash_write_dest_guard(
     host: &dyn Host,
     input: &HostNeutralInput,
     command_raw: &str,
+    started: Instant,
 ) -> Phase {
     if !config.validator.enabled || !config.validator.layer0_enabled {
         return Phase::Continue;
@@ -714,6 +765,20 @@ fn evaluate_bash_write_dest_guard(
                 None,
                 Some(&reason),
             );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "deny",
+                "guard",
+                LearningKind::Decision,
+                DecisionOrigin::ProtectedGuard,
+                None,
+                &reason,
+                Some(command_raw),
+                started,
+            );
             output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
             return Phase::Handled;
         }
@@ -727,10 +792,12 @@ fn evaluate_bash_write_dest_guard(
 /// mismatch, non-JSON token, unreadable file) removes the stale token file and
 /// returns [`Phase::Continue`] so normal validation runs.
 fn try_trust_mode(
+    config: &Config,
     host: &dyn Host,
     input: &HostNeutralInput,
     tool_name: &str,
     command_raw: &str,
+    started: Instant,
 ) -> Phase {
     let trust_token_path = clx_core::paths::clx_dir().join(".trust_mode_token");
 
@@ -777,6 +844,20 @@ fn try_trust_mode(
                 None,
                 Some(&reason),
             );
+            capture(
+                config,
+                host,
+                input,
+                tool_name,
+                "allow",
+                "trust",
+                LearningKind::Decision,
+                DecisionOrigin::TrustGate,
+                None,
+                &reason,
+                Some(command_raw),
+                started,
+            );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             return Phase::Handled;
         }
@@ -812,6 +893,7 @@ fn evaluate_bash_l0(
     input: &HostNeutralInput,
     command: &str,
     is_read_only: bool,
+    started: Instant,
 ) -> Phase {
     // Always evaluate as "Bash" so all Bash(...) rules apply universally
     // (MCP command tools have their commands extracted and validated identically)
@@ -831,6 +913,20 @@ fn evaluate_bash_l0(
                     None,
                     None,
                 );
+                capture(
+                    config,
+                    host,
+                    input,
+                    "Bash",
+                    "allow",
+                    "l0",
+                    LearningKind::Decision,
+                    DecisionOrigin::Whitelist,
+                    None,
+                    "L0 whitelist allow",
+                    Some(command),
+                    started,
+                );
                 output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                 Phase::Handled
             }
@@ -845,6 +941,20 @@ fn evaluate_bash_l0(
                     AuditDecision::Blocked,
                     None,
                     Some(&reason),
+                );
+                capture(
+                    config,
+                    host,
+                    input,
+                    "Bash",
+                    "deny",
+                    "l0",
+                    LearningKind::Decision,
+                    DecisionOrigin::Blacklist,
+                    None,
+                    &reason,
+                    Some(command),
+                    started,
                 );
                 output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
                 Phase::Handled
@@ -863,6 +973,20 @@ fn evaluate_bash_l0(
                         AuditDecision::Allowed,
                         None,
                         Some("Read-only command auto-allowed"),
+                    );
+                    capture(
+                        config,
+                        host,
+                        input,
+                        "Bash",
+                        "allow",
+                        "l0",
+                        LearningKind::Decision,
+                        DecisionOrigin::ReadOnly,
+                        None,
+                        "Read-only command auto-allowed",
+                        Some(command),
+                        started,
                     );
                     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                     return Phase::Handled;
@@ -906,6 +1030,20 @@ fn evaluate_bash_l0(
                 None,
                 Some("Read-only command auto-allowed (L0 disabled)"),
             );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "allow",
+                "l0",
+                LearningKind::Decision,
+                DecisionOrigin::ReadOnly,
+                None,
+                "Read-only command auto-allowed (L0 disabled)",
+                Some(command),
+                started,
+            );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             return Phase::Handled;
         }
@@ -929,6 +1067,7 @@ async fn escalate_l1(
     host: &dyn Host,
     input: &HostNeutralInput,
     command: &str,
+    started: Instant,
 ) -> Result<()> {
     // T9.1 (cache-bypass): consult the SQLite decision cache ONLY when BOTH
     // `layer0_enabled` and `layer1_enabled` are true. The cache is populated
@@ -963,6 +1102,20 @@ async fn escalate_l1(
                     cached.risk_score.map(|s| s as i32),
                     cached.reason.as_deref(),
                 );
+                capture(
+                    config,
+                    host,
+                    input,
+                    "Bash",
+                    &cached.decision,
+                    "l1",
+                    LearningKind::Decision,
+                    DecisionOrigin::CacheReplay,
+                    None,
+                    cached.reason.as_deref().unwrap_or("cache replay"),
+                    Some(command),
+                    started,
+                );
                 output_decision_for(
                     host,
                     &cached.decision,
@@ -990,6 +1143,20 @@ async fn escalate_l1(
             AuditDecision::Prompted,
             None,
             Some("L1-DISABLED"),
+        );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            "ask",
+            "l0",
+            LearningKind::Decision,
+            DecisionOrigin::UnknownFallthrough,
+            None,
+            "Command requires review",
+            Some(command),
+            started,
         );
         output_decision_for(
             host,
@@ -1046,6 +1213,20 @@ async fn escalate_l1(
                     "Ollama client error: {e} — effective_decision: \
                      {effective_decision} (configured: {configured})"
                 )),
+            );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                effective_decision,
+                "l1",
+                LearningKind::Error,
+                DecisionOrigin::L1Unavailable,
+                None,
+                &reason,
+                Some(command),
+                started,
             );
             output_decision_for(
                 host,
@@ -1113,6 +1294,20 @@ async fn escalate_l1(
                  (configured: {configured})"
             )),
         );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            effective_decision,
+            "l1",
+            LearningKind::Degraded,
+            DecisionOrigin::L1Unavailable,
+            None,
+            &reason,
+            Some(command),
+            started,
+        );
         output_decision_for(
             host,
             effective_decision,
@@ -1178,6 +1373,20 @@ async fn escalate_l1(
                 config.validator.layer1_timeout_ms
             )),
         );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            effective_decision,
+            "l1",
+            LearningKind::Error,
+            DecisionOrigin::L1Unavailable,
+            None,
+            &fallback_reason,
+            Some(command),
+            started,
+        );
         output_decision_for(
             host,
             effective_decision,
@@ -1224,6 +1433,20 @@ async fn escalate_l1(
                  {effective_decision} (configured: {configured})"
             )),
         );
+        capture(
+            config,
+            host,
+            input,
+            "Bash",
+            effective_decision,
+            "l1",
+            LearningKind::Error,
+            DecisionOrigin::L1Unavailable,
+            None,
+            &fallback_reason,
+            Some(command),
+            started,
+        );
         output_decision_for(
             host,
             effective_decision,
@@ -1249,6 +1472,20 @@ async fn escalate_l1(
                 AuditDecision::Allowed,
                 Some(1),
                 None,
+            );
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "allow",
+                "l1",
+                LearningKind::Decision,
+                DecisionOrigin::L1Allow,
+                None,
+                "L1 (LLM) allow",
+                Some(command),
+                started,
             );
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
             // Cache allow decision
@@ -1297,6 +1534,20 @@ async fn escalate_l1(
                     DecisionSource::Automated,
                 );
             }
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "deny",
+                "l1",
+                LearningKind::Decision,
+                DecisionOrigin::L1Caution,
+                None,
+                &reason,
+                Some(command),
+                started,
+            );
             output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
         }
         PolicyDecision::Ask { reason } => {
@@ -1331,6 +1582,20 @@ async fn escalate_l1(
                     );
                 }
             }
+            capture(
+                config,
+                host,
+                input,
+                "Bash",
+                "ask",
+                "l1",
+                LearningKind::Decision,
+                DecisionOrigin::L1Caution,
+                None,
+                &reason,
+                Some(command),
+                started,
+            );
             output_decision_for(host, "ask", Some(reason), Some(RULES_REMINDER), None);
         }
     }
@@ -1346,6 +1611,10 @@ async fn escalate_l1(
 /// owns one slice of the policy and emits at most one decision; see the
 /// per-phase docs for the preserved invariants.
 pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host) -> Result<()> {
+    // Capture handler-entry time so every learning-capture site can report the
+    // end-to-end decision latency. Cheap (`Instant::now`) and unused when
+    // learning mode is off (the capture helper gates before reading it).
+    let started = Instant::now();
     let raw_tool_name = input.tool_name.as_deref().unwrap_or("Unknown");
 
     // P7 input canonicalization: collapse host-specific tool names to their
@@ -1366,7 +1635,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
 
     // P4 FileEdit branch: FileEdit tools never enter the Bash L0+L1 pipeline.
     if tool_name == "FileEdit" {
-        match evaluate_fileedit_guard(&config, host, &input) {
+        match evaluate_fileedit_guard(&config, host, &input, started) {
             Phase::Handled => return Ok(()),
             Phase::Continue => {}
         }
@@ -1397,6 +1666,20 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
             McpExtraction::NotCommandTool => {
                 // Not a command-bearing MCP tool — use configured default decision
                 let decision = config.mcp_tools.default_decision.as_str();
+                capture(
+                    &config,
+                    host,
+                    &input,
+                    tool_name,
+                    decision,
+                    "l0",
+                    LearningKind::Decision,
+                    DecisionOrigin::McpDefault,
+                    None,
+                    "MCP non-command tool default decision",
+                    None,
+                    started,
+                );
                 output_decision_for(host, decision, None, Some(RULES_REMINDER), None);
                 return Ok(());
             }
@@ -1419,11 +1702,39 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         cmd.to_string()
     } else {
         // Non-Bash, non-MCP tools with no command (Read, Write, etc.) → auto-allow
+        capture(
+            &config,
+            host,
+            &input,
+            tool_name,
+            "allow",
+            "fallback",
+            LearningKind::Decision,
+            DecisionOrigin::MissingCommand,
+            None,
+            "Non-command tool auto-allowed (no command present)",
+            None,
+            started,
+        );
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     };
 
     if command_raw.is_empty() {
+        capture(
+            &config,
+            host,
+            &input,
+            tool_name,
+            "allow",
+            "fallback",
+            LearningKind::Decision,
+            DecisionOrigin::MissingCommand,
+            None,
+            "Empty command auto-allowed",
+            None,
+            started,
+        );
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     }
@@ -1435,13 +1746,27 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
 
     // Skip validation if disabled
     if !config.validator.enabled {
+        capture(
+            &config,
+            host,
+            &input,
+            tool_name,
+            "allow",
+            "fallback",
+            LearningKind::Decision,
+            DecisionOrigin::ValidatorDisabled,
+            None,
+            "Validator disabled — command auto-allowed",
+            Some(&command_raw),
+            started,
+        );
         output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         return Ok(());
     }
 
     // Trust mode: auto-allow ALL commands via JSON token (but still log for audit)
     if config.validator.trust_mode {
-        match try_trust_mode(host, &input, tool_name, &command_raw) {
+        match try_trust_mode(&config, host, &input, tool_name, &command_raw, started) {
             Phase::Handled => return Ok(()),
             Phase::Continue => {}
         }
@@ -1452,7 +1777,7 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     // config/trust dir, before L0 could whitelist it. Uses the ORIGINAL
     // `command_raw` (not the resolve_command_paths rewrite) so the extracted
     // destinations match the user's literal command.
-    match evaluate_bash_write_dest_guard(&config, host, &input, &command_raw) {
+    match evaluate_bash_write_dest_guard(&config, host, &input, &command_raw, started) {
         Phase::Handled => return Ok(()),
         Phase::Continue => {}
     }
@@ -1486,13 +1811,21 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     // Layer 0: deterministic ruleset (and the L0-disabled audit path). On an
     // L0 deny/allow, or a read-only auto-allow, this emits the decision and we
     // return; otherwise we escalate to the cache + L1 pipeline.
-    match evaluate_bash_l0(&policy_engine, &config, host, &input, command, is_read_only) {
+    match evaluate_bash_l0(
+        &policy_engine,
+        &config,
+        host,
+        &input,
+        command,
+        is_read_only,
+        started,
+    ) {
         Phase::Handled => return Ok(()),
         Phase::Continue => {}
     }
 
     // Layer 1: cache lookup + LLM validation + every fail-closed fallback arm.
-    escalate_l1(&policy_engine, &config, host, &input, command).await
+    escalate_l1(&policy_engine, &config, host, &input, command, started).await
 }
 
 /// Probabilistic cleanup trigger (~5% of invocations).
