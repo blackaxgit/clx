@@ -16,6 +16,7 @@
 mod analytics;
 mod audit;
 mod event;
+mod learning;
 mod migration;
 mod recall_repo;
 mod rules;
@@ -26,6 +27,7 @@ mod traits;
 mod util;
 mod validation_cache;
 
+pub use learning::{LearningFilter, MAX_LEARNING_EVENTS};
 pub use recall_repo::StorageSnapshotRepo;
 pub use traits::StorageBackend;
 pub use validation_cache::CachedDecision;

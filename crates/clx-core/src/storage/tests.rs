@@ -927,10 +927,10 @@ fn test_analytics_with_project_filter() {
 // =========================================================================
 
 #[test]
-fn test_schema_version_is_9() {
+fn test_schema_version_is_10() {
     let storage = create_test_storage();
     let version = storage.schema_version().unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -2249,4 +2249,204 @@ fn fix3_get_rule_by_pattern_valid_type_round_trips() {
     let got = storage.get_rule_by_pattern("Bash(ok:*)").unwrap();
     let got = got.expect("valid rule must be found");
     assert_eq!(got.rule_type, RuleType::Deny);
+}
+
+// =========================================================================
+// Learning events (opt-in firehose) storage tests
+// =========================================================================
+
+mod learning_events {
+    use super::create_test_storage;
+    use crate::storage::{LearningFilter, MAX_LEARNING_EVENTS};
+    use crate::types::{LearningEvent, LearningKind};
+
+    /// Build a minimal learning event with overridable fields.
+    fn ev(decision: &str, diverged: bool) -> LearningEvent {
+        LearningEvent {
+            ts: "2026-06-09T00:00:00Z".to_string(),
+            session_id: Some("s1".to_string()),
+            tool: "Bash".to_string(),
+            host: "claude".to_string(),
+            decision: decision.to_string(),
+            layer: "l1".to_string(),
+            kind: LearningKind::Decision,
+            matched_rule: None,
+            reason: "ok".to_string(),
+            command: Some("ls -la".to_string()),
+            effective_config: "{}".to_string(),
+            diverged,
+            divergence_reason: None,
+            latency_ms: Some(12),
+            policy_fingerprint: "sha256:fp".to_string(),
+        }
+    }
+
+    /// AC4: every free-text field is redacted at the choke-point. A secret in
+    /// the `reason`/`command`/`matched_rule`/`effective_config` must be stored
+    /// as `***REDACTED***`, never the raw secret.
+    #[test]
+    fn record_redacts_all_free_text_fields() {
+        let storage = create_test_storage();
+        let secret_key = "sk-livesecret0000000000";
+        let bearer = "Bearer abcdefghijklmnop";
+
+        let mut e = ev("ask", true);
+        e.reason = format!("denied because of {secret_key}");
+        e.command = Some(format!("curl -H 'Authorization: {bearer}' https://x"));
+        e.matched_rule = Some(format!("rule {secret_key}"));
+        e.effective_config = format!("{{\"token\":\"{secret_key}\",\"note\":\"{bearer}\"}}");
+
+        storage
+            .record_learning_event(&e)
+            .expect("record learning event");
+
+        let rows = storage
+            .list_learning_events(&LearningFilter::default())
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        for field in [
+            row.reason.as_str(),
+            row.command.as_deref().unwrap_or(""),
+            row.matched_rule.as_deref().unwrap_or(""),
+            row.effective_config.as_str(),
+        ] {
+            assert!(
+                !field.contains(secret_key),
+                "secret key leaked into stored field: {field}"
+            );
+            assert!(
+                !field.contains("abcdefghijklmnop"),
+                "bearer secret leaked into stored field: {field}"
+            );
+        }
+        assert!(
+            row.reason.contains("***REDACTED***"),
+            "reason must carry the redaction marker, got: {}",
+            row.reason
+        );
+        assert!(
+            row.effective_config.contains("***REDACTED***"),
+            "effective_config must carry the redaction marker, got: {}",
+            row.effective_config
+        );
+    }
+
+    /// AC6 / AC12: the COUNT-guard retention keeps the row count bounded. Insert
+    /// MAX + 200 rows; the count must never exceed MAX.
+    #[test]
+    fn retention_count_guard_caps_rows() {
+        let storage = create_test_storage();
+        // Insert beyond the cap. ts is recent so the TTL prune does not fire.
+        let total = MAX_LEARNING_EVENTS + 200;
+        for i in 0..total {
+            let mut e = ev("allow", false);
+            e.ts = "2099-01-01T00:00:00Z".to_string();
+            e.command = Some(format!("cmd-{i}"));
+            storage
+                .record_learning_event(&e)
+                .expect("record learning event");
+        }
+        let count = storage.count_learning_events().expect("count");
+        assert!(
+            count <= MAX_LEARNING_EVENTS,
+            "count {count} must stay <= cap {MAX_LEARNING_EVENTS}"
+        );
+        // The newest rows survive: the very last command must still be present.
+        let rows = storage
+            .list_learning_events(&LearningFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(
+            rows[0].command.as_deref(),
+            Some(format!("cmd-{}", total - 1)).as_deref()
+        );
+    }
+
+    /// TTL prune removes stale rows (older than the 30-day window).
+    #[test]
+    fn retention_ttl_prunes_stale_rows() {
+        let storage = create_test_storage();
+        let mut stale = ev("allow", false);
+        stale.ts = "2000-01-01T00:00:00Z".to_string();
+        storage.record_learning_event(&stale).expect("record stale");
+        // A fresh insert triggers retention, which TTL-prunes the stale row.
+        let mut fresh = ev("allow", false);
+        fresh.ts = "2099-01-01T00:00:00Z".to_string();
+        storage.record_learning_event(&fresh).expect("record fresh");
+
+        assert_eq!(
+            storage.count_learning_events().expect("count"),
+            1,
+            "the stale (>30d) row must be TTL-pruned"
+        );
+    }
+
+    /// Read API: filter by decision + diverged, count, and clear.
+    #[test]
+    fn filter_count_and_clear() {
+        let storage = create_test_storage();
+        storage.record_learning_event(&ev("allow", false)).unwrap();
+        storage.record_learning_event(&ev("ask", true)).unwrap();
+        storage.record_learning_event(&ev("deny", false)).unwrap();
+
+        assert_eq!(storage.count_learning_events().unwrap(), 3);
+
+        let asks = storage
+            .list_learning_events(&LearningFilter {
+                decision: Some("ask".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].decision, "ask");
+
+        let diverged = storage
+            .list_learning_events(&LearningFilter {
+                diverged: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(diverged.len(), 1);
+        assert!(diverged[0].diverged);
+
+        let removed = storage.clear_learning_events().unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(storage.count_learning_events().unwrap(), 0);
+    }
+
+    /// Suggestion aggregates: diverged asks grouped by command for the current
+    /// fingerprint only.
+    #[test]
+    fn pattern_aggregates_group_current_fingerprint_diverged_asks() {
+        let storage = create_test_storage();
+
+        let mut a = ev("ask", true);
+        a.command = Some("npm run deploy".to_string());
+        a.policy_fingerprint = "sha256:current".to_string();
+        storage.record_learning_event(&a).unwrap();
+        storage.record_learning_event(&a).unwrap();
+
+        // Different fingerprint: excluded.
+        let mut other = ev("ask", true);
+        other.command = Some("npm run deploy".to_string());
+        other.policy_fingerprint = "sha256:other".to_string();
+        storage.record_learning_event(&other).unwrap();
+
+        // Non-diverged ask: excluded.
+        let mut nondiv = ev("ask", false);
+        nondiv.command = Some("npm run deploy".to_string());
+        nondiv.policy_fingerprint = "sha256:current".to_string();
+        storage.record_learning_event(&nondiv).unwrap();
+
+        let aggs = storage
+            .learning_pattern_aggregates("sha256:current")
+            .expect("aggregates");
+        assert_eq!(aggs.len(), 1, "only the current-fingerprint diverged asks");
+        assert_eq!(aggs[0].0, "npm run deploy");
+        assert_eq!(aggs[0].1, 2);
+    }
 }

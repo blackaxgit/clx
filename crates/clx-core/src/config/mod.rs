@@ -14,6 +14,7 @@
 //! - `CLX_VALIDATOR_CACHE_ALLOW_TTL` (TTL for cached allow decisions, seconds)
 //! - `CLX_VALIDATOR_CACHE_ASK_TTL` (TTL for cached ask decisions, seconds)
 //! - `CLX_VALIDATOR_PROMPT_SENSITIVITY` (high/standard/low/custom)
+//! - `CLX_LEARNING_MODE` (opt-in learning/debug capture; observe-only)
 //! - `CLX_CONTEXT_ENABLED`
 //! - `CLX_CONTEXT_AUTO_SNAPSHOT`
 //! - `CLX_CONTEXT_EMBEDDING_MODEL`
@@ -692,6 +693,13 @@ pub struct ValidatorConfig {
     /// Default trust mode duration in seconds when no --duration given (default: 1h)
     #[serde(default = "default_trust_mode_default_duration")]
     pub trust_mode_default_duration: u64,
+
+    /// Opt-in learning/debug mode: record every `PreToolUse` decision + rationale
+    /// to the `learning_events` table. Observe-only; off by default; never
+    /// changes a decision. Trust-gated (lives under the `validator` subtree,
+    /// which is stripped from untrusted project config).
+    #[serde(default)]
+    pub learning_mode: bool,
 }
 
 /// Context configuration
@@ -1014,6 +1022,7 @@ impl Default for ValidatorConfig {
             prompt_sensitivity: PromptSensitivity::Standard,
             trust_mode_max_duration: default_trust_mode_max_duration(),
             trust_mode_default_duration: default_trust_mode_default_duration(),
+            learning_mode: false,
         }
     }
 }
@@ -1503,6 +1512,9 @@ impl Config {
                      Audit trail: env var weakens security posture."
                 );
             }
+        }
+        if let Ok(val) = env::var("CLX_LEARNING_MODE") {
+            apply_bool_override(&val, "CLX_LEARNING_MODE", &mut self.validator.learning_mode);
         }
         if let Ok(val) = env::var("CLX_VALIDATOR_CACHE_ENABLED") {
             apply_bool_override(
@@ -4070,5 +4082,53 @@ fallback:
         unsafe {
             std::env::remove_var("CLX_CONFIG_PROJECT");
         }
+    }
+
+    /// `learning_mode` defaults to false (observe-only, opt-in).
+    #[test]
+    fn learning_mode_defaults_to_false() {
+        assert!(
+            !Config::default().validator.learning_mode,
+            "learning_mode must default to false"
+        );
+        assert!(
+            !ValidatorConfig::default().learning_mode,
+            "ValidatorConfig::default().learning_mode must be false"
+        );
+    }
+
+    /// AC3: `CLX_LEARNING_MODE=1` enables capture via env override even when the
+    /// config flag defaults to false.
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn learning_mode_enabled_via_env() {
+        // SAFETY: test-only env var manipulation; serialized via serial_test.
+        unsafe {
+            std::env::set_var("CLX_LEARNING_MODE", "1");
+        }
+
+        let mut config = Config::default();
+        assert!(!config.validator.learning_mode);
+        config.apply_env_overrides();
+        let enabled = config.validator.learning_mode;
+
+        unsafe {
+            std::env::remove_var("CLX_LEARNING_MODE");
+        }
+        assert!(enabled, "CLX_LEARNING_MODE=1 must enable learning_mode");
+    }
+
+    /// AC3 (trust gate): an UNTRUSTED project config setting
+    /// `validator.learning_mode: true` is stripped along with the whole
+    /// `validator` subtree, so a hostile repo cannot enable capture.
+    #[test]
+    fn untrusted_validator_learning_mode_is_stripped() {
+        let raw = "validator:\n  learning_mode: true\n";
+        let out = crate::config::project::filter_inert_only(raw);
+        assert!(
+            !out.contains("learning_mode"),
+            "validator.learning_mode must be dropped from untrusted config; got: {out}"
+        );
     }
 }

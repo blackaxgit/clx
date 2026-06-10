@@ -89,11 +89,12 @@ fn v9_purges_secret_and_malformed_rules_preserves_legit() {
 
     let storage = Storage::open(&db).expect("open runs migrate_to_v9");
 
-    // Recorded schema version is the schema_version TABLE value, now 9.
+    // A full open() runs the whole migration chain, so the recorded schema
+    // version is the latest (the v9 purge still ran on the way through).
     assert_eq!(
         storage.schema_version().expect("schema version"),
-        9,
-        "v9 migration must stamp the schema_version table to 9"
+        10,
+        "a full open must migrate the schema_version table to the latest version"
     );
 
     let survivors = surviving_patterns(&storage);
@@ -108,13 +109,13 @@ fn v9_purges_secret_and_malformed_rules_preserves_legit() {
     );
 
     // Idempotent: a second open (close + reopen) does not delete the survivors
-    // and stays at v9.
+    // and stays at the latest version.
     drop(storage);
     let reopened = Storage::open(&db).expect("second open is a no-op");
     assert_eq!(
         reopened.schema_version().expect("schema version"),
-        9,
-        "second open must remain at schema version 9"
+        10,
+        "second open must remain at the latest schema version"
     );
     assert_eq!(
         surviving_patterns(&reopened),
@@ -142,7 +143,7 @@ fn v9_no_op_on_clean_database() {
     );
 
     let storage = Storage::open(&db).expect("open runs migrate_to_v9");
-    assert_eq!(storage.schema_version().expect("schema version"), 9);
+    assert_eq!(storage.schema_version().expect("schema version"), 10);
     assert_eq!(
         surviving_patterns(&storage),
         vec![
