@@ -286,12 +286,12 @@ async fn l1_allow_emits_allow_and_writes_cache_and_health_ok() {
 }
 
 // =========================================================================
-// L1 Deny + track_user_decision (V-R5 denial_count).
+// L1 Deny + track_user_decision (Issue 9: automated denials never learn).
 // pre_tool_use.rs:461-487
 // =========================================================================
 
 #[tokio::test]
-async fn l1_deny_emits_block_and_increments_denial_count() {
+async fn l1_deny_emits_block_and_does_not_learn() {
     let server = MockServer::start().await;
     mount_health_up(&server).await;
     mount_generate(
@@ -316,18 +316,18 @@ async fn l1_deny_emits_block_and_increments_denial_count() {
     assert_eq!(rows[0].layer, "L1");
     assert_eq!(rows[0].decision.as_str(), "blocked");
 
-    // V-R5: a DENY must create/track a learned rule with denial_count >= 1
-    // (track_user_decision). For a fresh pattern it creates a Deny rule
-    // with denial_count == 1.
+    // Issue 9: an AUTOMATED (LLM-originated) L1 deny must NOT learn. The
+    // pre-Issue-9 V-R5 contract (deny increments denial_count) now applies
+    // only to genuine user rejections; automated denials early-return in
+    // track_user_decision (DecisionSource::Automated) so two LLM denials can
+    // never auto-blacklist a pattern behind the user's back.
     let pattern = learned_rule_pattern(ASK_CMD);
-    let rule = db(home.path())
-        .get_rule_by_pattern(&pattern)
-        .expect("rule query")
-        .expect("L1 deny must create a learned rule (V-R5)");
     assert!(
-        rule.denial_count >= 1,
-        "V-R5: an L1 deny must increment denial_count, got {}",
-        rule.denial_count
+        db(home.path())
+            .get_rule_by_pattern(&pattern)
+            .expect("rule query")
+            .is_none(),
+        "Issue 9: an automated L1 deny must NOT create/track a learned rule"
     );
 
     // A deny is NOT cached (only allow/ask arms cache); pin that contract.
