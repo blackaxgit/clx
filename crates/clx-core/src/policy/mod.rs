@@ -220,11 +220,17 @@ impl PolicyEngine {
         }
 
         // 3. ALLOW — every effective segment must individually match a whitelist
-        //    rule. A single non-whitelisted segment => not allowed.
+        //    rule AND the command must NOT redirect output to a real file
+        //    (FIX-1). A whitelisted read command with an output redirection
+        //    (e.g. `git diff > ~/.bashrc`) is an exfiltration/overwrite vector,
+        //    so it must fall through to the Layer-1 Ask arm rather than be
+        //    silently allowed. fd-dups (`2>&1`), input redirs (`<`), and device
+        //    targets (`/dev/null`, `/dev/stdout`, ...) are NOT screened.
         if !effective.is_empty()
             && effective
                 .iter()
                 .all(|seg| self.matches_any_whitelist(tool_name, seg))
+            && !command_has_output_file_redirection(command)
         {
             debug!("Whitelist match (all segments): command='{}'", command);
             return PolicyDecision::Allow;
@@ -318,8 +324,46 @@ fn bash_writes_into_protected_dir(command: &str) -> bool {
 
 /// Per-segment destination extraction + protected-component test for FIX-2.
 fn segment_has_protected_write_destination(tokens: &[String]) -> bool {
+    segment_write_destinations(tokens)
+        .iter()
+        .any(|d| destination_is_protected(d))
+}
+
+/// Extract ALL write destinations from a Bash `command` (FIX-4-core).
+///
+/// Pure and filesystem-free: it neither resolves `~`/`$HOME` nor canonicalizes
+/// paths — it returns the raw destination strings exactly as they appear in the
+/// command. Callers that need home/symlink resolution (e.g. the hook) layer that
+/// on top of this extractor.
+///
+/// A "write destination" is:
+/// - (a) Redirection target: the path glued to a real OUTPUT redirection
+///   operator, or the token following a bare operator. Input redirs (`<`, `N<`)
+///   and fd-duplications (`2>&1`, `&1`, `N>&M`) are NOT destinations.
+/// - (b) `cp`/`mv`: the last non-flag arg, unless `-t DIR` /
+///   `--target-directory[=DIR]` is present (then that DIR).
+/// - (c) `tee` (incl. `-a`): every non-flag arg.
+/// - (d) `dd`: the value of `of=VALUE` (NOT `if=`).
+#[must_use]
+pub fn bash_write_destinations(command: &str) -> Vec<String> {
+    let Some(segments) = split_segments_quote_aware(command) else {
+        return Vec::new();
+    };
+    let mut dests = Vec::new();
+    for seg in &segments {
+        let Some(tokens) = shlex::split(seg) else {
+            continue;
+        };
+        dests.extend(segment_write_destinations(&tokens));
+    }
+    dests
+}
+
+/// All write destinations contributed by a single shlex-tokenized segment.
+fn segment_write_destinations(tokens: &[String]) -> Vec<String> {
+    let mut dests: Vec<String> = Vec::new();
     if tokens.is_empty() {
-        return false;
+        return dests;
     }
 
     // (a) Redirection destinations (any command).
@@ -328,16 +372,12 @@ fn segment_has_protected_write_destination(tokens: &[String]) -> bool {
         let tok = tokens[i].as_str();
         if is_redirection_token(tok) {
             if let Some(dest) = redirection_destination(tok) {
-                if destination_is_protected(dest) {
-                    return true;
-                }
+                dests.push(dest.to_string());
             } else if !redirection_is_input(tok) && !redirection_is_fd_dup(tok) {
                 // Bare operator (`>`, `>>`, `&>`, `2>`, ...): destination is the
                 // NEXT token. (Input `<`/`N<` and fd-dups are skipped.)
                 if let Some(next) = tokens.get(i + 1) {
-                    if destination_is_protected(next) {
-                        return true;
-                    }
+                    dests.push(next.clone());
                     i += 2;
                     continue;
                 }
@@ -353,11 +393,12 @@ fn segment_has_protected_write_destination(tokens: &[String]) -> bool {
     let argv0 = tokens[0].as_str();
     let argv0 = argv0.rsplit('/').next().unwrap_or(argv0);
     match argv0 {
-        "cp" | "mv" => cp_mv_destination_is_protected(&tokens[1..]),
-        "tee" => tee_destination_is_protected(&tokens[1..]),
-        "dd" => dd_destination_is_protected(&tokens[1..]),
-        _ => false,
+        "cp" | "mv" => dests.extend(cp_mv_destinations(&tokens[1..])),
+        "tee" => dests.extend(tee_destinations(&tokens[1..])),
+        "dd" => dests.extend(dd_destinations(&tokens[1..])),
+        _ => {}
     }
+    dests
 }
 
 /// True if `tok` is an INPUT redirection (`<`, `N<`) and never a write dest.
@@ -394,21 +435,80 @@ fn redirection_destination(tok: &str) -> Option<&str> {
     if path.is_empty() { None } else { Some(path) }
 }
 
+/// True iff `command` contains at least one OUTPUT redirection to a real FILE
+/// target (FIX-1). This is the screen on the whitelist ALLOW path: a whitelisted
+/// read command that redirects its output to a file is an exfiltration/overwrite
+/// vector and must NOT be auto-allowed.
+///
+/// A token counts as an output-file redirection when it is a redirection token
+/// (`is_redirection_token`) that is:
+/// - NOT an input redirection (`<`, `N<`),
+/// - NOT a file-descriptor duplication (`2>&1`, `&1`, `N>&M`), and
+/// - whose target path is NOT a device sink (`/dev/null`, `/dev/stdout`,
+///   `/dev/stderr`, `/dev/fd/*`).
+///
+/// The target is the path glued to the operator (`>file`) or, for a bare
+/// operator (`>`), the NEXT token in the segment.
+fn command_has_output_file_redirection(command: &str) -> bool {
+    let Some(segments) = split_segments_quote_aware(command) else {
+        // Unbalanced quotes: `evaluate` already falls through to Ask in this
+        // case; be conservative and report no redirection here.
+        return false;
+    };
+    for seg in &segments {
+        let Some(tokens) = shlex::split(seg) else {
+            continue;
+        };
+        let mut i = 0;
+        while i < tokens.len() {
+            let tok = tokens[i].as_str();
+            if is_redirection_token(tok) {
+                if redirection_is_input(tok) || redirection_is_fd_dup(tok) {
+                    i += 1;
+                    continue;
+                }
+                if let Some(dest) = redirection_destination(tok) {
+                    if !is_device_target(dest) {
+                        return true;
+                    }
+                } else {
+                    // Bare operator: the destination is the next token.
+                    if let Some(next) = tokens.get(i + 1) {
+                        if !is_device_target(next) {
+                            return true;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// True if `dest` is a device sink that is NOT a real file: `/dev/null`,
+/// `/dev/stdout`, `/dev/stderr`, or `/dev/fd/*`. Redirecting to these does not
+/// write attacker-controlled data to a persistent file, so they are excluded
+/// from the FIX-1 screen.
+fn is_device_target(dest: &str) -> bool {
+    matches!(dest, "/dev/null" | "/dev/stdout" | "/dev/stderr") || dest.starts_with("/dev/fd/")
+}
+
 /// `cp`/`mv` destination: last non-flag arg, UNLESS `-t DIR` /
 /// `--target-directory[=DIR]` is present (then that DIR is the destination).
-fn cp_mv_destination_is_protected(args: &[String]) -> bool {
+/// Returns at most one destination.
+fn cp_mv_destinations(args: &[String]) -> Vec<String> {
     let mut last_nonflag: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if let Some(dir) = a.strip_prefix("--target-directory=") {
-            return destination_is_protected(dir);
+            return vec![dir.to_string()];
         }
         if a == "-t" || a == "--target-directory" {
-            if let Some(dir) = args.get(i + 1) {
-                return destination_is_protected(dir);
-            }
-            return false;
+            return args.get(i + 1).map(|d| vec![d.clone()]).unwrap_or_default();
         }
         if a == "--" {
             // Everything after `--` is a positional operand.
@@ -424,11 +524,14 @@ fn cp_mv_destination_is_protected(args: &[String]) -> bool {
         last_nonflag = Some(a);
         i += 1;
     }
-    last_nonflag.is_some_and(destination_is_protected)
+    last_nonflag
+        .map(|d| vec![d.to_string()])
+        .unwrap_or_default()
 }
 
 /// `tee` (incl. `-a`): every non-flag arg is a write destination.
-fn tee_destination_is_protected(args: &[String]) -> bool {
+fn tee_destinations(args: &[String]) -> Vec<String> {
+    let mut dests = Vec::new();
     let mut after_ddash = false;
     for a in args {
         if !after_ddash && a == "--" {
@@ -438,23 +541,16 @@ fn tee_destination_is_protected(args: &[String]) -> bool {
         if !after_ddash && a.starts_with('-') {
             continue;
         }
-        if destination_is_protected(a) {
-            return true;
-        }
+        dests.push(a.clone());
     }
-    false
+    dests
 }
 
 /// `dd`: the value of an `of=VALUE` operand (NOT `if=`, which is the source).
-fn dd_destination_is_protected(args: &[String]) -> bool {
-    for a in args {
-        if let Some(value) = a.strip_prefix("of=")
-            && destination_is_protected(value)
-        {
-            return true;
-        }
-    }
-    false
+fn dd_destinations(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter_map(|a| a.strip_prefix("of=").map(str::to_string))
+        .collect()
 }
 
 /// True if any path COMPONENT of `dest` (case-insensitive) is a protected

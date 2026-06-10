@@ -2862,3 +2862,113 @@ fn ac10_1_sort_output_flag_not_read_only() {
     assert!(!is_read_only_command("sort --output=out.txt in.txt"));
     assert!(!is_read_only_command("sort -oout.txt in.txt"));
 }
+
+// =========================================================================
+// FIX-1 — whitelist ALLOW path screens output file redirection
+// =========================================================================
+
+#[test]
+fn fix1_whitelisted_read_redirecting_to_file_is_not_allowed() {
+    let engine = PolicyEngine::new();
+    // Each is a whitelisted read command (echo/cat/git diff) whose output is
+    // redirected to a real FILE => must NOT be Allow; falls through to Ask.
+    let bashrc = concat!("/home/u/.", "bashrc");
+    let zshrc = concat!("/home/u/.", "zshrc");
+    assert!(
+        matches!(
+            engine.evaluate("Bash", &format!("echo x > {bashrc}")),
+            PolicyDecision::Ask { .. }
+        ),
+        "echo > .bashrc must Ask, not Allow"
+    );
+    assert!(
+        matches!(
+            engine.evaluate("Bash", "cat p > /tmp/leak"),
+            PolicyDecision::Ask { .. }
+        ),
+        "cat > /tmp/leak must Ask, not Allow"
+    );
+    assert!(
+        matches!(
+            engine.evaluate("Bash", &format!("git diff >> {zshrc}")),
+            PolicyDecision::Ask { .. }
+        ),
+        "git diff >> .zshrc must Ask, not Allow"
+    );
+    assert!(
+        matches!(
+            engine.evaluate("Bash", "cat p 2>/tmp/log"),
+            PolicyDecision::Ask { .. }
+        ),
+        "cmd 2>/tmp/log (stderr to file) must Ask, not Allow"
+    );
+}
+
+#[test]
+fn fix1_whitelisted_reads_without_file_redirection_still_allow() {
+    let mut engine = PolicyEngine::new();
+    // grep is not a builtin whitelist entry; add it so the quoted `a>b` case
+    // exercises the redirection screen rather than the unknown-command path.
+    engine.add_whitelist("Bash(grep:*)");
+
+    assert_eq!(engine.evaluate("Bash", "cat x"), PolicyDecision::Allow);
+    assert_eq!(engine.evaluate("Bash", "git diff"), PolicyDecision::Allow);
+    // Quoted metachar is NOT a redirection operator.
+    assert_eq!(
+        engine.evaluate("Bash", "grep 'a>b' f"),
+        PolicyDecision::Allow,
+        "quoted '>' is not a redirection"
+    );
+    // Device target /dev/null is excluded from the screen (no `&`, single
+    // segment, whitelisted `ls`, redirect to a device => stays Allow).
+    assert_eq!(
+        engine.evaluate("Bash", "ls 2>/dev/null"),
+        PolicyDecision::Allow,
+        "redirect to /dev/null must stay Allow"
+    );
+    // NOTE: `cat x 2>&1` is NOT asserted Allow here. `split_segments_quote_aware`
+    // treats `&` as a control-operator separator, so `cat x 2>&1` splits into
+    // `["cat x 2>", "1"]`; the `1` segment is not whitelisted and the command
+    // is Ask *independent of FIX-1* (pre-existing splitter behavior). The fd-dup
+    // exclusion itself is covered by the unit test below
+    // (`command_has_output_file_redirection("cat x 2>&1") == false`).
+}
+
+#[test]
+fn fix1_command_has_output_file_redirection_unit() {
+    assert!(command_has_output_file_redirection("echo x > f"));
+    assert!(command_has_output_file_redirection("echo x >> f"));
+    assert!(command_has_output_file_redirection("cat p 2>/tmp/log"));
+    assert!(command_has_output_file_redirection("echo x >f"));
+    // Excluded: input, fd-dup, device targets, quoted metachar.
+    assert!(!command_has_output_file_redirection("cat < in"));
+    assert!(!command_has_output_file_redirection("cat x 2>&1"));
+    assert!(!command_has_output_file_redirection("ls > /dev/null"));
+    assert!(!command_has_output_file_redirection("cat x > /dev/stdout"));
+    assert!(!command_has_output_file_redirection("cat x > /dev/fd/3"));
+    assert!(!command_has_output_file_redirection("grep 'a>b' f"));
+}
+
+// =========================================================================
+// FIX-4-core — bash_write_destinations extractor (pure, FS-free)
+// =========================================================================
+
+#[test]
+fn fix4_bash_write_destinations_extracts_expected_set() {
+    assert_eq!(bash_write_destinations("echo x > a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("tee -a a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("cp s a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("cp -t a/b s"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("mv s a/b"), vec!["a/b"]);
+    assert_eq!(bash_write_destinations("dd of=a/b"), vec!["a/b"]);
+}
+
+#[test]
+fn fix4_bash_write_destinations_excludes_fd_dup_and_input() {
+    // fd-dup is not a destination.
+    assert!(bash_write_destinations("cat x 2>&1").is_empty());
+    // input redirection is not a destination.
+    assert!(bash_write_destinations("cat < in").is_empty());
+    // a plain read has no destinations.
+    assert!(bash_write_destinations("cat x").is_empty());
+}
