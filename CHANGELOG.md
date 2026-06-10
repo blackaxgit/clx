@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-10
+
+Features + a security-hardening pass. Adds a one-time schema migration (v9 → v10)
+for the new learning-events store; older binaries will refuse a v10 database.
+
+### Added
+
+- **Learning/debug mode (opt-in, observe-only).** `validator.learning_mode`
+  (and the `CLX_LEARNING_MODE` env toggle), off by default and trust-gated. When
+  enabled, every PreToolUse decision is recorded to a new `learning_events` table
+  (schema v10) with its rationale, a divergence flag (a prompt/deny that did NOT
+  come from a deterministic dangerous rule), and error/degraded events — all
+  redacted at the storage sink, with bounded retention. Never alters a decision.
+- **`clx learning` CLI.** `report` (decision/divergence/kind counts + deterministic
+  rule/config tuning suggestions), `list`, `export --json`, `clear`.
+- **Trust-mode durations editable in the dashboard.** `trust_mode_default_duration`
+  and `trust_mode_max_duration` are now editable in the Validator settings section,
+  with cross-field `default ≤ max` validation. (Config + CLI already honored them.)
+
+### Security
+
+- **Output redirection no longer bypasses the allow path.** A whitelisted read
+  carrying an output file-redirection (e.g. `echo x > ~/.bashrc`) is no longer
+  auto-allowed; it falls to Ask. fd-dups (`2>&1`) and `/dev/*` targets are excluded.
+- **Secrets redacted at every snapshot sink.** Both `create_snapshot` and the
+  auto-summary sink now redact `summary`/`key_facts`, so secrets cannot reach the
+  recall store.
+- **Strict learned-rule type read.** A corrupt/unknown `learned_rules.rule_type` is
+  dropped (logged) rather than silently defaulting to `Allow` (closes a fail-open).
+- **Symlink-resistant Bash-write guard.** Bash write destinations are canonicalized
+  (symlinks/`..`/`~`) before the protected-dir check, matching the FileEdit guard
+  via a shared helper.
+
+### Fixed
+
+- FileEdit guard matches the write target, not file content (no false-deny on a doc
+  that merely mentions a protected path).
+- Deterministic host-routing tests (scrub `CLX_HOOK_HOST`) and an Issue-9-aligned
+  L1-deny test; the full workspace suite is green.
+
 ## [0.11.1] - 2026-06-07
 
 ### Fixed
