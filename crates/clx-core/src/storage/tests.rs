@@ -2103,3 +2103,150 @@ fn recent_session_summaries_picks_latest_snapshot_per_session() {
         "should pick the latest snapshot summary per session"
     );
 }
+
+// =========================================================================
+// FIX-2 — both snapshot INSERT sinks redact summary + key_facts
+// =========================================================================
+
+const FIX2_SECRET_SK: &str = "sk-livesecret0000000000";
+const FIX2_SECRET_BODY: &str = "livesecret0000000000";
+
+fn fix2_secret_snapshot(session: &str, trigger: SnapshotTrigger) -> Snapshot {
+    let mut snap = Snapshot::new(SessionId::new(session), trigger);
+    snap.summary = Some(format!("token is {FIX2_SECRET_SK} here"));
+    snap.key_facts = Some("auth header: Bearer abcdefghijklmnopqrstuvwxyz".to_string());
+    snap
+}
+
+fn fix2_assert_redacted(storage: &Storage, id: i64) {
+    let (summary, key_facts): (Option<String>, Option<String>) = storage
+        .conn
+        .query_row(
+            "SELECT summary, key_facts FROM snapshots WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read back snapshot row");
+    let summary = summary.expect("summary present");
+    let key_facts = key_facts.expect("key_facts present");
+
+    assert!(
+        summary.contains("***REDACTED***"),
+        "summary must be redacted: {summary}"
+    );
+    assert!(
+        !summary.contains(FIX2_SECRET_BODY),
+        "summary must NOT contain the secret body: {summary}"
+    );
+    assert!(
+        key_facts.contains("***REDACTED***"),
+        "key_facts must be redacted: {key_facts}"
+    );
+    assert!(
+        !key_facts.contains("abcdefghijklmnopqrstuvwxyz"),
+        "key_facts must NOT contain the bearer token: {key_facts}"
+    );
+}
+
+fn fix2_seed_session(storage: &Storage, id: &str) {
+    storage
+        .create_session(&Session::new(SessionId::new(id), "/tmp/proj".to_string()))
+        .unwrap();
+}
+
+#[test]
+fn fix2_create_snapshot_redacts_secrets_at_sink() {
+    let storage = create_test_storage();
+    fix2_seed_session(&storage, "sess-fix2a");
+    let id = storage
+        .create_snapshot(&fix2_secret_snapshot("sess-fix2a", SnapshotTrigger::Manual))
+        .unwrap();
+    fix2_assert_redacted(&storage, id);
+}
+
+#[test]
+fn fix2_create_snapshot_if_no_recent_auto_summary_redacts_secrets_at_sink() {
+    let storage = create_test_storage();
+    fix2_seed_session(&storage, "sess-fix2b");
+    let snap = fix2_secret_snapshot("sess-fix2b", SnapshotTrigger::AutoSummary);
+    let inserted = storage
+        .create_snapshot_if_no_recent_auto_summary(&snap, 60)
+        .unwrap();
+    assert!(inserted, "first guarded insert must write the row");
+
+    let id: i64 = storage
+        .conn
+        .query_row(
+            "SELECT id FROM snapshots WHERE session_id = 'sess-fix2b'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fix2_assert_redacted(&storage, id);
+}
+
+// =========================================================================
+// FIX-3 — strict RuleType read; unknown rows dropped (fail-safe)
+// =========================================================================
+
+/// Insert a raw `learned_rules` row, bypassing `add_rule` (which only emits
+/// valid `rule_type` strings), so we can seed a corrupt/unknown type.
+fn fix3_seed_raw_rule(storage: &Storage, pattern: &str, rule_type: &str) {
+    storage
+        .conn
+        .execute(
+            "INSERT INTO learned_rules (pattern, rule_type, learned_at, source) \
+             VALUES (?1, ?2, ?3, 'test')",
+            params![pattern, rule_type, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("seed raw learned_rules row");
+}
+
+#[test]
+fn fix3_get_rules_drops_unknown_type_keeps_valid() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(bogus:*)", "bogus");
+    fix3_seed_raw_rule(&storage, "Bash(valid:*)", "allow");
+
+    let rules = storage.get_rules().unwrap();
+    assert_eq!(rules.len(), 1, "only the valid rule must load");
+    assert_eq!(rules[0].pattern, "Bash(valid:*)");
+    assert_eq!(rules[0].rule_type, RuleType::Allow);
+    // The bogus row must NOT have fail-open-defaulted to Allow.
+    assert!(
+        !rules.iter().any(|r| r.pattern == "Bash(bogus:*)"),
+        "bogus-type row must be skipped, not loaded as Allow"
+    );
+}
+
+#[test]
+fn fix3_get_rules_for_project_drops_unknown_type() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(bogus2:*)", "weird");
+    fix3_seed_raw_rule(&storage, "Bash(valid2:*)", "deny");
+
+    let rules = storage.get_rules_for_project("/some/project").unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].pattern, "Bash(valid2:*)");
+    assert_eq!(rules[0].rule_type, RuleType::Deny);
+}
+
+#[test]
+fn fix3_get_rule_by_pattern_unknown_type_returns_none() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(corrupt:*)", "nonsense");
+
+    // Fail-safe: a corrupt single lookup yields None (no rule), not an Allow
+    // and not a hard error.
+    let got = storage.get_rule_by_pattern("Bash(corrupt:*)").unwrap();
+    assert!(got.is_none(), "unknown rule_type must map to None");
+}
+
+#[test]
+fn fix3_get_rule_by_pattern_valid_type_round_trips() {
+    let storage = create_test_storage();
+    fix3_seed_raw_rule(&storage, "Bash(ok:*)", "deny");
+    let got = storage.get_rule_by_pattern("Bash(ok:*)").unwrap();
+    let got = got.expect("valid rule must be found");
+    assert_eq!(got.rule_type, RuleType::Deny);
+}

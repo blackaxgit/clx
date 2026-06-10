@@ -13,6 +13,17 @@ use crate::types::{Snapshot, SnapshotTrigger};
 impl Storage {
     /// Create a new snapshot
     pub fn create_snapshot(&self, snapshot: &Snapshot) -> crate::Result<i64> {
+        // FIX-2: redact secrets at the INSERT sink so no caller can persist a
+        // cleartext credential into `snapshots` (which feeds recall/embeddings).
+        // Idempotent: re-redacting already-redacted text is a no-op.
+        let summary = snapshot
+            .summary
+            .as_deref()
+            .map(crate::redaction::redact_secrets);
+        let key_facts = snapshot
+            .key_facts
+            .as_deref()
+            .map(crate::redaction::redact_secrets);
         self.conn.execute(
             "INSERT INTO snapshots (session_id, created_at, trigger, summary, key_facts, todos, message_count, input_tokens, output_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -20,8 +31,8 @@ impl Storage {
                 snapshot.session_id,
                 snapshot.created_at.to_rfc3339(),
                 snapshot.trigger.as_str(),
-                snapshot.summary,
-                snapshot.key_facts,
+                summary,
+                key_facts,
                 snapshot.todos,
                 snapshot.message_count,
                 snapshot.input_tokens,
@@ -64,6 +75,17 @@ impl Storage {
         // with IMMEDIATE locking instead of the default DEFERRED).
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
+        // FIX-2: redact secrets at this INSERT sink too (the auto-summary path
+        // does NOT pre-redact upstream). Idempotent on already-redacted text.
+        let summary = snapshot
+            .summary
+            .as_deref()
+            .map(crate::redaction::redact_secrets);
+        let key_facts = snapshot
+            .key_facts
+            .as_deref()
+            .map(crate::redaction::redact_secrets);
+
         // RFC3339 timestamps sort lexicographically, but the freshness
         // window is a duration so we compare against a computed lower
         // bound. `created_at` is stored via `to_rfc3339()`; SQLite's
@@ -84,8 +106,8 @@ impl Storage {
                 snapshot.session_id,
                 snapshot.created_at.to_rfc3339(),
                 snapshot.trigger.as_str(),
-                snapshot.summary,
-                snapshot.key_facts,
+                summary,
+                key_facts,
                 snapshot.todos,
                 snapshot.message_count,
                 snapshot.input_tokens,

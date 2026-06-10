@@ -2,7 +2,7 @@
 //!
 //! Add, query, update counts, and delete learned rules.
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Row, params};
 use tracing::{debug, warn};
 
 use super::Storage;
@@ -83,18 +83,24 @@ impl Storage {
         Ok(rules)
     }
 
-    /// Get a rule by pattern
+    /// Get a rule by pattern.
+    ///
+    /// FIX-3: a row whose `rule_type` fails the strict parse is treated as
+    /// "no rule" (`Ok(None)`) rather than propagating a hard error — fail-safe
+    /// for a single-rule lookup, so a corrupt cell cannot deny legitimate
+    /// access nor (post-FIX-3) fail open to Allow.
     pub fn get_rule_by_pattern(&self, pattern: &str) -> crate::Result<Option<LearnedRule>> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT id, pattern, rule_type, learned_at, source, confirmation_count, denial_count, project_path
+        match self.conn.query_row(
+            "SELECT id, pattern, rule_type, learned_at, source, confirmation_count, denial_count, project_path
                  FROM learned_rules WHERE pattern = ?1",
-                [pattern],
-                Self::row_to_learned_rule,
-            )
-            .optional()?;
-        Ok(result)
+            [pattern],
+            Self::row_to_learned_rule,
+        ) {
+            Ok(rule) => Ok(Some(rule)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(rusqlite::Error::FromSqlConversionFailure(..)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Increment confirmation count for a rule
@@ -128,11 +134,32 @@ impl Storage {
     fn row_to_learned_rule(row: &Row) -> rusqlite::Result<LearnedRule> {
         let learned_at_str: String = row.get(3)?;
         let rule_type_str: String = row.get(2)?;
+        let pattern: String = row.get(1)?;
+
+        // FIX-3: strict parse. The previous `RuleType::parse` was
+        // `unwrap_or_default() -> Allow`, so a corrupted/unknown/future
+        // `rule_type` cell silently became an Allow rule feeding L0
+        // whitelisting (fail-OPEN at a security boundary). Reject the row by
+        // returning a `rusqlite::Error` instead: the two list callers skip it
+        // via their `filter_map` + `warn!`, and `get_rule_by_pattern` maps it
+        // to `Ok(None)` (fail-SAFE). The rejected pattern is logged REDACTED.
+        let rule_type = rule_type_str.parse::<RuleType>().map_err(|_| {
+            warn!(
+                "Rejecting learned rule with unknown rule_type '{}' for pattern '{}' (skipped)",
+                rule_type_str,
+                crate::redaction::redact_secrets(&pattern),
+            );
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("unknown rule_type: '{rule_type_str}'").into(),
+            )
+        })?;
 
         Ok(LearnedRule {
             id: Some(row.get(0)?),
-            pattern: row.get(1)?,
-            rule_type: RuleType::parse(&rule_type_str),
+            pattern,
+            rule_type,
             learned_at: parse_datetime(&learned_at_str),
             source: row.get(4)?,
             confirmation_count: row.get(5)?,
