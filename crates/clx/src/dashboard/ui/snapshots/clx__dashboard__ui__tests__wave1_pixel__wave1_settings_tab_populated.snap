@@ -15,11 +15,11 @@ expression: rendered
 │  Sess Recovery     ││default_decision     ask                  ask           █
 │  MCP Tools         ││trust_mode           false                false         █
 │  Auto Recall       ││auto_allow_reads     true                 true          █
+│                    ││trust_mode_default_d 3600                 3600          █
+│                    ││trust_mode_max_durat 86400                86400         █
 │                    ││                                                        █
 │                    ││                                                        █
-│                    ││                                                        █
-│                    ││                                                        █
-│                    ││                                                        █
+│                    ││                                                        ║
 │                    ││                                                        ║
 │                    ││                                                        ║
 │                    ││                                                        ║

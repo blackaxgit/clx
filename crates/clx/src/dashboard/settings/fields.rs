@@ -75,6 +75,22 @@ pub const VALIDATOR_FIELDS: &[FieldDef] = &[
         description: "Auto-allow read-only commands",
         widget: FieldWidget::Toggle,
     },
+    FieldDef {
+        label: "trust_mode_default_duration",
+        description: "Default trust-mode duration in seconds (clx trust on)",
+        widget: FieldWidget::NumberU64 {
+            min: 300,
+            max: 86_400,
+        },
+    },
+    FieldDef {
+        label: "trust_mode_max_duration",
+        description: "Maximum allowed trust-mode duration in seconds",
+        widget: FieldWidget::NumberU64 {
+            min: 300,
+            max: 604_800,
+        },
+    },
 ];
 
 // --- Context fields (section 1) ---
