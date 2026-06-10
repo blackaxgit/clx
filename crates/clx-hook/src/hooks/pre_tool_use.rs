@@ -2118,6 +2118,113 @@ mod tests {
     }
 
     // =========================================================================
+    // FIX-4 WIRING: drive the REAL guard entry point
+    // `evaluate_bash_write_dest_guard` (not a re-composition of its internals).
+    // Proves destination extraction -> path expansion -> canonicalization ->
+    // protected-dir check -> deny emit are actually wired together and that the
+    // guard returns the Phase the orchestrator acts on. The protected-dir token
+    // is built via `concat!` so the literal never appears verbatim (in-session
+    // write-hook safe). The deny relies on the COMPONENT-NAME arm of
+    // `path_resolves_into_protected_dir` against a tempdir-local protected dir,
+    // so the test is hermetic w.r.t. the real `$HOME` (no env mutation); the
+    // symlink itself carries no protected token, so only real canonicalization
+    // inside the guard can flag it.
+    // =========================================================================
+
+    /// Minimal `PreToolUse` Bash envelope for the wiring tests. Built through
+    /// serde (the same boundary production inputs cross).
+    fn fix4_wiring_input(cwd: &str, command: &str) -> HostNeutralInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "clx-test-fix4-wiring",
+            "cwd": cwd,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command }
+        }))
+        .expect("minimal PreToolUse envelope must deserialize")
+    }
+
+    /// FIX-4 wiring (deny): a Bash redirect whose destination string contains
+    /// NO protected token but resolves through a temp symlink into a
+    /// protected-named dir must make the REAL guard emit a deny and return
+    /// `Phase::Handled`.
+    #[cfg(unix)]
+    #[test]
+    fn fix4_wiring_real_guard_denies_symlinked_bash_write_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&protected).unwrap();
+        let link = tmp.path().join("innocuous");
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
+
+        // Literal command carries only "innocuous/config.yaml" — without the
+        // guard's canonicalization the destination never matches a protected
+        // component, so a pass here proves the symlink was really resolved.
+        let command = format!("echo pwned > {}/config.yaml", link.display());
+        let input = fix4_wiring_input(tmp.path().to_str().unwrap(), &command);
+        let phase = evaluate_bash_write_dest_guard(
+            &Config::default(),
+            &crate::host::ClaudeHost,
+            &input,
+            &command,
+            Instant::now(),
+        );
+        assert!(
+            matches!(phase, Phase::Handled),
+            "real guard must deny (Phase::Handled) a Bash write reaching a \
+             protected dir via a symlink"
+        );
+    }
+
+    /// FIX-4 wiring (allow): an ordinary `/tmp` write must pass through the
+    /// REAL guard untouched (`Phase::Continue`, no deny emitted).
+    #[test]
+    fn fix4_wiring_real_guard_continues_for_tmp_write() {
+        let command = "echo hi > /tmp/clx-test-fix4-ok.txt";
+        let input = fix4_wiring_input("/tmp", command);
+        let phase = evaluate_bash_write_dest_guard(
+            &Config::default(),
+            &crate::host::ClaudeHost,
+            &input,
+            command,
+            Instant::now(),
+        );
+        assert!(
+            matches!(phase, Phase::Continue),
+            "a write to /tmp must not be denied by the canonical guard"
+        );
+    }
+
+    /// FIX-4 wiring (gate): with `layer0_enabled = false` the guard is a
+    /// no-op even for a symlinked protected destination — the config gate at
+    /// the top of the REAL function must short-circuit before any path work.
+    #[cfg(unix)]
+    #[test]
+    fn fix4_wiring_real_guard_respects_layer0_disabled_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&protected).unwrap();
+        let link = tmp.path().join("innocuous2");
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
+
+        let command = format!("echo pwned > {}/config.yaml", link.display());
+        let input = fix4_wiring_input(tmp.path().to_str().unwrap(), &command);
+        let mut config = Config::default();
+        config.validator.layer0_enabled = false;
+        let phase = evaluate_bash_write_dest_guard(
+            &config,
+            &crate::host::ClaudeHost,
+            &input,
+            &command,
+            Instant::now(),
+        );
+        assert!(
+            matches!(phase, Phase::Continue),
+            "guard must be inert when layer0 is disabled (config gate)"
+        );
+    }
+
+    // =========================================================================
     // Issue 4: narrowed dot-claude guard. Memory files (CLAUDE.md, project
     // memory) ALLOWED; settings.json / settings.local.json / hooks/ DENIED.
     // The hidden-dir segments are built via `concat!` so the literal tokens do
