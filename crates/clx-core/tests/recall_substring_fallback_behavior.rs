@@ -100,7 +100,10 @@ async fn substring_match_is_case_insensitive() {
 /// `key_facts` does must still match (the `matches_facts` arm).
 #[tokio::test]
 async fn key_facts_only_match_counts() {
-    let storage = seeded(Some("unrelated summary text"), Some("decision: chose tokio or smol"));
+    let storage = seeded(
+        Some("unrelated summary text"),
+        Some("decision: chose tokio or smol"),
+    );
     let repo = StorageSnapshotRepo::new(&storage, None);
     let engine = RecallEngine::new(&repo);
 
@@ -122,7 +125,10 @@ async fn no_match_is_clean_empty_not_degraded() {
 
     let result = engine.query("zzqq", &cfg()).await;
     assert!(result.hits.is_empty());
-    assert!(!result.degraded, "healthy empty must not be flagged degraded");
+    assert!(
+        !result.degraded,
+        "healthy empty must not be flagged degraded"
+    );
 }
 
 /// Ended sessions are invisible to the substring stage (it only scans

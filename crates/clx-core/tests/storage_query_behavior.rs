@@ -62,7 +62,13 @@ fn audit_at(s: &Storage, session: &str, command: &str, at: &str) {
     s.create_audit_log(&entry).expect("create audit row");
 }
 
-fn snapshot_at(s: &Storage, session: &str, trigger: SnapshotTrigger, summary: &str, at: &str) -> i64 {
+fn snapshot_at(
+    s: &Storage,
+    session: &str,
+    trigger: SnapshotTrigger,
+    summary: &str,
+    at: &str,
+) -> i64 {
     let mut snap = Snapshot::new(SessionId::new(session), trigger);
     snap.summary = Some(summary.to_string());
     snap.created_at = ts(at);
@@ -79,7 +85,8 @@ fn tool_event_at(s: &Storage, session: &str, target: &str, at: &str) {
         1_000,
     );
     ev.created_at = ts(at);
-    s.append_or_extend_tool_event(&ev).expect("append tool event");
+    s.append_or_extend_tool_event(&ev)
+        .expect("append tool event");
 }
 
 const T1: &str = "2026-01-01T00:00:01+00:00";

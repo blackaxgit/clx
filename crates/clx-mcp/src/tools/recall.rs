@@ -168,3 +168,34 @@ fn query_percentile_gate(value: f64) -> u32 {
         (value.clamp(0.0, 1.0) * 100.0).round() as u32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::query_percentile_gate;
+
+    /// Non-finite and non-positive config values must DISABLE the gate (0):
+    /// a NaN or negative `percentile_gate` from a hand-edited config must
+    /// never become a giant or random gate value.
+    #[test]
+    fn percentile_gate_disabled_for_non_finite_and_non_positive_values() {
+        assert_eq!(query_percentile_gate(f64::NAN), 0);
+        assert_eq!(query_percentile_gate(f64::INFINITY), 0);
+        assert_eq!(query_percentile_gate(f64::NEG_INFINITY), 0);
+        assert_eq!(query_percentile_gate(0.0), 0);
+        assert_eq!(query_percentile_gate(-0.25), 0);
+    }
+
+    /// A fraction in (0, 1] maps to whole percent; values above 1.0 clamp to
+    /// 100 instead of overflowing the percent scale.
+    #[test]
+    fn percentile_gate_maps_fraction_to_percent_and_clamps_above_one() {
+        assert_eq!(query_percentile_gate(0.35), 35);
+        assert_eq!(query_percentile_gate(0.5), 50);
+        assert_eq!(query_percentile_gate(1.0), 100);
+        assert_eq!(
+            query_percentile_gate(2.5),
+            100,
+            "values above 1.0 must clamp to 100%"
+        );
+    }
+}

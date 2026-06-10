@@ -89,7 +89,9 @@ fn dyn_backend_snapshot_create_and_search_round_trips() {
         "latest must be the newer snapshot"
     );
 
-    let found = backend.search_snapshots_fts("postgres pooling", 10).unwrap();
+    let found = backend
+        .search_snapshots_fts("postgres pooling", 10)
+        .unwrap();
     assert_eq!(found.len(), 1, "FTS through the trait must hit: {found:?}");
     assert_eq!(
         found[0].0.summary.as_deref(),

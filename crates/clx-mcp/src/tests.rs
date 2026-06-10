@@ -1651,3 +1651,728 @@ mod log_redaction_tests {
         );
     }
 }
+
+// =========================================================================
+// T40 — Uncovered-branch behavior contracts: the embedding pipeline
+// (success / wrong-dimension / unreachable / stalled embedder), degraded
+// recall (FIX-6, both arms), semantic search-type labeling, storage write
+// failure, and credential-backend failure arms.
+//
+// Hermetic by construction: loopback HTTP stubs (no real Ollama), in-memory
+// SQLite, and a tempdir-backed age-file credential store (never the user's
+// real CLX home, never the keychain).
+// =========================================================================
+mod failure_and_embedding_path_tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use clx_core::config::OllamaConfig;
+    use clx_core::credentials::{AgeFileBackend, CredentialStore};
+    use clx_core::embeddings::EmbeddingStore;
+    use clx_core::llm::{LlmClient, OllamaBackend};
+    use clx_core::storage::Storage;
+    use clx_core::types::{Session, SessionId};
+
+    use crate::protocol::types::INTERNAL_ERROR;
+    use crate::server::McpServer;
+
+    // ---------------------------------------------------------------------
+    // Builders and test doubles
+    // ---------------------------------------------------------------------
+
+    /// In-memory vector store with the sqlite-vec module registered (the
+    /// registration is process-global and idempotent).
+    fn in_memory_embedding_store() -> EmbeddingStore {
+        clx_core::init_sqlite_vec();
+        EmbeddingStore::open_in_memory().expect("embedding store")
+    }
+
+    /// Credential store backed by an age file inside an isolated tempdir.
+    fn file_credential_store(dir: &std::path::Path) -> CredentialStore {
+        CredentialStore::with_backend(Arc::new(
+            AgeFileBackend::with_dir(dir).expect("with_dir only records paths"),
+        ))
+    }
+
+    /// Build a server whose embedding seams (LLM client / vector store) and
+    /// credential backend are injected per test. Storage is in-memory.
+    fn server_with(
+        ollama: Option<LlmClient>,
+        embedding_store: Option<EmbeddingStore>,
+        credential_dir: &std::path::Path,
+    ) -> McpServer {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        McpServer {
+            storage: Storage::open_in_memory().expect("in-memory storage"),
+            session_id: Some(SessionId::new("test-session")),
+            db_path: ":memory:".to_string(),
+            credential_store: file_credential_store(credential_dir),
+            ollama_client: ollama,
+            embed_model: "stub-embed-model".to_string(),
+            embedding_store,
+            runtime,
+        }
+    }
+
+    fn seed_session(server: &McpServer) {
+        server
+            .storage
+            .create_session(&Session::new(
+                SessionId::new("test-session"),
+                "/test/project".to_string(),
+            ))
+            .expect("seed session");
+    }
+
+    /// Loopback Ollama-shaped client with retries disabled so failure tests
+    /// stay fast and deterministic.
+    fn ollama_at(host: &str, timeout_ms: u64) -> LlmClient {
+        let cfg = OllamaConfig {
+            host: host.to_string(),
+            timeout_ms,
+            max_retries: 0,
+            retry_delay_ms: 1,
+            ..OllamaConfig::default()
+        };
+        LlmClient::Ollama(OllamaBackend::new(cfg).expect("loopback host must be accepted"))
+    }
+
+    /// A loopback URL where nothing listens: connecting is refused instantly.
+    fn refused_base_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let addr = listener.local_addr().expect("probe addr");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// Read one HTTP/1.1 request (headers plus `Content-Length` body) from
+    /// `stream`. Returns `None` on any I/O error.
+    fn read_http_request(stream: &mut TcpStream) -> Option<()> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buf.len() > 1_048_576 {
+                return None;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let content_length: usize = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Some(())
+    }
+
+    /// Spawn a minimal HTTP stub that answers every request with the canned
+    /// `/api/embeddings` JSON body, then exits after `max_requests`
+    /// connections.
+    fn spawn_embedding_stub(embedding: &[f32], max_requests: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let body = json!({ "embedding": embedding }).to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(max_requests) {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                if read_http_request(&mut stream).is_none() {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Spawn a stub that accepts connections and reads the request but never
+    /// answers, so the embed future stalls until the caller's deadline.
+    fn spawn_stalling_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalling stub");
+        let addr = listener.local_addr().expect("stub addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let _ = read_http_request(&mut stream);
+                    // Hold the socket open without answering; the pipeline
+                    // deadline (EMBEDDING_STORE_TIMEOUT_MS) fires first.
+                    std::thread::sleep(std::time::Duration::from_secs(12));
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn embedding_count(server: &McpServer) -> i64 {
+        server
+            .embedding_store
+            .as_ref()
+            .expect("embedding store injected")
+            .count_embeddings()
+            .expect("count embeddings")
+    }
+
+    fn response_text(value: &serde_json::Value) -> &str {
+        value["content"][0]["text"]
+            .as_str()
+            .expect("MCP text payload")
+    }
+
+    // ---------------------------------------------------------------------
+    // remember / checkpoint embedding pipeline
+    // ---------------------------------------------------------------------
+
+    /// Happy path through the embed-and-store pipeline: a reachable embedder
+    /// plus an enabled vector store must persist exactly one embedding for
+    /// the remembered snapshot.
+    #[test]
+    fn remember_with_working_embedder_persists_embedding() {
+        let store = in_memory_embedding_store();
+        let dim = store.embedding_dim();
+        let url = spawn_embedding_stub(&vec![0.25_f32; dim], 4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(Some(ollama_at(&url, 10_000)), Some(store), dir.path());
+        seed_session(&server);
+
+        let result = server.tool_remember(&json!({"text": "embedding pipeline happy path"}));
+
+        let value = result.expect("remember must succeed");
+        let text = response_text(&value);
+        assert!(
+            text.contains("Successfully remembered"),
+            "unexpected response: {text}"
+        );
+        assert_eq!(
+            embedding_count(&server),
+            1,
+            "the generated embedding must be persisted in the vector store"
+        );
+    }
+
+    /// The stub returns an 8-dim vector while the store expects its
+    /// configured dimension: `store_embedding` must fail, remember must
+    /// still succeed (graceful degradation), and nothing may land in the
+    /// vector store.
+    #[test]
+    fn remember_with_wrong_dimension_embedding_saves_snapshot_without_embedding() {
+        let store = in_memory_embedding_store();
+        assert_ne!(
+            store.embedding_dim(),
+            8,
+            "test precondition: dimensions must mismatch"
+        );
+        let url = spawn_embedding_stub(&[0.5_f32; 8], 4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(Some(ollama_at(&url, 10_000)), Some(store), dir.path());
+        seed_session(&server);
+
+        let result = server.tool_remember(&json!({"text": "dimension mismatch path"}));
+
+        let value = result.expect("remember must succeed despite the bad embedding");
+        assert!(
+            response_text(&value).contains("Successfully remembered"),
+            "unexpected response: {value}"
+        );
+        assert_eq!(
+            embedding_count(&server),
+            0,
+            "a mismatched-dimension embedding must be rejected, not stored"
+        );
+        let snaps = server
+            .storage
+            .get_snapshots_by_session("test-session")
+            .expect("snapshots");
+        assert_eq!(snaps.len(), 1, "the snapshot itself must still be saved");
+    }
+
+    /// Connection-refused embedder: the memory is saved, no embedding lands.
+    #[test]
+    fn remember_with_unreachable_embedder_saves_snapshot_without_embedding() {
+        let store = in_memory_embedding_store();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(
+            Some(ollama_at(&refused_base_url(), 2_000)),
+            Some(store),
+            dir.path(),
+        );
+        seed_session(&server);
+
+        let result = server.tool_remember(&json!({"text": "embedder offline path"}));
+
+        let value = result.expect("remember must succeed without a reachable embedder");
+        assert!(
+            response_text(&value).contains("Successfully remembered"),
+            "unexpected response: {value}"
+        );
+        assert_eq!(embedding_count(&server), 0);
+    }
+
+    /// The 5s embed deadline (`EMBEDDING_STORE_TIMEOUT_MS`) must fire when
+    /// the embedder accepts but never answers; the memory is still saved.
+    /// Costs ~5s wall clock by design (the deadline itself is the contract).
+    #[test]
+    fn remember_with_stalling_embedder_hits_deadline_and_still_saves() {
+        let store = in_memory_embedding_store();
+        let url = spawn_stalling_stub();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // reqwest timeout far above the 5s pipeline deadline so the
+        // tokio::time::timeout arm (not a reqwest error) is what fires.
+        let server = server_with(Some(ollama_at(&url, 60_000)), Some(store), dir.path());
+        seed_session(&server);
+
+        let started = std::time::Instant::now();
+        let result = server.tool_remember(&json!({"text": "stalled embedder path"}));
+        let elapsed = started.elapsed();
+
+        let value = result.expect("remember must succeed despite the stall");
+        assert!(
+            response_text(&value).contains("Successfully remembered"),
+            "unexpected response: {value}"
+        );
+        assert_eq!(
+            embedding_count(&server),
+            0,
+            "no embedding may be stored after the deadline"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(4_500),
+            "the 5s deadline arm should be the taken path (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the deadline must bound the stall (took {elapsed:?})"
+        );
+    }
+
+    /// Checkpoint with a note and a working embedder must persist the note's
+    /// embedding (the success arm of the checkpoint embed branch).
+    #[test]
+    fn checkpoint_with_note_and_working_embedder_stores_embedding() {
+        let store = in_memory_embedding_store();
+        let dim = store.embedding_dim();
+        let url = spawn_embedding_stub(&vec![0.125_f32; dim], 4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(Some(ollama_at(&url, 10_000)), Some(store), dir.path());
+        seed_session(&server);
+
+        let result = server.tool_checkpoint(&json!({"note": "before big refactor"}));
+
+        let value = result.expect("checkpoint must succeed");
+        let text = response_text(&value);
+        assert!(text.contains("Checkpoint created"), "unexpected: {text}");
+        assert!(
+            text.contains("before big refactor"),
+            "the note must be echoed: {text}"
+        );
+        assert_eq!(
+            embedding_count(&server),
+            1,
+            "the checkpoint note embedding must be persisted"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // storage failure arms
+    // ---------------------------------------------------------------------
+
+    /// A read-only database file makes every write fail while reads keep
+    /// working: `tool_remember` must surface `INTERNAL_ERROR` with an
+    /// actionable message (and the standalone-session auto-create warning
+    /// path runs on the way because the session insert also fails).
+    #[test]
+    #[cfg(unix)]
+    fn remember_on_readonly_database_returns_internal_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("clx-test.db");
+        drop(Storage::open(&db_path).expect("create schema"));
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o444))
+            .expect("make db read-only");
+
+        let storage = Storage::open(&db_path).expect("reopen read-only db");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let server = McpServer {
+            storage,
+            session_id: Some(SessionId::new("never-created-session")),
+            db_path: db_path.to_string_lossy().to_string(),
+            credential_store: file_credential_store(dir.path()),
+            ollama_client: None,
+            embed_model: String::new(),
+            embedding_store: None,
+            runtime,
+        };
+
+        let err = server
+            .tool_remember(&json!({"text": "this write must fail"}))
+            .expect_err("a read-only database must fail the snapshot write");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("Failed to save information"),
+            "actionable error message expected, got: {}",
+            err.1
+        );
+
+        // Restore permissions so the tempdir cleans up.
+        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    /// When the session lookup itself errors (here: the `sessions` table is
+    /// dropped out from under a live connection through a second connection
+    /// to the same database file), `clx_session_info` must report the
+    /// failure in `session_error` instead of failing the whole tool call.
+    #[test]
+    fn session_info_reports_session_error_when_session_read_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("clx-test.db");
+        let storage = Storage::open(&db_path).expect("open file-backed db");
+        // Second connection to the same file (the embedding store exposes
+        // its raw connection): dropping the table makes the server's next
+        // `get_session` fail with a hard storage error, not Ok(None).
+        clx_core::init_sqlite_vec();
+        let saboteur = EmbeddingStore::open(&db_path).expect("second connection");
+        saboteur
+            .connection()
+            .execute_batch("DROP TABLE sessions;")
+            .expect("drop sessions table");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let server = McpServer {
+            storage,
+            session_id: Some(SessionId::new("test-session")),
+            db_path: db_path.to_string_lossy().to_string(),
+            credential_store: file_credential_store(dir.path()),
+            ollama_client: None,
+            embed_model: String::new(),
+            embedding_store: None,
+            runtime,
+        };
+
+        let value = server
+            .tool_session_info(&json!({}))
+            .expect("session_info must never hard-fail");
+        let text = response_text(&value);
+        assert!(
+            text.contains("session_error") && text.contains("Failed to get session"),
+            "a failing session read must surface session_error, got: {text}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // degraded recall (FIX-6) and search-type labeling
+    // ---------------------------------------------------------------------
+
+    /// Embedder configured but unreachable: the semantic stage errors
+    /// (degraded) while FTS runs healthy on an empty store (no hits).
+    /// FIX-6: that must read as unavailability, NOT as "nothing relevant".
+    #[test]
+    fn recall_degraded_with_no_hits_reports_temporary_unavailability() {
+        let store = in_memory_embedding_store();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(
+            Some(ollama_at(&refused_base_url(), 2_000)),
+            Some(store),
+            dir.path(),
+        );
+
+        let value = server
+            .tool_recall(&json!({"query": "anything"}))
+            .expect("degraded recall must still return Ok");
+        let text = response_text(&value);
+        assert!(
+            text.contains("Recall temporarily unavailable"),
+            "degraded+empty must be reported as unavailability, got: {text}"
+        );
+        assert!(
+            !text.contains("No relevant context found"),
+            "degraded recall must not masquerade as a clean empty result: {text}"
+        );
+    }
+
+    /// Embedder down but FTS healthy and matching: the hits are returned
+    /// WITH the partial-failure note so the agent knows one path was out.
+    #[test]
+    fn recall_degraded_with_fts_hits_appends_partial_note() {
+        let store = in_memory_embedding_store();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(
+            Some(ollama_at(&refused_base_url(), 2_000)),
+            Some(store),
+            dir.path(),
+        );
+        seed_session(&server);
+        server
+            .tool_remember(&json!({"text": "flyway database migration ledger"}))
+            .expect("remember succeeds without embedder");
+
+        let value = server
+            .tool_recall(&json!({"query": "flyway migration"}))
+            .expect("recall ok");
+        let text = response_text(&value);
+        assert!(
+            text.contains("Found"),
+            "an FTS hit was expected, got: {text}"
+        );
+        assert!(
+            text.contains("[partial: one search path was unavailable]"),
+            "degraded-with-hits must carry the partial note, got: {text}"
+        );
+    }
+
+    /// A hit reachable ONLY through the vector path (the query shares no
+    /// token with the stored text; the stub returns the identical vector for
+    /// every embed call, i.e. perfect similarity) must be labeled `semantic`
+    /// and the header must report the hybrid search method.
+    #[test]
+    fn recall_semantic_only_hit_is_labeled_semantic() {
+        let store = in_memory_embedding_store();
+        let dim = store.embedding_dim();
+        let url = spawn_embedding_stub(&vec![0.5_f32; dim], 8);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(Some(ollama_at(&url, 10_000)), Some(store), dir.path());
+        seed_session(&server);
+        server
+            .tool_remember(&json!({"text": "alpha bravo charlie delta"}))
+            .expect("remember with embedding");
+        assert_eq!(
+            embedding_count(&server),
+            1,
+            "precondition: embedding stored"
+        );
+
+        let value = server
+            .tool_recall(&json!({"query": "zulu"}))
+            .expect("recall ok");
+        let text = response_text(&value);
+        assert!(
+            text.contains("Found"),
+            "a semantic hit was expected, got: {text}"
+        );
+        assert!(
+            text.contains("semantic + fts5 (hybrid)"),
+            "the header must report the semantic method, got: {text}"
+        );
+        assert!(
+            text.contains("\"search_type\": \"semantic\""),
+            "the hit must be labeled semantic, got: {text}"
+        );
+        assert!(
+            !text.contains("[partial:"),
+            "a healthy recall must not carry the partial note: {text}"
+        );
+    }
+
+    /// A snapshot found by BOTH the vector path and FTS must be deduplicated
+    /// into a single hit labeled `hybrid`.
+    #[test]
+    fn recall_hit_found_by_both_paths_is_labeled_hybrid() {
+        let store = in_memory_embedding_store();
+        let dim = store.embedding_dim();
+        let url = spawn_embedding_stub(&vec![0.5_f32; dim], 8);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(Some(ollama_at(&url, 10_000)), Some(store), dir.path());
+        seed_session(&server);
+        server
+            .tool_remember(&json!({"text": "alpha bravo charlie delta"}))
+            .expect("remember with embedding");
+
+        let value = server
+            .tool_recall(&json!({"query": "alpha bravo"}))
+            .expect("recall ok");
+        let text = response_text(&value);
+        assert!(
+            text.contains("Found"),
+            "a merged hit was expected, got: {text}"
+        );
+        assert!(
+            text.contains("\"search_type\": \"hybrid\""),
+            "a hit found by both paths must be labeled hybrid, got: {text}"
+        );
+    }
+
+    // NOTE: a test attempting to force the FTS->substring degraded path by
+    // `DROP TABLE snapshots_fts` through a second connection was removed: the
+    // server connection still resolved the query via fts5 (the DDL did not make
+    // its FTS stage error), so the sabotage could not exercise the degraded
+    // `[partial]` path. The genuine substring-fallback + degraded behavior is
+    // covered at the engine level by
+    // clx-core/tests/recall_substring_fallback_behavior.rs.
+
+    // ---------------------------------------------------------------------
+    // credentials: project fallback, empty list, backend failure arms
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn credentials_list_on_empty_store_says_none_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(None, None, dir.path());
+
+        let value = server
+            .tool_credentials(&json!({"action": "list"}))
+            .expect("list on an empty store is not an error");
+        assert_eq!(response_text(&value), "No credentials stored");
+    }
+
+    /// `get` with a `project` argument must fall back to the global scope
+    /// when no project-scoped value exists — and the value must stay masked.
+    #[test]
+    fn credentials_get_with_project_falls_back_to_global_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(None, None, dir.path());
+        server
+            .tool_credentials(
+                &json!({"action": "set", "key": "api-token", "value": "SYNTH-cred-value-123"}),
+            )
+            .expect("set ok");
+
+        let value = server
+            .tool_credentials(&json!({"action": "get", "key": "api-token", "project": "proj-x"}))
+            .expect("get with project must fall back to the global value");
+        let text = response_text(&value);
+        assert!(
+            text.contains("Credential 'api-token' exists"),
+            "fallback lookup must find the global value, got: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED:"),
+            "the value must be masked: {text}"
+        );
+        assert!(
+            !text.contains("SYNTH-cred-value-123"),
+            "plaintext must never be returned: {text}"
+        );
+    }
+
+    /// A blank/whitespace `project` must be treated as "no project" and use
+    /// the plain global lookup.
+    #[test]
+    fn credentials_get_with_blank_project_uses_global_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = server_with(None, None, dir.path());
+        server
+            .tool_credentials(
+                &json!({"action": "set", "key": "blank-proj-key", "value": "SYNTH-value"}),
+            )
+            .expect("set ok");
+
+        let value = server
+            .tool_credentials(&json!({"action": "get", "key": "blank-proj-key", "project": "   "}))
+            .expect("get with blank project must use the global path");
+        assert!(
+            response_text(&value).contains("Credential 'blank-proj-key' exists"),
+            "blank project must behave like no project"
+        );
+    }
+
+    #[test]
+    fn credentials_get_on_corrupt_backend_returns_internal_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("credentials.age"),
+            b"definitely-not-an-age-v1-file",
+        )
+        .expect("plant corrupt credential file");
+        let server = server_with(None, None, dir.path());
+
+        let err = server
+            .tool_credentials(&json!({"action": "get", "key": "any-key"}))
+            .expect_err("a corrupt backend must fail the get");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(err.1.contains("Failed to get credential"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn credentials_list_on_corrupt_backend_returns_internal_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("credentials.age"),
+            b"definitely-not-an-age-v1-file",
+        )
+        .expect("plant corrupt credential file");
+        let server = server_with(None, None, dir.path());
+
+        let err = server
+            .tool_credentials(&json!({"action": "list"}))
+            .expect_err("a corrupt backend must fail the list");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("Failed to list credentials"),
+            "got: {}",
+            err.1
+        );
+    }
+
+    #[test]
+    fn credentials_delete_on_corrupt_backend_returns_internal_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("credentials.age"),
+            b"definitely-not-an-age-v1-file",
+        )
+        .expect("plant corrupt credential file");
+        let server = server_with(None, None, dir.path());
+
+        let err = server
+            .tool_credentials(&json!({"action": "delete", "key": "any-key"}))
+            .expect_err("a corrupt backend must fail the delete");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("Failed to delete credential"),
+            "got: {}",
+            err.1
+        );
+    }
+
+    /// The age backend self-heals directory permissions (0700), so a
+    /// read-only dir cannot fail it; planting a DIRECTORY where the data
+    /// file belongs makes the write path fail unrecoverably instead.
+    #[test]
+    fn credentials_set_on_unwritable_backend_returns_internal_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("credentials.age"))
+            .expect("plant directory where the credential file belongs");
+        let server = server_with(None, None, dir.path());
+
+        let err = server
+            .tool_credentials(&json!({"action": "set", "key": "k", "value": "v"}))
+            .expect_err("an unwritable backend must fail the store");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("Failed to store credential"),
+            "got: {}",
+            err.1
+        );
+    }
+}
