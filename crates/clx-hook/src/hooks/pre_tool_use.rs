@@ -141,10 +141,26 @@ fn dot_claude_path_is_sensitive(resolved: &std::path::Path, dot_claude: &str) ->
     false
 }
 
-fn fileedit_resolves_into_protected_dir(
-    tool_input: Option<&serde_json::Value>,
-    cwd: &str,
+/// ARCH-01 shared helper: given an ALREADY-resolved (`canonicalize_best_effort`)
+/// absolute path and the home dir, return a deny reason if the path lands inside
+/// a protected config/trust dir, else `None`. This is the single source of truth
+/// for the "resolved path lands in a protected dir" decision, used by BOTH the
+/// `FileEdit` guard and the Bash-write-destination guard so the two cannot
+/// diverge. The `kind` label ("File edit" / "Bash write") only flavors the
+/// returned reason string.
+///
+/// Checks (in order):
+///   (a)  canonical prefix match against `~/.codex`, `~/.claude`, `~/.cursor`,
+///        `~/.clx` (dot-claude is NARROW — only sensitive targets; the rest are
+///        BROAD).
+///   (a2) hardlink identity: the resolved target shares (dev, ino) with a known
+///        protected file even with no protected path component (unix only).
+///   (b)  component-name match (case-insensitive, any location): case variants,
+///        not-yet-existing-dir literals, and repo-local config dirs.
+fn path_resolves_into_protected_dir(
+    resolved: &std::path::Path,
     home: &std::path::Path,
+    kind: &str,
 ) -> Option<String> {
     // The dot-claude config dir component name. Built via `concat!` so the
     // literal hidden-dir token does not appear verbatim (write-hook safe).
@@ -158,6 +174,104 @@ fn fileedit_resolves_into_protected_dir(
             std::fs::canonicalize(&p).unwrap_or(p)
         })
         .collect();
+    // (a) canonical prefix match against the home config/trust dirs.
+    for prot in &protected {
+        if resolved.starts_with(prot) {
+            // Issue 4: the dot-claude dir guard is NARROW — only sensitive
+            // targets (settings.json / settings.local.json / hooks/) are
+            // denied; other dot-claude paths (CLAUDE.md, project memory)
+            // are allowed. The codex/cursor/clx dirs stay BROAD.
+            if dir_is_dot_claude(prot, dot_claude)
+                && !dot_claude_path_is_sensitive(resolved, dot_claude)
+            {
+                continue;
+            }
+            return Some(format!(
+                "{kind} resolves into protected config/trust dir: {}",
+                prot.display()
+            ));
+        }
+    }
+    // (a2) hardlink identity: a hardlink to a protected file shares its
+    // (device, inode) but carries no `.codex` path component and is not a
+    // symlink. Compare the resolved target's inode against the known host
+    // trust/config files when they exist. (TOCTOU between this check and the
+    // host's actual write remains an inherent limit of any pre-execution
+    // gate; see the best-effort caveat.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(t) = std::fs::metadata(resolved) {
+            let protected_files = [
+                home.join(".codex").join("config.toml"),
+                home.join(".claude").join("settings.json"),
+                home.join(".cursor").join("mcp.json"),
+                home.join(".cursor").join("hooks.json"),
+            ];
+            for pf in &protected_files {
+                if let Ok(m) = std::fs::metadata(pf)
+                    && m.dev() == t.dev()
+                    && m.ino() == t.ino()
+                {
+                    return Some(format!(
+                        "{kind} targets a hardlink to protected file: {}",
+                        pf.display()
+                    ));
+                }
+            }
+        }
+    }
+    // (b) component-name match (case-insensitive, any location): catches
+    // case variants (~/.CODEX), the not-yet-existing-dir literal fallback,
+    // and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
+    for comp in resolved.components() {
+        if let std::path::Component::Normal(name) = comp {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            if lower == dot_claude {
+                // Issue 4: NARROW dot-claude guard — only deny sensitive
+                // targets; allow other dot-claude paths (memory files).
+                if dot_claude_path_is_sensitive(resolved, dot_claude) {
+                    return Some(format!(
+                        "{kind} targets a protected config/trust dir component: {lower}"
+                    ));
+                }
+            } else if matches!(lower.as_str(), ".codex" | ".cursor" | ".clx") {
+                return Some(format!(
+                    "{kind} targets a protected config/trust dir component: {lower}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Expand a candidate path token into an absolute path: `~/`/`~` resolve against
+/// `home`, relative paths against `cwd`. Mirrors the `FileEdit` guard's historical
+/// inline expansion; shared so the Bash-write guard expands identically.
+fn expand_candidate_path(
+    tok: &str,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(rest) = tok.strip_prefix("~/") {
+        home.join(rest)
+    } else if tok == "~" {
+        home.to_path_buf()
+    } else {
+        let p = std::path::Path::new(tok);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    }
+}
+
+fn fileedit_resolves_into_protected_dir(
+    tool_input: Option<&serde_json::Value>,
+    cwd: &str,
+    home: &std::path::Path,
+) -> Option<String> {
     let cwd_path = std::path::Path::new(cwd);
     // Extract WHOLE candidate path strings (spaces preserved). Whitespace
     // tokenizing a path is unsafe: a target like "safe link/config.toml" (where
@@ -166,94 +280,15 @@ fn fileedit_resolves_into_protected_dir(
     // fields and the V4A/diff markers.
     let candidates = fileedit_candidate_paths(tool_input);
 
-    // Per-candidate resolution + the three protection checks.
+    // Per-candidate resolution + the shared protected-dir check.
     let check = |raw: &str| -> Option<String> {
         let tok = raw.trim();
         if tok.is_empty() {
             return None;
         }
-        let expanded = if let Some(rest) = tok.strip_prefix("~/") {
-            home.join(rest)
-        } else if tok == "~" {
-            home.to_path_buf()
-        } else {
-            let p = std::path::Path::new(tok);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd_path.join(p)
-            }
-        };
+        let expanded = expand_candidate_path(tok, cwd_path, home);
         let resolved = canonicalize_best_effort(&expanded);
-        // (a) canonical prefix match against the home config/trust dirs.
-        for prot in &protected {
-            if resolved.starts_with(prot) {
-                // Issue 4: the dot-claude dir guard is NARROW — only sensitive
-                // targets (settings.json / settings.local.json / hooks/) are
-                // denied; other dot-claude paths (CLAUDE.md, project memory)
-                // are allowed. The codex/cursor/clx dirs stay BROAD.
-                if dir_is_dot_claude(prot, dot_claude)
-                    && !dot_claude_path_is_sensitive(&resolved, dot_claude)
-                {
-                    continue;
-                }
-                return Some(format!(
-                    "File edit resolves into protected config/trust dir: {}",
-                    prot.display()
-                ));
-            }
-        }
-        // (a2) hardlink identity: a hardlink to a protected file shares its
-        // (device, inode) but carries no `.codex` path component and is not a
-        // symlink. Compare the resolved target's inode against the known host
-        // trust/config files when they exist. (TOCTOU between this check and the
-        // host's actual write remains an inherent limit of any pre-execution
-        // gate; see the best-effort caveat.)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(t) = std::fs::metadata(&resolved) {
-                let protected_files = [
-                    home.join(".codex").join("config.toml"),
-                    home.join(".claude").join("settings.json"),
-                    home.join(".cursor").join("mcp.json"),
-                    home.join(".cursor").join("hooks.json"),
-                ];
-                for pf in &protected_files {
-                    if let Ok(m) = std::fs::metadata(pf)
-                        && m.dev() == t.dev()
-                        && m.ino() == t.ino()
-                    {
-                        return Some(format!(
-                            "File edit targets a hardlink to protected file: {}",
-                            pf.display()
-                        ));
-                    }
-                }
-            }
-        }
-        // (b) component-name match (case-insensitive, any location): catches
-        // case variants (~/.CODEX), the not-yet-existing-dir literal fallback,
-        // and repo-local `.codex`/`.claude`/`.cursor`/`.clx` config dirs.
-        for comp in resolved.components() {
-            if let std::path::Component::Normal(name) = comp {
-                let lower = name.to_string_lossy().to_ascii_lowercase();
-                if lower == dot_claude {
-                    // Issue 4: NARROW dot-claude guard — only deny sensitive
-                    // targets; allow other dot-claude paths (memory files).
-                    if dot_claude_path_is_sensitive(&resolved, dot_claude) {
-                        return Some(format!(
-                            "File edit targets a protected config/trust dir component: {lower}"
-                        ));
-                    }
-                } else if matches!(lower.as_str(), ".codex" | ".cursor" | ".clx") {
-                    return Some(format!(
-                        "File edit targets a protected config/trust dir component: {lower}"
-                    ));
-                }
-            }
-        }
-        None
+        path_resolves_into_protected_dir(&resolved, home, "File edit")
     };
 
     candidates.iter().find_map(|c| check(c))
@@ -623,6 +658,67 @@ fn evaluate_fileedit_guard(config: &Config, host: &dyn Host, input: &HostNeutral
     );
     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
     Phase::Handled
+}
+
+/// FIX-4 canonical Bash-write guard (symlink/alias-resistant): deny any Bash
+/// command whose write destination resolves into a protected config/trust dir,
+/// regardless of how the destination string is written (`~/` alias, relative
+/// path, or a symlink/alias whose name does not literally contain `.clx` etc).
+///
+/// Runs BEFORE `evaluate_bash_l0` so it denies before the L0 whitelist could
+/// allow. It ADDS canonicalization on top of clx-core's
+/// `bash_writes_into_protected_dir` component backstop (which stays in place for
+/// the pure string-pattern case).
+///
+/// Uses the ORIGINAL `command_raw` (not the `resolve_command_paths` rewrite) so
+/// the extracted destinations match what the user actually typed.
+///
+/// Fail-closed posture mirrors the `FileEdit` guard: if `home_dir()` is `None`
+/// this is a no-op (returns [`Phase::Continue`]); the component backstop in
+/// clx-core still applies downstream.
+///
+/// Returns [`Phase::Handled`] once it emits a Deny decision (the caller must
+/// return); otherwise [`Phase::Continue`].
+fn evaluate_bash_write_dest_guard(
+    config: &Config,
+    host: &dyn Host,
+    input: &HostNeutralInput,
+    command_raw: &str,
+) -> Phase {
+    if !config.validator.enabled || !config.validator.layer0_enabled {
+        return Phase::Continue;
+    }
+    let Some(home) = dirs::home_dir() else {
+        // Fail-closed parity with the FileEdit guard: no home => this canonical
+        // overlay is skipped; the clx-core component backstop still applies.
+        return Phase::Continue;
+    };
+    let cwd_path = std::path::Path::new(&input.cwd);
+    let dests = clx_core::policy::bash_write_destinations(command_raw);
+    for dest in &dests {
+        let tok = dest.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let expanded = expand_candidate_path(tok, cwd_path, &home);
+        let resolved = canonicalize_best_effort(&expanded);
+        if let Some(reason) = path_resolves_into_protected_dir(&resolved, &home, "Bash write") {
+            debug!("Bash L0 (canonical write guard): denied: {}", reason);
+            log_audit_entry(
+                host.host_id(),
+                &input.session_id,
+                command_raw,
+                &input.cwd,
+                "L0",
+                AuditDecision::Blocked,
+                None,
+                Some(&reason),
+            );
+            output_decision_for(host, "deny", Some(reason), Some(RULES_REMINDER), None);
+            return Phase::Handled;
+        }
+    }
+    Phase::Continue
 }
 
 /// Trust mode: a valid (unexpired, session-matching) signed JSON `TrustToken` is
@@ -1351,6 +1447,16 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
         }
     }
 
+    // FIX-4 canonical Bash-write guard (runs FIRST, symlink/alias-resistant):
+    // deny any command whose write destination resolves into a protected
+    // config/trust dir, before L0 could whitelist it. Uses the ORIGINAL
+    // `command_raw` (not the resolve_command_paths rewrite) so the extracted
+    // destinations match the user's literal command.
+    match evaluate_bash_write_dest_guard(&config, host, &input, &command_raw) {
+        Phase::Handled => return Ok(()),
+        Phase::Continue => {}
+    }
+
     // Resolve symlinks in command paths for TOCTOU mitigation
     let resolved_command = resolve_command_paths(&command_raw);
     let command = resolved_command.as_str();
@@ -1584,6 +1690,97 @@ mod tests {
             fileedit_resolves_into_protected_dir(Some(&ti), cwd.to_str().unwrap(), home.path())
                 .is_none(),
             "ordinary project file edit must not be flagged"
+        );
+    }
+
+    // =========================================================================
+    // FIX-4: canonical Bash-write-destination guard (symlink/alias-resistant).
+    // Exercised through the shared `path_resolves_into_protected_dir` helper
+    // (ARCH-01 dedup) plus `bash_write_destinations` extraction. The hidden-dir
+    // tokens are built via `concat!` so the literal tokens never appear verbatim
+    // (in-session write-hook safe).
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_write_via_symlink_into_protected_dir_resolves_protected() {
+        // A symlink `link -> ~/.clx` whose NAME does not contain the protected
+        // token. A redirect target `link/config.yaml` must resolve through the
+        // symlink into the protected dir and be flagged by the shared helper.
+        let home = tempfile::tempdir().unwrap();
+        let clx_home = home.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&clx_home).unwrap();
+        let link = home.path().join("alias");
+        std::os::unix::fs::symlink(&clx_home, &link).unwrap();
+
+        let command_raw = format!("echo trust > {}/config.yaml", link.display());
+        let dests = clx_core::policy::bash_write_destinations(&command_raw);
+        let flagged = dests.iter().any(|d| {
+            let expanded =
+                expand_candidate_path(d.trim(), std::path::Path::new("/tmp"), home.path());
+            let resolved = canonicalize_best_effort(&expanded);
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some()
+        });
+        assert!(
+            flagged,
+            "redirect through a symlink into the protected dir must be flagged: {dests:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_cp_via_symlink_into_protected_dir_resolves_protected() {
+        // Same bypass via `cp src link/config.yaml` (cp destination extraction).
+        let home = tempfile::tempdir().unwrap();
+        let clx_home = home.path().join(concat!(".", "clx"));
+        std::fs::create_dir_all(&clx_home).unwrap();
+        let link = home.path().join("alias2");
+        std::os::unix::fs::symlink(&clx_home, &link).unwrap();
+
+        let command_raw = format!("cp /tmp/evil.yaml {}/config.yaml", link.display());
+        let dests = clx_core::policy::bash_write_destinations(&command_raw);
+        let flagged = dests.iter().any(|d| {
+            let expanded =
+                expand_candidate_path(d.trim(), std::path::Path::new("/tmp"), home.path());
+            let resolved = canonicalize_best_effort(&expanded);
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some()
+        });
+        assert!(
+            flagged,
+            "cp destination through a symlink into the protected dir must be flagged: {dests:?}"
+        );
+    }
+
+    #[test]
+    fn bash_write_to_tmp_is_not_flagged() {
+        // A write to an ordinary /tmp path must NOT be flagged.
+        let home = tempfile::tempdir().unwrap();
+        let command_raw = "echo hi > /tmp/x";
+        let dests = clx_core::policy::bash_write_destinations(command_raw);
+        let flagged = dests.iter().any(|d| {
+            let expanded =
+                expand_candidate_path(d.trim(), std::path::Path::new("/tmp"), home.path());
+            let resolved = canonicalize_best_effort(&expanded);
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some()
+        });
+        assert!(!flagged, "a write to /tmp/x must not be flagged: {dests:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolves_into_protected_dir_follows_symlink_directly() {
+        // Direct unit test of the shared helper: a path under a symlink that
+        // resolves into a protected dir must be flagged even if the literal
+        // string carries no protected token.
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let link = home.path().join("plain");
+        std::os::unix::fs::symlink(&codex, &link).unwrap();
+        let resolved = canonicalize_best_effort(&link.join("config.toml"));
+        assert!(
+            path_resolves_into_protected_dir(&resolved, home.path(), "Bash write").is_some(),
+            "symlinked path resolving into ~/.codex must be flagged by the shared helper"
         );
     }
 
