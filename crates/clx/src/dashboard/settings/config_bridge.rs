@@ -1074,6 +1074,7 @@ mod tests {
         }
     }
 
+    // Regression: trust-duration dashboard fields must enforce range AND default<=max cross-field validation (no silent persist of inconsistent durations).
     // --- trust-mode duration tests ---
 
     #[test]
