@@ -4,32 +4,44 @@
 
 use chrono::{DateTime, Utc};
 
-/// Sanitize a user query for FTS5 MATCH syntax
+/// Convert arbitrary/untrusted user text into a safe FTS5 `MATCH` expression.
 ///
-/// Strips FTS5 special characters and joins remaining terms with spaces
-/// (implicit AND). Returns an empty string if no valid terms remain.
+/// Each whitespace-separated token is wrapped in a double-quoted FTS5 *string*
+/// (embedded `"` doubled), so every FTS5 metacharacter inside it — `:` (the
+/// column-filter operator), `*`, `^`, `-`, `(`, `)`, `+`, and the operator
+/// words `AND`/`OR`/`NOT`/`NEAR` — is treated as a literal search term instead
+/// of query syntax. Tokens are combined with implicit AND. This never produces
+/// an FTS5 syntax error and, unlike stripping, preserves non-ASCII (CJK/Cyrillic/
+/// accented) terms so they still match what the `unicode61` tokenizer indexed.
+///
+/// Notes on robustness:
+/// - Control characters (including NUL) are removed from each token; an embedded
+///   NUL truncates the `SQLite` text and can still make FTS5 error.
+/// - Tokens with no alphanumeric content (pure punctuation) are skipped, so we
+///   never emit an empty `""` phrase (which itself makes FTS5 error).
+/// - The whole-query length and term-count caps bound work as a cheap `DoS` guard.
+///
+/// Returns an empty string when no searchable term remains; the caller
+/// (`search_snapshots_fts`) short-circuits on empty.
 pub(super) fn sanitize_fts_query(query: &str) -> String {
     const MAX_QUERY_LENGTH: usize = 1000;
     const MAX_TERMS: usize = 20;
-    const MIN_TERM_LENGTH: usize = 2;
-    const MAX_TERM_LENGTH: usize = 50;
-
-    // FTS5 reserved words that could be used as operators
-    const FTS5_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 
     let truncated: String = query.chars().take(MAX_QUERY_LENGTH).collect();
 
     truncated
         .split_whitespace()
-        .map(|word| {
-            word.chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .collect::<String>()
-        })
-        .filter(|w| {
-            w.len() >= MIN_TERM_LENGTH
-                && w.len() <= MAX_TERM_LENGTH
-                && !FTS5_OPERATORS.contains(&w.to_uppercase().as_str())
+        .filter_map(|token| {
+            // Drop control chars (incl. NUL) that can break SQLite text / FTS5.
+            let cleaned: String = token.chars().filter(|c| !c.is_control()).collect();
+            // Keep only tokens with tokenizable (Unicode-aware) content so pure
+            // punctuation does not become an empty `""` phrase.
+            if cleaned.chars().any(char::is_alphanumeric) {
+                // Wrap as an FTS5 literal string; escape embedded `"` by doubling.
+                Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
+            } else {
+                None
+            }
         })
         .take(MAX_TERMS)
         .collect::<Vec<_>>()

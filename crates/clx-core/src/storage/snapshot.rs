@@ -212,8 +212,10 @@ impl Storage {
     /// Returns matching snapshots paired with their relevance score (0.0-1.0),
     /// where higher scores indicate better matches.
     ///
-    /// The query is sanitized for FTS5 syntax: special characters are stripped
-    /// and terms are joined with spaces (implicit AND).
+    /// The query is sanitized for FTS5 syntax: each term is wrapped as a
+    /// double-quoted FTS5 literal (so colons, operators, and other
+    /// metacharacters are treated as text, never query syntax) and terms are
+    /// joined with spaces (implicit AND).
     pub fn search_snapshots_fts(
         &self,
         query: &str,
