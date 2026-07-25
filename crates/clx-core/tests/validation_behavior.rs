@@ -418,10 +418,26 @@ fn read_only_classification_examples() {
 // =========================================================================
 
 #[test]
-fn cache_key_is_full_string_cwd_and_command() {
-    // FIX-3: NUL separator (illegal in paths/commands) makes the key injective.
+fn cache_key_is_hashed_not_raw_command() {
+    // F1: the key is persisted to `validation_cache` and debug-logged, so it must
+    // NOT be the raw command (which can carry secrets). It is the SHA-256 of the
+    // NUL-separated (cwd, command) pre-image — hex, 64 chars, injective.
     let k = compute_cache_key("rm -rf /tmp/x", "/work/dir");
-    assert_eq!(k, "/work/dir\0rm -rf /tmp/x", "no hashing, no collisions");
+    assert_ne!(
+        k, "/work/dir\0rm -rf /tmp/x",
+        "key must be hashed, not the raw pair"
+    );
+    assert!(
+        !k.contains("rm -rf"),
+        "raw command must not appear in the persisted key"
+    );
+    assert_eq!(k.len(), 64);
+    assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
+    // Injective: the NUL pre-image keeps colliding-under-`:` pairs distinct.
+    assert_ne!(
+        compute_cache_key("b:c", "/a"),
+        compute_cache_key("c", "/a:b")
+    );
 }
 
 #[test]

@@ -39,7 +39,15 @@ const AZURE_HOST_REDACTED: &str = "***AZURE-HOST-REDACTED***";
 #[must_use]
 fn redact_azure_hosts(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let lower = text.to_lowercase();
+    // P1-3: use to_ascii_lowercase() here, not to_lowercase(). `lower`'s byte
+    // offsets are used below to index directly into the ORIGINAL `text`. A
+    // full Unicode `to_lowercase()` can change a character's UTF-8 byte
+    // length (e.g. U+0130 `İ` -> 3-byte `i̇`), desyncing `lower`'s offsets
+    // from `text`'s and either slicing mid-secret or panicking on a
+    // non-char-boundary split. `to_ascii_lowercase()` only touches ASCII
+    // A-Z (1 byte -> 1 byte), so offsets stay valid while the ASCII scheme
+    // literals (`https://`, `http://`) still match case-insensitively.
+    let lower = text.to_ascii_lowercase();
     let mut cursor = 0usize;
 
     // Pass 1: URL-bearing tokens (`https?://authority/...`).
@@ -225,8 +233,14 @@ pub fn redact_secrets(text: &str) -> String {
         "secret:",
     ];
     for keyword in &keywords {
-        let lower = redacted.to_lowercase();
-        let kw_lower = keyword.to_lowercase();
+        // P1-3: `to_ascii_lowercase()` — offsets found in `lower` are used
+        // below to index back into `redacted`. See the comment on the
+        // `redact_azure_hosts` lowering above for the desync/panic hazard
+        // that a full Unicode `to_lowercase()` would reintroduce here.
+        let lower = redacted.to_ascii_lowercase();
+        // Keywords are ASCII literals, so ASCII-only lowering is sufficient
+        // and keeps this consistent with `lower`.
+        let kw_lower = keyword.to_ascii_lowercase();
         let positions: Vec<usize> = {
             let mut pos = Vec::new();
             let mut search_from = 0;
@@ -262,7 +276,10 @@ pub fn redact_secrets(text: &str) -> String {
         // no-code-exec leak into logs/audit (Codex PURPLE NO-SHIP).
         let mut from = 0usize;
         loop {
-            let lower_search = redacted.to_lowercase();
+            // P1-3: `to_ascii_lowercase()` — `rel`/`after_kw` below index back
+            // into `redacted`; a full Unicode lowering could desync those
+            // offsets (see comment above `redact_azure_hosts`'s `lower`).
+            let lower_search = redacted.to_ascii_lowercase();
             let Some(rel) = lower_search.get(from..).and_then(|s| s.find(scheme)) else {
                 break;
             };
@@ -314,7 +331,9 @@ pub fn redact_secrets(text: &str) -> String {
         "secret",
         "authorization",
     ];
-    let lower = redacted.to_lowercase();
+    // P1-3: `to_ascii_lowercase()` — `abs`/`cursor` below index back into
+    // `redacted`; see the desync/panic hazard noted above `redact_azure_hosts`.
+    let lower = redacted.to_ascii_lowercase();
     let mut tolerant_replacements: Vec<(usize, usize)> = Vec::new();
     for kw in &tolerant_keywords {
         let mut search_from = 0;
@@ -1196,5 +1215,99 @@ mod tests {
         // The surrounding multi-byte arrows must be intact (valid UTF-8, no
         // mojibake), and the redaction sits between them.
         assert_eq!(out, "→ ***AZURE-HOST-REDACTED*** ←", "got: {out}");
+    }
+
+    // =========================================================================
+    // P1-3 regression tests — Unicode offset desync between the lowercased
+    // scratch copy and the original string being sliced.
+    //
+    // `to_lowercase()` performs full Unicode case folding, which can change a
+    // character's UTF-8 byte length (e.g. U+0130 `İ` LATIN CAPITAL LETTER I
+    // WITH DOT ABOVE lowercases to the 2-codepoint / 3-byte sequence `i̇`, and
+    // U+1E9E `ẞ` LATIN CAPITAL LETTER SHARP S lowercases to 2-byte `ß`). When
+    // byte offsets are found by searching a `to_lowercase()`'d copy but then
+    // used to slice the ORIGINAL string, a preceding length-changing char
+    // desyncs every offset after it — either leaking the secret's leading
+    // byte(s) into "redacted" output, or slicing on a non-char-boundary and
+    // panicking the fail-safe. The fix replaces those lowering calls with
+    // `to_ascii_lowercase()`, which only maps ASCII A-Z (always 1 byte -> 1
+    // byte), so offsets into the original string stay valid.
+    // =========================================================================
+
+    /// P1-3 regression: a length-growing Unicode char (`İ`, 2 bytes -> 3 bytes
+    /// under full lowercasing) immediately before a `keyword=value` match must
+    /// not desync the offsets used to redact the value in the ORIGINAL string.
+    #[test]
+    fn p1_3_redact_secrets_unicode_prefix_before_keyword_password() {
+        let input = "İpassword=SUPERSECRET123";
+        let redacted = redact_secrets(input);
+        assert!(
+            !redacted.contains("SUPERSECRET123"),
+            "P1-3 REGRESSION: Unicode-prefixed password value leaked: {redacted}"
+        );
+    }
+
+    /// P1-3 regression: `ẞ` (2 bytes -> 1 byte `ß` under full lowercasing, a
+    /// length-SHRINKING case) immediately before a `token:` match must not
+    /// desync offsets used to redact the value in the ORIGINAL string.
+    #[test]
+    fn p1_3_redact_secrets_unicode_prefix_before_token_colon() {
+        let input = "ẞtoken: SUPERSECRET456";
+        let redacted = redact_secrets(input);
+        assert!(
+            !redacted.contains("SUPERSECRET456"),
+            "P1-3 REGRESSION: Unicode-prefixed token value leaked: {redacted}"
+        );
+    }
+
+    /// P1-3 regression: a length-changing char sitting immediately before a
+    /// matched keyword's value, at a position that would previously produce a
+    /// non-char-boundary byte index into the original string, must not panic.
+    /// This exercises the tolerant (`2b`) and bearer (`3`) scan paths as well,
+    /// since `redact_secrets` runs all passes over the same string.
+    #[test]
+    fn p1_3_redact_secrets_unicode_prefix_does_not_panic() {
+        // `İ` (U+0130) folds to a 3-byte lowercase sequence; placed directly
+        // before several keyword/scheme forms to stress every offset-reuse
+        // site (keyword=, keyword:, tolerant "kw : value", Bearer/Basic).
+        let inputs = [
+            "İpassword=abc123def456",
+            "İtoken: abc123def456",
+            "İsecret = abc123def456",
+            "İAuthorization: Bearer abc123def456",
+            "ẞapi_key=abc123def456",
+            "ẞBasic\tabc123def456",
+        ];
+        for input in inputs {
+            // Must not panic (fail-safe would otherwise trip on a
+            // non-char-boundary `str` slice), and the secret value must be
+            // fully scrubbed, not partially leaked via a desynced offset.
+            let redacted = redact_secrets(input);
+            assert!(
+                !redacted.contains("abc123def456"),
+                "P1-3 REGRESSION: secret leaked for input {input:?}: {redacted}"
+            );
+        }
+    }
+
+    /// P1-3 non-regression: existing plain-ASCII vectors must still redact
+    /// exactly as before — the `to_ascii_lowercase()` fix must not change
+    /// behavior for inputs with no non-ASCII characters.
+    #[test]
+    fn p1_3_ascii_only_vectors_unaffected() {
+        let cases = [
+            ("password=hunter2", "hunter2"),
+            ("token: abc123longvalue", "abc123longvalue"),
+            ("Bearer eyJabcdefghij1234", "eyJabcdefghij1234"),
+            ("api_key = sk_test_abcdef1234", "sk_test_abcdef1234"),
+        ];
+        for (input, secret) in cases {
+            let redacted = redact_secrets(input);
+            assert!(
+                !redacted.contains(secret),
+                "P1-3: ASCII vector regressed for {input:?}: {redacted}"
+            );
+            assert!(redacted.contains("***REDACTED***"), "got: {redacted}");
+        }
     }
 }

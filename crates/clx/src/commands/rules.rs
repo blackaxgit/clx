@@ -6,7 +6,7 @@ use colored::Colorize;
 use std::env;
 use std::io::{self, Write};
 
-use clx_core::policy::{PolicyEngine, RuleSource};
+use clx_core::policy::{PolicyEngine, RuleSource, is_overbroad_allow_pattern};
 use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use clx_core::types::{LearnedRule, RuleType};
@@ -207,6 +207,23 @@ pub async fn cmd_rules(cli: &Cli, action: &RulesAction) -> Result<()> {
         }
 
         RulesAction::Allow { pattern, global } => {
+            // B3-2 (shared with the MCP `clx_rules` tool, see
+            // clx-mcp/src/tools/rules.rs): an overbroad allow pattern
+            // (`*`, `Bash(*)`, ...) must never be persisted from the CLI
+            // either, or a locally-run `clx rules allow` could whitelist
+            // every command. Fail closed before touching storage.
+            if is_overbroad_allow_pattern(pattern) {
+                // `main.rs::run_command`'s error handler prints this in the
+                // right shape for both `--json` and human-readable output;
+                // returning `Err` here (rather than printing here too) keeps
+                // that a single source of truth.
+                anyhow::bail!(
+                    "Refusing to add overbroad allow rule '{pattern}': it would \
+                     whitelist arbitrary commands. Use a specific pattern (e.g. \
+                     'Bash(git status)')."
+                );
+            }
+
             let storage = Storage::open_default().context("Failed to open database")?;
 
             let mut rule = LearnedRule::new(pattern.clone(), RuleType::Allow, "cli".to_string());
@@ -476,6 +493,22 @@ fn cmd_rules_import(cli: &Cli, file: &str) -> Result<()> {
             );
             continue;
         };
+
+        // B3-2 (shared with the MCP `clx_rules` tool and `rules allow`
+        // above): an imported envelope must not be able to smuggle in an
+        // overbroad allow rule (`*`, `Bash(*)`, ...) that would whitelist
+        // arbitrary commands. Skip it (not a hard `bail!`) so one bad entry
+        // in an otherwise-valid envelope doesn't block the rest of the
+        // import; it is counted as rejected like the other gates above.
+        if matches!(rule_type, RuleType::Allow) && is_overbroad_allow_pattern(&entry.pattern) {
+            rejected += 1;
+            tracing::warn!(
+                pattern = %redact_secrets(&entry.pattern),
+                "rejected rule on import (overbroad allow pattern)"
+            );
+            continue;
+        }
+
         let mut rule = LearnedRule::new(entry.pattern, rule_type, "import".to_owned());
         rule.project_path = entry.project_path;
         storage

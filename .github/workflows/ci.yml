@@ -4,9 +4,10 @@
 #   check    — Format + lint validation (fast gate, runs on ubuntu only)
 #   test     — Run full test suite (matrix: ubuntu + macos)
 #   build    — Compile release binaries (matrix: ubuntu + macos)
-#   coverage — Measure line coverage with cargo-llvm-cov; fails if < 70%
+#   coverage — Measure line coverage with cargo-llvm-cov; fails if < 88%
 #              Also verifies no unreviewed insta snapshots are present.
-#   audit    — Check dependencies for known vulnerabilities (ubuntu only)
+#   audit    — Curated supply-chain gate via cargo-deny (advisories + bans +
+#              licenses + sources, governed by deny.toml; ubuntu only)
 #
 # Caching: Swatinem/rust-cache caches ~/.cargo/registry, ~/.cargo/git,
 # and the target directory keyed on Cargo.lock + OS + toolchain.
@@ -79,8 +80,10 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
+      # --locked fails fast if Cargo.lock is stale (e.g. a dep bump not committed),
+      # surfacing lockfile drift in-PR rather than as a later mysterious red.
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # ---------------------------------------------------------------------------
   # build: compile release binaries to verify the workspace builds cleanly
@@ -107,12 +110,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
   # ---------------------------------------------------------------------------
   # coverage: measure line coverage with cargo-llvm-cov on macOS to match
   # the primary dev environment. Fails the build if line coverage drops
-  # below 80%. Also verifies that no unreviewed insta snapshots exist.
+  # below 88%. Also verifies that no unreviewed insta snapshots exist.
   #
   # Two cargo-llvm-cov invocations are used intentionally:
   #   1. Generate the LCOV report for artifact upload.
@@ -190,24 +193,31 @@ jobs:
   # Gates: cargo-audit (RustSec advisories), cargo-deny (policy/licenses/sources)
   # ---------------------------------------------------------------------------
   audit:
-    name: Audit dependencies
+    name: Supply-chain (cargo-deny)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-audit and cargo-deny
-        run: cargo install cargo-audit cargo-deny --quiet
-
-      - name: Run cargo audit (RustSec advisories)
-        run: cargo audit
-
-      - name: "Run cargo deny (policy, licenses, sources, bans)"
-        run: cargo deny check
+      # Single curated supply-chain gate — advisories + bans + licenses + sources,
+      # all governed by deny.toml (yanked = deny, vulnerabilities/unsound denied,
+      # triaged unmaintained crates enumerated under [advisories].ignore).
+      #
+      # This replaces the previous standalone `cargo audit` step: `cargo audit`
+      # does not read deny.toml, so it was an unconfigured duplicate of the same
+      # RustSec advisory check with divergent severity handling — pure noise, not
+      # a stronger second opinion. `cargo-deny` covers the same vulnerability
+      # surface plus policy checks. Using the official pre-built, pinned action
+      # also drops the slow `cargo install cargo-deny` compile.
+      #
+      # Advisories stay a per-PR blocking gate (a real vulnerability must not
+      # merge). A scheduled daily drift check lives in advisories.yml so newly
+      # published upstream advisories surface for triage between PRs too.
+      - name: cargo-deny (advisories, bans, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # The action defaults to an older Rust; pin to the workspace MSRV so
+          # it can read the edition-2024 / lockfile-v4 workspace metadata.
+          rust-version: "1.85"

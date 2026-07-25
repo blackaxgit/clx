@@ -320,30 +320,30 @@ fn remember_success_reports_numeric_snapshot_id() {
 
 /// `clx_checkpoint` with a valid session present creates a snapshot and
 /// returns a success envelope echoing the new id. We seed `CLX_SESSION_ID`
-/// AND a matching session row first, because `create_snapshot` has a FOREIGN
-/// KEY on the session: a checkpoint against a non-existent session is a real
-/// failure (see `checkpoint_without_session_row_is_internal_error`).
+/// AND a matching session row here; the no-session-row path is covered by
+/// `checkpoint_without_session_row_auto_creates_and_succeeds`.
 ///
-/// GENUINE BEHAVIORAL FINDING: with no session row, `clx_checkpoint` falls
-/// back to `SessionId::new("default")`, whose row does not exist, so the DB
-/// rejects the insert with a FOREIGN KEY constraint and the tool returns
-/// INTERNAL_ERROR (-32603). That is asserted as the contract below rather
-/// than treated as success.
+/// P1-5 fix: `clx_checkpoint` now ensures-or-creates its session before the
+/// snapshot insert (mirroring `clx_remember`), so a missing session row is no
+/// longer a FOREIGN KEY failure — it is auto-created. See the dedicated test
+/// below.
 #[test]
-fn checkpoint_without_session_row_is_internal_error() {
+fn checkpoint_without_session_row_auto_creates_and_succeeds() {
     let home = HermeticHome::new();
-    // Fresh :memory: DB, no session seeded -> "default" session has no row.
+    // Fresh :memory: DB, no session seeded and no CLX_SESSION_ID. Before the
+    // P1-5 fix this hit the sessions->snapshots FK and returned INTERNAL_ERROR
+    // (-32603); now the tool ensure-creates the standalone session first and
+    // the checkpoint succeeds. This is the exact standard-install path (Claude
+    // Code's MCP registration never sets CLX_SESSION_ID).
     let v = call_once(&home, "clx_checkpoint", serde_json::json!({}));
-    assert_eq!(
-        v["error"]["code"], -32603,
-        "checkpoint without a session row must be INTERNAL_ERROR: {v}"
-    );
     assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Failed to create checkpoint"),
-        "checkpoint failure must surface an actionable message: {v}"
+        v.get("error").is_none(),
+        "checkpoint must no longer FK-fail on a missing session row: {v}"
+    );
+    let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("Checkpoint created"),
+        "checkpoint must return a success envelope with the new id: {v}"
     );
 }
 

@@ -8,6 +8,7 @@ use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
     is_read_only_command,
 };
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use clx_core::types::{AuditDecision, DecisionOrigin, LearningKind};
 use std::time::Instant;
@@ -832,7 +833,9 @@ fn try_trust_mode(
             );
             debug!(
                 "Trust mode: auto-allowing [{}] command '{}' ({})",
-                tool_name, command_raw, reason
+                tool_name,
+                redact_secrets(command_raw),
+                reason
             );
             log_audit_entry(
                 host.host_id(),
@@ -902,7 +905,7 @@ fn evaluate_bash_l0(
 
         match l0_decision {
             PolicyDecision::Allow => {
-                debug!("L0: Allowed command '{}'", command);
+                debug!("L0: Allowed command '{}'", redact_secrets(command));
                 log_audit_entry(
                     host.host_id(),
                     &input.session_id,
@@ -931,7 +934,11 @@ fn evaluate_bash_l0(
                 Phase::Handled
             }
             PolicyDecision::Deny { reason } => {
-                debug!("L0: Denied command '{}': {}", command, reason);
+                debug!(
+                    "L0: Denied command '{}': {}",
+                    redact_secrets(command),
+                    reason
+                );
                 log_audit_entry(
                     host.host_id(),
                     &input.session_id,
@@ -963,7 +970,10 @@ fn evaluate_bash_l0(
                 // For read-only commands: auto-allow without confirmation dialog
                 // (L0 didn't explicitly block it, so it's safe)
                 if is_read_only {
-                    debug!("L0: Unknown read-only command '{}', auto-allowing", command);
+                    debug!(
+                        "L0: Unknown read-only command '{}', auto-allowing",
+                        redact_secrets(command)
+                    );
                     log_audit_entry(
                         host.host_id(),
                         &input.session_id,
@@ -991,7 +1001,10 @@ fn evaluate_bash_l0(
                     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                     return Phase::Handled;
                 }
-                debug!("L0: Unknown command '{}', checking L1", command);
+                debug!(
+                    "L0: Unknown command '{}', checking L1",
+                    redact_secrets(command)
+                );
                 // Continue to Layer 1
                 Phase::Continue
             }
@@ -1090,7 +1103,7 @@ async fn escalate_l1(
             }
 
             if let Ok(Some(cached)) = storage.get_cached_decision(&cache_key) {
-                debug!("L1-CACHE hit for command: {}", command);
+                debug!("L1-CACHE hit for command: {}", redact_secrets(command));
                 let audit_decision = audit_decision_from_str(&cached.decision);
                 log_audit_entry(
                     host.host_id(),
@@ -1462,7 +1475,7 @@ async fn escalate_l1(
 
     match l1_decision {
         PolicyDecision::Allow => {
-            debug!("L1: Allowed command '{}'", command);
+            debug!("L1: Allowed command '{}'", redact_secrets(command));
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -1503,7 +1516,11 @@ async fn escalate_l1(
             }
         }
         PolicyDecision::Deny { reason } => {
-            debug!("L1: Denied command '{}': {}", command, reason);
+            debug!(
+                "L1: Denied command '{}': {}",
+                redact_secrets(command),
+                reason
+            );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -1558,7 +1575,11 @@ async fn escalate_l1(
             // `is_read_only` is provably always false; the former
             // `if is_read_only { L1-READ auto-allow }` branch was dead code
             // (unreachable for any HookInput) and has been removed.
-            debug!("L1: Ask for command '{}': {}", command, reason);
+            debug!(
+                "L1: Ask for command '{}': {}",
+                redact_secrets(command),
+                reason
+            );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -1573,10 +1594,13 @@ async fn escalate_l1(
             if config.validator.cache_enabled {
                 let cache_key = compute_cache_key(command, &input.cwd);
                 if let Ok(storage) = Storage::open_default() {
+                    // Redact before persisting: the LLM reason can echo the raw
+                    // command (and thus a secret) into validation_cache on disk.
+                    let cache_reason = redact_secrets(&reason);
                     let _ = storage.cache_decision(
                         &cache_key,
                         "ask",
-                        Some(&reason),
+                        Some(&cache_reason),
                         Some(5),
                         config.validator.cache_ask_ttl_secs as i64,
                     );
@@ -1661,7 +1685,31 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     } else if tool_name.starts_with("mcp__") && config.mcp_tools.enabled {
         // MCP tool: check if it carries an executable command
         let tool_input = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
-        match extract_mcp_command(tool_name, &tool_input, &config.mcp_tools.command_tools) {
+        let extraction =
+            extract_mcp_command(tool_name, &tool_input, &config.mcp_tools.command_tools);
+        // P2-2 (fail-closed): a command-bearing MCP tool that arrives with a
+        // missing/empty `command` field is anomalous. It must NOT fall through to
+        // the generic empty-command auto-allow below (a fail-OPEN). Surface it to
+        // the user (Ask) instead of silently allowing it.
+        if extraction.is_missing_command() {
+            capture(
+                &config,
+                host,
+                &input,
+                tool_name,
+                "ask",
+                "l0",
+                LearningKind::Decision,
+                DecisionOrigin::MissingCommand,
+                None,
+                "MCP command tool with missing/empty command (fail-closed)",
+                None,
+                started,
+            );
+            output_decision_for(host, "ask", None, Some(RULES_REMINDER), None);
+            return Ok(());
+        }
+        match extraction {
             McpExtraction::Command(cmd) => cmd,
             McpExtraction::NotCommandTool => {
                 // Not a command-bearing MCP tool — use configured default decision

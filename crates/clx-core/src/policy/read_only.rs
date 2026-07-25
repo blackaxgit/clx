@@ -93,10 +93,35 @@ fn contains_dangerous_metachar(command: &str) -> bool {
     false
 }
 
-/// True if `token` is, starts with, or ends with a redirection operator —
-/// including arbitrary file descriptors (`3>`, `4>>`) and `&>`/`&>>`. Strips an
-/// optional leading fd number or `&` before checking for a leading `>`/`<`, so
-/// `3>/tmp/o` is caught as a write target (fail-closed).
+/// True if `token` is, starts with, ends with, or has GLUED into its middle a
+/// redirection operator — including arbitrary file descriptors (`3>`, `4>>`)
+/// and `&>`/`&>>`. Strips an optional leading fd number or `&` before checking
+/// for a leading `>`/`<`, so `3>/tmp/o` is caught as a write target
+/// (fail-closed).
+///
+/// # P1-2 — glued-redirection anywhere in the token
+///
+/// `split_segments_quote_aware` deliberately does not split on `>`/`<` (see its
+/// doc comment), so a command like `grep x file>~/.clx/config.yaml` survives
+/// segmentation as a single segment. `shlex::split` then does not split on
+/// `>`/`<` either (only whitespace and quotes are word boundaries to `shlex`),
+/// so the whole `file>~/.clx/config.yaml` becomes ONE token with the operator
+/// glued into its middle. The original start/end-only check missed this
+/// shape entirely, so the segment was classified read-only and auto-allowed —
+/// a silent write into a protected dir. Any `>`/`<` remaining anywhere in the
+/// token is therefore also treated as a redirection operator.
+///
+/// This intentionally does NOT try to exempt a `>`/`<` that was inside shell
+/// quotes in the ORIGINAL command (e.g. `grep 'a>b' f`): by the time this
+/// function runs, `shlex::split` has already resolved and stripped that
+/// quoting — the token `a>b` is byte-for-byte identical whether it came from
+/// `'a>b'` (quoted, safe) or the glued-unquoted `a>b` (a real redirect in
+/// bash), and that distinction is not recoverable from the token alone.
+/// Re-deriving it heuristically by treating a residual `'`/`"` byte in the
+/// token as a delimiter is unsound: an escaped quote character (e.g. `\"`) is
+/// legitimate token DATA, not a delimiter, and treating it as one would let a
+/// real operator hide behind it (fail-OPEN). So any `>`/`<` in the token is
+/// conservatively flagged, full stop — fail-closed over convenience.
 pub(crate) fn is_redirection_token(token: &str) -> bool {
     let mut rest = token.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
     // Bash named file descriptor: `{varname}>file`.
@@ -105,7 +130,11 @@ pub(crate) fn is_redirection_token(token: &str) -> bool {
     {
         rest = &rest[close + 1..];
     }
-    rest.starts_with('>') || rest.starts_with('<') || token.ends_with('>') || token.ends_with('<')
+    let at_edge = rest.starts_with('>')
+        || rest.starts_with('<')
+        || token.ends_with('>')
+        || token.ends_with('<');
+    at_edge || token.contains('>') || token.contains('<')
 }
 
 /// Quote-aware split of a raw command into segments on unquoted control

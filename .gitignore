@@ -33,12 +33,15 @@ Thumbs.db
 
 # Internal docs / research / notes
 /docs/
+/wiki/
 /todo/
 SPEC.md
 
 # Personal orchestration (not part of CLX)
 /claude/
 /.claude/
+/codex/
+/.codex/
 *.cdx.xml
 clx-sbom.xml
 /*.cdx.xml

@@ -194,9 +194,16 @@ pub fn write_codex_hooks(home: &Path) -> Result<bool> {
 /// all other keys. Returns `true` if the file was created or changed.
 ///
 /// Shape (plan §3): `command = "~/.clx/bin/clx-mcp"`, plus an `env` table
-/// carrying `CLX_INSTRUCTIONS_FILE` (the AGENTS.md path) and a `CLX_SESSION_ID`
-/// placeholder (Codex provides the session id in the hook envelope, but the
-/// MCP server reads it from the environment when present).
+/// carrying `CLX_INSTRUCTIONS_FILE` (the AGENTS.md path). `CLX_SESSION_ID` is
+/// deliberately NOT written here: no real session id is available at install
+/// time (Codex only provides one later, in the hook envelope), and writing an
+/// empty string is worse than omitting the key. `clx-mcp` reads
+/// `CLX_SESSION_ID` from the process environment (see
+/// `crates/clx-mcp/src/server.rs`) via `env::var(..).ok()`, which already
+/// treats "unset" as "no session id" (`None`); an empty-string value would
+/// instead flow into `SessionId::from("")`, producing an empty session id
+/// that fails downstream foreign-key lookups (P1-5). Omitting the key lets
+/// Codex/the environment populate it later with a real value if one exists.
 pub fn write_codex_mcp(home: &Path) -> Result<bool> {
     let path = config_toml_path(home);
     if let Some(parent) = path.parent() {
@@ -222,10 +229,9 @@ pub fn write_codex_mcp(home: &Path) -> Result<bool> {
         "CLX_INSTRUCTIONS_FILE".to_string(),
         toml::Value::String(agents_md.display().to_string()),
     );
-    env_table.insert(
-        "CLX_SESSION_ID".to_string(),
-        toml::Value::String(String::new()),
-    );
+    // Do NOT insert CLX_SESSION_ID here: see the doc comment above (P1-5).
+    // An empty value is strictly worse than an absent one for downstream
+    // session-id resolution, so the key is omitted rather than set to "".
     clx_table.insert("env".to_string(), toml::Value::Table(env_table));
 
     let table = doc
@@ -427,6 +433,41 @@ mod tests {
 
         // Idempotent.
         assert!(!write_codex_mcp(home).unwrap());
+    }
+
+    /// P1-5: the generated `[mcp_servers.clx]` block must never carry an
+    /// empty `CLX_SESSION_ID`. `clx-mcp` resolves the session id via
+    /// `env::var("CLX_SESSION_ID").ok()`, which treats an unset var as
+    /// `None`; an empty string instead becomes an empty `SessionId`, causing
+    /// FK failures downstream. The key must be entirely absent, not merely
+    /// empty.
+    #[test]
+    fn write_mcp_never_emits_empty_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        write_codex_mcp(home).unwrap();
+        let raw = fs::read_to_string(config_toml_path(home)).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+
+        let env = &doc["mcp_servers"]["clx"]["env"];
+        // Key must be entirely absent, not present-and-empty.
+        assert!(
+            env.get("CLX_SESSION_ID").is_none(),
+            "CLX_SESSION_ID must be omitted, not set (even to \"\"); got: {env:?}"
+        );
+        // Serialized TOML must not contain the key at all.
+        assert!(
+            !raw.contains("CLX_SESSION_ID"),
+            "serialized config.toml must not mention CLX_SESSION_ID; got:\n{raw}"
+        );
+        // The instructions file env var is still present and correct.
+        assert!(
+            env["CLX_INSTRUCTIONS_FILE"]
+                .as_str()
+                .unwrap()
+                .ends_with("AGENTS.md")
+        );
     }
 
     #[test]

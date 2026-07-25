@@ -120,7 +120,7 @@ fn age_backend_blob_is_ciphertext_not_plaintext() {
     assert!(
         hay.starts_with("age-encryption.org/v1"),
         "blob must be a real age v1 file, got header: {:?}",
-        &hay.chars().take(40).collect::<String>()
+        hay.chars().take(40).collect::<String>()
     );
     // The keyfile must NOT contain the secret either.
     let keyfile = std::fs::read_to_string(tmp.path().join("cred.key")).unwrap();

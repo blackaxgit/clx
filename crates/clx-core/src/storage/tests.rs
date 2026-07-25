@@ -1019,7 +1019,7 @@ fn test_search_snapshots_fts_empty_query() {
 }
 
 #[test]
-fn test_search_snapshots_fts_special_chars_sanitized() {
+fn test_search_snapshots_fts_special_chars_are_literal_not_syntax() {
     let storage = create_test_storage();
 
     let session = Session::new(SessionId::new("fts-special"), "/project".to_string());
@@ -1029,23 +1029,25 @@ fn test_search_snapshots_fts_special_chars_sanitized() {
     snapshot.summary = Some("Testing error handling in production".to_string());
     storage.create_snapshot(&snapshot).unwrap();
 
-    // Query with special FTS5 characters should not cause errors
-    // After sanitization, "error AND handling" becomes "error handling"
-    // ("AND" is blocked as FTS5 operator, special chars stripped)
+    // FTS5 metacharacters are quoted as literals, never parsed as syntax:
+    // "error:" and "handling*" tokenize to the literal terms error / handling
+    // (the colon and star are neutralized), so real content still matches and
+    // the query never raises an FTS5 error.
     let results = storage
-        .search_snapshots_fts("error AND handling", 10)
+        .search_snapshots_fts("error: handling*", 10)
         .unwrap();
-    // Should find results based on sanitized terms (error, handling are both in the snapshot)
     assert!(
         !results.is_empty(),
-        "Should find results even with special chars in query"
+        "quoted literals should still match the indexed content"
     );
 
-    // Verify query with only operators returns empty
-    let empty_results = storage.search_snapshots_fts("AND OR NOT NEAR", 10).unwrap();
+    // A query whose literal terms are absent returns a clean empty (not an error).
+    let empty = storage
+        .search_snapshots_fts("kubernetes: (deploy)", 10)
+        .unwrap();
     assert!(
-        empty_results.is_empty(),
-        "Query with only operators should return no results"
+        empty.is_empty(),
+        "absent literal terms should return no results, not an error"
     );
 }
 
@@ -1112,55 +1114,68 @@ fn test_fts_backfill_existing_snapshots() {
 
 #[test]
 fn test_sanitize_fts_query() {
-    assert_eq!(sanitize_fts_query("hello world"), "hello world");
-    assert_eq!(sanitize_fts_query("hello  world"), "hello world");
+    // Each token is wrapped as a double-quoted FTS5 literal; implicit AND.
+    assert_eq!(sanitize_fts_query("hello world"), "\"hello\" \"world\"");
+    assert_eq!(sanitize_fts_query("hello  world"), "\"hello\" \"world\"");
     assert_eq!(sanitize_fts_query("  "), "");
-    assert_eq!(sanitize_fts_query("hello_world"), "hello_world");
-    assert_eq!(sanitize_fts_query("my-component"), "my-component");
+    assert_eq!(sanitize_fts_query("hello_world"), "\"hello_world\"");
+    assert_eq!(sanitize_fts_query("my-component"), "\"my-component\"");
 }
 
 // =========================================================================
-// C3: FTS5 SQL Injection Tests
+// C3: FTS5 query-escaping tests (issue #38: quote, don't strip)
 // =========================================================================
 
 #[test]
-fn test_sanitize_fts_query_strips_unicode() {
-    // Unicode characters should be stripped (only ASCII allowed)
-    assert_eq!(sanitize_fts_query("hello \u{4e16}\u{754c}"), "hello");
-    assert_eq!(sanitize_fts_query("caf\u{e9}"), "caf");
+fn test_sanitize_fts_query_preserves_unicode() {
+    // Non-ASCII terms are preserved (quoted) so they can match what the
+    // unicode61 tokenizer indexed — the issue #38 recall-loss fix.
+    assert_eq!(
+        sanitize_fts_query("hello \u{4e16}\u{754c}"),
+        "\"hello\" \"\u{4e16}\u{754c}\""
+    );
+    assert_eq!(sanitize_fts_query("caf\u{e9}"), "\"caf\u{e9}\"");
     assert_eq!(
         sanitize_fts_query("\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{43c}\u{438}\u{440}"),
-        ""
+        "\"\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}\" \"\u{43c}\u{438}\u{440}\""
     );
 }
 
 #[test]
-fn test_sanitize_fts_query_blocks_fts5_operators() {
-    // FTS5 operators should be blocked
-    assert_eq!(sanitize_fts_query("AND"), "");
-    assert_eq!(sanitize_fts_query("OR"), "");
-    assert_eq!(sanitize_fts_query("NOT"), "");
-    assert_eq!(sanitize_fts_query("NEAR"), "");
-    assert_eq!(sanitize_fts_query("and or not"), ""); // lowercase also blocked
-    assert_eq!(sanitize_fts_query("AnD oR nOt"), ""); // mixed case also blocked
-    assert_eq!(sanitize_fts_query("hello AND world"), "hello world");
+fn test_sanitize_fts_query_quotes_fts5_operators_as_literals() {
+    // Operator words are no longer dropped; a quoted string is never parsed as
+    // an operator, so they become harmless literal terms.
+    assert_eq!(sanitize_fts_query("AND"), "\"AND\"");
+    assert_eq!(sanitize_fts_query("OR"), "\"OR\"");
+    assert_eq!(sanitize_fts_query("NOT"), "\"NOT\"");
+    assert_eq!(sanitize_fts_query("NEAR"), "\"NEAR\"");
+    assert_eq!(
+        sanitize_fts_query("hello AND world"),
+        "\"hello\" \"AND\" \"world\""
+    );
 }
 
 #[test]
-fn test_sanitize_fts_query_enforces_length_limits() {
-    // Query length limit (1000 chars)
+fn test_sanitize_fts_query_escapes_quotes_and_drops_control_chars() {
+    // Embedded double-quotes are doubled (the only FTS5 string escape).
+    assert_eq!(sanitize_fts_query("foo\"bar"), "\"foo\"\"bar\"");
+    // Control chars (incl. NUL) are removed from within a token.
+    assert_eq!(sanitize_fts_query("a\u{0}b"), "\"ab\"");
+    // A token that is only control chars is dropped entirely.
+    assert_eq!(sanitize_fts_query("\u{0}\u{7}"), "");
+}
+
+#[test]
+fn test_sanitize_fts_query_enforces_limits() {
+    // Whole-query length cap (1000 chars): a single 1500-char token is
+    // truncated to 1000 chars and quoted (still one term).
     let long_query = "a".repeat(1500);
-    let result = sanitize_fts_query(&long_query);
-    // Each 'a' is a single char term but under MIN_TERM_LENGTH, so should be empty
-    assert_eq!(result, "");
+    assert_eq!(
+        sanitize_fts_query(&long_query),
+        format!("\"{}\"", "a".repeat(1000))
+    );
 
-    // Term length limits (min 2, max 50)
-    assert_eq!(sanitize_fts_query("a"), ""); // too short
-    assert_eq!(sanitize_fts_query("ab"), "ab"); // exactly min
-    let long_term = "a".repeat(60);
-    assert_eq!(sanitize_fts_query(&long_term), ""); // too long
-
-    // Max terms (20)
+    // Max terms (20).
     let many_terms = (0..25)
         .map(|i| format!("term{i}"))
         .collect::<Vec<_>>()
@@ -1171,22 +1186,23 @@ fn test_sanitize_fts_query_enforces_length_limits() {
 }
 
 #[test]
-fn test_sanitize_fts_query_filters_single_char_terms() {
-    // Single character terms should be filtered out (MIN_TERM_LENGTH = 2)
-    assert_eq!(sanitize_fts_query("a b c"), "");
+fn test_sanitize_fts_query_keeps_single_char_terms() {
+    // Single-char terms are now preserved (quoted) — recovers recall for
+    // single-character CJK words and short tokens.
+    assert_eq!(sanitize_fts_query("a b c"), "\"a\" \"b\" \"c\"");
     assert_eq!(
-        sanitize_fts_query("hello a world b test"),
-        "hello world test"
+        sanitize_fts_query("hello a world"),
+        "\"hello\" \"a\" \"world\""
     );
 }
 
 #[test]
-fn test_sanitize_fts_query_empty_after_sanitization() {
-    // Queries that become empty after sanitization
+fn test_sanitize_fts_query_empty_when_no_searchable_content() {
+    // Queries with no tokenizable content collapse to empty (caller skips).
     assert_eq!(sanitize_fts_query(""), "");
     assert_eq!(sanitize_fts_query("   "), "");
     assert_eq!(sanitize_fts_query("!@#$%^&*()"), "");
-    assert_eq!(sanitize_fts_query("AND OR NOT"), "");
+    assert_eq!(sanitize_fts_query(":: -- (( ))"), "");
 }
 
 // =========================================================================
@@ -1210,27 +1226,19 @@ mod prop_tests {
         }
     }
 
-    // Strings containing SQLite FTS5 special characters must not cause
-    // a storage query to panic or return an error when used in a real
-    // in-memory FTS5 search.
+    // The real contract (issue #38): a RAW, unsanitised query fed straight into
+    // the production FTS path must NEVER produce an FTS5 error — the quoting
+    // sanitizer makes every metacharacter a literal.
     proptest! {
         #[test]
-        fn prop_fts_query_no_sql_injection(
-            // Bias towards characters that are meaningful to FTS5 / SQL
+        fn prop_raw_query_never_errors_fts5(
+            // Bias towards characters that are meaningful to FTS5 / SQL.
             query in r#"[a-zA-Z0-9 "*()\-_\[\]:^~?!@#$%&/\\|<>{}]{0,120}"#,
         ) {
-            // Arrange
             let storage = Storage::open_in_memory().expect("in-memory storage");
-            // Act: sanitise then execute a real FTS5 search — must not panic
-            let sanitised = sanitize_fts_query(&query);
-            if !sanitised.is_empty() {
-                // search_snapshots performs an FTS5 MATCH query; verify it does
-                // not panic or return a storage-level error from malformed SQL.
-                let result = storage.search_snapshots_fts(&sanitised, 10);
-                // Either Ok (empty results) or an Err (FTS parse error) are both
-                // acceptable — what must NOT happen is a panic or memory unsafety.
-                let _ = result;
-            }
+            // Feed the RAW query (search_snapshots_fts sanitises internally).
+            let result = storage.search_snapshots_fts(&query, 10);
+            prop_assert!(result.is_ok(), "raw query errored: {result:?}");
         }
     }
 }
@@ -2261,9 +2269,13 @@ mod learning_events {
     use crate::types::{LearningEvent, LearningKind};
 
     /// Build a minimal learning event with overridable fields.
+    ///
+    /// The timestamp is `now` (not a hardcoded date) so the event is always
+    /// inside the 30-day retention window and is not TTL-pruned on insert.
+    /// Tests that exercise retention override `.ts` explicitly.
     fn ev(decision: &str, diverged: bool) -> LearningEvent {
         LearningEvent {
-            ts: "2026-06-09T00:00:00Z".to_string(),
+            ts: chrono::Utc::now().to_rfc3339(),
             session_id: Some("s1".to_string()),
             tool: "Bash".to_string(),
             host: "claude".to_string(),

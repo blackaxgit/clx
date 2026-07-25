@@ -1392,6 +1392,125 @@ fn test_remember_auto_creates_missing_bound_session() {
     assert_eq!(snapshots.len(), 1, "exactly one snapshot persisted");
 }
 
+// =========================================================================
+// tool_checkpoint — P1-5: FK-safe on a standard install (checkpoint.rs)
+// =========================================================================
+
+/// P1-5 regression: `clx_checkpoint` on a fresh in-memory DB with NO
+/// pre-created session and no bound `session_id` (the real shape of a
+/// standard Claude Code MCP registration, which never sets
+/// `CLX_SESSION_ID`) must succeed instead of tripping the
+/// `sessions -> snapshots` foreign key. Unlike `test_tool_checkpoint` above
+/// (which pre-creates "test-session"), this test deliberately exercises the
+/// path with no session row present anywhere, mirroring
+/// `test_remember_standalone_uses_clx_standalone_session`.
+#[test]
+fn test_checkpoint_standalone_creates_session_and_succeeds() {
+    let server = create_standalone_server(); // session_id: None, no pre-created session
+
+    let result = server.tool_checkpoint(&json!({"note": "fresh install checkpoint"}));
+    assert!(
+        result.is_ok(),
+        "checkpoint must succeed with no bound session id and no pre-created session: {:?}",
+        result.err()
+    );
+
+    let value = result.unwrap();
+    let content = value.get("content").unwrap().as_array().unwrap();
+    let text = content[0].get("text").unwrap().as_str().unwrap();
+    assert!(text.contains("Checkpoint created"));
+
+    // The fallback session must now exist and own the snapshot.
+    let session = server
+        .storage
+        .get_session("clx-standalone")
+        .expect("get_session ok")
+        .expect("standalone session must be auto-created by tool_checkpoint");
+    assert_eq!(session.id.as_str(), "clx-standalone");
+
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("clx-standalone")
+        .expect("snapshots query ok");
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "checkpoint snapshot must be retrievable under the auto-created session"
+    );
+}
+
+/// P1-5 regression: when a `session_id` IS bound (e.g. a future host sets
+/// `CLX_SESSION_ID`) but that session row was never created, `tool_checkpoint`
+/// must auto-create it before inserting the snapshot rather than failing on
+/// the FK — the same guard `tool_remember` already has.
+#[test]
+fn test_checkpoint_auto_creates_missing_bound_session() {
+    let server = create_test_server(); // session_id = Some("test-session")
+    assert!(
+        server
+            .storage
+            .get_session("test-session")
+            .unwrap()
+            .is_none(),
+        "precondition: session row absent"
+    );
+
+    let result = server.tool_checkpoint(&json!({"note": "auto-create the session"}));
+    assert!(
+        result.is_ok(),
+        "checkpoint must auto-create the missing session, not fail on the FK: {:?}",
+        result.err()
+    );
+
+    assert!(
+        server
+            .storage
+            .get_session("test-session")
+            .unwrap()
+            .is_some(),
+        "missing session must be auto-created by tool_checkpoint"
+    );
+    let snapshots = server
+        .storage
+        .get_snapshots_by_session("test-session")
+        .unwrap();
+    assert_eq!(snapshots.len(), 1, "exactly one snapshot persisted");
+}
+
+// =========================================================================
+// McpServer::session_id_from_env — P1-5: empty CLX_SESSION_ID is absent
+// =========================================================================
+
+/// Some installers set `CLX_SESSION_ID=""` rather than leaving it unset.
+/// That must be treated identically to an unset variable (`None`), not as
+/// `Some(SessionId::new(""))` — otherwise `tool_checkpoint`/`tool_remember`
+/// would try to use the empty id directly instead of falling back to the
+/// auto-created `clx-standalone` session.
+#[test]
+fn test_session_id_from_env_empty_string_is_absent() {
+    assert!(McpServer::session_id_from_env(Some(String::new())).is_none());
+}
+
+/// Whitespace-only values are equally not a usable session id.
+#[test]
+fn test_session_id_from_env_whitespace_only_is_absent() {
+    assert!(McpServer::session_id_from_env(Some("   ".to_string())).is_none());
+}
+
+/// A genuinely unset variable stays absent.
+#[test]
+fn test_session_id_from_env_none_is_absent() {
+    assert!(McpServer::session_id_from_env(None).is_none());
+}
+
+/// A real value is passed through as the bound session id.
+#[test]
+fn test_session_id_from_env_valid_value_is_bound() {
+    let session_id = McpServer::session_id_from_env(Some("real-session".to_string()))
+        .expect("non-empty value must produce a bound session id");
+    assert_eq!(session_id.as_str(), "real-session");
+}
+
 /// Branch: the snapshot summary embeds the tags suffix when tags are present
 /// and omits it when empty (`remember.rs` lines 48-57). Kills a mutant that
 /// always emits the tag suffix or drops it. The `key_facts` must always be the
@@ -2373,6 +2492,33 @@ mod failure_and_embedding_path_tests {
             err.1.contains("Failed to store credential"),
             "got: {}",
             err.1
+        );
+    }
+
+    // F2: the text handed to the embedder must be redacted, so a secret in a
+    // remembered note / checkpoint never reaches the vector store even though the
+    // snapshot summary is redacted separately at its INSERT sink.
+    #[test]
+    fn embedding_input_text_redacts_secrets() {
+        let out = McpServer::embedding_input_text(
+            "deploy notes password=hunter2secret and export API_TOKEN=sk-abcdefghijklmnop",
+        );
+        assert!(
+            out.contains("***REDACTED***"),
+            "expected redaction marker: {out}"
+        );
+        assert!(
+            !out.contains("hunter2secret"),
+            "password value leaked: {out}"
+        );
+        assert!(
+            !out.contains("sk-abcdefghijklmnop"),
+            "token value leaked: {out}"
+        );
+        // Non-secret text is preserved so recall quality is unaffected.
+        assert!(
+            out.contains("deploy notes"),
+            "benign text must survive: {out}"
         );
     }
 }

@@ -98,7 +98,8 @@ pub enum HookExit {
     Ok,
     /// Input exceeded `MAX_INPUT_SIZE`; a block decision was emitted.
     InputTooLarge,
-    /// Stdin could not be read at all; an allow fallback was emitted.
+    /// Stdin could not be read at all; a block decision was emitted
+    /// (fail-closed — see P1-1).
     ReadError,
     /// JSON parse failed; an "ask" fallback was emitted on stdout.
     ParseError,
@@ -108,16 +109,27 @@ pub enum HookExit {
 
 /// Read stdin into a bounded `String`, capping at `MAX_INPUT_SIZE` bytes.
 ///
+/// Reads raw bytes (`read_to_end`, not `read_to_string`) so a valid JSON
+/// envelope that happens to carry a handful of stray non-UTF-8 bytes (e.g.
+/// in a free-text field) does not turn into a hard read error. The bytes
+/// are decoded with `String::from_utf8_lossy`, which substitutes U+FFFD for
+/// invalid sequences instead of failing outright — the envelope still
+/// parses as JSON as long as the *structural* bytes are valid UTF-8, which
+/// they always are for a legitimate Claude Code hook payload.
+///
 /// Returns `Ok(s)` on success, `Err(ReadOutcome::TooLarge)` when the cap is
-/// hit, or `Err(ReadOutcome::ReadFailed)` if the underlying reader errors.
+/// hit, or `Err(ReadOutcome::ReadFailed)` if the underlying reader itself
+/// errors (a genuine I/O failure, not a decoding issue — decoding can no
+/// longer fail here). Callers MUST treat `ReadFailed` as fail-closed: see
+/// the `ReadOutcome::ReadFailed` arm in `handle_event` (P1-1).
 pub(crate) fn read_input<R: Read>(reader: R) -> Result<String, ReadOutcome> {
-    let mut buf = String::new();
-    match reader.take(MAX_INPUT_SIZE).read_to_string(&mut buf) {
+    let mut buf = Vec::new();
+    match reader.take(MAX_INPUT_SIZE).read_to_end(&mut buf) {
         Ok(n) => {
             if n as u64 >= MAX_INPUT_SIZE {
                 Err(ReadOutcome::TooLarge)
             } else {
-                Ok(buf)
+                Ok(String::from_utf8_lossy(&buf).into_owned())
             }
         }
         Err(_) => Err(ReadOutcome::ReadFailed),
@@ -208,8 +220,20 @@ where
             return HookExit::InputTooLarge;
         }
         Err(ReadOutcome::ReadFailed) => {
-            // Historical behavior on read error: fall back to allow.
-            output_decision("allow", None, None, None);
+            // P1-1: a read error means the hook envelope could not be
+            // obtained at all, so no policy decision can be evaluated for
+            // it. The historical behavior emitted "allow" here — a
+            // fail-OPEN on the PreToolUse security gate that lets a tool
+            // call through whenever stdin misbehaves. Fail CLOSED instead,
+            // mirroring the oversize-input arm above (same JSON shape).
+            let output = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "block",
+                    "permissionDecisionReason": "Failed to read hook input"
+                }
+            });
+            let _ = writeln!(writer, "{output}");
             return HookExit::ReadError;
         }
     };
@@ -350,6 +374,43 @@ mod tests {
         assert_eq!(err, ReadOutcome::TooLarge);
     }
 
+    /// P1-1(a): a valid JSON envelope carrying a stray non-UTF-8 byte inside
+    /// a string value must still be readable (lossy-decoded), not surfaced
+    /// as `ReadFailed`. FAIL-BEFORE: `read_to_string` returns an `Err` for
+    /// any non-UTF-8 byte, which the old `handle_event` mapped to an
+    /// "allow" fallback (fail-open). PASS-AFTER: `read_input` succeeds and
+    /// the invalid byte is replaced with U+FFFD, so the JSON still parses.
+    #[test]
+    fn read_input_lossy_decodes_stray_non_utf8_bytes() {
+        let mut bytes = br#"{"hook_event_name":"PreToolUse","note":""#.to_vec();
+        bytes.push(0xFF); // invalid UTF-8 byte, not a valid continuation anywhere
+        bytes.extend_from_slice(br#""}"#);
+        let out = read_input(&bytes[..]).expect("lossy decode must succeed, not error");
+        assert!(
+            out.contains('\u{FFFD}'),
+            "expected the invalid byte to be replaced with U+FFFD, got: {out:?}"
+        );
+        // The envelope must still parse as JSON despite the substitution.
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(parsed["hook_event_name"], "PreToolUse");
+    }
+
+    /// A reader whose `Read` impl always errors (simulating a genuine stdin
+    /// I/O failure, e.g. a broken pipe) must still surface as `ReadFailed`.
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated stdin read failure"))
+        }
+    }
+
+    #[test]
+    fn read_input_propagates_genuine_io_errors_as_read_failed() {
+        let err = read_input(FailingReader).expect_err("should fail");
+        assert_eq!(err, ReadOutcome::ReadFailed);
+    }
+
     #[test]
     fn parse_input_malformed_returns_err() {
         let err = parse_input("not json").expect_err("should fail");
@@ -378,6 +439,34 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(s.trim()).expect("valid json");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "block");
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    /// P1-1(b) regression: driving `handle_event` with a reader that yields
+    /// a genuine I/O error must emit a block/deny decision, never "allow".
+    ///
+    /// FAIL-BEFORE: the old `ReadFailed` arm called
+    /// `output_decision("allow", ...)`, fail-OPEN on the `PreToolUse` security
+    /// gate — a broken/failing stdin let every pending tool call through.
+    /// PASS-AFTER: the arm writes a `"permissionDecision":"block"` JSON to
+    /// the injected writer (mirroring the oversize-input arm) and returns
+    /// `HookExit::ReadError`.
+    #[tokio::test]
+    async fn handle_event_read_failure_emits_block_never_allow() {
+        let mut out = Vec::<u8>::new();
+        let exit = handle_event(FailingReader, &mut out).await;
+        assert_eq!(exit, HookExit::ReadError);
+
+        let s = String::from_utf8_lossy(&out);
+        let parsed: serde_json::Value =
+            serde_json::from_str(s.trim()).expect("ReadFailed arm must emit valid JSON");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "block",
+            "read failure must fail CLOSED (block), never fail-open (allow); got: {parsed}"
+        );
+        assert_ne!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "allow",
+            "read failure must never emit an allow decision"
+        );
     }
 
     #[tokio::test]

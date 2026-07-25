@@ -48,6 +48,19 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    /// Normalize the raw `CLX_SESSION_ID` env value into a bound session id.
+    ///
+    /// Some installers (e.g. Claude Code's MCP registration) set
+    /// `CLX_SESSION_ID=""` rather than leaving it unset. An empty string is
+    /// not a valid session id — treating it as `Some("")` would make
+    /// `tool_checkpoint`/`tool_remember` try to use it directly instead of
+    /// falling back to the auto-created `clx-standalone` session, tripping
+    /// the `sessions -> snapshots` foreign key. Blank/whitespace-only values
+    /// are therefore treated as absent, same as an unset variable.
+    pub(crate) fn session_id_from_env(raw: Option<String>) -> Option<SessionId> {
+        raw.filter(|s| !s.trim().is_empty()).map(SessionId::from)
+    }
+
     pub fn new() -> Result<Self> {
         // Get database path from environment or use default
         let db_path = env::var("CLX_DB_PATH").unwrap_or_else(|_| {
@@ -57,7 +70,7 @@ impl McpServer {
         });
 
         let storage = Storage::open(&db_path).context("Failed to open database")?;
-        let session_id = env::var("CLX_SESSION_ID").ok().map(SessionId::from);
+        let session_id = Self::session_id_from_env(env::var("CLX_SESSION_ID").ok());
 
         // Load config first so the credential store uses the user's
         // configured backend (default `file`: a local age-encrypted file

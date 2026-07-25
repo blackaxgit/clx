@@ -56,10 +56,24 @@ fn config_path(tmp: &TempDir) -> PathBuf {
     clx_home(tmp).join("config.yaml")
 }
 
+/// A recent, `Z`-suffixed RFC3339 timestamp, computed once per process.
+///
+/// Must be inside the 30-day retention window or `record_learning_event` prunes
+/// the row on insert (report/list counts would collapse to 0). Cached so the
+/// builder and the truncation assertion observe the identical value. The
+/// `...:SSZ` shape (20 chars, trailing `Z`) matches the format the plain `list`
+/// renderer truncates to 19 chars.
+fn recent_ts() -> String {
+    use std::sync::OnceLock;
+    static TS: OnceLock<String> = OnceLock::new();
+    TS.get_or_init(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .clone()
+}
+
 /// A learning event with full control over the fields the assertions read.
 fn event(decision: &str, diverged: bool, kind: LearningKind, command: &str) -> LearningEvent {
     LearningEvent {
-        ts: "2026-06-01T12:00:00Z".to_string(),
+        ts: recent_ts(),
         session_id: Some("s1".to_string()),
         tool: "Bash".to_string(),
         host: "claude".to_string(),
@@ -137,13 +151,11 @@ fn list_plain_table_renders_header_truncation_and_reason() {
         assert!(header.contains(col), "header missing {col}: {header}");
     }
 
-    // Timestamp truncated to 19 chars: the seeded `...:00Z` loses its Z.
+    // Timestamp truncated to 19 chars: the seeded `...:SSZ` loses its Z.
+    let ts = recent_ts();
+    assert!(text.contains(&ts[..19]), "truncated ts missing:\n{text}");
     assert!(
-        text.contains("2026-06-01T12:00:00"),
-        "truncated ts missing:\n{text}"
-    );
-    assert!(
-        !text.contains("2026-06-01T12:00:00Z"),
+        !text.contains(&ts),
         "ts must be truncated to 19 chars (no Z):\n{text}"
     );
 
