@@ -2269,9 +2269,13 @@ mod learning_events {
     use crate::types::{LearningEvent, LearningKind};
 
     /// Build a minimal learning event with overridable fields.
+    ///
+    /// The timestamp is `now` (not a hardcoded date) so the event is always
+    /// inside the 30-day retention window and is not TTL-pruned on insert.
+    /// Tests that exercise retention override `.ts` explicitly.
     fn ev(decision: &str, diverged: bool) -> LearningEvent {
         LearningEvent {
-            ts: "2026-06-09T00:00:00Z".to_string(),
+            ts: chrono::Utc::now().to_rfc3339(),
             session_id: Some("s1".to_string()),
             tool: "Bash".to_string(),
             host: "claude".to_string(),
