@@ -2494,4 +2494,31 @@ mod failure_and_embedding_path_tests {
             err.1
         );
     }
+
+    // F2: the text handed to the embedder must be redacted, so a secret in a
+    // remembered note / checkpoint never reaches the vector store even though the
+    // snapshot summary is redacted separately at its INSERT sink.
+    #[test]
+    fn embedding_input_text_redacts_secrets() {
+        let out = McpServer::embedding_input_text(
+            "deploy notes password=hunter2secret and export API_TOKEN=sk-abcdefghijklmnop",
+        );
+        assert!(
+            out.contains("***REDACTED***"),
+            "expected redaction marker: {out}"
+        );
+        assert!(
+            !out.contains("hunter2secret"),
+            "password value leaked: {out}"
+        );
+        assert!(
+            !out.contains("sk-abcdefghijklmnop"),
+            "token value leaked: {out}"
+        );
+        // Non-secret text is preserved so recall quality is unaffected.
+        assert!(
+            out.contains("deploy notes"),
+            "benign text must survive: {out}"
+        );
+    }
 }

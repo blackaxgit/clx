@@ -99,7 +99,20 @@ impl McpServer {
     ///
     /// Returns true if embedding was successfully stored, false otherwise.
     /// This method never fails - it handles errors gracefully by logging and returning false.
+    /// The exact text handed to the embedder — redacted so a secret in the
+    /// remembered text / checkpoint note can never reach the vector store (F2).
+    /// Pure; unit-tested independently of embedding infrastructure. The stored
+    /// snapshot summary is already redacted at its INSERT sink; this closes the
+    /// parallel embedding path that previously embedded the ORIGINAL text.
+    pub(crate) fn embedding_input_text(text: &str) -> String {
+        clx_core::redaction::redact_secrets(text)
+    }
+
     pub(crate) fn store_embedding_for_snapshot(&self, snapshot_id: i64, text: &str) -> bool {
+        // F2: embed the redacted text, not the original (see embedding_input_text).
+        let redacted = Self::embedding_input_text(text);
+        let text = redacted.as_str();
+
         // Check if embedding infrastructure is available
         let (ollama, embedding_store) = match (&self.ollama_client, &self.embedding_store) {
             (Some(o), Some(e)) if e.is_vector_search_enabled() => (o, e),

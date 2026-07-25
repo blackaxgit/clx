@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use super::types::PolicyDecision;
 
 /// Cache entry for LLM validation results
@@ -150,14 +152,20 @@ impl ValidationCache {
 
 /// Compute a cache key from command and working directory.
 ///
-/// Uses a NUL (`\0`) separator rather than a printable delimiter so the
-/// `(working_dir, command)` pair maps injectively to a key. NUL is illegal in
-/// both filesystem paths and shell command strings, so it cannot appear in
-/// either field; the encoding therefore has no collisions (unlike a `:`
-/// separator, where `("/a", "b:c")` and `("/a:b", "c")` collide).
+/// The key is the SHA-256 of `working_dir` + NUL + `command`, hex-encoded.
+/// Hashing is a security requirement, not an optimization: the key is persisted
+/// verbatim to `validation_cache.cache_key` on disk (and debug-logged), and the
+/// raw command may contain secrets (`export TOKEN=...`, `--password ...`). A raw
+/// key would leak those to the DB/logs. The NUL separator keeps the
+/// `(working_dir, command)` pre-image injective, and SHA-256 is
+/// collision-resistant, so distinct pairs still map to distinct keys.
 #[must_use]
 pub fn compute_cache_key(command: &str, working_dir: &str) -> String {
-    format!("{working_dir}\0{command}")
+    let mut hasher = Sha256::new();
+    hasher.update(working_dir.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(command.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -171,5 +179,26 @@ mod tests {
         let a = compute_cache_key("b:c", "/a");
         let b = compute_cache_key("c", "/a:b");
         assert_ne!(a, b, "distinct (cwd,cmd) pairs must yield distinct keys");
+    }
+
+    #[test]
+    fn cache_key_is_hashed_and_hides_raw_command() {
+        // F1: the key is persisted to `validation_cache` and debug-logged, so it
+        // must NOT contain the raw command/cwd (which can carry secrets).
+        let k = compute_cache_key("export TOKEN=supersecret123", "/work/dir");
+        assert!(
+            !k.contains("supersecret123"),
+            "raw secret leaked into key: {k}"
+        );
+        assert!(!k.contains("export"), "raw command leaked into key: {k}");
+        assert!(!k.contains("/work/dir"), "raw cwd leaked into key: {k}");
+        assert_eq!(k.len(), 64, "sha-256 hex is 64 chars");
+        assert!(k.chars().all(|c| c.is_ascii_hexdigit()), "key must be hex");
+        // Deterministic + injective.
+        assert_eq!(
+            k,
+            compute_cache_key("export TOKEN=supersecret123", "/work/dir")
+        );
+        assert_ne!(k, compute_cache_key("export TOKEN=different", "/work/dir"));
     }
 }
