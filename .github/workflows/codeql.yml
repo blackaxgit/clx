@@ -1,0 +1,37 @@
+# CodeQL code scanning (advanced setup). Authored as a workflow rather than the
+# repo "default setup" because the latter requires the security_events API scope.
+# Rust is analyzed with build-mode `none` (CodeQL builds the database from source,
+# no cargo compile needed).
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * 1" # weekly, Monday 07:00 UTC
+
+jobs:
+  analyze:
+    name: Analyze (Rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"

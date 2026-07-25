@@ -1,0 +1,27 @@
+# Dependabot version updates (the security-updates half is enabled via the repo
+# security settings; this file adds routine version-bump PRs).
+version: 2
+updates:
+  # Rust crates (workspace root Cargo.toml / Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Batch low-risk bumps into one PR to cut noise; majors stay separate.
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # GitHub Actions used by the workflows in .github/workflows/.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(ci)"
