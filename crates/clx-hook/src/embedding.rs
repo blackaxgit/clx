@@ -140,6 +140,7 @@ mod tests {
     /// We redirect HOME to a temp directory so the real ~/.clx is untouched.
     /// Wiremock binds to 127.0.0.1, which the Ollama backend accepts as localhost.
     #[tokio::test]
+    #[serial_test::serial(clx_home)]
     async fn test_generate_and_store_embedding_success() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -202,6 +203,7 @@ mod tests {
     /// We use a 6-second response delay on `/api/embeddings` so the 5-second
     /// `tokio::time::timeout` inside the production code fires first.
     #[tokio::test]
+    #[serial_test::serial(clx_home)]
     async fn test_generate_and_store_embedding_timeout_no_panic() {
         use std::time::Duration;
         use wiremock::matchers::{method, path};
@@ -266,6 +268,7 @@ mod tests {
     /// the text as-is, the "truncation before sending" contract lives at the caller
     /// level. This test verifies the function is panic-free for very long inputs.
     #[tokio::test]
+    #[serial_test::serial(clx_home)]
     async fn test_generate_and_store_embedding_long_text_no_panic() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};

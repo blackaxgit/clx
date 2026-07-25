@@ -156,6 +156,7 @@ mod tests {
     /// where the 2 s health-check timeout caused Claude Code to cancel the
     /// hook.
     #[tokio::test]
+    #[serial_test::serial(clx_home)]
     async fn test_session_end_completes_within_timeout_with_unreachable_ollama() {
         use std::io::Write;
 
