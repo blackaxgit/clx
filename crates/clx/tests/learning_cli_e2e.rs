@@ -58,9 +58,13 @@ fn default_fingerprint() -> String {
 }
 
 /// Build a diverged-ask `LearningEvent` for `command` under the default policy.
+///
+/// Timestamp is `now` (not a hardcoded date) so seeded events stay inside the
+/// 30-day retention window and are not TTL-pruned on insert (a hardcoded past
+/// date silently prunes every row and the report/export counts collapse to 0).
 fn diverged_ask(command: &str) -> LearningEvent {
     LearningEvent {
-        ts: "2026-06-01T12:00:00Z".to_string(),
+        ts: chrono::Utc::now().to_rfc3339(),
         session_id: Some("s1".to_string()),
         tool: "Bash".to_string(),
         host: "claude".to_string(),

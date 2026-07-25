@@ -35,5 +35,5 @@ workspace = true
 tempfile = "3"
 wiremock = "0.6"
 insta = { version = "1", features = ["yaml", "json", "redactions", "filters"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 serial_test = "3"

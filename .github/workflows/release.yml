@@ -70,14 +70,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Pre-build supply-chain security gates: RustSec advisories + policy enforcement
-      - name: Install cargo-audit and cargo-deny
-        run: cargo install cargo-audit cargo-deny --quiet
+      # Pre-build supply-chain gate — cargo-deny is the single curated source of
+      # truth (advisories + bans + licenses + sources via deny.toml). The former
+      # standalone `cargo audit` step was a redundant, unconfigured duplicate of
+      # the advisories check and has been removed (see ci.yml).
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --quiet
 
-      - name: Supply-chain gate — cargo audit (RustSec advisories)
-        run: cargo audit
-
-      - name: Supply-chain gate — cargo deny (licenses, sources, bans, advisories)
+      - name: Supply-chain gate — cargo deny (advisories, licenses, sources, bans)
         run: cargo deny check
 
       # Build all three binary crates in a single workspace compile.

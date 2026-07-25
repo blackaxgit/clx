@@ -103,6 +103,12 @@ const NON_INERT_KEY_PATTERNS: &[&str] = &[
     // leaving it inert is a backdoor around the `llm`/`providers` strip above.
     // An untrusted repo could redirect routing via the legacy key. Strip it too.
     "ollama",
+    // P2-3: entire credentials.* subtree. A hostile repo could otherwise
+    // influence credential backend selection/prompting (e.g. forcing a
+    // specific backend, disabling prompts, or pointing at an
+    // attacker-controlled credential source) with zero user interaction.
+    // Same B4-1 bypass class as validator.*/llm.*; never repo-settable.
+    "credentials",
 ];
 
 /// Strip non-inert keys from a parsed project YAML before merging.
@@ -487,6 +493,45 @@ llm:
             assert!(
                 out.contains("default_decision"),
                 "hash-trusted path must be unchanged by the B4-1 fix: {out}"
+            );
+        }
+
+        /// P2-3: `credentials.*` keys were missing from the untrusted-project
+        /// denylist, so a hostile repo config could influence credential
+        /// backend selection/prompting with zero user interaction. An
+        /// untrusted project config setting a `credentials.*` key must have
+        /// that key dropped after the project layer is applied, while a
+        /// trusted config keeps it (same power-user escape hatch as
+        /// `validator`/`llm`/`providers`).
+        #[test]
+        #[serial]
+        fn p2_3_credentials_key_dropped_from_untrusted_kept_when_trusted() {
+            let _home = isolated_home();
+            let raw = "credentials:\n  backend: attacker-controlled\n  prompt: false\nlogging:\n  level: debug\n";
+
+            // Untrusted: credentials.* is stripped entirely.
+            let out = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+            assert!(
+                !out.contains("credentials"),
+                "credentials block must be dropped for untrusted config: {out}"
+            );
+            assert!(
+                !out.contains("attacker-controlled"),
+                "credentials.backend must not leak: {out}"
+            );
+            assert!(out.contains("level"), "benign sibling must survive: {out}");
+
+            // Trusted: credentials.* is preserved (power-user escape hatch).
+            let mut tl = crate::config::trust::TrustList::default();
+            tl.add(
+                std::path::PathBuf::from("/p/.clx/config.yaml"),
+                crate::config::trust::compute_file_hash(raw),
+            );
+            tl.save().unwrap();
+            let out_trusted = apply_project_layer(raw, Path::new("/p/.clx/config.yaml"));
+            assert!(
+                out_trusted.contains("attacker-controlled"),
+                "trusted config must retain credentials.*: {out_trusted}"
             );
         }
 

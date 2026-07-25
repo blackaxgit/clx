@@ -329,22 +329,63 @@ impl EmbeddingStore {
     ///
     /// Writes the vector via [`store_embedding`] then updates the
     /// `embedding_model` column on the corresponding `snapshots` row.
+    ///
+    /// Both writes are wrapped in a single `BEGIN IMMEDIATE` / `COMMIT`
+    /// transaction so they commit atomically: a crash or error between the
+    /// two statements can no longer desync provenance (a stored vector
+    /// attributed to the wrong/no model, or a model column pointing at a
+    /// vector that was never written). `IMMEDIATE` acquires the write lock
+    /// up front, mirroring the transaction idiom in
+    /// `storage::snapshot::create_snapshot_if_no_recent_auto_summary`. On
+    /// any failure the transaction is rolled back and the error propagated;
+    /// neither statement's effect survives.
+    ///
+    /// # Errors
+    /// Returns an error if the vector's dimension doesn't match, or if
+    /// either the vector write or the `embedding_model` update fails (the
+    /// transaction is rolled back first).
     pub fn store_with_model(
         &self,
         snapshot_id: i64,
         vector: Vec<f32>,
         model_ident: &str,
     ) -> crate::Result<()> {
-        self.store_embedding(snapshot_id, vector)?;
-        self.conn.execute(
-            "UPDATE snapshots SET embedding_model = ?2 WHERE id = ?1",
-            rusqlite::params![snapshot_id, model_ident],
-        )?;
-        debug!(
-            "Tagged snapshot {} with embedding model '{}'",
-            snapshot_id, model_ident
-        );
-        Ok(())
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        let write = move || -> crate::Result<()> {
+            self.store_embedding(snapshot_id, vector)?;
+            let affected = self.conn.execute(
+                "UPDATE snapshots SET embedding_model = ?2 WHERE id = ?1",
+                rusqlite::params![snapshot_id, model_ident],
+            )?;
+            // `snapshot_embeddings` has no FK to `snapshots`, so a vector for a
+            // non-existent snapshot would otherwise commit as an orphan (the
+            // UPDATE matches zero rows but the INSERT already ran). Require the
+            // provenance UPDATE to touch its row; erroring here rolls back the
+            // vector insert too, keeping vector+provenance all-or-nothing.
+            if affected == 0 {
+                return Err(crate::Error::InvalidInput(format!(
+                    "store_with_model: no snapshot with id {snapshot_id}; refusing to store an orphan embedding"
+                )));
+            }
+            Ok(())
+        };
+
+        match write() {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                debug!(
+                    "Tagged snapshot {} with embedding model '{}'",
+                    snapshot_id, model_ident
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback; ignore secondary failure.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Return the most-recently-stored model identifier, ignoring the
@@ -884,6 +925,108 @@ mod tests {
             store.current_model().unwrap().as_deref(),
             Some("azure-prod:text-embedding-3-large"),
             "store_with_model must overwrite the sentinel"
+        );
+    }
+
+    // =========================================================================
+    // store_with_model atomicity tests (P2-5a: non-transactional provenance)
+    // =========================================================================
+
+    /// A normal `store_with_model` call commits BOTH the vector row and the
+    /// `snapshots.embedding_model` column update - proving the two writes
+    /// land together under the wrapping transaction, not just individually.
+    #[test]
+    fn store_with_model_commits_both_vector_and_model_atomically() {
+        let store = create_test_store_with_snapshots();
+        let snap_id = insert_snapshot(&store, "hello world");
+        let vec = vec![0.2f32; DEFAULT_EMBEDDING_DIM];
+
+        store
+            .store_with_model(snap_id, vec, "ollama-local:qwen3-embedding:0.6b")
+            .unwrap();
+
+        assert!(
+            store.has_embedding(snap_id).unwrap(),
+            "the vector write must be committed"
+        );
+        assert_eq!(
+            store.current_model().unwrap().as_deref(),
+            Some("ollama-local:qwen3-embedding:0.6b"),
+            "the embedding_model update must be committed in the same transaction"
+        );
+    }
+
+    /// Create a test store whose `snapshots` table rejects a specific
+    /// `embedding_model` value via a CHECK constraint, so the SECOND
+    /// statement inside `store_with_model` (the `UPDATE ... SET
+    /// embedding_model`) can be forced to fail deterministically without
+    /// touching the vector write itself.
+    fn create_test_store_with_check_constraint() -> EmbeddingStore {
+        crate::init_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL DEFAULT 'test',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z',
+                trigger TEXT NOT NULL DEFAULT 'auto',
+                summary TEXT,
+                key_facts TEXT,
+                todos TEXT,
+                embedding_model TEXT NOT NULL DEFAULT '<unknown-pre-migration>'
+                    CHECK (embedding_model != 'FORCE_FAIL')
+            );",
+        )
+        .unwrap();
+        EmbeddingStore::with_dimension(conn, DEFAULT_EMBEDDING_DIM).unwrap()
+    }
+
+    /// Regression test for P2-5a: forcing the second statement (the
+    /// `embedding_model` UPDATE) to fail must leave the FIRST statement's
+    /// effect (the vector INSERT) rolled back too - proving both-or-neither
+    /// rather than the pre-fix behavior where the vector row could survive
+    /// as an orphan with no matching provenance update.
+    #[test]
+    fn store_with_model_rolls_back_vector_when_update_fails() {
+        let store = create_test_store_with_check_constraint();
+        let snap_id = insert_snapshot(&store, "text");
+        let vec = vec![0.3f32; DEFAULT_EMBEDDING_DIM];
+
+        let result = store.store_with_model(snap_id, vec, "FORCE_FAIL");
+
+        assert!(
+            result.is_err(),
+            "the CHECK constraint on embedding_model must reject this update"
+        );
+        assert!(
+            !store.has_embedding(snap_id).unwrap(),
+            "the vector INSERT from the first statement must be rolled back \
+             when the second statement (embedding_model UPDATE) fails: \
+             both-or-neither, not a desynced orphan vector"
+        );
+    }
+
+    /// P2-5 (codex follow-up): a vector for a NON-EXISTENT snapshot must not
+    /// commit as an orphan. `snapshot_embeddings` has no FK to `snapshots`, so
+    /// when the provenance UPDATE matches zero rows, `store_with_model` must
+    /// error and roll back the vector INSERT rather than leave an orphan vector.
+    #[test]
+    fn store_with_model_refuses_orphan_when_snapshot_missing() {
+        let store = create_test_store_with_check_constraint(); // snapshots table exists
+        let missing_id = 999_999i64; // never inserted
+        let vec = vec![0.4f32; DEFAULT_EMBEDDING_DIM];
+
+        // A normal model ident (not FORCE_FAIL): the UPDATE is well-formed but
+        // matches no row, which the zero-row guard must treat as an error.
+        let result = store.store_with_model(missing_id, vec, "model-x");
+
+        assert!(
+            result.is_err(),
+            "store_with_model must refuse a snapshot id that does not exist"
+        );
+        assert!(
+            !store.has_embedding(missing_id).unwrap(),
+            "no orphan vector may remain after the refused store"
         );
     }
 }

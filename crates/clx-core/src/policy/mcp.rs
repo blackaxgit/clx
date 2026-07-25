@@ -10,11 +10,34 @@ use crate::config::McpCommandTool;
 /// Result of attempting to extract a command from an MCP tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpExtraction {
-    /// Tool matched a registry entry and a command was extracted.
+    /// Tool matched a registry entry and a command was extracted. `command`
+    /// may be EMPTY when the registry entry matched but `command_field` was
+    /// missing/absent from `tool_input` — see [`McpExtraction::is_missing_command`]
+    /// (P2-2): callers MUST treat that case as fail-CLOSED (Ask/Deny), never
+    /// as an implicit Allow.
     Command(String),
 
     /// Tool is not in the command-tools registry (not a command-bearing tool).
     NotCommandTool,
+}
+
+impl McpExtraction {
+    /// P2-2: true if this is a matched command-tool call whose command is
+    /// missing or empty.
+    ///
+    /// A registry entry matched `tool_name` (this IS a command-bearing tool),
+    /// but `tool_input[command_field]` was absent, non-string, or the empty
+    /// string. This is NOT "safe to allow" — an empty command commonly
+    /// indicates a malformed/spoofed tool-call envelope (a field rename, a
+    /// client bug, or an attacker probing the registry match without
+    /// supplying a payload) rather than a genuinely empty, harmless
+    /// invocation. Callers MUST route this to a fail-CLOSED decision (Ask or
+    /// Deny) rather than the Allow a truly absent/`NotCommandTool` case might
+    /// otherwise receive via a permissive `default_decision`.
+    #[must_use]
+    pub fn is_missing_command(&self) -> bool {
+        matches!(self, Self::Command(cmd) if cmd.is_empty())
+    }
 }
 
 /// Extract an executable command from an MCP tool's input.
@@ -24,7 +47,10 @@ pub enum McpExtraction {
 /// `tool_input[command_field]` as the command string.
 ///
 /// - Match found, field present  → `Command(value)`
-/// - Match found, field missing  → `Command("")` (empty = safe to allow)
+/// - Match found, field missing  → `Command("")`. This does NOT mean "safe to
+///   allow" (P2-2) — callers MUST check
+///   [`McpExtraction::is_missing_command`] and fail CLOSED (Ask/Deny) for
+///   this case rather than treating an empty command as an implicit auto-allow.
 /// - No match                    → `NotCommandTool`
 #[must_use]
 pub fn extract_mcp_command(
@@ -146,6 +172,64 @@ mod tests {
 
         let result = extract_mcp_command("mcp__ssh__execute", &input, &tools);
         assert_eq!(result, McpExtraction::Command(String::new()));
+    }
+
+    // =====================================================================
+    // P2-2 — missing/empty MCP command must fail CLOSED, not Allow.
+    //
+    // `extract_mcp_command` itself only extracts; it does not decide. The
+    // decision (auto-allow vs. Ask/Deny) is made by the caller
+    // (`crates/clx-hook/src/hooks/pre_tool_use.rs`), which is out of this
+    // module's scope. `McpExtraction::is_missing_command` is the fail-closed
+    // primitive this module now exposes so that caller can distinguish "a
+    // matched command-tool with no usable command" (must Ask/Deny) from "a
+    // matched command-tool with a real command" (must go through normal L0/L1
+    // validation) — see the updated `McpExtraction::Command` doc comment,
+    // which no longer claims empty is "safe to allow".
+    // =====================================================================
+
+    #[test]
+    fn p2_2_is_missing_command_true_for_absent_field() {
+        let tools = default_command_tools();
+        let input = json!({"other_field": "value"});
+        let result = extract_mcp_command("mcp__ssh__execute", &input, &tools);
+        assert!(
+            result.is_missing_command(),
+            "a matched command-tool with an absent command field must be flagged missing"
+        );
+    }
+
+    #[test]
+    fn p2_2_is_missing_command_true_for_empty_string_field() {
+        let tools = default_command_tools();
+        let input = json!({"command": ""});
+        let result = extract_mcp_command("mcp__ssh__execute", &input, &tools);
+        assert!(
+            result.is_missing_command(),
+            "a matched command-tool with an explicit empty-string command must be flagged missing"
+        );
+    }
+
+    #[test]
+    fn p2_2_is_missing_command_false_for_real_command() {
+        let tools = default_command_tools();
+        let input = json!({"command": "ls -la"});
+        let result = extract_mcp_command("mcp__ssh__execute", &input, &tools);
+        assert!(
+            !result.is_missing_command(),
+            "a real, non-empty command must not be flagged missing"
+        );
+    }
+
+    #[test]
+    fn p2_2_is_missing_command_false_for_not_command_tool() {
+        let tools = default_command_tools();
+        let input = json!({"libraryName": "react"});
+        let result = extract_mcp_command("mcp__context7__resolve-library-id", &input, &tools);
+        assert!(
+            !result.is_missing_command(),
+            "NotCommandTool is a distinct case from a matched-but-empty command"
+        );
     }
 
     #[test]

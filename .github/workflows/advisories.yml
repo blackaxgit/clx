@@ -1,0 +1,37 @@
+# Scheduled advisory-drift check.
+#
+# Rationale: the per-PR CI gate (ci.yml `audit` job) already blocks on real
+# vulnerabilities via `cargo deny check`. But upstream publishes new RustSec
+# advisories against already-pinned transitive deps at any time, which would
+# otherwise only surface the next time an unrelated PR happens to run CI —
+# turning that PR red for a problem it did not introduce.
+#
+# This job runs `cargo deny check advisories` daily on `main` so newly published
+# advisories surface as their own dedicated, triageable red run (independent of
+# feature PRs). It is ADDITIVE early-warning — it does NOT replace the per-PR
+# advisory gate.
+name: Advisories
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch: {} # allow manual runs
+
+permissions:
+  contents: read
+
+jobs:
+  advisory-drift:
+    name: Advisory drift (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: cargo-deny (advisories only)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          # Pin to the workspace MSRV so the action can read the edition-2024 /
+          # lockfile-v4 workspace metadata (its default Rust is older).
+          rust-version: "1.85"
