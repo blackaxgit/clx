@@ -25,7 +25,29 @@ impl McpServer {
         let session_id = self
             .session_id
             .clone()
-            .unwrap_or_else(|| SessionId::new("default"));
+            .unwrap_or_else(|| SessionId::new("clx-standalone"));
+
+        // Ensure the session exists (create if needed for standalone MCP usage).
+        // `sessions -> snapshots` has an enforced FK; without this, a fresh
+        // install with no `CLX_SESSION_ID` set (or a session id that was
+        // never registered) would fail every checkpoint with an FK violation.
+        // Mirrors the same guard in `tool_remember` (remember.rs).
+        if self
+            .storage
+            .get_session(session_id.as_str())
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let session = clx_core::types::Session::new(
+                session_id.clone(),
+                std::env::current_dir()
+                    .map_or_else(|_| "/tmp".to_string(), |p| p.to_string_lossy().to_string()),
+            );
+            if let Err(e) = self.storage.create_session(&session) {
+                warn!("Failed to create standalone session: {}", e);
+            }
+        }
 
         let mut snapshot = Snapshot::new(session_id.clone(), SnapshotTrigger::Checkpoint);
         snapshot.summary.clone_from(&note);

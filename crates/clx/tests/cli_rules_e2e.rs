@@ -195,6 +195,59 @@ fn rules_reset_json_on_empty_store_reports_zero_deleted() {
 }
 
 // ===========================================================================
+// B3-2: overbroad allow patterns are rejected on the CLI path too
+// (crates/clx/src/commands/rules.rs mirrors the guard in
+// crates/clx-mcp/src/tools/rules.rs so a locally-run `clx rules allow *`
+// can't whitelist every command either).
+// ===========================================================================
+
+#[test]
+fn rules_allow_overbroad_wildcard_is_rejected() {
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+    clx(&t)
+        .args(["--json", "rules", "allow", "*"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("overbroad"));
+
+    // Fail-closed: nothing was persisted (rules list --json is pretty-printed).
+    clx(&t)
+        .args(["--json", "rules", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"learned\": []"));
+}
+
+#[test]
+fn rules_allow_overbroad_bash_wildcard_is_rejected() {
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+    clx(&t)
+        .args(["--json", "rules", "allow", "Bash(*)"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("overbroad"));
+}
+
+#[test]
+fn rules_allow_specific_pattern_still_works_after_overbroad_guard() {
+    // The guard must not collaterally reject scoped, legitimate patterns.
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+    clx(&t)
+        .args(["--json", "rules", "allow", "Bash(git status)"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"success\":true"));
+    clx(&t)
+        .args(["--json", "rules", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Bash(git status)"));
+}
+
+// ===========================================================================
 // Invalid input
 // ===========================================================================
 

@@ -3,6 +3,9 @@
 //! Handles database schema versioning and incremental migrations.
 
 use tracing::info;
+// `warn` is only used by the test-only `column_exists`/`table_exists` bool shims.
+#[cfg(test)]
+use tracing::warn;
 
 use super::Storage;
 
@@ -35,14 +38,16 @@ impl Storage {
             [],
         )?;
 
-        let current_version: i32 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        // P2-5b: propagate a genuine query error (I/O, lock contention,
+        // corruption) instead of collapsing it to `0`. Silently treating a
+        // transient failure as "no schema_version row yet" would make
+        // `run_migrations` believe an already-migrated database is fresh
+        // and re-run every migration step from v1 against it.
+        let current_version: i32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )?;
 
         // Refuse to operate on a database created by a newer CLX. Running
         // an older binary's migrations (or queries) against a newer schema
@@ -113,11 +118,22 @@ impl Storage {
         Ok(())
     }
 
-    /// Check if a column exists in a table
+    /// Check if a column exists in a table, propagating a genuine query
+    /// error instead of collapsing it into "absent".
     ///
     /// Table name is validated against a whitelist to prevent SQL injection,
-    /// since `SQLite` pragma queries cannot use parameterized table names.
-    pub(super) fn column_exists(&self, table: &str, column: &str) -> bool {
+    /// since `SQLite` pragma queries cannot use parameterized table names. An
+    /// unlisted table name is not a query error - it fails safe as `Ok(false)`,
+    /// matching [`Self::column_exists`]'s contract.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying `pragma_table_info` query fails for
+    /// a reason other than the column being absent (e.g. I/O error, lock
+    /// contention). The query itself always returns exactly one row (a
+    /// `COUNT(*)`), so a real `Err` here means something is actually wrong,
+    /// not merely that the column doesn't exist - callers (migration steps)
+    /// should propagate it rather than treat it as "safe to `ALTER TABLE`".
+    pub(super) fn column_exists_checked(&self, table: &str, column: &str) -> crate::Result<bool> {
         const VALID_TABLES: &[&str] = &[
             "sessions",
             "snapshots",
@@ -130,31 +146,76 @@ impl Storage {
             "learning_events",
         ];
         if !VALID_TABLES.contains(&table) {
-            return false;
+            return Ok(false);
         }
 
-        self.conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-                [column],
-                |row| row.get::<_, i64>(0).map(|c| c > 0),
-            )
-            .unwrap_or(false)
+        let count: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            [column],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Check if a column exists in a table.
+    ///
+    /// Fail-safe boolean wrapper over [`Self::column_exists_checked`] for
+    /// callers outside the migration runner (tests, ad-hoc introspection)
+    /// that need a plain `bool` and are fine treating a query failure as
+    /// "absent". Unlike the pre-fix version, a genuine query error is now
+    /// logged at `warn` before being folded into `false`, instead of being
+    /// silently discarded. Migration steps should prefer
+    /// [`Self::column_exists_checked`] so a transient error surfaces as an
+    /// `Err` rather than triggering a possibly-bogus `ALTER TABLE`.
+    ///
+    /// Test-only: the migration runner uses the `_checked` variant; this plain
+    /// `bool` shim exists solely for test/introspection convenience.
+    #[cfg(test)]
+    pub(super) fn column_exists(&self, table: &str, column: &str) -> bool {
+        self.column_exists_checked(table, column)
+            .unwrap_or_else(|e| {
+                warn!("column_exists({table}, {column}): query failed, treating as absent: {e}");
+                false
+            })
+    }
+
+    /// Check whether a table exists in the database, propagating a genuine
+    /// query error instead of collapsing it into "absent".
+    ///
+    /// Used by additive migrations to stay fail-safe against a malformed or
+    /// partially-built database (e.g. a hand-rolled legacy DB missing a table
+    /// that a real CLX DB would always have) - but a real I/O or lock error
+    /// is a different situation entirely and must not be read as "table is
+    /// absent, go ahead and create/alter it".
+    ///
+    /// # Errors
+    /// Returns an error if the underlying `sqlite_master` query fails for a
+    /// reason other than the table being absent.
+    pub(super) fn table_exists_checked(&self, table: &str) -> crate::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Check whether a table exists in the database.
     ///
-    /// Used by additive migrations to stay fail-safe against a malformed or
-    /// partially-built database (e.g. a hand-rolled legacy DB missing a table
-    /// that a real CLX DB would always have).
+    /// Fail-safe boolean wrapper over [`Self::table_exists_checked`] for
+    /// callers outside the migration runner. See [`Self::column_exists`] for
+    /// the same rationale: a real query error is now logged at `warn` rather
+    /// than silently discarded, and migration steps should prefer the
+    /// `_checked` variant.
+    ///
+    /// Test-only: the migration runner uses the `_checked` variant; this plain
+    /// `bool` shim exists solely for test/introspection convenience.
+    #[cfg(test)]
     pub(super) fn table_exists(&self, table: &str) -> bool {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
-                [table],
-                |row| row.get::<_, i64>(0).map(|c| c > 0),
-            )
-            .unwrap_or(false)
+        self.table_exists_checked(table).unwrap_or_else(|e| {
+            warn!("table_exists({table}): query failed, treating as absent: {e}");
+            false
+        })
     }
 
     /// Migrate to schema version 1
@@ -285,7 +346,7 @@ impl Storage {
         ];
 
         for (table, column, col_type) in &columns {
-            if !self.column_exists(table, column) {
+            if !self.column_exists_checked(table, column)? {
                 alter_table_add_column(&self.conn, table, column, col_type)?;
             }
         }
@@ -373,7 +434,7 @@ impl Storage {
     pub(super) fn migrate_to_v5(&self) -> crate::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
-        if !self.column_exists("snapshots", "embedding_model") {
+        if !self.column_exists_checked("snapshots", "embedding_model")? {
             alter_table_add_column(
                 &self.conn,
                 "snapshots",
@@ -470,7 +531,7 @@ impl Storage {
             // A real CLX DB always has both tables (created in v1). Guard on
             // existence anyway so the migration is safe against a malformed /
             // partially-built database (fail-safe, not fail-fast).
-            if self.table_exists(table) && !self.column_exists(table, "host") {
+            if self.table_exists_checked(table)? && !self.column_exists_checked(table, "host")? {
                 alter_table_add_column(
                     &self.conn,
                     table,
@@ -482,7 +543,7 @@ impl Storage {
 
         // Index the audit host so cross-host forensic queries
         // ("show me everything Codex did") stay cheap as the log grows.
-        if self.table_exists("audit_log") {
+        if self.table_exists_checked("audit_log")? {
             self.conn
                 .execute_batch("CREATE INDEX IF NOT EXISTS idx_audit_host ON audit_log(host);")?;
         }
@@ -514,7 +575,7 @@ impl Storage {
         let tx = self.conn.unchecked_transaction()?;
 
         // Fail-safe against a malformed / partially-built database.
-        if !self.table_exists("learned_rules") {
+        if !self.table_exists_checked("learned_rules")? {
             tx.commit()?;
             info!("Completed migration to schema version 9 (no learned_rules table, no-op)");
             return Ok(());
@@ -855,5 +916,81 @@ mod tests {
             .expect("third v10 migration must be a no-op, not an error");
 
         assert!(storage.table_exists("learning_events"));
+    }
+
+    // =========================================================================
+    // P2-5b: column_exists_checked / table_exists_checked error propagation
+    // =========================================================================
+
+    /// `column_exists_checked` reports presence and absence correctly on a
+    /// well-formed, fully-migrated database - both the positive case (column
+    /// is there) and the negative case (column and table are absent, and an
+    /// unlisted table name fails safe). This is the same contract the old
+    /// infallible `column_exists` exposed; the `_checked` variant must
+    /// preserve it on the `Ok` path.
+    #[test]
+    fn column_exists_checked_detects_presence_and_absence() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+
+        assert!(
+            storage.column_exists_checked("sessions", "id").unwrap(),
+            "an existing column must be reported present"
+        );
+        assert!(
+            !storage
+                .column_exists_checked("sessions", "nonexistent_column")
+                .unwrap(),
+            "a missing column on a real table must be reported absent, not an error"
+        );
+        assert!(
+            !storage
+                .column_exists_checked("nonexistent_table", "id")
+                .unwrap(),
+            "an unlisted table name must fail safe as Ok(false), not an error"
+        );
+    }
+
+    /// `table_exists_checked` reports presence and absence correctly on a
+    /// well-formed database: a real table (created by the v1 migration) is
+    /// present, and a table that was never created is absent - both as
+    /// `Ok(bool)`, not an error.
+    #[test]
+    fn table_exists_checked_detects_presence_and_absence() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+
+        assert!(
+            storage.table_exists_checked("sessions").unwrap(),
+            "a table created by migrations must be reported present"
+        );
+        assert!(
+            !storage.table_exists_checked("never_created_table").unwrap(),
+            "a table that was never created must be reported absent, not an error"
+        );
+    }
+
+    /// The infallible `column_exists`/`table_exists` wrappers must still
+    /// agree with the `_checked` variants on a normal database, preserving
+    /// the pre-fix public contract for callers outside the migration runner
+    /// (e.g. `storage/tests.rs`).
+    #[test]
+    fn bool_wrappers_agree_with_checked_variants() {
+        let storage = Storage::open_in_memory().expect("open in-memory db");
+
+        assert_eq!(
+            storage.column_exists("sessions", "id"),
+            storage.column_exists_checked("sessions", "id").unwrap()
+        );
+        assert_eq!(
+            storage.column_exists("sessions", "nope"),
+            storage.column_exists_checked("sessions", "nope").unwrap()
+        );
+        assert_eq!(
+            storage.table_exists("sessions"),
+            storage.table_exists_checked("sessions").unwrap()
+        );
+        assert_eq!(
+            storage.table_exists("nope"),
+            storage.table_exists_checked("nope").unwrap()
+        );
     }
 }

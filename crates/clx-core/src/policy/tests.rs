@@ -2913,11 +2913,19 @@ fn fix1_whitelisted_reads_without_file_redirection_still_allow() {
 
     assert_eq!(engine.evaluate("Bash", "cat x"), PolicyDecision::Allow);
     assert_eq!(engine.evaluate("Bash", "git diff"), PolicyDecision::Allow);
-    // Quoted metachar is NOT a redirection operator.
-    assert_eq!(
-        engine.evaluate("Bash", "grep 'a>b' f"),
-        PolicyDecision::Allow,
-        "quoted '>' is not a redirection"
+    // P1-2 (fail-closed behavior change): a quoted `>` and a glued-unquoted `>`
+    // are byte-identical once `shlex::split` strips the quoting, so the two are
+    // indistinguishable at the token layer. To close the glued-redirection
+    // bypass (`grep x file>~/.clx/config.yaml` auto-allowed → silent write), any
+    // `>`/`<` in a token is treated as a redirection. The cost is that a
+    // legitimately-quoted `grep 'a>b' f` now Asks instead of auto-allowing —
+    // fail-closed over convenience for a genuine (if narrow) UX regression.
+    assert!(
+        matches!(
+            engine.evaluate("Bash", "grep 'a>b' f"),
+            PolicyDecision::Ask { .. }
+        ),
+        "post-shlex a quoted '>' is indistinguishable from a glued redirect; Ask (fail-closed)"
     );
     // Device target /dev/null is excluded from the screen (no `&`, single
     // segment, whitelisted `ls`, redirect to a device => stays Allow).
@@ -2940,13 +2948,16 @@ fn fix1_command_has_output_file_redirection_unit() {
     assert!(command_has_output_file_redirection("echo x >> f"));
     assert!(command_has_output_file_redirection("cat p 2>/tmp/log"));
     assert!(command_has_output_file_redirection("echo x >f"));
-    // Excluded: input, fd-dup, device targets, quoted metachar.
+    // Excluded: input, fd-dup, device targets.
     assert!(!command_has_output_file_redirection("cat < in"));
     assert!(!command_has_output_file_redirection("cat x 2>&1"));
     assert!(!command_has_output_file_redirection("ls > /dev/null"));
     assert!(!command_has_output_file_redirection("cat x > /dev/stdout"));
     assert!(!command_has_output_file_redirection("cat x > /dev/fd/3"));
-    assert!(!command_has_output_file_redirection("grep 'a>b' f"));
+    // P1-2 (fail-closed): a quoted `>` is indistinguishable from a glued
+    // redirect once shlex strips the quotes, so it is now flagged as a write
+    // redirection (previously exempted). Closes `grep x file>target` bypass.
+    assert!(command_has_output_file_redirection("grep 'a>b' f"));
 }
 
 // =========================================================================

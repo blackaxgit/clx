@@ -112,7 +112,11 @@ pub fn cursor_mcp_entry() -> serde_json::Value {
     serde_json::json!({
         "command": "~/.clx/bin/clx-mcp",
         "args": [],
-        "env": { "CLX_SESSION_ID": "" }
+        // P1-5: do NOT emit an empty CLX_SESSION_ID — an empty value would be
+        // parsed downstream as Some(SessionId("")), an uncreated session id that
+        // trips the sessions->snapshots FK. Omit the env entirely so the MCP
+        // server treats the session as standalone (see server.rs session_id_from_env).
+        "env": {}
     })
 }
 

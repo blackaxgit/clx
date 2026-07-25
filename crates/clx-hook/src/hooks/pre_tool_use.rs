@@ -1661,7 +1661,31 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
     } else if tool_name.starts_with("mcp__") && config.mcp_tools.enabled {
         // MCP tool: check if it carries an executable command
         let tool_input = input.tool_input.clone().unwrap_or(serde_json::Value::Null);
-        match extract_mcp_command(tool_name, &tool_input, &config.mcp_tools.command_tools) {
+        let extraction =
+            extract_mcp_command(tool_name, &tool_input, &config.mcp_tools.command_tools);
+        // P2-2 (fail-closed): a command-bearing MCP tool that arrives with a
+        // missing/empty `command` field is anomalous. It must NOT fall through to
+        // the generic empty-command auto-allow below (a fail-OPEN). Surface it to
+        // the user (Ask) instead of silently allowing it.
+        if extraction.is_missing_command() {
+            capture(
+                &config,
+                host,
+                &input,
+                tool_name,
+                "ask",
+                "l0",
+                LearningKind::Decision,
+                DecisionOrigin::MissingCommand,
+                None,
+                "MCP command tool with missing/empty command (fail-closed)",
+                None,
+                started,
+            );
+            output_decision_for(host, "ask", None, Some(RULES_REMINDER), None);
+            return Ok(());
+        }
+        match extraction {
             McpExtraction::Command(cmd) => cmd,
             McpExtraction::NotCommandTool => {
                 // Not a command-bearing MCP tool — use configured default decision

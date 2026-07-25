@@ -265,6 +265,71 @@ fn ac10_5_garbage_json_errors_cleanly() {
     );
 }
 
+/// B3-2: an import envelope carrying an overbroad allow pattern (`Bash(*)`,
+/// `Bash( * )`, ...) must not be persisted -- it's skipped (counted as
+/// `rejected`, with a clear log) while the well-formed entries in the same
+/// envelope still import. Both entries here are well-formed `Tool(...)`
+/// patterns (so they pass the pre-existing secret/malformed gate and land on
+/// the new overbroad-allow gate specifically) -- distinct from a bare `*`,
+/// which the malformed-pattern gate already rejected before this fix.
+/// Mirrors the guard in `crates/clx-mcp/src/tools/rules.rs` (B3-2) and the
+/// `rules allow` CLI path.
+#[test]
+fn import_rejects_overbroad_allow_pattern() {
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+
+    let file = t.path().join("overbroad.json");
+    let body = serde_json::json!({
+        "version": 1,
+        "rules": [
+            { "pattern": "Bash(*)", "rule_type": "allow" },
+            { "pattern": "Bash( * )", "rule_type": "allow" },
+            { "pattern": "Bash(cargo test)", "rule_type": "allow" }
+        ]
+    });
+    std::fs::write(&file, serde_json::to_string(&body).unwrap()).unwrap();
+
+    clx(&t)
+        .args(["--json", "rules", "import", &file.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"imported\":1"))
+        .stdout(predicate::str::contains("\"rejected\":2"));
+
+    let after = learned_patterns(&t);
+    assert_eq!(after, vec!["Bash(cargo test)".to_owned()], "{after:?}");
+    assert!(
+        !after.contains(&"Bash(*)".to_owned()) && !after.contains(&"Bash( * )".to_owned()),
+        "overbroad allow patterns must not import: {after:?}"
+    );
+}
+
+/// An overbroad pattern imported as a `deny` rule is NOT restricted (the
+/// guard only ever gates `Allow`/whitelist rules, matching the MCP tool and
+/// the CLI `rules deny` path, which has no such gate). Uses the well-formed
+/// `Bash(*)` shape (not a bare `*`) so this exercises the overbroad-allow
+/// gate specifically, rather than the separate malformed-pattern gate.
+#[test]
+fn import_overbroad_pattern_as_deny_is_not_restricted() {
+    let t = tmp();
+    clx(&t).args(["--json", "install"]).assert().success();
+
+    let file = t.path().join("deny_wild.json");
+    let body = serde_json::json!({
+        "version": 1,
+        "rules": [ { "pattern": "Bash(*)", "rule_type": "deny" } ]
+    });
+    std::fs::write(&file, serde_json::to_string(&body).unwrap()).unwrap();
+
+    clx(&t)
+        .args(["--json", "rules", "import", &file.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"imported\":1"))
+        .stdout(predicate::str::contains("\"rejected\":0"));
+}
+
 /// An unknown future envelope version is rejected with a clear message.
 #[test]
 fn import_rejects_unknown_future_version() {
