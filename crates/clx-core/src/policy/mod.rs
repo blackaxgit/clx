@@ -44,6 +44,8 @@ use matching::parse_pattern;
 use rate_limiter::RateLimiter;
 use read_only::{is_redirection_token, split_segments_quote_aware};
 
+use crate::redaction::redact_secrets;
+
 use tracing::debug;
 
 /// Policy engine for deterministic command validation (Layer 0)
@@ -176,7 +178,8 @@ impl PolicyEngine {
                     .unwrap_or_else(|| format!("Matched blacklist pattern: {}", rule.pattern));
                 debug!(
                     "Blacklist match: command='{}' pattern='{}'",
-                    command, rule.pattern
+                    redact_secrets(command),
+                    rule.pattern
                 );
                 return PolicyDecision::Deny { reason };
             }
@@ -188,7 +191,10 @@ impl PolicyEngine {
         //     check that does not false-fire on `->` arrows, `2>&1` fd-dups, or
         //     a protected dir used as a copy/move SOURCE (a read).
         if tool_name == "Bash" && bash_writes_into_protected_dir(command) {
-            debug!("Protected-dir write backstop: command='{}'", command);
+            debug!(
+                "Protected-dir write backstop: command='{}'",
+                redact_secrets(command)
+            );
             return PolicyDecision::Deny {
                 reason: "Write into a protected config dir".to_string(),
             };
@@ -232,7 +238,10 @@ impl PolicyEngine {
                 .all(|seg| self.matches_any_whitelist(tool_name, seg))
             && !command_has_output_file_redirection(command)
         {
-            debug!("Whitelist match (all segments): command='{}'", command);
+            debug!(
+                "Whitelist match (all segments): command='{}'",
+                redact_secrets(command)
+            );
             return PolicyDecision::Allow;
         }
 

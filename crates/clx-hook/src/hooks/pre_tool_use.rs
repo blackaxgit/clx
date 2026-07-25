@@ -833,7 +833,9 @@ fn try_trust_mode(
             );
             debug!(
                 "Trust mode: auto-allowing [{}] command '{}' ({})",
-                tool_name, command_raw, reason
+                tool_name,
+                redact_secrets(command_raw),
+                reason
             );
             log_audit_entry(
                 host.host_id(),
@@ -1592,10 +1594,13 @@ async fn escalate_l1(
             if config.validator.cache_enabled {
                 let cache_key = compute_cache_key(command, &input.cwd);
                 if let Ok(storage) = Storage::open_default() {
+                    // Redact before persisting: the LLM reason can echo the raw
+                    // command (and thus a secret) into validation_cache on disk.
+                    let cache_reason = redact_secrets(&reason);
                     let _ = storage.cache_decision(
                         &cache_key,
                         "ask",
-                        Some(&reason),
+                        Some(&cache_reason),
                         Some(5),
                         config.validator.cache_ask_ttl_secs as i64,
                     );

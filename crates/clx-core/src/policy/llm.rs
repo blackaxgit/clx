@@ -95,7 +95,7 @@ impl PolicyEngine {
         if let Some(cache) = cache
             && let Some(cached_decision) = cache.get(&cache_key)
         {
-            debug!("L1 cache hit for command: {}", command);
+            debug!("L1 cache hit for command: {}", redact_secrets(command));
             return cached_decision;
         }
 
@@ -118,7 +118,11 @@ impl PolicyEngine {
             .replace("{{working_dir}}", &escaped_working_dir)
             .replace("{{command}}", &escaped_command);
 
-        debug!("L1 evaluating command: {} in {}", command, working_dir);
+        debug!(
+            "L1 evaluating command: {} in {}",
+            redact_secrets(command),
+            working_dir
+        );
 
         // Call LLM for inference, routing to the configured model
         let result = ollama.generate(&prompt, Some(model)).await;
