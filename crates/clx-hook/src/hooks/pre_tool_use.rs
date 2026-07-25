@@ -8,6 +8,7 @@ use clx_core::policy::{
     McpExtraction, PolicyDecision, PolicyEngine, compute_cache_key, extract_mcp_command,
     is_read_only_command,
 };
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use clx_core::types::{AuditDecision, DecisionOrigin, LearningKind};
 use std::time::Instant;
@@ -902,7 +903,7 @@ fn evaluate_bash_l0(
 
         match l0_decision {
             PolicyDecision::Allow => {
-                debug!("L0: Allowed command '{}'", command);
+                debug!("L0: Allowed command '{}'", redact_secrets(command));
                 log_audit_entry(
                     host.host_id(),
                     &input.session_id,
@@ -931,7 +932,11 @@ fn evaluate_bash_l0(
                 Phase::Handled
             }
             PolicyDecision::Deny { reason } => {
-                debug!("L0: Denied command '{}': {}", command, reason);
+                debug!(
+                    "L0: Denied command '{}': {}",
+                    redact_secrets(command),
+                    reason
+                );
                 log_audit_entry(
                     host.host_id(),
                     &input.session_id,
@@ -963,7 +968,10 @@ fn evaluate_bash_l0(
                 // For read-only commands: auto-allow without confirmation dialog
                 // (L0 didn't explicitly block it, so it's safe)
                 if is_read_only {
-                    debug!("L0: Unknown read-only command '{}', auto-allowing", command);
+                    debug!(
+                        "L0: Unknown read-only command '{}', auto-allowing",
+                        redact_secrets(command)
+                    );
                     log_audit_entry(
                         host.host_id(),
                         &input.session_id,
@@ -991,7 +999,10 @@ fn evaluate_bash_l0(
                     output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
                     return Phase::Handled;
                 }
-                debug!("L0: Unknown command '{}', checking L1", command);
+                debug!(
+                    "L0: Unknown command '{}', checking L1",
+                    redact_secrets(command)
+                );
                 // Continue to Layer 1
                 Phase::Continue
             }
@@ -1090,7 +1101,7 @@ async fn escalate_l1(
             }
 
             if let Ok(Some(cached)) = storage.get_cached_decision(&cache_key) {
-                debug!("L1-CACHE hit for command: {}", command);
+                debug!("L1-CACHE hit for command: {}", redact_secrets(command));
                 let audit_decision = audit_decision_from_str(&cached.decision);
                 log_audit_entry(
                     host.host_id(),
@@ -1462,7 +1473,7 @@ async fn escalate_l1(
 
     match l1_decision {
         PolicyDecision::Allow => {
-            debug!("L1: Allowed command '{}'", command);
+            debug!("L1: Allowed command '{}'", redact_secrets(command));
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -1503,7 +1514,11 @@ async fn escalate_l1(
             }
         }
         PolicyDecision::Deny { reason } => {
-            debug!("L1: Denied command '{}': {}", command, reason);
+            debug!(
+                "L1: Denied command '{}': {}",
+                redact_secrets(command),
+                reason
+            );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -1558,7 +1573,11 @@ async fn escalate_l1(
             // `is_read_only` is provably always false; the former
             // `if is_read_only { L1-READ auto-allow }` branch was dead code
             // (unreachable for any HookInput) and has been removed.
-            debug!("L1: Ask for command '{}': {}", command, reason);
+            debug!(
+                "L1: Ask for command '{}': {}",
+                redact_secrets(command),
+                reason
+            );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
