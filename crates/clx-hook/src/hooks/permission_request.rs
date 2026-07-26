@@ -16,6 +16,7 @@
 use anyhow::Result;
 use clx_core::config::Config;
 use clx_core::policy::{PolicyDecision, is_read_only_command};
+use clx_core::redaction::redact_secrets;
 use clx_core::types::AuditDecision;
 use tracing::debug;
 
@@ -100,7 +101,7 @@ pub(crate) async fn handle_permission_request(
 
     match decision {
         PolicyDecision::Allow => {
-            debug!("PermissionRequest L0: allow '{}'", command);
+            debug!("PermissionRequest L0: allow '{}'", redact_secrets(command));
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -114,7 +115,11 @@ pub(crate) async fn handle_permission_request(
             output_decision_for(host, "allow", None, Some(RULES_REMINDER), None);
         }
         PolicyDecision::Deny { reason } => {
-            debug!("PermissionRequest L0: deny '{}': {}", command, reason);
+            debug!(
+                "PermissionRequest L0: deny '{}': {}",
+                redact_secrets(command),
+                redact_secrets(&reason)
+            );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -133,7 +138,7 @@ pub(crate) async fn handle_permission_request(
             if is_read_only {
                 debug!(
                     "PermissionRequest L0: unknown read-only '{}', allowing",
-                    command
+                    redact_secrets(command)
                 );
                 log_audit_entry(
                     host.host_id(),
@@ -149,7 +154,7 @@ pub(crate) async fn handle_permission_request(
             } else {
                 debug!(
                     "PermissionRequest L0: unknown '{}', failing closed",
-                    command
+                    redact_secrets(command)
                 );
                 log_audit_entry(
                     host.host_id(),

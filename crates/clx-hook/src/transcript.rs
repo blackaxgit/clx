@@ -46,7 +46,7 @@ fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
     if !metadata.file_type().is_file() {
         warn!(
             "transcript '{}' is not a regular file ({:?}); refusing to read",
-            canonical.display(),
+            redact_secrets(&canonical.display().to_string()),
             metadata.file_type()
         );
         return None;
@@ -55,7 +55,7 @@ fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
     if len > MAX_TRANSCRIPT_BYTES {
         warn!(
             "transcript '{}' is {} bytes (> {} cap); refusing to read",
-            canonical.display(),
+            redact_secrets(&canonical.display().to_string()),
             len,
             MAX_TRANSCRIPT_BYTES
         );
@@ -185,7 +185,7 @@ pub(crate) async fn process_transcript(
     let Some(safe_path) = safe_transcript_path(transcript_path) else {
         warn!(
             "Refusing transcript file '{}' (missing, unresolvable, or over size cap)",
-            transcript_path
+            redact_secrets(transcript_path)
         );
         return TranscriptResult {
             summary: None,
@@ -201,7 +201,8 @@ pub(crate) async fn process_transcript(
         Err(e) => {
             warn!(
                 "Failed to open transcript file '{}': {}",
-                transcript_path, e
+                redact_secrets(transcript_path),
+                redact_secrets(&e.to_string())
             );
             return TranscriptResult {
                 summary: None,

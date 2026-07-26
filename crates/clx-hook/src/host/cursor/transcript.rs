@@ -63,7 +63,7 @@ fn safe_db_path(db_path: &str) -> Option<PathBuf> {
     if !metadata.file_type().is_file() {
         warn!(
             "cursor state.vscdb '{}' is not a regular file ({:?}); refusing to read",
-            canonical.display(),
+            redact_secrets(&canonical.display().to_string()),
             metadata.file_type()
         );
         return None;
@@ -71,7 +71,7 @@ fn safe_db_path(db_path: &str) -> Option<PathBuf> {
     if metadata.len() > MAX_DB_BYTES {
         warn!(
             "cursor state.vscdb '{}' is {} bytes (> {} cap); refusing to read",
-            canonical.display(),
+            redact_secrets(&canonical.display().to_string()),
             metadata.len(),
             MAX_DB_BYTES
         );

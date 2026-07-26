@@ -45,7 +45,7 @@ pub(crate) fn build_trust_gated_engine(host: &dyn Host, cwd: &str) -> PolicyEngi
         ProjectTrust::Untrusted | ProjectTrust::NotSeen => {
             debug!(
                 "Codex trust gate: project '{}' is not trusted; project-local config dropped",
-                cwd
+                redact_secrets(cwd)
             );
             engine.without_project_config()
         }
@@ -621,7 +621,10 @@ fn evaluate_fileedit_guard(
         && let Some(reason) =
             fileedit_resolves_into_protected_dir(input.tool_input.as_ref(), &input.cwd, &home)
     {
-        debug!("FileEdit L0 (canonical guard): denied: {}", reason);
+        debug!(
+            "FileEdit L0 (canonical guard): denied: {}",
+            redact_secrets(&reason)
+        );
         log_audit_entry(
             host.host_id(),
             &input.session_id,
@@ -654,7 +657,11 @@ fn evaluate_fileedit_guard(
         && config.validator.layer0_enabled
         && let PolicyDecision::Deny { reason } = engine.evaluate("FileEdit", &summary)
     {
-        debug!("FileEdit L0: denied '{}': {}", summary, reason);
+        debug!(
+            "FileEdit L0: denied '{}': {}",
+            redact_secrets(&summary),
+            redact_secrets(&reason)
+        );
         log_audit_entry(
             host.host_id(),
             &input.session_id,
@@ -755,7 +762,10 @@ fn evaluate_bash_write_dest_guard(
         let expanded = expand_candidate_path(tok, cwd_path, &home);
         let resolved = canonicalize_best_effort(&expanded);
         if let Some(reason) = path_resolves_into_protected_dir(&resolved, &home, "Bash write") {
-            debug!("Bash L0 (canonical write guard): denied: {}", reason);
+            debug!(
+                "Bash L0 (canonical write guard): denied: {}",
+                redact_secrets(&reason)
+            );
             log_audit_entry(
                 host.host_id(),
                 &input.session_id,
@@ -835,7 +845,7 @@ fn try_trust_mode(
                 "Trust mode: auto-allowing [{}] command '{}' ({})",
                 tool_name,
                 redact_secrets(command_raw),
-                reason
+                redact_secrets(&reason)
             );
             log_audit_entry(
                 host.host_id(),
@@ -937,7 +947,7 @@ fn evaluate_bash_l0(
                 debug!(
                     "L0: Denied command '{}': {}",
                     redact_secrets(command),
-                    reason
+                    redact_secrets(&reason)
                 );
                 log_audit_entry(
                     host.host_id(),
@@ -1014,7 +1024,7 @@ fn evaluate_bash_l0(
         // operators can see the weakening at the per-command row level.
         debug!(
             "L0 disabled, skipping deterministic ruleset for '{}'",
-            command
+            redact_secrets(command)
         );
         log_audit_entry(
             host.host_id(),
@@ -1031,7 +1041,7 @@ fn evaluate_bash_l0(
         if is_read_only {
             debug!(
                 "L0 disabled: read-only command '{}' auto-allowed via auto_allow_reads",
-                command
+                redact_secrets(command)
             );
             log_audit_entry(
                 host.host_id(),
@@ -1191,7 +1201,8 @@ async fn escalate_l1(
         Err(e) => {
             debug!(
                 "Failed to create LLM client: {}, defaulting to {}",
-                e, config.validator.default_decision
+                redact_secrets(&e.to_string()),
+                config.validator.default_decision
             );
             // T9.2 / F7-deferred posture: a command reaching this fallback has
             // either (a) bypassed L0 (`layer0_enabled=false`) or (b) been
@@ -1519,7 +1530,7 @@ async fn escalate_l1(
             debug!(
                 "L1: Denied command '{}': {}",
                 redact_secrets(command),
-                reason
+                redact_secrets(&reason)
             );
             log_audit_entry(
                 host.host_id(),
@@ -1578,7 +1589,7 @@ async fn escalate_l1(
             debug!(
                 "L1: Ask for command '{}': {}",
                 redact_secrets(command),
-                reason
+                redact_secrets(&reason)
             );
             log_audit_entry(
                 host.host_id(),
@@ -1789,7 +1800,9 @@ pub(crate) async fn handle_pre_tool_use(input: HostNeutralInput, host: &dyn Host
 
     debug!(
         "PreToolUse: validating [{}] command '{}' in '{}'",
-        tool_name, command_raw, input.cwd
+        tool_name,
+        redact_secrets(&command_raw),
+        redact_secrets(&input.cwd)
     );
 
     // Skip validation if disabled

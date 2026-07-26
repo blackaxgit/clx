@@ -73,6 +73,9 @@ workspace = true
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
+# F3 log-redaction regression: capture tracing output to assert no raw secret
+# reaches a debug/warn sink on the policy hot path.
+tracing-subscriber.workspace = true
 wiremock = "0.6"
 rstest = "0.26"
 insta = { version = "1", features = ["yaml", "json", "redactions"] }

@@ -28,6 +28,7 @@
 //! ```
 
 use crate::config::OllamaConfig;
+use crate::redaction::redact_secrets;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -221,7 +222,7 @@ impl OllamaBackend {
                 }
                 tracing::warn!(
                     "Using remote Ollama host: {} (security override active)",
-                    host
+                    redact_secrets(host)
                 );
             }
             None => {
@@ -339,7 +340,7 @@ impl OllamaBackend {
                                 attempt + 1,
                                 self.max_retries + 1,
                                 delay,
-                                e
+                                redact_secrets(&e.to_string())
                             );
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             attempt += 1;

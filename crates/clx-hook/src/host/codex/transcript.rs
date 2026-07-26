@@ -62,7 +62,7 @@ fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
     if !metadata.file_type().is_file() {
         warn!(
             "codex transcript '{}' is not a regular file ({:?}); refusing to read",
-            canonical.display(),
+            redact_secrets(&canonical.display().to_string()),
             metadata.file_type()
         );
         return None;
@@ -70,7 +70,7 @@ fn safe_transcript_path(transcript_path: &str) -> Option<PathBuf> {
     if metadata.len() > MAX_TRANSCRIPT_BYTES {
         warn!(
             "codex transcript '{}' is {} bytes (> {} cap); refusing to read",
-            canonical.display(),
+            redact_secrets(&canonical.display().to_string()),
             metadata.len(),
             MAX_TRANSCRIPT_BYTES
         );

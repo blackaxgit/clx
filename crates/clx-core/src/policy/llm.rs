@@ -121,7 +121,7 @@ impl PolicyEngine {
         debug!(
             "L1 evaluating command: {} in {}",
             redact_secrets(command),
-            working_dir
+            redact_secrets(working_dir)
         );
 
         // Call LLM for inference, routing to the configured model
@@ -146,8 +146,10 @@ impl PolicyEngine {
                                 &validation.category,
                             );
                             debug!(
-                                "L1 decision: {:?} (score={}, category={})",
-                                decision, validation.risk_score, validation.category
+                                "L1 decision: {} (score={}, category={})",
+                                redact_secrets(&format!("{decision:?}")),
+                                validation.risk_score,
+                                redact_secrets(&validation.category)
                             );
                             decision
                         }
@@ -155,7 +157,8 @@ impl PolicyEngine {
                     Err(e) => {
                         warn!(
                             "L1 failed to parse LLM response: {} - response: {}",
-                            e, response
+                            redact_secrets(&e),
+                            redact_secrets(&response)
                         );
                         PolicyDecision::Ask {
                             reason: "LLM response parsing failed".to_string(),
@@ -422,14 +425,14 @@ pub fn load_validator_prompt(cwd: &str, sensitivity: &PromptSensitivity) -> Stri
         if let Some(content) = try_load_prompt_file(&project_prompt) {
             debug!(
                 "Loaded per-project validator prompt from {}",
-                project_prompt.display()
+                redact_secrets(&project_prompt.display().to_string())
             );
             return content;
         }
     } else {
         debug!(
             "Project at {} is not config-trusted; skipping per-project validator prompt (P1-4)",
-            cwd
+            redact_secrets(cwd)
         );
     }
 
@@ -438,7 +441,7 @@ pub fn load_validator_prompt(cwd: &str, sensitivity: &PromptSensitivity) -> Stri
     if let Some(content) = try_load_prompt_file(&global_prompt) {
         debug!(
             "Loaded global validator prompt from {}",
-            global_prompt.display()
+            redact_secrets(&global_prompt.display().to_string())
         );
         return content;
     }
@@ -492,7 +495,7 @@ fn try_load_prompt_file(path: &Path) -> Option<String> {
     if !is_file_safe(path) {
         warn!(
             "Validator prompt file {} has unsafe permissions (world-writable), skipping",
-            path.display()
+            redact_secrets(&path.display().to_string())
         );
         return None;
     }
@@ -501,7 +504,7 @@ fn try_load_prompt_file(path: &Path) -> Option<String> {
             if let Err(reason) = validate_prompt_template(&content) {
                 warn!(
                     "Validator prompt file {} failed validation: {}, skipping",
-                    path.display(),
+                    redact_secrets(&path.display().to_string()),
                     reason
                 );
                 return None;
@@ -511,8 +514,8 @@ fn try_load_prompt_file(path: &Path) -> Option<String> {
         Err(e) => {
             warn!(
                 "Failed to read validator prompt file {}: {}, skipping",
-                path.display(),
-                e
+                redact_secrets(&path.display().to_string()),
+                redact_secrets(&e.to_string())
             );
             None
         }
