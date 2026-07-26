@@ -579,7 +579,7 @@ fn ollama_required_models(config: &Config) -> Vec<String> {
         let route = config.capability_route(cap).ok()?;
         match config.providers.get(&route.provider)? {
             ProviderConfig::Ollama(_) => Some(route.model.clone()),
-            ProviderConfig::AzureOpenai(_) => None,
+            ProviderConfig::AzureOpenai(_) | ProviderConfig::OpenRouter(_) => None,
         }
     };
 

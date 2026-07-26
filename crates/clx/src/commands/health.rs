@@ -97,6 +97,9 @@ async fn check_providers(config: &clx_core::config::Config) -> (Vec<ProviderRow>
             ProviderConfig::AzureOpenai(a) => {
                 ("azure_openai".to_owned(), redact_secrets(&a.endpoint))
             }
+            ProviderConfig::OpenRouter(o) => {
+                ("open_router".to_owned(), redact_secrets(&o.endpoint))
+            }
         };
 
         let (healthy, error) = match config.create_llm_client_by_name(&name) {
@@ -446,9 +449,11 @@ fn classify_capability_route(
             host: o.host.clone(),
             model: route.model.clone(),
         },
-        Some(ProviderConfig::AzureOpenai(_)) => RouteProbe::Remote {
-            provider: route.provider.clone(),
-        },
+        Some(ProviderConfig::AzureOpenai(_) | ProviderConfig::OpenRouter(_)) => {
+            RouteProbe::Remote {
+                provider: route.provider.clone(),
+            }
+        }
         None => RouteProbe::Unresolved,
     }
 }

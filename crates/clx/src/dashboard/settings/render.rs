@@ -228,14 +228,19 @@ fn render_field_table(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
 
-/// Infer the credential source label for an Azure provider without calling
-/// keychain APIs.  Returns `"Env (<VAR>)"` when the named env var is set and
+/// Infer the credential source label for a remote provider without calling
+/// keychain APIs. Returns `"Env (<VAR>)"` when the named env var is set and
 /// non-empty, otherwise `"Keychain/file"` when an env var name is configured
-/// but the var is absent, or `"Not configured"` when no env var is set.
+/// but the var is absent, `"File"` when only `api_key_file` is set, or
+/// `"Not configured"` when neither is set.
 ///
 /// The secret value is never read here — only the env var *name* is inspected.
-fn azure_credential_source(cfg: &clx_core::config::AzureOpenAIConfig) -> String {
-    match cfg.api_key_env.as_deref() {
+/// Shared by Azure and `OpenRouter` (both credential-shaped identically: R5).
+fn credential_source_label(
+    api_key_env: Option<&str>,
+    api_key_file: Option<&std::path::Path>,
+) -> String {
+    match api_key_env {
         Some(var) if !var.is_empty() => {
             if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
                 format!("Env ({var})")
@@ -246,13 +251,26 @@ fn azure_credential_source(cfg: &clx_core::config::AzureOpenAIConfig) -> String 
         _ => {
             // No env var configured; credential comes from keychain or file
             // if api_key_file is set, indicate that — otherwise "Not configured"
-            if cfg.api_key_file.is_some() {
+            if api_key_file.is_some() {
                 "File".to_owned()
             } else {
                 "Not configured".to_owned()
             }
         }
     }
+}
+
+/// Azure-specific wrapper over [`credential_source_label`] (kept for call-site
+/// readability and to preserve the existing test name/contract).
+fn azure_credential_source(cfg: &clx_core::config::AzureOpenAIConfig) -> String {
+    credential_source_label(cfg.api_key_env.as_deref(), cfg.api_key_file.as_deref())
+}
+
+/// `OpenRouter`-specific wrapper over [`credential_source_label`] (parity
+/// with `azure_credential_source` — same field shapes, same resolution order
+/// per R5).
+fn openrouter_credential_source(cfg: &clx_core::config::OpenRouterConfig) -> String {
+    credential_source_label(cfg.api_key_env.as_deref(), cfg.api_key_file.as_deref())
 }
 
 /// Append per-provider and routing read-only rows to the LLM section field list.
@@ -277,6 +295,7 @@ fn append_provider_rows(config: &Config, rows: &mut Vec<Row<'_>>, value_max_widt
             let (kind_label, endpoint_val) = match provider {
                 ProviderConfig::Ollama(c) => ("ollama".to_owned(), c.host.clone()),
                 ProviderConfig::AzureOpenai(c) => ("azure_openai".to_owned(), c.endpoint.clone()),
+                ProviderConfig::OpenRouter(c) => ("open_router".to_owned(), c.endpoint.clone()),
             };
 
             let endpoint_display = truncate_value(&endpoint_val, value_max_width);
@@ -287,9 +306,14 @@ fn append_provider_rows(config: &Config, rows: &mut Vec<Row<'_>>, value_max_widt
                 Cell::from(""),
             ]));
 
-            // For Azure: show credential source (never the secret value)
-            if let ProviderConfig::AzureOpenai(c) = provider {
-                let cred = azure_credential_source(c);
+            // For remote providers (Azure, OpenRouter): show credential source
+            // (never the secret value).
+            let cred = match provider {
+                ProviderConfig::AzureOpenai(c) => Some(azure_credential_source(c)),
+                ProviderConfig::OpenRouter(c) => Some(openrouter_credential_source(c)),
+                ProviderConfig::Ollama(_) => None,
+            };
+            if let Some(cred) = cred {
                 rows.push(Row::new(vec![
                     Cell::from("    credential").style(Style::default().fg(Color::DarkGray)),
                     Cell::from(cred).style(Style::default().fg(Color::DarkGray)),

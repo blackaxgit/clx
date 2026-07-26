@@ -1137,6 +1137,52 @@ fn default_azure_timeout() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// OpenRouter provider config (WP3)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the `OpenRouter` (openrouter.ai) chat-only backend.
+///
+/// Mirrors `AzureOpenAIConfig`'s credential/timeout/retry shape (spec R4);
+/// unlike Azure, `endpoint` has a sensible default (`OpenRouter`'s public API
+/// base) rather than being required. `referer`/`title` map to the optional
+/// `HTTP-Referer`/`X-Title` headers `OpenRouterBackend` sends for app
+/// identification; both are omitted from the request when unset.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct OpenRouterConfig {
+    /// Full base URL, e.g. `https://openrouter.ai/api`. The backend
+    /// normalizes this to `.../api/v1/chat/completions` and `.../api/v1/models`
+    /// (R6), tolerating a trailing `/`, `/api`, or `/api/v1`.
+    #[serde(default = "default_openrouter_endpoint")]
+    pub endpoint: String,
+    /// Name of the env var whose value is the API key (optional).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Path to a file containing the API key (optional).
+    #[serde(default)]
+    pub api_key_file: Option<std::path::PathBuf>,
+    /// HTTP request timeout in milliseconds (default 30 000).
+    #[serde(default = "default_openrouter_timeout")]
+    pub timeout_ms: u64,
+    /// Retry policy (uses the shared `RetryConfig` from `llm::retry`).
+    #[serde(default)]
+    pub retry: crate::llm::retry::RetryConfig,
+    /// Optional `HTTP-Referer` header value (`OpenRouter` app identification).
+    #[serde(default)]
+    pub referer: Option<String>,
+    /// Optional `X-Title` header value (`OpenRouter` app identification).
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+fn default_openrouter_endpoint() -> String {
+    "https://openrouter.ai/api".to_string()
+}
+
+fn default_openrouter_timeout() -> u64 {
+    30_000
+}
+
+// ---------------------------------------------------------------------------
 // New provider/routing schema (Task 9)
 // ---------------------------------------------------------------------------
 
@@ -1153,12 +1199,17 @@ fn default_azure_timeout() -> u64 {
 ///     endpoint: "https://x.openai.azure.com"
 ///     api_key_env: "AZURE_KEY"
 ///     timeout_ms: 30000
+///   my-openrouter:
+///     kind: open_router
+///     endpoint: "https://openrouter.ai/api"
+///     api_key_env: "OPENROUTER_API_KEY"
 /// ```
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderConfig {
     Ollama(OllamaConfig),
     AzureOpenai(AzureOpenAIConfig),
+    OpenRouter(OpenRouterConfig),
 }
 
 /// Top-level LLM routing: which provider+model handles each capability.
@@ -1943,6 +1994,19 @@ impl Config {
         capability: Capability,
     ) -> Result<crate::llm::LlmClient, LlmConfigError> {
         let route = self.capability_route(capability)?;
+
+        // C8/AC14: OpenRouter is a chat-only backend (R2/E7). Reject it on the
+        // embeddings route — PRIMARY and, if present, FALLBACK — before
+        // constructing any client or resolving any credential (no I/O).
+        // embed()'s own `InvalidResponse` (R2) is defense-in-depth only; this
+        // is the routing-level gate the spec requires.
+        if capability == Capability::Embeddings {
+            self.reject_openrouter_for_embeddings(&route.provider)?;
+            if let Some(fb) = route.fallback.as_deref() {
+                self.reject_openrouter_for_embeddings(&fb.provider)?;
+            }
+        }
+
         let primary = self.build_client_for_provider(&route.provider)?;
         if let Some(fb) = route.fallback.as_deref() {
             let fallback = self.build_client_for_provider(&fb.provider)?;
@@ -1951,6 +2015,24 @@ impl Config {
             return Ok(crate::llm::LlmClient::Fallback(wrapper));
         }
         Ok(primary)
+    }
+
+    /// C8/AC14 guard: error out (actionably) if `provider_name` resolves to
+    /// `ProviderConfig::OpenRouter`. An unknown provider name is left for
+    /// `build_client_for_provider` to report as `UnknownProvider` — this
+    /// guard only concerns itself with the chat-only restriction.
+    fn reject_openrouter_for_embeddings(&self, provider_name: &str) -> Result<(), LlmConfigError> {
+        if matches!(
+            self.providers.get(provider_name),
+            Some(ProviderConfig::OpenRouter(_))
+        ) {
+            return Err(LlmConfigError::ProviderInit(
+                "OpenRouter is a chat-only backend and cannot be used for the embeddings \
+                 route; use Ollama or Azure for embeddings"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Construct an `LlmClient` for a named provider, bypassing routing.
@@ -2022,6 +2104,23 @@ impl Config {
                         .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
                 Ok(crate::llm::LlmClient::Azure(backend))
             }
+            ProviderConfig::OpenRouter(c) => {
+                let kind = self
+                    .credential_backend_kind()
+                    .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                let secret = resolve_openrouter_credential(name, c, kind)
+                    .map_err(LlmConfigError::ProviderInit)?;
+                let backend = crate::llm::OpenRouterBackend::new(
+                    &c.endpoint,
+                    c.timeout_ms,
+                    c.retry,
+                    c.referer.clone(),
+                    c.title.clone(),
+                    secret,
+                )
+                .map_err(|e| LlmConfigError::ProviderInit(e.to_string()))?;
+                Ok(crate::llm::LlmClient::OpenRouter(backend))
+            }
         }
     }
 }
@@ -2067,6 +2166,72 @@ pub enum LlmConfigError {
 fn resolve_azure_credential(
     provider_name: &str,
     cfg: &AzureOpenAIConfig,
+    backend_kind: crate::credentials::CredentialBackendKind,
+) -> Result<secrecy::SecretString, String> {
+    use secrecy::SecretString;
+
+    // 1. env var
+    if let Some(name) = cfg.api_key_env.as_deref()
+        && let Ok(v) = std::env::var(name)
+        && !v.is_empty()
+    {
+        return Ok(SecretString::new(v.into()));
+    }
+
+    // 2. selected backend (file by default; keychain ONLY if opted in)
+    let store = crate::credentials::CredentialStore::from_config(backend_kind);
+    let key = format!("{provider_name}-api-key");
+    match store.get(&key) {
+        Ok(Some(v)) => return Ok(SecretString::new(v.into())),
+        Ok(None) => {} // fall through to api_key_file (NOT to the keychain)
+        Err(e) => {
+            // File backend IO error / headless keychain unavailable. Log and
+            // fall through to api_key_file. We never silently retry a
+            // different store (reintroducing prompts).
+            tracing::warn!(
+                provider = %provider_name,
+                backend = %backend_kind_label(backend_kind),
+                error = %e,
+                "credential backend unavailable, falling back to api_key_file"
+            );
+        }
+    }
+
+    // 3. file
+    if let Some(path) = cfg.api_key_file.as_deref() {
+        return read_file_credential(path).map(|s| SecretString::new(s.into()));
+    }
+
+    Err(format!(
+        "no credentials available for provider '{provider_name}' \
+         (checked env var, {} backend key '{key}', and api_key_file). \
+         Run: clx credentials set {provider_name}-api-key '<your-key>' \
+         (or `clx credentials migrate` if the secret is only in the old \
+         macOS keychain).",
+        backend_kind_label(backend_kind)
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter credential resolution (WP3, R5 — copy of `resolve_azure_credential`)
+// ---------------------------------------------------------------------------
+
+/// Resolve an `OpenRouter` provider's API key.
+///
+/// Resolution order is identical to [`resolve_azure_credential`] (the
+/// critical correctness requirement, R5/E3):
+/// 1. Env var named in `cfg.api_key_env` (if set and non-empty) -> 0 prompts.
+/// 2. The selected `CredentialBackend` entry keyed `"<provider_name>-api-key"`.
+///    With the DEFAULT backend (`file`) this is the local age-encrypted file
+///    and NEVER touches the keychain / prompts. The keychain is consulted
+///    here ONLY if the user explicitly set `credentials.backend: keychain`.
+///    (Hyphen, not colon: `CredentialStore` rejects colons in user keys.)
+/// 3. File at `cfg.api_key_file` (Unix: must be mode 0600) -> 0 prompts.
+/// 4. Error (with an actionable, one-time message). NEVER a keychain
+///    fallback under the default backend -- that was the entire bug.
+fn resolve_openrouter_credential(
+    provider_name: &str,
+    cfg: &OpenRouterConfig,
     backend_kind: crate::credentials::CredentialBackendKind,
 ) -> Result<secrecy::SecretString, String> {
     use secrecy::SecretString;
@@ -3820,6 +3985,55 @@ llm:
         let cfg: Config = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.llm.as_ref().unwrap().chat.model, "gpt-4o-mini");
+    }
+
+    /// AC1: `providers.openrouter { kind: open_router, endpoint, api_key_env }`
+    /// together with `llm.chat { provider: openrouter, model }` deserializes
+    /// to `ProviderConfig::OpenRouter`.
+    #[test]
+    fn openrouter_schema_passes_through() {
+        let yaml = r#"
+providers:
+  openrouter:
+    kind: open_router
+    endpoint: "https://openrouter.ai/api"
+    api_key_env: "OPENROUTER_API_KEY"
+llm:
+  chat: { provider: "openrouter", model: "anthropic/claude-3.5-sonnet" }
+  embeddings: { provider: "ollama-local", model: "qwen3-embedding:0.6b" }
+"#;
+        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert!(
+            matches!(
+                cfg.providers.get("openrouter"),
+                Some(ProviderConfig::OpenRouter(_))
+            ),
+            "kind: open_router must deserialize to ProviderConfig::OpenRouter"
+        );
+        assert_eq!(
+            cfg.llm.as_ref().unwrap().chat.model,
+            "anthropic/claude-3.5-sonnet"
+        );
+    }
+
+    /// R4: `endpoint`/`timeout_ms`/`retry` all have sensible defaults so a
+    /// minimal `kind: open_router` block still deserializes.
+    #[test]
+    fn openrouter_config_defaults_when_fields_omitted() {
+        let yaml = "kind: open_router\n";
+        let cfg: ProviderConfig = serde_yml::from_str(yaml).unwrap();
+        match cfg {
+            ProviderConfig::OpenRouter(c) => {
+                assert_eq!(c.endpoint, "https://openrouter.ai/api");
+                assert_eq!(c.timeout_ms, 30_000);
+                assert!(c.api_key_env.is_none());
+                assert!(c.api_key_file.is_none());
+                assert!(c.referer.is_none());
+                assert!(c.title.is_none());
+            }
+            other => panic!("expected ProviderConfig::OpenRouter, got {other:?}"),
+        }
     }
 
     #[test]

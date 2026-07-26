@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use clx_core::config::trust::{TrustList, compute_file_hash};
 use clx_core::config::{
-    AzureOpenAIConfig, Capability, CapabilityRoute, Config, LlmRouting, ProviderConfig,
+    AzureOpenAIConfig, Capability, CapabilityRoute, Config, LlmRouting, OpenRouterConfig,
+    ProviderConfig,
 };
 use clx_core::credentials::{
     CredentialBackend, CredentialBackendKind, CredentialError, CredentialStore,
@@ -85,6 +86,32 @@ fn config_with_azure(cfg: AzureOpenAIConfig) -> Config {
     let mut c = Config::default();
     c.providers
         .insert("azure".to_string(), ProviderConfig::AzureOpenai(cfg));
+    c
+}
+
+/// `OpenRouterConfig` builder mirroring `azure_cfg` (WP3). Endpoint defaults
+/// to the real `openrouter.ai` host so `OpenRouterBackend::new`'s SSRF-pinning
+/// allowlist check (C2/AC6) never rejects the construction in these
+/// credential-resolution tests.
+fn openrouter_cfg(api_key_env: Option<&str>, api_key_file: Option<&str>) -> OpenRouterConfig {
+    OpenRouterConfig {
+        endpoint: "https://openrouter.ai/api".to_string(),
+        api_key_env: api_key_env.map(str::to_string),
+        api_key_file: api_key_file.map(std::path::PathBuf::from),
+        timeout_ms: 30_000,
+        retry: clx_core::llm::retry::RetryConfig::default(),
+        referer: None,
+        title: None,
+    }
+}
+
+/// Build a `Config` whose only provider is an `OpenRouter` provider named
+/// `openrouter` (so `create_llm_client_by_name("openrouter")` drives
+/// `resolve_openrouter_credential` and the `openrouter-api-key` store key).
+fn config_with_openrouter(cfg: OpenRouterConfig) -> Config {
+    let mut c = Config::default();
+    c.providers
+        .insert("openrouter".to_string(), ProviderConfig::OpenRouter(cfg));
     c
 }
 
@@ -782,6 +809,249 @@ fn fallback_provider_credential_resolved_independently() {
         "fallback side resolves independently; got: {err}"
     );
     clear_env("PRIMARY_AZ_KEY");
+}
+
+// =========================================================================
+// 5c. OpenRouter (WP3, spec `docs/feature-plan/openrouter/02-spec.md`):
+//     AC1 build + fallback wrap, AC14 embeddings-route rejection (primary AND
+//     fallback, before any credential resolution / I/O), E3 credential order.
+// =========================================================================
+
+#[test]
+#[serial]
+fn openrouter_build_client_for_provider_env_key(// AC1
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+    set_env("OPENROUTER_KEY_RESOLVE_TEST", "sk-or-from-env-AAA");
+
+    let c = config_with_openrouter(openrouter_cfg(Some("OPENROUTER_KEY_RESOLVE_TEST"), None));
+    let client = c
+        .create_llm_client_by_name("openrouter")
+        .expect("populated env key must resolve and build the OpenRouter client");
+    assert!(
+        matches!(client, clx_core::llm::LlmClient::OpenRouter(_)),
+        "env-resolved OpenRouter provider must yield an OpenRouter client"
+    );
+    clear_env("OPENROUTER_KEY_RESOLVE_TEST");
+}
+
+#[test]
+#[serial]
+fn openrouter_route_with_fallback_yields_fallback_client_wrapper(// AC1
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+    set_env("OPENROUTER_FALLBACK_WIRE_KEY", "sk-or-primary-XYZ");
+
+    let mut c = Config::default();
+    c.providers.insert(
+        "openrouter".to_string(),
+        ProviderConfig::OpenRouter(openrouter_cfg(Some("OPENROUTER_FALLBACK_WIRE_KEY"), None)),
+    );
+    c.providers.insert("local".to_string(), ollama_provider());
+    c.llm = Some(LlmRouting {
+        chat: CapabilityRoute {
+            provider: "openrouter".to_string(),
+            model: "openai/gpt-4o-mini".to_string(),
+            fallback: Some(Box::new(CapabilityRoute {
+                provider: "local".to_string(),
+                model: "qwen3:1.7b".to_string(),
+                fallback: None,
+                dimension: None,
+            })),
+            dimension: None,
+        },
+        embeddings: CapabilityRoute {
+            provider: "local".to_string(),
+            model: "qwen3-embedding:0.6b".to_string(),
+            fallback: None,
+            dimension: None,
+        },
+    });
+
+    // chat route declares a fallback => primary (OpenRouter) + fallback
+    // (Ollama) are wrapped in a FallbackClient, exactly like the Azure case.
+    let chat = c
+        .create_llm_client(Capability::Chat)
+        .expect("chat client with an OpenRouter primary + fallback must build");
+    assert!(
+        matches!(chat, clx_core::llm::LlmClient::Fallback(_)),
+        "an OpenRouter route with a fallback must wrap in FallbackClient"
+    );
+
+    // embeddings route has NO fallback and does not touch OpenRouter at all.
+    let emb = c
+        .create_llm_client(Capability::Embeddings)
+        .expect("embeddings client (Ollama-only route) must build");
+    assert!(matches!(emb, clx_core::llm::LlmClient::Ollama(_)));
+    clear_env("OPENROUTER_FALLBACK_WIRE_KEY");
+}
+
+#[test]
+#[serial]
+fn openrouter_rejected_on_embeddings_primary_before_any_io(// AC14
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+    // Deliberately NO credential anywhere for this provider. If the C8 guard
+    // fires before credential resolution / client construction (the spec
+    // requirement), the error is the OpenRouter-specific chat-only message,
+    // never the "no credentials available" message that
+    // `resolve_openrouter_credential` would raise on an actual build attempt.
+    clear_env("OPENROUTER_NEVER_SET_KEY");
+
+    let mut c = Config::default();
+    c.providers.insert(
+        "openrouter".to_string(),
+        ProviderConfig::OpenRouter(openrouter_cfg(Some("OPENROUTER_NEVER_SET_KEY"), None)),
+    );
+    c.llm = Some(LlmRouting {
+        chat: CapabilityRoute {
+            provider: "openrouter".to_string(),
+            model: "openai/gpt-4o-mini".to_string(),
+            fallback: None,
+            dimension: None,
+        },
+        embeddings: CapabilityRoute {
+            provider: "openrouter".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            fallback: None,
+            dimension: None,
+        },
+    });
+
+    let err = c
+        .create_llm_client(Capability::Embeddings)
+        .expect_err("OpenRouter must be rejected on the embeddings route (primary)");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("chat-only") && msg.contains("embeddings"),
+        "rejection message must actionably name the fix: {msg}"
+    );
+    assert!(
+        !msg.contains("no credentials available"),
+        "must reject BEFORE attempting credential resolution: {msg}"
+    );
+}
+
+#[test]
+#[serial]
+fn openrouter_rejected_on_embeddings_fallback_before_any_io(// AC14
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+
+    let mut c = Config::default();
+    c.providers.insert("local".to_string(), ollama_provider());
+    c.providers.insert(
+        "openrouter".to_string(),
+        ProviderConfig::OpenRouter(openrouter_cfg(None, None)),
+    );
+    c.llm = Some(LlmRouting {
+        chat: CapabilityRoute {
+            provider: "local".to_string(),
+            model: "qwen3:1.7b".to_string(),
+            fallback: None,
+            dimension: None,
+        },
+        embeddings: CapabilityRoute {
+            provider: "local".to_string(),
+            model: "qwen3-embedding:0.6b".to_string(),
+            fallback: Some(Box::new(CapabilityRoute {
+                provider: "openrouter".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                fallback: None,
+                dimension: None,
+            })),
+            dimension: None,
+        },
+    });
+
+    let err = c
+        .create_llm_client(Capability::Embeddings)
+        .expect_err("an OpenRouter FALLBACK on the embeddings route must also be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("chat-only"),
+        "fallback-side OpenRouter must be rejected too: {msg}"
+    );
+    assert!(
+        !msg.contains("no credentials available"),
+        "must reject BEFORE attempting credential resolution: {msg}"
+    );
+}
+
+#[test]
+#[serial]
+fn openrouter_chat_route_unaffected_by_embeddings_guard(// C8 scope: Chat unaffected
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+    set_env("OPENROUTER_CHAT_ROUTE_KEY", "sk-or-chat-only");
+
+    let c = config_with_openrouter(openrouter_cfg(Some("OPENROUTER_CHAT_ROUTE_KEY"), None));
+    // create_llm_client_by_name bypasses routing entirely (used by `clx
+    // health`), so this also proves the guard lives in create_llm_client's
+    // Embeddings arm specifically, not in construction itself.
+    let client = c
+        .create_llm_client_by_name("openrouter")
+        .expect("OpenRouter construction outside the embeddings route must be unaffected");
+    assert!(matches!(client, clx_core::llm::LlmClient::OpenRouter(_)));
+    clear_env("OPENROUTER_CHAT_ROUTE_KEY");
+}
+
+#[test]
+#[serial]
+fn openrouter_env_key_wins_over_api_key_file(// E3
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+    set_env("OPENROUTER_E3_ENV_KEY", "sk-or-env-wins");
+
+    let tmpf = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmpf.path(), "sk-or-file-should-never-be-read").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmpf.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Both api_key_env (set, populated) AND api_key_file (present, valid
+    // mode) are configured; resolution must stop at the env var (order:
+    // env -> credential store -> file) and never touch the file.
+    let cfg = openrouter_cfg(Some("OPENROUTER_E3_ENV_KEY"), tmpf.path().to_str());
+    let client = config_with_openrouter(cfg)
+        .create_llm_client_by_name("openrouter")
+        .expect("env var must win over api_key_file");
+    assert!(matches!(client, clx_core::llm::LlmClient::OpenRouter(_)));
+    clear_env("OPENROUTER_E3_ENV_KEY");
+}
+
+#[test]
+#[serial]
+fn openrouter_no_credential_anywhere_is_actionable_hard_error(// E3
+) {
+    let _home = HomeGuard::new();
+    clear_env("CLX_CREDENTIALS_BACKEND");
+
+    // Neither api_key_env nor api_key_file configured, nothing in the
+    // credential store: construction must hard-fail with an actionable
+    // message and NOT build a client.
+    let c = config_with_openrouter(openrouter_cfg(None, None));
+    let err = c
+        .create_llm_client_by_name("openrouter")
+        .expect_err("nothing anywhere => hard error, no client built");
+    let msg = format!("{err}");
+    assert!(msg.contains("no credentials available"), "got: {msg}");
+    assert!(
+        msg.contains("file backend key 'openrouter-api-key'"),
+        "got: {msg}"
+    );
+    assert!(
+        msg.contains("clx credentials set openrouter-api-key"),
+        "got: {msg}"
+    );
 }
 
 // =========================================================================
