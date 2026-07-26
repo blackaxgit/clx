@@ -161,7 +161,7 @@ jobs:
 
       - name: Annotate PR with summary
         if: steps.summary.outputs.missed != '' && fromJSON(steps.summary.outputs.missed) > 0
-        uses: peter-evans/create-or-update-comment@v4
+        uses: peter-evans/create-or-update-comment@v5
         with:
           issue-number: ${{ github.event.pull_request.number }}
           body: |
