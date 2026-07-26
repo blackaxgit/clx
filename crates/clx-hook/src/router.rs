@@ -263,7 +263,10 @@ where
     let input = match parse_input_with_host(&*host, &raw) {
         Ok(input) => input,
         Err(e) => {
-            error!("Failed to parse hook input: {}", e);
+            error!(
+                "Failed to parse hook input: {}",
+                redact_secrets(&e.to_string())
+            );
             output_decision(
                 "ask",
                 Some("CLX: Input parse error, manual confirmation required".to_string()),
@@ -277,7 +280,7 @@ where
     match dispatch(input, &*host).await {
         Ok(()) => HookExit::Ok,
         Err(e) => {
-            error!("Hook handler error: {}", e);
+            error!("Hook handler error: {}", redact_secrets(&e.to_string()));
             HookExit::HandlerError
         }
     }

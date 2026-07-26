@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clx_core::config::{Capability, Config};
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use tracing::{debug, info, warn};
 
@@ -17,7 +18,10 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
         }) {
         Ok(pair) => pair,
         Err(e) => {
-            debug!("Failed to create LLM client for embedding: {}, skipping", e);
+            debug!(
+                "Failed to create LLM client for embedding: {}, skipping",
+                redact_secrets(&e.to_string())
+            );
             return Ok(());
         }
     };
@@ -38,7 +42,10 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
     {
         Ok(Ok(emb)) => emb,
         Ok(Err(e)) => {
-            warn!("Failed to generate embedding: {}", e);
+            warn!(
+                "Failed to generate embedding: {}",
+                redact_secrets(&e.to_string())
+            );
             return Ok(());
         }
         Err(_) => {
@@ -59,7 +66,10 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
         Ok(emb_store) => {
             if emb_store.is_vector_search_enabled() {
                 if let Err(e) = emb_store.store_with_model(snapshot_id, embedding, &model_ident) {
-                    warn!("Failed to store embedding: {}", e);
+                    warn!(
+                        "Failed to store embedding: {}",
+                        redact_secrets(&e.to_string())
+                    );
                 } else {
                     info!(
                         "Stored embedding for snapshot {} (model={})",
@@ -71,7 +81,10 @@ pub(crate) async fn generate_and_store_embedding(snapshot_id: i64, text: &str) -
             }
         }
         Err(e) => {
-            warn!("Failed to create embedding store: {}", e);
+            warn!(
+                "Failed to create embedding store: {}",
+                redact_secrets(&e.to_string())
+            );
         }
     }
 
@@ -92,7 +105,11 @@ pub(crate) fn resolve_command_paths(command: &str) -> String {
             if let Ok(canonical) = std::fs::canonicalize(part) {
                 let canonical_str = canonical.to_string_lossy().to_string();
                 if canonical_str != *part {
-                    debug!("TOCTOU: resolved path '{}' -> '{}'", part, canonical_str);
+                    debug!(
+                        "TOCTOU: resolved path '{}' -> '{}'",
+                        redact_secrets(part),
+                        redact_secrets(&canonical_str)
+                    );
                     any_resolved = true;
                 }
                 resolved.push(canonical_str);

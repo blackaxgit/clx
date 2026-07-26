@@ -3,6 +3,7 @@
 use std::sync::Once;
 
 use anyhow::Result;
+use clx_core::redaction::redact_secrets;
 use tracing::{debug, warn};
 
 use crate::host::Host;
@@ -18,7 +19,8 @@ static MODEL_PREFETCH_ONCE: Once = Once::new();
 pub(crate) async fn handle_subagent_start(input: HostNeutralInput, _host: &dyn Host) -> Result<()> {
     debug!(
         "SubagentStart: session_id={}, cwd={}",
-        input.session_id, input.cwd
+        input.session_id,
+        redact_secrets(&input.cwd)
     );
 
     const SPECIALIST_CONTEXT: &str = "[SPECIALIST RULES] Execute task directly. Do NOT delegate. Follow CLAUDE.md rules. Output format: Summary, Changes, Verification, Risks.";
@@ -37,7 +39,8 @@ pub(crate) async fn handle_user_prompt_submit(
 ) -> Result<()> {
     debug!(
         "UserPromptSubmit: session_id={}, cwd={}",
-        input.session_id, input.cwd
+        input.session_id,
+        redact_secrets(&input.cwd)
     );
 
     // D2 first-run UX: if the reranker model is missing, spawn a
@@ -170,7 +173,10 @@ async fn do_recall(
     let ollama = match config.create_llm_client(clx_core::config::Capability::Embeddings) {
         Ok(client) => Some(client),
         Err(e) => {
-            warn!("Auto-recall: failed to create LLM client: {e}");
+            warn!(
+                "Auto-recall: failed to create LLM client: {}",
+                redact_secrets(&e.to_string())
+            );
             None
         }
     };

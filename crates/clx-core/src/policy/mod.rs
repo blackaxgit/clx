@@ -219,7 +219,8 @@ impl PolicyEngine {
                     .unwrap_or_else(|| format!("Matched graylist pattern: {}", rule.pattern));
                 debug!(
                     "Graylist match: command='{}' pattern='{}'",
-                    command, rule.pattern
+                    redact_secrets(command),
+                    rule.pattern
                 );
                 return PolicyDecision::Ask { reason };
             }

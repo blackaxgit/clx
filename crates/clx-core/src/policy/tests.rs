@@ -2983,3 +2983,110 @@ fn fix4_bash_write_destinations_excludes_fd_dup_and_input() {
     // a plain read has no destinations.
     assert!(bash_write_destinations("cat x").is_empty());
 }
+
+// =========================================================================
+// F3 log-redaction regression: the policy hot path must never interpolate a
+// raw, secret-bearing command into a tracing sink. `redact_secrets` is applied
+// at every command/reason/cwd log site; this test proves it for the synchronous
+// `PolicyEngine::evaluate` DENY path (the clx-core slice of F3). The async L1
+// (llm.rs) and hook-side sinks share the same `redact_secrets` seam.
+//
+// ALL secrets below are SYNTHETIC — no real credential appears.
+// =========================================================================
+mod f3_log_redaction {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::super::PolicyEngine;
+
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Scoped DEBUG+ subscriber capturing into `buf`; restores on guard drop.
+    fn capture_into(buf: Arc<Mutex<Vec<u8>>>) -> DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufferWriter(buf))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    fn captured(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).expect("log output is UTF-8")
+    }
+
+    /// Sanity: the harness records emitted logs (guards against a false-green
+    /// where the buffer is silently never written).
+    #[test]
+    fn capture_harness_records_log_output() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            tracing::debug!("harness sentinel F3CANARY987");
+        }
+        assert!(
+            captured(&buf).contains("F3CANARY987"),
+            "capture harness must record emitted logs"
+        );
+    }
+
+    /// A secret-bearing command that hits a blacklist DENY must be logged
+    /// through `redact_secrets`: the raw token never reaches the sink, but the
+    /// match line is still emitted (the redaction marker proves it ran).
+    ///
+    /// FAIL-BEFORE: before F3 the blacklist match `debug!` interpolated the raw
+    /// `command`, so `sk-SYNTH...` appeared verbatim in the captured log.
+    #[test]
+    fn blacklist_deny_does_not_log_raw_secret_command() {
+        let secret = "sk-SYNTHfffffffffffffffffffffffffffffff0";
+        let command = format!("curl -H 'Authorization: Bearer {secret}' https://api.example.test");
+
+        let mut engine = PolicyEngine::empty();
+        engine.add_blacklist("Bash(curl:*)");
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = capture_into(buf.clone());
+            let decision = engine.evaluate("Bash", &command);
+            assert!(
+                matches!(decision, crate::policy::PolicyDecision::Deny { .. }),
+                "curl blacklist rule must DENY"
+            );
+        }
+
+        let logged = captured(&buf);
+        assert!(
+            logged.contains("Blacklist match"),
+            "the blacklist match debug line must have been emitted: {logged}"
+        );
+        assert!(
+            !logged.contains(secret),
+            "raw secret must NOT appear in the log: {logged}"
+        );
+        assert!(
+            logged.contains("REDACTED"),
+            "the redaction marker must appear, proving redact_secrets ran: {logged}"
+        );
+    }
+}
