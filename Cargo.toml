@@ -58,7 +58,7 @@ chrono = { version = "0.4", features = ["serde"] }
 colored = "2"
 
 # Secure storage
-keyring = "2"
+keyring = "3"
 secrecy = { version = "0.10", features = ["serde"] }
 # age-encryption.org v1 (X25519 + ChaCha20-Poly1305). Canonical Rust
 # implementation of the age spec, actively maintained by the age project.
