@@ -1629,6 +1629,41 @@ mod tests {
         serde_yml::from_str::<Config>(yaml).expect("valid Config YAML")
     }
 
+    /// AC13 health-render regression: an `OpenRouter` provider's endpoint
+    /// host must appear redacted (not raw) in the `ProviderRow` that `clx
+    /// health` renders/serializes. No `api_key_env` is configured, so
+    /// `create_llm_client_by_name` fails on credential resolution BEFORE
+    /// `OpenRouterBackend::new` (and therefore before any network call) —
+    /// `check_providers` still computes and redacts the endpoint
+    /// independently of whether the client construction succeeds.
+    #[tokio::test]
+    async fn check_providers_redacts_openrouter_endpoint_host() {
+        let cfg = config_from_yaml(
+            r#"
+providers:
+  openrouter:
+    kind: open_router
+    endpoint: "https://openrouter.ai/api"
+"#,
+        );
+        let (rows, _routing) = check_providers(&cfg).await;
+        let row = rows
+            .iter()
+            .find(|r| r.name == "openrouter")
+            .expect("openrouter provider row present");
+        assert_eq!(row.kind, "open_router");
+        assert!(
+            !row.endpoint.contains("openrouter.ai"),
+            "AC13 REGRESSION: raw OpenRouter endpoint host in ProviderRow: {}",
+            row.endpoint
+        );
+        assert!(
+            row.endpoint.contains("***OPENROUTER-HOST-REDACTED***"),
+            "expected the OpenRouter host-redaction marker: {}",
+            row.endpoint
+        );
+    }
+
     /// Finding #2: embeddings routed to a remote (Azure) provider must NOT
     /// report the local ollama literal as missing.
     #[tokio::test]

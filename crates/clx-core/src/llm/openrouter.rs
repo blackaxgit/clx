@@ -849,6 +849,40 @@ mod tests {
         );
     }
 
+    // AC5 host-redaction portion (deferred from WP2 — `redact_secrets` did not
+    // scrub `openrouter.ai` until WP4's redaction extension landed). Drives
+    // the REAL backend error path (`build_error_summary` -> `redact_secrets`)
+    // with an error body embedding the production `openrouter.ai` endpoint
+    // host, and asserts the resulting `LlmError`'s `Display` contains neither
+    // the host nor the synthetic key.
+    #[tokio::test]
+    async fn error_body_with_endpoint_host_is_redacted_in_display() {
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                r#"{"error":{"message":"invalid key sk-abcdefghijklmnopqrstuvwxyz1234567890 for host https://openrouter.ai/api/v1/chat/completions"}}"#,
+            ))
+            .mount(&mock)
+            .await;
+        let backend = backend(&mock.uri());
+        let err = backend.generate("hi", Some("m")).await.unwrap_err();
+        let display = err.to_string();
+        assert!(
+            !display.contains("openrouter.ai"),
+            "AC5 REGRESSION: openrouter.ai endpoint host leaked into LlmError Display: {display}"
+        );
+        assert!(
+            !display.contains("abcdefghijklmnopqrstuvwxyz1234567890"),
+            "AC5 REGRESSION: sk- key leaked into LlmError Display: {display}"
+        );
+        // Note: the redaction MARKER itself is not asserted here — the error
+        // summary bounds the body to `MAX_BODY_EXCERPT_BYTES` (80) *after*
+        // redaction, so a long marker can be partially truncated in the
+        // Display output. What matters (and is asserted above) is that
+        // neither raw secret ever appears, truncated or not.
+    }
+
     // -- AC6: construction hard-fail -----------------------------------------
 
     #[test]

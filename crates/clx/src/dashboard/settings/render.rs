@@ -1,4 +1,5 @@
 use clx_core::config::{Config, ProviderConfig};
+use clx_core::redaction::redact_secrets;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
@@ -295,7 +296,15 @@ fn append_provider_rows(config: &Config, rows: &mut Vec<Row<'_>>, value_max_widt
             let (kind_label, endpoint_val) = match provider {
                 ProviderConfig::Ollama(c) => ("ollama".to_owned(), c.host.clone()),
                 ProviderConfig::AzureOpenai(c) => ("azure_openai".to_owned(), c.endpoint.clone()),
-                ProviderConfig::OpenRouter(c) => ("open_router".to_owned(), c.endpoint.clone()),
+                // AC13: redact the endpoint host before it reaches the
+                // dashboard's field table — an OpenRouter endpoint (or a
+                // `CLX_ALLOW_OPENROUTER_HOSTS`-configured gateway host) must
+                // not render raw, matching `health.rs`'s
+                // `check_providers` (B6-1-style redaction, now covering
+                // OpenRouter too since WP4 extended `redact_secrets`).
+                ProviderConfig::OpenRouter(c) => {
+                    ("open_router".to_owned(), redact_secrets(&c.endpoint))
+                }
             };
 
             let endpoint_display = truncate_value(&endpoint_val, value_max_width);
@@ -903,6 +912,50 @@ mod render_snapshots {
 
         // nothing configured → "Not configured"
         assert_eq!(super::azure_credential_source(&base), "Not configured");
+    }
+
+    /// AC13 dashboard-render regression: an `OpenRouter` provider's endpoint
+    /// host must render redacted, not raw, in the Settings LLM section.
+    /// Mirrors `snapshot_settings_llm_populated_providers_and_routing` but
+    /// asserts on rendered content directly (not an insta snapshot) so the
+    /// contract is explicit: the apex host `openrouter.ai` must never appear
+    /// in the rendered buffer, and the redaction marker must.
+    #[test]
+    fn dashboard_settings_openrouter_endpoint_is_redacted_not_raw() {
+        use clx_core::config::OpenRouterConfig;
+
+        let mut app = make_settings_app();
+        let mut cfg = make_default_config();
+        cfg.providers.insert(
+            "openrouter-prod".to_string(),
+            ProviderConfig::OpenRouter(OpenRouterConfig {
+                endpoint: "https://openrouter.ai/api".to_string(),
+                api_key_env: Some("CLX_TEST_OPENROUTER_KEY_UNSET".to_string()),
+                api_key_file: None,
+                timeout_ms: 30_000,
+                retry: clx_core::llm::RetryConfig::default(),
+                referer: None,
+                title: None,
+            }),
+        );
+        app.settings_editing_config = Some(cfg.clone());
+        app.settings_original_config = Some(cfg);
+        app.settings_section_idx = 2;
+        let rendered = render_settings_to_string(&mut app);
+        assert!(
+            !rendered.contains("openrouter.ai"),
+            "AC13 REGRESSION: raw OpenRouter endpoint host rendered in dashboard: {rendered}"
+        );
+        // The value column truncates at a fixed width (see `truncate_value`),
+        // so the full `***OPENROUTER-HOST-REDACTED***` marker may itself be
+        // cut off in narrow terminals. What matters is that the raw host
+        // never appears (asserted above) and that the truncated value still
+        // visibly reads as redacted (the marker's `***` prefix survives any
+        // width truncation since it's the first thing substituted in).
+        assert!(
+            rendered.contains("https://***"),
+            "expected a redaction marker in place of the raw endpoint host: {rendered}"
+        );
     }
 
     /// MCP Tools section (index 7) with a populated `command_tools` registry
