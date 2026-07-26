@@ -7,7 +7,7 @@
 //! (`/openai/deployments/<deployment>/...?api-version=<v>`).
 
 use crate::config::AzureOpenAIConfig;
-use crate::llm::openai_wire::{ChatMessage, ChatRequest, ChatResponse};
+use crate::llm::openai_wire::{ChatMessage, ChatRequest, ChatResponse, map_api_error};
 use crate::llm::retry::{RetryConfig, with_backoff};
 use crate::llm::{LlmError, LocalLlmBackend};
 use crate::redaction::redact_secrets;
@@ -311,7 +311,20 @@ async fn post_chat(
         .await
         // T2/B6-1: redact at source — never embed raw reqwest error strings.
         .map_err(|e| redact_connection_error(&e))?;
-    map_response(resp).await
+    let parsed: ChatResponse = map_response(resp).await?;
+    // F-d: check the inline `error` envelope HERE, inside `post_chat` — the
+    // closure `with_backoff` retries — rather than only after `with_backoff`
+    // has already returned. A 2xx response can carry a top-level `error`
+    // (same shape OpenRouter uses); if it does, surface it as an `Err` from
+    // this closure so a transient inline error (inline 429/503/etc.) is
+    // retried per `LlmError::is_transient`, exactly like an HTTP-level
+    // transient failure. Before this fix, `resp.error` was only inspected
+    // once, after `with_backoff` had already returned `Ok`, so an inline
+    // transient error was never retried.
+    if let Some(err) = &parsed.error {
+        return Err(map_api_error(err, None));
+    }
+    Ok(parsed)
 }
 
 async fn post_embed(
@@ -357,6 +370,21 @@ impl LocalLlmBackend for AzureOpenAIBackend {
             retry_after_for,
         )
         .await?;
+        // WP1 review finding / C3 parity: a 2xx response can still carry a
+        // top-level `error` envelope (the same shape OpenRouter uses), which
+        // must be checked before ever reading `choices` so it is never
+        // mistaken for an empty/successful completion.
+        //
+        // F-d: that check now lives inside `post_chat` (the closure
+        // `with_backoff` retries) instead of here, so a transient inline
+        // error is retried rather than only observed once `with_backoff`
+        // already returned `Ok`. By the time control reaches this line,
+        // `resp.error` is therefore guaranteed to be `None` — `post_chat`
+        // maps any `Some` to an `Err` before it can propagate this far.
+        debug_assert!(
+            resp.error.is_none(),
+            "post_chat must map resp.error to Err before returning Ok"
+        );
         let content = resp
             .choices
             .into_iter()
@@ -1133,6 +1161,130 @@ mod tests {
         assert!(
             matches!(r, Err(LlmError::InvalidResponse(_))),
             "expected InvalidResponse for empty choices, got {r:?}"
+        );
+    }
+
+    /// WP2 closes a WP1 review finding: Azure's `generate()` must check the
+    /// shared `resp.error` envelope BEFORE reading `choices`, exactly like
+    /// `OpenRouter`. A 200 response whose body carries `{"error": {...}}`
+    /// and NO `choices` key must map through `map_api_error`, not fall
+    /// through to `InvalidResponse("no choices returned")`.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn generate_200_with_inline_error_is_mapped_not_parsed_as_empty_choices() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": 429, "message": "rate limited upstream" }
+            })))
+            .mount(&mock)
+            .await;
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+        let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
+        assert!(
+            matches!(r, Err(LlmError::RateLimit { .. })),
+            "expected the inline error to map to RateLimit, got {r:?}"
+        );
+    }
+
+    /// F-d regression: an inline transient error (HTTP 200 body carrying a
+    /// top-level `{"error": {"code": 503, ...}}` envelope) must be retried by
+    /// `with_backoff`, exactly like an HTTP-level transient failure. Before
+    /// the fix, `resp.error` was only inspected once — AFTER `with_backoff`
+    /// had already returned `Ok` — so this exact case was never retried; the
+    /// first inline-503 response would be returned to the caller as a final
+    /// `LlmError::Server{503}` without ever going through the retry loop.
+    ///
+    /// The mock server returns the inline-503 body for the first 2 calls
+    /// (`up_to_n_times(2)`), then falls through to the unlimited success
+    /// mock. A `received_requests().len() == 3` assertion proves 2 retries
+    /// actually happened (1 initial attempt + 2 retries), not just that the
+    /// final call happened to succeed.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn f_d_inline_transient_error_is_retried_via_with_backoff() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": 503, "message": "upstream unavailable" }
+            })))
+            .up_to_n_times(2)
+            .mount(&mock)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "hello back" } }]
+            })))
+            .mount(&mock)
+            .await;
+
+        let mut c = cfg(mock.uri());
+        c.retry = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(5),
+            backoff_factor: 2.0,
+            max_delay: Duration::from_millis(50),
+        };
+        let backend =
+            AzureOpenAIBackend::new(&c, SecretString::new("test-key".to_string().into())).unwrap();
+        let out = backend.generate("hi", Some("gpt-5.4-mini")).await.unwrap();
+        assert_eq!(out, "hello back");
+
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "F-d REGRESSION: expected 2 inline-transient failures + 1 success \
+             to be retried by with_backoff, got {} request(s)",
+            requests.len()
+        );
+    }
+
+    /// F-d companion: an inline NON-transient error (e.g. inline 404) must
+    /// still surface immediately without retry — proves the fix routes the
+    /// inline error through `LlmError::is_transient`, not an unconditional
+    /// retry-everything change.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn f_d_inline_non_transient_error_is_not_retried() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": 404, "message": "unknown model" }
+            })))
+            .mount(&mock)
+            .await;
+
+        let mut c = cfg(mock.uri());
+        c.retry = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(5),
+            backoff_factor: 2.0,
+            max_delay: Duration::from_millis(50),
+        };
+        let backend =
+            AzureOpenAIBackend::new(&c, SecretString::new("test-key".to_string().into())).unwrap();
+        let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
+        assert!(
+            matches!(r, Err(LlmError::Server { status: 404, .. })),
+            "expected non-transient Server{{404}}, got {r:?}"
+        );
+
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a non-transient inline error must not be retried, got {} request(s)",
+            requests.len()
         );
     }
 
