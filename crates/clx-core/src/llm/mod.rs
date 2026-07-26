@@ -3,6 +3,7 @@
 mod azure;
 pub mod fallback;
 mod ollama;
+mod openai_wire;
 pub mod retry;
 
 pub use azure::AzureOpenAIBackend;

@@ -7,6 +7,7 @@
 //! (`/openai/deployments/<deployment>/...?api-version=<v>`).
 
 use crate::config::AzureOpenAIConfig;
+use crate::llm::openai_wire::{ChatMessage, ChatRequest, ChatResponse};
 use crate::llm::retry::{RetryConfig, with_backoff};
 use crate::llm::{LlmError, LocalLlmBackend};
 use crate::redaction::redact_secrets;
@@ -198,36 +199,11 @@ impl AzureOpenAIBackend {
     }
 }
 
-// --- Wire types ----------------------------------------------------------
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_completion_tokens: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatChoiceMessage {
-    content: String,
-}
+// --- Wire types ------------------------------------------------------------
+//
+// `ChatRequest`/`ChatMessage`/`ChatResponse` are shared with the OpenRouter
+// backend — see `crate::llm::openai_wire`. Azure-specific embed types stay
+// local since OpenRouter is chat-only (R2/AC7).
 
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
@@ -323,7 +299,7 @@ fn redact_connection_error(e: &reqwest::Error) -> LlmError {
 async fn post_chat(
     backend: &AzureOpenAIBackend,
     url: &Url,
-    body: &ChatRequest<'_>,
+    body: &ChatRequest,
 ) -> Result<ChatResponse, LlmError> {
     let resp = backend
         .http
@@ -365,12 +341,14 @@ impl LocalLlmBackend for AzureOpenAIBackend {
         })?;
         let url = self.chat_url(deployment);
         let body = ChatRequest {
-            model: deployment,
+            model: deployment.to_string(),
             messages: vec![ChatMessage {
-                role: "user",
-                content: prompt,
+                role: "user".to_string(),
+                content: prompt.to_string(),
             }],
+            max_tokens: None,
             max_completion_tokens: Some(2048),
+            provider: None,
         };
         let resp = with_backoff(
             self.retry,
@@ -379,11 +357,27 @@ impl LocalLlmBackend for AzureOpenAIBackend {
             retry_after_for,
         )
         .await?;
-        resp.choices
+        let content = resp
+            .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| LlmError::InvalidResponse("no choices returned".into()))
+            .ok_or_else(|| LlmError::InvalidResponse("no choices returned".into()))?
+            .message
+            .content;
+        // The shared wire type models `content` as `Option<String>` because a
+        // provider may omit it or return `null` (e.g. a refusal). Azure
+        // previously declared `content: String`, so this path could not be
+        // reached before; now it must fail closed rather than silently
+        // returning an empty completion via `unwrap_or_default()`.
+        match content {
+            Some(c) if !c.is_empty() => Ok(c),
+            Some(_) => Err(LlmError::InvalidResponse(
+                "chat response choice had empty content".into(),
+            )),
+            None => Err(LlmError::InvalidResponse(
+                "chat response choice had no content".into(),
+            )),
+        }
     }
 
     async fn embed(&self, text: &str, model: Option<&str>) -> Result<Vec<f32>, LlmError> {
@@ -1010,6 +1004,160 @@ mod tests {
         assert!(
             !display.contains("openai.azure.com"),
             "T2: Azure hostname leaked in connection error Display: {display}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // WP1 regression tests — Azure refactor onto `crate::llm::openai_wire`
+    //
+    // C7 requires the Azure refactor onto shared wire types to be a
+    // byte-identical, behavior-identical change. These tests pin:
+    // 1. The exact serialized request bytes Azure sends (golden literal),
+    //    proving the new `max_tokens`/`provider` fields (added for
+    //    OpenRouter) do not appear in Azure's wire body.
+    // 2. Response parsing parity for a representative Azure response.
+    // 3. The new fail-closed behavior for `content: None`/absent `choices`,
+    //    which replaces what was a compile-time-impossible case before
+    //    `ChatChoiceMessage::content` became `Option<String>`.
+    // -------------------------------------------------------------------------
+
+    /// Golden-request regression (C7): Azure's `generate()` request body must
+    /// serialize to exactly the same bytes it did before the shared
+    /// `openai_wire` refactor. Before the refactor, `ChatRequest` had only
+    /// `{model, messages, max_completion_tokens}`; the refactor adds
+    /// `max_tokens`/`provider` fields for `OpenRouter`'s benefit, but both are
+    /// `None` for Azure and `skip_serializing_if = "Option::is_none"`, so
+    /// they must not appear on the wire at all — a field addition, removal,
+    /// or reorder that changed the bytes would fail this assertion.
+    #[test]
+    fn azure_chat_request_wire_bytes_are_byte_identical_to_pre_refactor() {
+        let body = ChatRequest {
+            model: "gpt-5.4-mini".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            max_tokens: None,
+            max_completion_tokens: Some(2048),
+            provider: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            json,
+            r#"{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":2048}"#,
+            "Azure request wire bytes changed — this is a C7 regression"
+        );
+    }
+
+    /// Response parity (WP1): deserializing a representative Azure chat
+    /// response through the shared `ChatResponse`/`ChatChoice`/
+    /// `ChatChoiceMessage` types must still extract the same content string
+    /// Azure extracted before the refactor.
+    #[test]
+    fn azure_chat_response_parity_extracts_expected_content() {
+        let raw = r#"{"choices":[{"message":{"content":"hello back"}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(raw).unwrap();
+        let content = resp.choices.into_iter().next().unwrap().message.content;
+        assert_eq!(content, Some("hello back".to_string()));
+    }
+
+    /// WP1 fail-closed behavior: a response with `content: null` must yield
+    /// `LlmError::InvalidResponse` from `generate()`, not an empty-string
+    /// success (no `unwrap_or_default()`).
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn generate_null_content_yields_invalid_response() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": null } }]
+            })))
+            .mount(&mock)
+            .await;
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+        let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
+        assert!(
+            matches!(r, Err(LlmError::InvalidResponse(_))),
+            "expected InvalidResponse for null content, got {r:?}"
+        );
+    }
+
+    /// WP1 fail-closed behavior: a response with `content` entirely absent
+    /// from the message object (not just `null`) must also yield
+    /// `LlmError::InvalidResponse`.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn generate_absent_content_field_yields_invalid_response() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": {} }]
+            })))
+            .mount(&mock)
+            .await;
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+        let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
+        assert!(
+            matches!(r, Err(LlmError::InvalidResponse(_))),
+            "expected InvalidResponse for absent content field, got {r:?}"
+        );
+    }
+
+    /// WP1 fail-closed behavior: empty `choices` must yield
+    /// `LlmError::InvalidResponse` (pre-existing behavior, pinned again here
+    /// since the refactor touches the exact code path).
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn generate_empty_choices_yields_invalid_response() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": []
+            })))
+            .mount(&mock)
+            .await;
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+        let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
+        assert!(
+            matches!(r, Err(LlmError::InvalidResponse(_))),
+            "expected InvalidResponse for empty choices, got {r:?}"
+        );
+    }
+
+    /// WP1 fail-closed behavior: empty-string content (as opposed to
+    /// `null`/absent) must also yield `LlmError::InvalidResponse`, not a
+    /// vacuous success.
+    #[tokio::test]
+    #[serial(env_azure_hosts)]
+    async fn generate_empty_string_content_yields_invalid_response() {
+        allow_local();
+        let mock = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "" } }]
+            })))
+            .mount(&mock)
+            .await;
+        let backend =
+            AzureOpenAIBackend::new(&cfg(mock.uri()), SecretString::new("k".to_string().into()))
+                .unwrap();
+        let r = backend.generate("hi", Some("gpt-5.4-mini")).await;
+        assert!(
+            matches!(r, Err(LlmError::InvalidResponse(_))),
+            "expected InvalidResponse for empty-string content, got {r:?}"
         );
     }
 }
