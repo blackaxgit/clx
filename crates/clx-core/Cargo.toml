@@ -71,7 +71,7 @@ core-foundation = "0.9"
 workspace = true
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
 tempfile = "3"
 # F3 log-redaction regression: capture tracing output to assert no raw secret
 # reaches a debug/warn sink on the policy hot path.
