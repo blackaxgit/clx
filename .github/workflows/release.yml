@@ -56,7 +56,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -179,7 +179,7 @@ jobs:
       # Checkout is needed for the tag context; softprops/action-gh-release reads
       # it for the tag name and auto-generated notes.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Fetch full history so release notes can reference the commit range.
           fetch-depth: 0
@@ -244,7 +244,7 @@ jobs:
 
     steps:
       - name: Checkout tap repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: blackaxgit/homebrew-clx
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
