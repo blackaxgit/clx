@@ -7,6 +7,7 @@
 //! - Shared types and error definitions
 //! - Configuration management
 
+pub mod bounded_read;
 pub mod config;
 pub mod credentials;
 pub mod embeddings;

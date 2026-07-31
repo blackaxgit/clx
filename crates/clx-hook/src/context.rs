@@ -2,9 +2,18 @@
 
 use crate::embedding::truncate_to_char_boundary;
 use crate::host::Host;
+use clx_core::bounded_read::{self, Error as BoundedReadError};
+use clx_core::redaction::redact_secrets;
 use clx_core::storage::Storage;
 use clx_core::types::SessionId;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Hard ceiling on a project/global instructions file (`CLAUDE.md`,
+/// `AGENTS.md`, ...). These are hand-written prose docs; 4 MiB is generous
+/// headroom while still bounding a FIFO/device/oversized-file footgun at a
+/// path this process does not control (project repos are third-party
+/// content from CLX's point of view).
+const MAX_RULES_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Load previous session summary for context
 pub(crate) fn load_previous_session_summary(
@@ -40,32 +49,71 @@ pub(crate) fn load_project_rules(cwd: &str, host: &dyn Host) -> Option<String> {
     let label = host.instructions_file_label();
 
     // 1. Check project-specific instructions file (e.g. cwd/CLAUDE.md).
+    //
+    // Best-effort: any failure to read skips this source exactly as the
+    // former `if let Ok(content) = ...` did, EXCEPT `NotRegularFile` /
+    // `TooLarge`, which now warn (redacted path) instead of failing
+    // silently -- a project repo is not fully trusted content, so a FIFO,
+    // device, or oversized file dropped at `CLAUDE.md`/`AGENTS.md` should be
+    // visible somewhere, not swallowed. `.exists()` is redundant with
+    // `NotFound` and dropped.
     let project_instructions = Path::new(cwd).join(label);
-    if project_instructions.exists()
-        && let Ok(content) = std::fs::read_to_string(&project_instructions)
-    {
-        let rules = extract_critical_rules(&content);
-        if !rules.is_empty() {
-            all_rules.push(format!("## Project Rules ({cwd})\n{rules}"));
+    match bounded_read::read_bounded_to_string(&project_instructions, MAX_RULES_FILE_BYTES) {
+        Ok(content) => {
+            let rules = extract_critical_rules(&content);
+            if !rules.is_empty() {
+                all_rules.push(format!("## Project Rules ({cwd})\n{rules}"));
+            }
         }
+        Err(BoundedReadError::NotFound) => {}
+        Err(BoundedReadError::NotRegularFile { file_type }) => {
+            warn!(
+                "project rules file '{}' is not a regular file ({file_type:?}); skipping",
+                redact_secrets(&project_instructions.display().to_string())
+            );
+        }
+        Err(BoundedReadError::TooLarge { len, cap }) => {
+            warn!(
+                "project rules file '{}' is {len} bytes (> {cap} byte cap); skipping",
+                redact_secrets(&project_instructions.display().to_string())
+            );
+        }
+        Err(BoundedReadError::Io(_)) => {}
     }
 
     // 2. Check the host's global instructions file (e.g. ~/.claude/CLAUDE.md).
     //    Cursor has no global file (`global_instructions_path` -> None).
     if let Some(home) = dirs::home_dir()
         && let Some(global_path) = host.global_instructions_path(&home)
-        && global_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&global_path)
     {
-        let rules = extract_critical_rules(&content);
-        if !rules.is_empty() {
-            // Render the global path with a `~` prefix when it lives under
-            // $HOME, preserving the historical "~/.claude/CLAUDE.md" header.
-            let display = global_path.strip_prefix(&home).map_or_else(
-                |_| global_path.display().to_string(),
-                |rel| format!("~/{}", rel.display()),
-            );
-            all_rules.push(format!("## Global Rules ({display})\n{rules}"));
+        match bounded_read::read_bounded_to_string(&global_path, MAX_RULES_FILE_BYTES) {
+            Ok(content) => {
+                let rules = extract_critical_rules(&content);
+                if !rules.is_empty() {
+                    // Render the global path with a `~` prefix when it lives
+                    // under $HOME, preserving the historical
+                    // "~/.claude/CLAUDE.md" header.
+                    let display = global_path.strip_prefix(&home).map_or_else(
+                        |_| global_path.display().to_string(),
+                        |rel| format!("~/{}", rel.display()),
+                    );
+                    all_rules.push(format!("## Global Rules ({display})\n{rules}"));
+                }
+            }
+            Err(BoundedReadError::NotFound) => {}
+            Err(BoundedReadError::NotRegularFile { file_type }) => {
+                warn!(
+                    "global rules file '{}' is not a regular file ({file_type:?}); skipping",
+                    redact_secrets(&global_path.display().to_string())
+                );
+            }
+            Err(BoundedReadError::TooLarge { len, cap }) => {
+                warn!(
+                    "global rules file '{}' is {len} bytes (> {cap} byte cap); skipping",
+                    redact_secrets(&global_path.display().to_string())
+                );
+            }
+            Err(BoundedReadError::Io(_)) => {}
         }
     }
 

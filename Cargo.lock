@@ -923,6 +923,7 @@ dependencies = [
  "hex",
  "insta",
  "keyring",
+ "libc",
  "proptest",
  "regex",
  "reqwest 0.13.4",

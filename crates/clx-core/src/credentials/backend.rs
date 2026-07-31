@@ -29,7 +29,16 @@ use fs4::FileExt;
 use fs4::TryLockError;
 use secrecy::ExposeSecret;
 
+use crate::bounded_read::{self, Error as BoundedReadError};
+
 use super::{CredentialError, Result};
+
+/// Hard ceiling on `credentials.age`'s size. An age-encrypted map of a
+/// handful of provider API keys is kilobytes at most; 16 MiB is absurd
+/// headroom that only ever rejects something that is obviously wrong (a
+/// directory, device, or unrelated huge file dropped at the path), never a
+/// legitimate credential store.
+const MAX_CREDENTIALS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Storage/retrieval of already-scoped credential keys.
 ///
@@ -271,12 +280,43 @@ impl AgeFileBackend {
     ///   (then `set`/`migrate` repopulates from scratch).
     /// * File present, non-zero garbage -> already errors at the age decoder;
     ///   that behavior is preserved.
+    /// * File present but NOT a regular file (directory, FIFO, device, ...),
+    ///   or larger than [`MAX_CREDENTIALS_FILE_BYTES`] -> a HARD error, never
+    ///   treated as an empty store. Silently falling back to "empty" here
+    ///   would let a later `set`/`delete` re-encrypt an empty map and
+    ///   overwrite whatever is actually at that path, permanently destroying
+    ///   real credentials that might exist behind a symlink/mount swap.
     fn load_map(&self, identity: &age::x25519::Identity) -> Result<BTreeMap<String, String>> {
-        let encrypted = match fs::read(&self.cred_file) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(e) => return Err(Self::map_err("read credentials.age", e)),
-        };
+        let encrypted =
+            match bounded_read::read_bounded(&self.cred_file, MAX_CREDENTIALS_FILE_BYTES) {
+                Ok(b) => b,
+                Err(BoundedReadError::NotFound) => return Ok(BTreeMap::new()),
+                Err(BoundedReadError::NotRegularFile { file_type }) => {
+                    return Err(Self::map_err(
+                        "read credentials.age",
+                        format!(
+                            "{} is not a regular file ({file_type:?}); refusing to read it \
+                             (this is a hard error, not an empty store, so a later write can \
+                             never overwrite whatever is actually there)",
+                            self.cred_file.display()
+                        ),
+                    ));
+                }
+                Err(BoundedReadError::TooLarge { len, cap }) => {
+                    return Err(Self::map_err(
+                        "read credentials.age",
+                        format!(
+                            "{} is {len} bytes, exceeding the {cap} byte cap; refusing to read \
+                             it (hard error, not an empty store, for the same reason as a \
+                             non-regular file above)",
+                            self.cred_file.display()
+                        ),
+                    ));
+                }
+                Err(BoundedReadError::Io(e)) => {
+                    return Err(Self::map_err("read credentials.age", e));
+                }
+            };
         if encrypted.is_empty() {
             return Err(self.zero_byte_corruption_error());
         }

@@ -21,11 +21,18 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
 use colored::Colorize;
 
+use clx_core::bounded_read::{self, Error as BoundedReadError};
 use clx_core::config::Config;
 use clx_core::config::trust::{TrustList, compute_file_hash, trusted_configs_path};
 use clx_core::types::TrustToken;
 
 use crate::Cli;
+
+/// Hard ceiling on a project `.clx/config.yaml` being trusted. These are
+/// small hand-written YAML files; 4 MiB is generous headroom while still
+/// bounding a FIFO/device/oversized-file footgun at a path the CLI user
+/// supplied on the command line.
+const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Trust mode subcommands.
 #[derive(Debug, Clone, Subcommand)]
@@ -353,8 +360,31 @@ pub fn cmd_config_trust(cli: &Cli, action: ConfigTrustAction) -> Result<()> {
 fn handle_config_trust_add(cli: &Cli, path: PathBuf, yes: bool) -> Result<()> {
     let canonical = std::fs::canonicalize(&path)
         .with_context(|| format!("config file not found: {}", path.display()))?;
-    let content = std::fs::read_to_string(&canonical)
-        .with_context(|| format!("failed to read {}", canonical.display()))?;
+    let content = match bounded_read::read_bounded_to_string(&canonical, MAX_CONFIG_FILE_BYTES) {
+        Ok(content) => content,
+        // Extremely unlikely after a canonicalize that just succeeded (a
+        // TOCTOU race would have to remove the file in between), but handled
+        // for completeness rather than assumed away.
+        Err(BoundedReadError::NotFound) => {
+            bail!("config file not found: {}", canonical.display());
+        }
+        Err(BoundedReadError::NotRegularFile { file_type }) => {
+            bail!(
+                "{} is not a regular file ({file_type:?}); refusing to trust it",
+                canonical.display()
+            );
+        }
+        Err(BoundedReadError::TooLarge { len, cap }) => {
+            bail!(
+                "{} is {len} bytes, exceeding the {cap} byte cap for a project config; \
+                 refusing to read it",
+                canonical.display()
+            );
+        }
+        Err(BoundedReadError::Io(e)) => {
+            return Err(e).with_context(|| format!("failed to read {}", canonical.display()));
+        }
+    };
     let hash = compute_file_hash(&content);
 
     let mut tl = TrustList::load()?;

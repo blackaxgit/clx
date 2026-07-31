@@ -67,6 +67,15 @@ fastembed = "5"
 security-framework = "2.11"
 core-foundation = "0.9"
 
+# `bounded_read` opens untrusted-path files with O_NONBLOCK on Unix so the
+# open() call itself cannot hang on a FIFO with no writer attached (a plain
+# blocking open on such a FIFO blocks indefinitely -- verified -- which would
+# reintroduce the exact hang the module exists to prevent). Already resolved
+# in the workspace lockfile transitively (0.2.180); pinning it directly here
+# adds no new supply-chain surface.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
 
