@@ -187,7 +187,7 @@ jobs:
       # Download every artifact uploaded by the build matrix into ./artifacts/.
       # Each artifact lands in its own subdirectory keyed by the artifact name.
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
