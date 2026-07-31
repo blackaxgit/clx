@@ -30,7 +30,7 @@ pub fn ensure_default_rules_file() -> crate::Result<()> {
             ],
         };
 
-        let yaml = serde_yml::to_string(&default_config)?;
+        let yaml = serde_yaml_ng::to_string(&default_config)?;
         let yaml = format!(
             "# Note: CLX includes built-in rules for common commands. These are user-customizable extras.\n\
              # Run 'clx rules list' to see all active rules.\n\
@@ -116,7 +116,7 @@ mod tests {
             let rules_path = crate::paths::default_rules_path();
             let contents = std::fs::read_to_string(&rules_path).expect("read file");
 
-            let parsed: Result<super::RulesConfig, _> = serde_yml::from_str(&contents);
+            let parsed: Result<super::RulesConfig, _> = serde_yaml_ng::from_str(&contents);
             assert!(
                 parsed.is_ok(),
                 "file must parse as RulesConfig YAML: {parsed:?}"

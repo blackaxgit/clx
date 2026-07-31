@@ -263,15 +263,17 @@ fn config_migrate_legacy_ollama_block_succeeds_and_backs_up() {
         "migrate must write a .bak backup"
     );
     let migrated = std::fs::read_to_string(cfg_dir.join("config.yaml")).unwrap();
-    let parsed: serde_yml::Value = serde_yml::from_str(&migrated).unwrap();
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&migrated).unwrap();
     assert!(
         parsed
             .get("providers")
-            .is_some_and(serde_yml::Value::is_mapping),
+            .is_some_and(serde_yaml_ng::Value::is_mapping),
         "migrated config must have a providers: mapping; got:\n{migrated}"
     );
     assert!(
-        parsed.get("llm").is_some_and(serde_yml::Value::is_mapping),
+        parsed
+            .get("llm")
+            .is_some_and(serde_yaml_ng::Value::is_mapping),
         "migrated config must have an llm: routing block; got:\n{migrated}"
     );
 }

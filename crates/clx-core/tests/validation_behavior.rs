@@ -850,7 +850,7 @@ fn edge_very_long_command_no_panic_no_redos() {
 #[test]
 fn v_r8_malformed_config_swallowed_to_default() {
     // The malformed-YAML branch the hook tolerates.
-    let parsed: Result<Config, _> = serde_yml::from_str("validator: : : not yaml [[[");
+    let parsed: Result<Config, _> = serde_yaml_ng::from_str("validator: : : not yaml [[[");
     assert!(
         parsed.is_err(),
         "broken YAML must fail to deserialize into Config"

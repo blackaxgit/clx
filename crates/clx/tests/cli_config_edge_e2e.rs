@@ -91,7 +91,7 @@ fn config_set_float_value_roundtrips_through_get() {
 
     // It was written as a YAML number, not a quoted string.
     let raw = std::fs::read_to_string(config_file(&t)).unwrap();
-    let v: serde_yml::Value = serde_yml::from_str(&raw).unwrap();
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw).unwrap();
     assert!(
         v["auto_recall"]["similarity_threshold"].is_number(),
         "float must be stored as a number:\n{raw}"
@@ -223,10 +223,10 @@ fn config_set_bool_and_int_values_are_stored_typed() {
         .success();
 
     let raw = std::fs::read_to_string(config_file(&t)).unwrap();
-    let v: serde_yml::Value = serde_yml::from_str(&raw).unwrap();
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw).unwrap();
     assert_eq!(
         v["validator"]["enabled"],
-        serde_yml::Value::Bool(false),
+        serde_yaml_ng::Value::Bool(false),
         "bool stored typed:\n{raw}"
     );
     assert_eq!(

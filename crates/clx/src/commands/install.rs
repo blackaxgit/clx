@@ -261,13 +261,15 @@ fn merge_missing_config_keys(
     existing_yaml: &str,
     default_yaml: &str,
 ) -> Result<(String, Vec<String>)> {
-    let existing: serde_yml::Value =
-        serde_yml::from_str(existing_yaml).context("Existing config.yaml is not valid YAML")?;
-    let defaults: serde_yml::Value =
-        serde_yml::from_str(default_yaml).context("Default config is not valid YAML")?;
+    let existing: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(existing_yaml).context("Existing config.yaml is not valid YAML")?;
+    let defaults: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(default_yaml).context("Default config is not valid YAML")?;
 
-    let (serde_yml::Value::Mapping(mut existing_map), serde_yml::Value::Mapping(default_map)) =
-        (existing.clone(), defaults)
+    let (
+        serde_yaml_ng::Value::Mapping(mut existing_map),
+        serde_yaml_ng::Value::Mapping(default_map),
+    ) = (existing.clone(), defaults)
     else {
         // Not a mapping (empty or scalar) -> leave untouched, no-op.
         return Ok((existing_yaml.to_string(), Vec::new()));
@@ -277,7 +279,7 @@ fn merge_missing_config_keys(
     for (k, v) in &default_map {
         if !existing_map.contains_key(k) {
             existing_map.insert(k.clone(), v.clone());
-            if let serde_yml::Value::String(name) = k {
+            if let serde_yaml_ng::Value::String(name) = k {
                 added.push(name.clone());
             }
         }
@@ -287,7 +289,7 @@ fn merge_missing_config_keys(
         return Ok((existing_yaml.to_string(), Vec::new()));
     }
 
-    let merged = serde_yml::to_string(&serde_yml::Value::Mapping(existing_map))
+    let merged = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(existing_map))
         .context("Failed to re-serialize merged config")?;
     Ok((merged, added))
 }
@@ -1140,7 +1142,7 @@ pub async fn cmd_install(cli: &Cli, target: InstallTarget) -> Result<()> {
         // existing config.yaml without clobbering user values.
         match (
             fs::read_to_string(&config_path),
-            serde_yml::to_string(&Config::default()),
+            serde_yaml_ng::to_string(&Config::default()),
         ) {
             (Ok(existing), Ok(default_yaml)) => {
                 match merge_missing_config_keys(&existing, &default_yaml) {
@@ -1183,7 +1185,7 @@ pub async fn cmd_install(cli: &Cli, target: InstallTarget) -> Result<()> {
         }
     } else {
         let config = Config::default();
-        let yaml = serde_yml::to_string(&config)?;
+        let yaml = serde_yaml_ng::to_string(&config)?;
         fs::write(&config_path, yaml)?;
         if !cli.json {
             println!("  {} Created {}", "+".green(), config_path.display());
@@ -1981,7 +1983,7 @@ mod tests {
         let defaults = "alpha: default_value\nbeta: 42\n";
         let (merged, added) = merge_missing_config_keys(existing, defaults).unwrap();
         assert_eq!(added, vec!["beta".to_string()]);
-        let v: serde_yml::Value = serde_yml::from_str(&merged).unwrap();
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&merged).unwrap();
         assert_eq!(v["alpha"].as_str(), Some("user_value"));
         assert_eq!(v["beta"].as_i64(), Some(42));
     }
@@ -1997,7 +1999,7 @@ mod tests {
 
     #[test]
     fn merge_handles_empty_existing_config_as_noop() {
-        // serde_yml parses "" as Null (not a mapping) -> leave untouched.
+        // serde_yaml_ng parses "" as Null (not a mapping) -> leave untouched.
         let (merged, added) = merge_missing_config_keys("", "alpha: 1\n").unwrap();
         assert!(added.is_empty());
         assert_eq!(merged, "");
@@ -2087,7 +2089,7 @@ mod tests {
     // -- ollama_required_models: route-gated model pulls (Finding #5 caveat) --
 
     fn config_from_yaml(yaml: &str) -> Config {
-        serde_yml::from_str(yaml).expect("test YAML should deserialize into Config")
+        serde_yaml_ng::from_str(yaml).expect("test YAML should deserialize into Config")
     }
 
     #[test]

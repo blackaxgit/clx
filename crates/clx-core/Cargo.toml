@@ -10,7 +10,7 @@ description = "Core library for CLX - command validation, context persistence, a
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
+serde_yaml_ng.workspace = true
 tokio.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true

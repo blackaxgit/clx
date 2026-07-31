@@ -1626,7 +1626,7 @@ mod tests {
     /// route-awareness tests do not need the (non-exported) inner provider
     /// structs.
     fn config_from_yaml(yaml: &str) -> Config {
-        serde_yml::from_str::<Config>(yaml).expect("valid Config YAML")
+        serde_yaml_ng::from_str::<Config>(yaml).expect("valid Config YAML")
     }
 
     /// AC13 health-render regression: an `OpenRouter` provider's endpoint

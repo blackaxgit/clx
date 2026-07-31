@@ -301,11 +301,11 @@ fn test_rules_config_serialization() {
         blacklist: vec!["Bash(rm:-rf /*)".to_string()],
     };
 
-    let yaml = serde_yml::to_string(&config).unwrap();
+    let yaml = serde_yaml_ng::to_string(&config).unwrap();
     assert!(yaml.contains("whitelist:"));
     assert!(yaml.contains("blacklist:"));
 
-    let parsed: RulesConfig = serde_yml::from_str(&yaml).unwrap();
+    let parsed: RulesConfig = serde_yaml_ng::from_str(&yaml).unwrap();
     assert_eq!(parsed.whitelist.len(), 2);
     assert_eq!(parsed.blacklist.len(), 1);
 }

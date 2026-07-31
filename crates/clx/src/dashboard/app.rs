@@ -693,7 +693,7 @@ impl App {
         let config_path = config_dir.join("config.yaml");
         let tmp_path = config_dir.join("config.yaml.tmp");
 
-        let yaml = match serde_yml::to_string(editing) {
+        let yaml = match serde_yaml_ng::to_string(editing) {
             Ok(y) => y,
             Err(e) => {
                 self.settings_save_result = Some(format!("Serialize error: {e}"));
