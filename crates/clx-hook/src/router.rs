@@ -14,7 +14,7 @@
 //!   its own failure handling, so the router does not inject shared deps.
 //! - Mapping: `crate::output::*`
 //!
-//! Known limitation: `output::output_decision` / `output::output_generic`
+//! Known limitation: `output::output_decision_for` / `output::output_generic`
 //! still write to the process stdout via `println!`. The `writer` parameter
 //! is currently used only for the parse-error/oversize-input fallback. A
 //! follow-up will plumb the writer through `output::*` to make stdout
@@ -31,7 +31,7 @@ use crate::hooks::{
     handle_subagent_start, handle_user_prompt_submit,
 };
 use crate::host::{Host, detect_host};
-use crate::output::output_decision;
+use crate::output::output_decision_for;
 use crate::types::{HostNeutralInput, MAX_INPUT_SIZE};
 
 /// Best-effort provenance verdict for the hook invocation (finding F7).
@@ -143,6 +143,27 @@ pub(crate) enum ReadOutcome {
     ReadFailed,
 }
 
+/// Resolve the working directory for a parsed envelope (Domain layer: pure).
+///
+/// `envelope_cwd` is what the host sent (possibly empty: Cursor omits the key
+/// entirely, and `CursorHost::parse_hook_input` also defaults it to empty when
+/// `workspace_roots` is absent). `process_cwd` is the hook process's own
+/// working directory, read at the infrastructure edge by the caller.
+///
+/// Falling back to the process cwd is safe rather than permissive: the host
+/// spawns the hook *in* the directory the tool call is about, and every
+/// consumer of `cwd` (the Codex trust gate, project-rule loading, the policy
+/// engine's project path) treats an unknown project as NOT trusted. An empty
+/// string, by contrast, would leave relative-path joins to resolve against
+/// the process cwd implicitly and unlogged; this makes that explicit.
+#[must_use]
+pub(crate) fn resolve_cwd(envelope_cwd: &str, process_cwd: Option<&str>) -> String {
+    if !envelope_cwd.trim().is_empty() {
+        return envelope_cwd.to_string();
+    }
+    process_cwd.unwrap_or_default().to_string()
+}
+
 /// Host-explicit parse, used by `handle_event` (which has already detected
 /// the host) and by tests that want a deterministic host.
 pub(crate) fn parse_input_with_host(
@@ -153,13 +174,27 @@ pub(crate) fn parse_input_with_host(
     // for the Claude path is a serde parse error. Re-run the serde parse to
     // surface the typed `serde_json::Error` the callers expect, preserving
     // the historical parse-error behaviour exactly.
-    match host.parse_hook_input(raw) {
+    let parsed = match host.parse_hook_input(raw) {
         Ok(input) => Ok(input),
         Err(_) => serde_json::from_str::<HostNeutralInput>(raw).map(|mut input| {
             input.host = host.host_id();
             input
         }),
-    }
+    };
+    parsed.map(|mut input| {
+        if input.cwd.trim().is_empty() {
+            let process_cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string());
+            input.cwd = resolve_cwd(&input.cwd, process_cwd.as_deref());
+            debug!(
+                "Envelope carried no cwd ({:?} event, host {:?}); using the hook \
+                 process working directory instead",
+                input.hook_event_name, input.host
+            );
+        }
+        input
+    })
 }
 
 /// Run the parsed event through the matching handler. Unknown event names
@@ -181,7 +216,11 @@ pub(crate) async fn dispatch(input: HostNeutralInput, host: &dyn Host) -> anyhow
         "Stop" => handle_stop_auto_summary(input, host).await,
         unknown => {
             warn!("Unknown hook event: {}", unknown);
-            output_decision("allow", None, None, None);
+            // Emit through the detected host: an unknown Cursor lifecycle
+            // event must get Cursor's flat-`permission` shape, not Claude's
+            // `hookSpecificOutput` envelope, or the host sees no decision at
+            // all.
+            output_decision_for(host, "allow", None, None, None);
             Ok(())
         }
     }
@@ -267,7 +306,19 @@ where
                 "Failed to parse hook input: {}",
                 redact_secrets(&e.to_string())
             );
-            output_decision(
+            // F7 posture, same as `on_validator_unavailable`: an envelope we
+            // cannot parse yields no policy evaluation, so fail CLOSED to
+            // `ask` rather than letting the tool call through unvalidated.
+            //
+            // Emit it through the DETECTED host, not the Claude default. A
+            // Claude-shaped `hookSpecificOutput` written to Cursor (which
+            // reads a flat `permission` field) or to Codex (which has no
+            // interactive `ask` and needs the fail-closed deny mapping) is a
+            // decision the host cannot read - i.e. a fail-OPEN dressed up as
+            // a fail-closed. `Host::write_decision` applies each host's own
+            // ask semantics.
+            output_decision_for(
+                &*host,
                 "ask",
                 Some("CLX: Input parse error, manual confirmation required".to_string()),
                 None,
@@ -412,6 +463,119 @@ mod tests {
     fn read_input_propagates_genuine_io_errors_as_read_failed() {
         let err = read_input(FailingReader).expect_err("should fail");
         assert_eq!(err, ReadOutcome::ReadFailed);
+    }
+
+    // =====================================================================
+    // `missing field cwd` regression.
+    //
+    // cursor-agent stamps `workspace_roots` on every hook payload and never
+    // sends a `cwd` key. Before the fix such an envelope reached the strict
+    // Claude parser, failed with `missing field cwd`, and the event was
+    // dropped before L0/L1 ever ran.
+    // =====================================================================
+
+    /// A cursor-agent envelope for `event`: no `cwd` key anywhere.
+    fn cursor_envelope_without_cwd(event: &str) -> String {
+        serde_json::json!({
+            "session_id": "sess-cursor-nocwd",
+            "conversation_id": "conv-cursor-nocwd",
+            "hook_event_name": event,
+            "cursor_version": "2026.07.17",
+            "workspace_roots": ["/Users/dev/project"],
+            "user_email": "dev@example.com"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn resolve_cwd_prefers_the_envelope_value() {
+        assert_eq!(
+            resolve_cwd("/from/envelope", Some("/from/process")),
+            "/from/envelope"
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_falls_back_to_process_cwd_when_absent_or_blank() {
+        assert_eq!(resolve_cwd("", Some("/from/process")), "/from/process");
+        assert_eq!(resolve_cwd("   ", Some("/from/process")), "/from/process");
+    }
+
+    /// Both sources missing is degenerate but must not panic; the empty
+    /// string is the historical `CursorHost` default and every consumer
+    /// treats an unknown project as untrusted.
+    #[test]
+    fn resolve_cwd_with_no_source_is_empty() {
+        assert_eq!(resolve_cwd("", None), "");
+    }
+
+    /// FAIL-BEFORE: `cwd: String` was required, so this returned
+    /// `Err(missing field "cwd")`.
+    /// PASS-AFTER: the envelope parses and `cwd` is filled from
+    /// `workspace_roots` by `CursorHost`.
+    #[test]
+    fn parse_input_cursor_envelope_without_cwd_succeeds() {
+        let input = parse_input(&cursor_envelope_without_cwd("afterShellExecution"))
+            .expect("a cwd-less Cursor envelope must parse, not hard-fail");
+        assert_eq!(input.host, crate::host::HostId::Cursor);
+        assert_eq!(input.hook_event_name, "PostToolUse");
+        assert_eq!(input.cwd, "/Users/dev/project");
+    }
+
+    /// The narrower case: a host-neutral envelope with NO cwd source at all.
+    /// It must still parse, and `cwd` must be resolved to a non-empty path
+    /// (the hook process's own working directory) rather than left blank.
+    #[test]
+    fn parse_input_without_any_cwd_source_falls_back_to_process_cwd() {
+        let raw = serde_json::json!({
+            "session_id": "sess-nocwd",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/tmp/test.txt" }
+        })
+        .to_string();
+        let input = parse_input(&raw).expect("cwd-less envelope must parse");
+        let expected = std::env::current_dir()
+            .expect("test cwd")
+            .display()
+            .to_string();
+        assert_eq!(input.cwd, expected);
+    }
+
+    /// The happy path must be untouched: an envelope that DOES carry `cwd`
+    /// keeps it verbatim and is never overwritten by the process cwd.
+    #[test]
+    fn parse_input_with_cwd_is_unchanged() {
+        let input = parse_input(&pre_tool_use_envelope()).expect("parse");
+        assert_eq!(input.cwd, "/tmp/test-project");
+        assert_eq!(input.hook_event_name, "PreToolUse");
+    }
+
+    /// End-to-end: a cwd-less Cursor envelope must reach dispatch. Before the
+    /// fix this returned `HookExit::ParseError` - the event was dropped and
+    /// neither L0 nor L1 ran for it.
+    #[tokio::test]
+    async fn handle_event_cursor_envelope_without_cwd_is_not_a_parse_error() {
+        for event in [
+            "afterShellExecution",
+            "sessionStart",
+            "sessionEnd",
+            "stop",
+            "userPromptSubmit",
+        ] {
+            let raw = cursor_envelope_without_cwd(event);
+            let mut out = Vec::<u8>::new();
+            let exit = handle_event(raw.as_bytes(), &mut out).await;
+            assert_ne!(
+                exit,
+                HookExit::ParseError,
+                "cwd-less Cursor {event} envelope must not be dropped as a parse error"
+            );
+            assert!(
+                matches!(exit, HookExit::Ok | HookExit::HandlerError),
+                "unexpected exit for {event}: {exit:?}"
+            );
+        }
     }
 
     #[test]

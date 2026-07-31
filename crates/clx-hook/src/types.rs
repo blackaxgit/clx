@@ -42,7 +42,17 @@ pub(crate) struct HostNeutralInput {
     /// Path to transcript JSONL file
     pub transcript_path: Option<String>,
 
-    /// Current working directory
+    /// Current working directory.
+    ///
+    /// NOT every host sends this key. Cursor's hook envelope
+    /// (cursor-agent 2026.07) carries `workspace_roots` and has no `cwd`
+    /// field at all, so making this a hard requirement turned every Cursor
+    /// envelope that reached the Claude parser into a
+    /// a `missing-field-cwd` parse error, which skipped L0/L1 validation
+    /// for that event entirely. Defaulted here; `router::resolve_cwd`
+    /// substitutes the hook process's own working directory when the
+    /// envelope carries none, so handlers still see a usable path.
+    #[serde(default)]
     pub cwd: String,
 
     /// Name of the hook event

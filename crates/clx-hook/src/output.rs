@@ -34,28 +34,14 @@ fn decision_from_parts(decision: &str, reason: Option<String>) -> Option<PolicyD
     }
 }
 
-/// Output a permission decision to stdout as JSON.
+/// Host-routed permission-decision output: every decision is serialized in
+/// the protocol of the host that produced the envelope.
 ///
-/// Delegates serialization to the default host (`ClaudeHost`). Behaviour is
-/// byte-identical to the pre-refactor `println!` path.
-pub(crate) fn output_decision(
-    decision: &str,
-    reason: Option<String>,
-    additional_context: Option<&str>,
-    system_message: Option<&str>,
-) {
-    output_decision_for(
-        &ClaudeHost,
-        decision,
-        reason,
-        additional_context,
-        system_message,
-    );
-}
-
-/// Host-routed permission-decision output. The default-host path is exercised
-/// by `output_decision`; this form lets host-aware callers (P4) emit through
-/// any `&dyn Host`.
+/// There is deliberately no host-less wrapper. A decision written in the
+/// wrong host's shape is a decision the host cannot read - for a `deny` or an
+/// `ask` on the `PreToolUse` gate that degrades silently into a fail-open -
+/// so callers must pass the host they detected. For `ClaudeHost` the emitted
+/// bytes are identical to the pre-refactor `println!` path.
 pub(crate) fn output_decision_for(
     host: &dyn Host,
     decision: &str,

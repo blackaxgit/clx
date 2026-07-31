@@ -162,9 +162,11 @@ pub(crate) trait Host: Send + Sync {
 /// ignored (fall through to envelope detection).
 pub const HOST_OVERRIDE_ENV_VAR: &str = "CLX_HOOK_HOST";
 
-/// Env var Claude Code sets in its own spawned processes. When truthy it forces
-/// `HostId::Claude` (after the explicit `CLX_HOOK_HOST` override, before the
-/// envelope sniff).
+/// Env var Claude Code sets in its own spawned processes. When truthy it
+/// forces `HostId::Claude` - after the explicit `CLX_HOOK_HOST` override and
+/// after a positively-marked Cursor envelope, before the Codex sniff. It is
+/// an *inherited* variable, so it cannot outrank host-specific keys in the
+/// envelope itself; see [`host_id_for`].
 pub const CLAUDECODE_ENV_VAR: &str = "CLAUDECODE";
 
 /// Return `true` when an env value is *truthy*: present, non-empty after
@@ -183,8 +185,10 @@ fn is_truthy_env(value: Option<&str>) -> bool {
 ///
 /// Resolution order (per spec §1):
 /// 1. `CLX_HOOK_HOST` env override (`claude`/`codex`/`cursor`).
-/// 2. Envelope shape (Codex/Cursor signatures).
-/// 3. Claude (the ambiguous-envelope default).
+/// 2. A positively-marked Cursor envelope (Cursor-only keys / event names).
+/// 3. Truthy `CLAUDECODE`.
+/// 4. Envelope shape (the Codex `turn_id` signature).
+/// 5. Claude (the ambiguous-envelope default).
 ///
 /// The env read is the only process-state touch; it lives here at the
 /// orchestration edge so the rest of the pipeline is pure.
@@ -212,11 +216,25 @@ pub(crate) fn detect_host_with_override(
 /// Pure decision: which `HostId` does this envelope + override + `CLAUDECODE`
 /// signal resolve to.
 ///
-/// Precedence: explicit `CLX_HOOK_HOST` override > truthy `CLAUDECODE` >
-/// envelope `turn_id`/shape sniff > Claude default.
+/// Precedence: explicit `CLX_HOOK_HOST` override > positively-marked Cursor
+/// envelope > truthy `CLAUDECODE` > envelope `turn_id`/shape sniff > Claude
+/// default.
+///
+/// The Cursor arm sits ABOVE `CLAUDECODE` deliberately. `CLAUDECODE` is an
+/// inherited environment variable: a `cursor-agent` launched from a Claude
+/// Code shell (an MCP bridge, a review panel, any nested spawn) inherits it,
+/// and Cursor's own hook then resolved to `ClaudeHost` and failed to parse.
+/// `cursor_version` / `workspace_roots` are keys Claude Code never emits, so
+/// the envelope itself is strictly stronger evidence than the env var. The
+/// Codex `turn_id` sniff stays BELOW `CLAUDECODE` (AC2.1): `turn_id` is a
+/// weaker signal and the Claude-misclassified-as-Codex regression it guards
+/// against is still live.
 fn host_id_for(raw: &str, override_value: Option<&str>, claudecode: bool) -> HostId {
     if let Some(forced) = override_value.and_then(parse_host_override) {
         return forced;
+    }
+    if is_cursor_envelope(raw) {
+        return HostId::Cursor;
     }
     if claudecode {
         return HostId::Claude;
@@ -235,14 +253,68 @@ fn parse_host_override(value: &str) -> Option<HostId> {
     }
 }
 
-/// Sniff the host from the envelope shape. Conservative: only positively
-/// identified Codex/Cursor envelopes divert; everything else is Claude.
+/// Envelope keys that ONLY Cursor emits. cursor-agent stamps `cursor_version`
+/// and `workspace_roots` onto every hook payload it sends, regardless of the
+/// event, so either key positively identifies the host even for events this
+/// module does not enumerate by name. Neither Claude Code nor Codex emits
+/// them.
+const CURSOR_MARKER_KEYS: &[&str] = &["cursor_version", "workspace_roots"];
+
+/// Cursor's camelCase hook event names (cursor-agent 2026.07).
+///
+/// Cursor is the only host using lower-camel event names, so matching one is
+/// a positive host identification. The previous list held only the two
+/// `before*Execution` gating events; every OTHER Cursor event therefore fell
+/// through to the Claude default and hard-failed on the absent `cwd` key -
+/// note that `cursor::normalize_event_name` has always mapped
+/// `afterShellExecution` / `sessionStart` / `sessionEnd` / `stop`, i.e. the
+/// parser was built to receive events the detector never routed to it.
+const CURSOR_EVENT_NAMES: &[&str] = &[
+    "beforeShellExecution",
+    "beforeMCPExecution",
+    "afterShellExecution",
+    "afterMCPExecution",
+    "beforeReadFile",
+    "afterFileEdit",
+    "beforeSubmitPrompt",
+    "sessionStart",
+    "sessionEnd",
+    "userPromptSubmit",
+    "stop",
+    "subagentStop",
+    "preToolUse",
+    "postToolUse",
+    "postToolUseFailure",
+];
+
+/// Positive Cursor identification: a Cursor-only marker key, or a Cursor
+/// camelCase event name. Kept separate from [`sniff_envelope`] because it
+/// outranks `CLAUDECODE` (see [`host_id_for`]).
+fn is_cursor_envelope(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if CURSOR_MARKER_KEYS.iter().any(|k| obj.contains_key(*k)) {
+        return true;
+    }
+    obj.get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|event| CURSOR_EVENT_NAMES.contains(&event))
+}
+
+/// Sniff the host from the envelope shape. Conservative: only a positively
+/// identified Codex envelope diverts; everything else is Claude.
 ///
 /// Codex envelopes carry Codex-specific keys (`turn_id`, `permission_mode`)
-/// alongside the shared Claude-style keys (per P0 finding F4). Cursor
-/// `beforeShellExecution` envelopes carry a flat `permission` field and the
-/// Cursor-specific `hook_event_name` values. Anything we cannot positively
-/// classify is treated as Claude (the historical default).
+/// alongside the shared Claude-style keys (per P0 finding F4). Anything we
+/// cannot positively classify is treated as Claude (the historical default).
+///
+/// Cursor is NOT decided here: [`is_cursor_envelope`] runs earlier, in
+/// [`host_id_for`], because a Cursor-marked envelope also outranks
+/// `CLAUDECODE`.
 fn sniff_envelope(raw: &str) -> HostId {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return HostId::Claude;
@@ -251,14 +323,8 @@ fn sniff_envelope(raw: &str) -> HostId {
         return HostId::Claude;
     };
 
-    // Cursor: GUI-only events that Claude/Codex never emit.
-    if let Some(event) = obj
-        .get("hook_event_name")
-        .and_then(serde_json::Value::as_str)
-        && matches!(event, "beforeShellExecution" | "beforeMCPExecution")
-    {
-        return HostId::Cursor;
-    }
+    // Cursor is resolved earlier, in `host_id_for`, because it outranks
+    // `CLAUDECODE`; by the time we get here the envelope is not Cursor.
 
     // Codex: envelope carries the Codex-only `turn_id` key. NOTE: do NOT key on
     // `permission_mode` here - Claude Code ALSO emits a top-level `permission_mode`
@@ -351,6 +417,111 @@ mod tests {
         })
         .to_string();
         assert_eq!(host_id_for(&env, None, false), HostId::Cursor);
+    }
+
+    // =====================================================================
+    // `missing field cwd` regression: Cursor events other than the two
+    // `before*Execution` gating events used to fall through to the Claude
+    // default, where the strict `cwd: String` parse hard-failed and the
+    // event was never validated. See `CURSOR_EVENT_NAMES`.
+    // =====================================================================
+
+    /// A real cursor-agent envelope: `workspace_roots` instead of `cwd`,
+    /// `conversation_id` alongside `session_id`, plus `cursor_version`.
+    fn cursor_envelope(event: &str) -> String {
+        serde_json::json!({
+            "session_id": "sess-cursor-x",
+            "conversation_id": "conv-cursor-x",
+            "hook_event_name": event,
+            "cursor_version": "2026.07.17",
+            "workspace_roots": ["/Users/dev/project"],
+            "user_email": "dev@example.com"
+        })
+        .to_string()
+    }
+
+    /// FAIL-BEFORE: only `beforeShellExecution` / `beforeMCPExecution` were
+    /// recognised, so every other Cursor event resolved to `HostId::Claude`
+    /// and then died on a `missing-field-cwd`.
+    /// PASS-AFTER: every Cursor camelCase event resolves to Cursor.
+    #[test]
+    fn every_cursor_event_name_resolves_to_cursor() {
+        for event in CURSOR_EVENT_NAMES {
+            let env = serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": event,
+            })
+            .to_string();
+            assert_eq!(
+                host_id_for(&env, None, false),
+                HostId::Cursor,
+                "Cursor event {event} must route to CursorHost, not the Claude default"
+            );
+        }
+    }
+
+    /// The marker keys identify Cursor even for an event name this build does
+    /// not know (forward compatibility): a future `beforeSomethingNew` still
+    /// carries `cursor_version` / `workspace_roots`.
+    #[test]
+    fn cursor_marker_keys_identify_unknown_future_events() {
+        let env = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "beforeSomeFutureCursorEvent",
+            "cursor_version": "2027.01.01",
+            "workspace_roots": ["/w"],
+        })
+        .to_string();
+        assert_eq!(host_id_for(&env, None, false), HostId::Cursor);
+    }
+
+    /// A Cursor envelope must resolve to Cursor even when `CLAUDECODE` is
+    /// truthy. `cursor-agent` spawned from a Claude Code shell inherits that
+    /// variable; before this the inherited env forced `ClaudeHost` and the
+    /// Cursor envelope failed to parse. The envelope's own Cursor-only keys
+    /// are stronger evidence than an inherited env var.
+    #[test]
+    fn cursor_envelope_beats_inherited_claudecode() {
+        assert_eq!(
+            host_id_for(&cursor_envelope("afterShellExecution"), None, true),
+            HostId::Cursor
+        );
+    }
+
+    /// The inverse guard: a genuine Claude envelope carries none of the
+    /// Cursor markers, so the new arm cannot steal it (with or without
+    /// `CLAUDECODE`), and AC2.1's Codex behaviour is untouched.
+    #[test]
+    fn claude_and_codex_envelopes_are_not_stolen_by_cursor_arm() {
+        assert_eq!(host_id_for(&claude_envelope(), None, false), HostId::Claude);
+        assert_eq!(host_id_for(&claude_envelope(), None, true), HostId::Claude);
+        assert_eq!(
+            host_id_for(&codex_turn_id_envelope(), None, false),
+            HostId::Codex
+        );
+        assert_eq!(
+            host_id_for(&codex_turn_id_envelope(), None, true),
+            HostId::Claude
+        );
+    }
+
+    /// Claude's `PascalCase` lifecycle names must NOT be confused with
+    /// Cursor's lower-camel ones (`Stop` is Claude, `stop` is Cursor).
+    #[test]
+    fn pascal_case_event_names_stay_claude() {
+        for event in ["Stop", "SessionStart", "SessionEnd", "PreToolUse"] {
+            let env = serde_json::json!({
+                "session_id": "s",
+                "cwd": "/tmp",
+                "hook_event_name": event,
+            })
+            .to_string();
+            assert_eq!(
+                host_id_for(&env, None, false),
+                HostId::Claude,
+                "Claude event {event} must stay on ClaudeHost"
+            );
+        }
     }
 
     #[test]
