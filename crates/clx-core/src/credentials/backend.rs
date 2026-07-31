@@ -573,7 +573,7 @@ impl CredentialBackend for KeyringBackend {
 
     fn delete(&self, scoped_key: &str) -> Result<()> {
         let entry = self.entry(scoped_key)?;
-        match entry.delete_password() {
+        match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(Self::map_keyring_error(e, scoped_key)),
         }

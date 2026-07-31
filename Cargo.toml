@@ -57,8 +57,19 @@ dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 colored = "2"
 
-# Secure storage
-keyring = "2"
+# Secure storage.
+# keyring 3.x made the OS-native stores opt-in (2.x enabled them by default);
+# without these features the crate silently falls back to an in-memory mock
+# store. This is keyring's own recommended cross-platform set: macOS/iOS
+# Keychain (apple-native), Windows Credential Manager (windows-native), and
+# Linux keyutils + persistent Secret Service (linux-native-sync-persistent),
+# with the pure-Rust crypto backend so Linux needs no system OpenSSL.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "linux-native-sync-persistent",
+    "crypto-rust",
+] }
 secrecy = { version = "0.10", features = ["serde"] }
 # age-encryption.org v1 (X25519 + ChaCha20-Poly1305). Canonical Rust
 # implementation of the age spec, actively maintained by the age project.
