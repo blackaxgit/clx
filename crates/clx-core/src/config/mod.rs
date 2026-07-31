@@ -1365,7 +1365,7 @@ impl Config {
         let config_path = Self::config_dir()?.join("config.yaml");
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
-            let mut cfg: Self = serde_yml::from_str(&content)?;
+            let mut cfg: Self = serde_yaml_ng::from_str(&content)?;
             cfg.translate_legacy_in_place();
             Ok(cfg)
         } else {
@@ -2656,7 +2656,7 @@ logging:
   max_files: 10
 "#;
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert!(!config.validator.enabled);
         assert!(config.validator.layer1_enabled);
@@ -2696,7 +2696,7 @@ validator:
   enabled: false
 ";
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
 
         // Validator has one value set, rest are defaults
         assert!(!config.validator.enabled);
@@ -2797,8 +2797,8 @@ validator:
     #[test]
     fn test_config_serialization_roundtrip() {
         let config = Config::default();
-        let yaml = serde_yml::to_string(&config).unwrap();
-        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
+        let parsed: Config = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(config, parsed);
     }
 
@@ -3242,7 +3242,7 @@ ollama:
   embedding_dim: 512
 "#;
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(
             config.ollama.as_ref().unwrap().embedding_model,
             "custom-model"
@@ -3257,7 +3257,7 @@ ollama:
   embedding_model: "custom-model"
 "#;
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.ollama.as_ref().unwrap().embedding_dim, 1024);
     }
 
@@ -3375,7 +3375,7 @@ context_pressure:
   threshold: 0.75
 "#;
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.context_pressure.mode, ContextPressureMode::Notify);
         assert_eq!(config.context_pressure.context_window_size, 100_000);
         assert!((config.context_pressure.threshold - 0.75).abs() < f64::EPSILON);
@@ -3389,7 +3389,7 @@ session_recovery:
   stale_hours: 4
 ";
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(!config.session_recovery.enabled);
         assert_eq!(config.session_recovery.stale_hours, 4);
     }
@@ -3536,7 +3536,7 @@ mcp_tools:
       command_field: "expression"
 "#;
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(!config.mcp_tools.enabled);
         assert_eq!(config.mcp_tools.default_decision, DefaultDecision::Ask);
         assert_eq!(config.mcp_tools.command_tools.len(), 2);
@@ -3554,7 +3554,7 @@ mcp_tools:
   enabled: false
 ";
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(!config.mcp_tools.enabled);
         assert_eq!(config.mcp_tools.default_decision, DefaultDecision::Allow); // default
         assert_eq!(config.mcp_tools.command_tools.len(), 4); // defaults
@@ -3563,8 +3563,8 @@ mcp_tools:
     #[test]
     fn test_mcp_tools_serialization_roundtrip() {
         let config = Config::default();
-        let yaml = serde_yml::to_string(&config).unwrap();
-        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
+        let parsed: Config = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(config.mcp_tools, parsed.mcp_tools);
     }
 
@@ -3618,7 +3618,7 @@ auto_recall:
   reranker_timeout_ms: 125
 ";
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(!config.auto_recall.enabled);
         assert_eq!(config.auto_recall.max_results, 5);
         assert!((config.auto_recall.similarity_threshold - 0.5).abs() < f32::EPSILON);
@@ -3638,7 +3638,7 @@ auto_recall:
     #[test]
     fn test_auto_recall_missing_section_gets_defaults() {
         let yaml = "validator:\n  enabled: true\n";
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.auto_recall.enabled);
         assert_eq!(config.auto_recall.max_results, 3);
         assert!((config.auto_recall.similarity_threshold - 0.35).abs() < f32::EPSILON);
@@ -3662,7 +3662,7 @@ auto_recall:
   enabled: false
 ";
 
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(!config.auto_recall.enabled);
         // All other fields should be defaults
         assert_eq!(config.auto_recall.max_results, 3);
@@ -3677,8 +3677,8 @@ auto_recall:
     #[test]
     fn test_auto_recall_serialization_roundtrip() {
         let config = Config::default();
-        let yaml = serde_yml::to_string(&config).unwrap();
-        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
+        let parsed: Config = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(config.auto_recall, parsed.auto_recall);
     }
 
@@ -3756,8 +3756,9 @@ auto_recall:
         // Assert: the returned config has coherent default-like structure.
         // We cannot assert specific values without knowing what is in the user's
         // config.yaml, but we can verify the config round-trips through serde.
-        let yaml = serde_yml::to_string(&config).expect("config must serialize");
-        let reparsed: Config = serde_yml::from_str(&yaml).expect("serialized config must parse");
+        let yaml = serde_yaml_ng::to_string(&config).expect("config must serialize");
+        let reparsed: Config =
+            serde_yaml_ng::from_str(&yaml).expect("serialized config must parse");
         assert_eq!(config, reparsed);
     }
 
@@ -3772,7 +3773,7 @@ auto_recall:
 validator:
   enabled: false
 ";
-        let config: Config = serde_yml::from_str(yaml).expect("yaml must parse");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("yaml must parse");
 
         // Assert: file-only values preserved without env var influence.
         assert!(!config.validator.enabled);
@@ -3800,7 +3801,7 @@ validator:
             ("custom", PromptSensitivity::Custom),
         ] {
             let yaml = format!("validator:\n  prompt_sensitivity: \"{yaml_val}\"\n");
-            let config: Config = serde_yml::from_str(&yaml).unwrap();
+            let config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
             assert_eq!(
                 config.validator.prompt_sensitivity, expected,
                 "Failed for yaml value: {yaml_val}"
@@ -3811,7 +3812,7 @@ validator:
     #[test]
     fn test_prompt_sensitivity_missing_uses_default() {
         let yaml = "validator:\n  enabled: true\n";
-        let config: Config = serde_yml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(
             config.validator.prompt_sensitivity,
             PromptSensitivity::Standard
@@ -3854,8 +3855,8 @@ validator:
     #[test]
     fn test_prompt_sensitivity_serialization_roundtrip() {
         let config = Config::default();
-        let yaml = serde_yml::to_string(&config).unwrap();
-        let parsed: Config = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
+        let parsed: Config = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(
             config.validator.prompt_sensitivity,
             parsed.validator.prompt_sensitivity
@@ -3919,11 +3920,11 @@ validator:
                     "validator:\n  enabled: {enabled}\n  layer1_timeout_ms: {timeout_ms}\nuser_learning:\n  auto_whitelist_threshold: {threshold}\n"
                 );
                 // Act + Assert: parsing must not panic
-                let result = serde_yml::from_str::<Config>(&yaml);
+                let result = serde_yaml_ng::from_str::<Config>(&yaml);
                 prop_assert!(result.is_ok(), "YAML must parse: {result:?}");
                 // Round-trip: serialise the parsed config and re-parse
-                let serialised = serde_yml::to_string(&result.unwrap()).expect("must serialise");
-                let reparsed = serde_yml::from_str::<Config>(&serialised);
+                let serialised = serde_yaml_ng::to_string(&result.unwrap()).expect("must serialise");
+                let reparsed = serde_yaml_ng::from_str::<Config>(&serialised);
                 prop_assert!(reparsed.is_ok(), "Re-parse must succeed: {reparsed:?}");
             }
         }
@@ -3960,7 +3961,7 @@ ollama:
   retry_delay_ms: 100
   retry_backoff: 2.0
 "#;
-        let mut cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let mut cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         cfg.translate_legacy_in_place();
         assert!(cfg.providers.contains_key("ollama-local"));
         let llm = cfg.llm.as_ref().unwrap();
@@ -3982,7 +3983,7 @@ llm:
   chat: { provider: "azure-prod", model: "gpt-4o-mini" }
   embeddings: { provider: "azure-prod", model: "text-embedding-3-large" }
 "#;
-        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.llm.as_ref().unwrap().chat.model, "gpt-4o-mini");
     }
@@ -4002,7 +4003,7 @@ llm:
   chat: { provider: "openrouter", model: "anthropic/claude-3.5-sonnet" }
   embeddings: { provider: "ollama-local", model: "qwen3-embedding:0.6b" }
 "#;
-        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.providers.len(), 1);
         assert!(
             matches!(
@@ -4022,7 +4023,7 @@ llm:
     #[test]
     fn openrouter_config_defaults_when_fields_omitted() {
         let yaml = "kind: open_router\n";
-        let cfg: ProviderConfig = serde_yml::from_str(yaml).unwrap();
+        let cfg: ProviderConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match cfg {
             ProviderConfig::OpenRouter(c) => {
                 assert_eq!(c.endpoint, "https://openrouter.ai/api");
@@ -4058,7 +4059,7 @@ llm:
   chat: { provider: "azure-prod", model: "new-model" }
   embeddings: { provider: "azure-prod", model: "new-embed" }
 "#;
-        let mut cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let mut cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         cfg.translate_legacy_in_place();
         // new section wins
         assert_eq!(cfg.llm.as_ref().unwrap().chat.model, "new-model");
@@ -4089,7 +4090,7 @@ ollama:
   retry_delay_ms: 100
   retry_backoff: 2.0
 "#;
-        let mut cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let mut cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         cfg.translate_legacy_in_place();
         cfg.translate_legacy_in_place(); // second call must be a no-op
         assert_eq!(cfg.providers.len(), 1);
@@ -4168,15 +4169,15 @@ fallback:
   provider: ollama-local
   model: \"qwen3:1.7b\"
 ";
-        let route: CapabilityRoute = serde_yml::from_str(yaml).unwrap();
+        let route: CapabilityRoute = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(route.provider, "azure-prod");
         let fb = route.fallback.as_deref().expect("fallback present");
         assert_eq!(fb.provider, "ollama-local");
         assert_eq!(fb.model, "qwen3:1.7b");
         assert!(fb.fallback.is_none());
 
-        let yaml2 = serde_yml::to_string(&route).unwrap();
-        let route2: CapabilityRoute = serde_yml::from_str(&yaml2).unwrap();
+        let yaml2 = serde_yaml_ng::to_string(&route).unwrap();
+        let route2: CapabilityRoute = serde_yaml_ng::from_str(&yaml2).unwrap();
         assert_eq!(route, route2);
     }
 
@@ -4188,7 +4189,7 @@ fallback:
             fallback: None,
             dimension: None,
         };
-        let yaml = serde_yml::to_string(&route).unwrap();
+        let yaml = serde_yaml_ng::to_string(&route).unwrap();
         assert!(
             !yaml.contains("fallback"),
             "skip_serializing_if not respected: {yaml}"

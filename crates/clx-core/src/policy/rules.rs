@@ -304,7 +304,7 @@ impl PolicyEngine {
         }
 
         let content = fs::read_to_string(path)?;
-        let config: RulesConfig = serde_yml::from_str(&content)?;
+        let config: RulesConfig = serde_yaml_ng::from_str(&content)?;
 
         let whitelist_count = config.whitelist.len();
         let blacklist_count = config.blacklist.len();

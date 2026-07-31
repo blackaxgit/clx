@@ -48,7 +48,7 @@ pub async fn cmd_config(cli: &Cli, action: Option<&ConfigAction>) -> Result<()> 
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             } else {
-                let yaml = serde_yml::to_string(&config)?;
+                let yaml = serde_yaml_ng::to_string(&config)?;
                 println!("{}", "Current Configuration".cyan().bold());
                 println!("{}", "=".repeat(50));
                 println!();
@@ -61,7 +61,7 @@ pub async fn cmd_config(cli: &Cli, action: Option<&ConfigAction>) -> Result<()> 
             // Ensure config file exists with defaults
             if !config_path.exists() {
                 let config = Config::default();
-                let yaml = serde_yml::to_string(&config)?;
+                let yaml = serde_yaml_ng::to_string(&config)?;
                 if let Some(parent) = config_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -135,7 +135,7 @@ pub async fn cmd_config(cli: &Cli, action: Option<&ConfigAction>) -> Result<()> 
 
             // Write default config
             let config = Config::default();
-            let yaml = serde_yml::to_string(&config)?;
+            let yaml = serde_yaml_ng::to_string(&config)?;
             if let Some(parent) = config_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -180,7 +180,7 @@ fn migrate(cli: &Cli) -> Result<()> {
     // Parse the raw file (no env-var overrides — we want the on-disk shape).
     let raw = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
-    let mut cfg: Config = serde_yml::from_str(&raw)
+    let mut cfg: Config = serde_yaml_ng::from_str(&raw)
         .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
     // Guard: already new schema.
@@ -206,7 +206,7 @@ fn migrate(cli: &Cli) -> Result<()> {
         .with_context(|| format!("Failed to write backup to {}", bak_path.display()))?;
 
     // Serialize and atomically replace the config file.
-    let new_yaml = serde_yml::to_string(&cfg).context("Failed to serialize updated config")?;
+    let new_yaml = serde_yaml_ng::to_string(&cfg).context("Failed to serialize updated config")?;
     let tmp_path = config_path.with_extension("yaml.tmp");
     std::fs::write(&tmp_path, &new_yaml)
         .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
@@ -240,23 +240,23 @@ fn migrate(cli: &Cli) -> Result<()> {
 /// Walk a dotted key path through a raw YAML mapping and return the leaf node.
 ///
 /// Returns `None` when any intermediate segment is missing or is not a mapping.
-fn yaml_get<'a>(root: &'a serde_yml::Value, key: &str) -> Option<&'a serde_yml::Value> {
+fn yaml_get<'a>(root: &'a serde_yaml_ng::Value, key: &str) -> Option<&'a serde_yaml_ng::Value> {
     let mut cur = root;
     for seg in key.split('.') {
         let map = cur.as_mapping()?;
-        cur = map.get(serde_yml::Value::String(seg.to_owned()))?;
+        cur = map.get(serde_yaml_ng::Value::String(seg.to_owned()))?;
     }
     Some(cur)
 }
 
 /// Format a scalar YAML leaf for display. Refuses non-scalar leaves (maps /
 /// sequences) so `get` never prints a structured subtree as if it were a value.
-fn yaml_scalar_to_string(v: &serde_yml::Value) -> Option<String> {
+fn yaml_scalar_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
     match v {
-        serde_yml::Value::String(s) => Some(s.clone()),
-        serde_yml::Value::Bool(b) => Some(b.to_string()),
-        serde_yml::Value::Number(n) => Some(n.to_string()),
-        serde_yml::Value::Null => Some("null".to_owned()),
+        serde_yaml_ng::Value::String(s) => Some(s.clone()),
+        serde_yaml_ng::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
+        serde_yaml_ng::Value::Null => Some("null".to_owned()),
         _ => None,
     }
 }
@@ -264,25 +264,25 @@ fn yaml_scalar_to_string(v: &serde_yml::Value) -> Option<String> {
 /// Parse a CLI string value into the most specific YAML scalar: bool, then
 /// integer, then float, falling back to a string (Q8-a). `Config::load`
 /// validation is the safety net for an unexpected type.
-fn parse_value(value: &str) -> serde_yml::Value {
+fn parse_value(value: &str) -> serde_yaml_ng::Value {
     if let Ok(b) = value.parse::<bool>() {
-        return serde_yml::Value::Bool(b);
+        return serde_yaml_ng::Value::Bool(b);
     }
     if let Ok(i) = value.parse::<i64>() {
-        return serde_yml::Value::Number(i.into());
+        return serde_yaml_ng::Value::Number(i.into());
     }
     if let Ok(f) = value.parse::<f64>() {
-        return serde_yml::Value::Number(serde_yml::Number::from(f));
+        return serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(f));
     }
-    serde_yml::Value::String(value.to_owned())
+    serde_yaml_ng::Value::String(value.to_owned())
 }
 
 /// Walk/create the dotted path in `root`, creating intermediate mappings, and
 /// assign `leaf` at the final segment.
-fn yaml_set(root: &mut serde_yml::Value, key: &str, leaf: serde_yml::Value) -> Result<()> {
+fn yaml_set(root: &mut serde_yaml_ng::Value, key: &str, leaf: serde_yaml_ng::Value) -> Result<()> {
     // Ensure the root itself is a mapping (an empty/Null document becomes one).
     if !root.is_mapping() {
-        *root = serde_yml::Value::Mapping(serde_yml::Mapping::new());
+        *root = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
     }
 
     let segments: Vec<&str> = key.split('.').collect();
@@ -292,12 +292,12 @@ fn yaml_set(root: &mut serde_yml::Value, key: &str, leaf: serde_yml::Value) -> R
             .as_mapping_mut()
             .context("config path traverses a non-mapping node")?;
         let entry = map
-            .entry(serde_yml::Value::String((*seg).to_owned()))
-            .or_insert_with(|| serde_yml::Value::Mapping(serde_yml::Mapping::new()));
+            .entry(serde_yaml_ng::Value::String((*seg).to_owned()))
+            .or_insert_with(|| serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()));
         // If an existing intermediate is not a mapping, replace it with one so
         // the dotted path can be created.
         if !entry.is_mapping() {
-            *entry = serde_yml::Value::Mapping(serde_yml::Mapping::new());
+            *entry = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
         }
         cur = entry;
     }
@@ -306,7 +306,7 @@ fn yaml_set(root: &mut serde_yml::Value, key: &str, leaf: serde_yml::Value) -> R
     let map = cur
         .as_mapping_mut()
         .context("config path traverses a non-mapping node")?;
-    map.insert(serde_yml::Value::String(last.to_owned()), leaf);
+    map.insert(serde_yaml_ng::Value::String(last.to_owned()), leaf);
     Ok(())
 }
 
@@ -322,8 +322,8 @@ fn config_get(cli: &Cli, key: &str) -> Result<()> {
         )
     })?;
 
-    let root: serde_yml::Value =
-        serde_yml::from_str(&raw).context("Failed to parse config file as YAML")?;
+    let root: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&raw).context("Failed to parse config file as YAML")?;
 
     let leaf = yaml_get(&root, key).with_context(|| format!("key not found: {key}"))?;
     let value = yaml_scalar_to_string(leaf)
@@ -354,16 +354,16 @@ fn config_set(cli: &Cli, key: &str, value: &str) -> Result<()> {
         }
     };
 
-    let mut root: serde_yml::Value = match &original {
+    let mut root: serde_yaml_ng::Value = match &original {
         Some(s) if !s.trim().is_empty() => {
-            serde_yml::from_str(s).context("Failed to parse config file as YAML")?
+            serde_yaml_ng::from_str(s).context("Failed to parse config file as YAML")?
         }
-        _ => serde_yml::Value::Mapping(serde_yml::Mapping::new()),
+        _ => serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()),
     };
 
     yaml_set(&mut root, key, parse_value(value))?;
 
-    let new_yaml = serde_yml::to_string(&root).context("Failed to serialize updated config")?;
+    let new_yaml = serde_yaml_ng::to_string(&root).context("Failed to serialize updated config")?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

@@ -30,7 +30,7 @@ pub enum Error {
 
     /// YAML parsing error
     #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yml::Error),
+    Yaml(#[from] serde_yaml_ng::Error),
 
     /// IO error
     #[error("IO error: {0}")]

@@ -116,12 +116,12 @@ const NON_INERT_KEY_PATTERNS: &[&str] = &[
 /// returns an empty string if the YAML is invalid (the project layer
 /// is then a no-op and the global layer wins).
 pub fn filter_inert_only(raw_yaml: &str) -> String {
-    let value: serde_yml::Value = match serde_yml::from_str(raw_yaml) {
+    let value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(raw_yaml) {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
     let filtered = filter_value(&value, "");
-    serde_yml::to_string(&filtered).unwrap_or_default()
+    serde_yaml_ng::to_string(&filtered).unwrap_or_default()
 }
 
 /// Apply the project-layer trust gate (§3.11).
@@ -167,11 +167,11 @@ pub fn apply_project_layer(raw_yaml: &str, project_path: &std::path::Path) -> St
     }
 }
 
-fn filter_value(v: &serde_yml::Value, path: &str) -> serde_yml::Value {
-    use serde_yml::Value;
+fn filter_value(v: &serde_yaml_ng::Value, path: &str) -> serde_yaml_ng::Value {
+    use serde_yaml_ng::Value;
     match v {
         Value::Mapping(m) => {
-            let mut out = serde_yml::Mapping::new();
+            let mut out = serde_yaml_ng::Mapping::new();
             for (k, vv) in m {
                 let Some(key) = k.as_str() else {
                     continue;

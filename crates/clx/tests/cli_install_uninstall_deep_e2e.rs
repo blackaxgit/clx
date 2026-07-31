@@ -138,7 +138,7 @@ fn install_merges_missing_config_keys_without_clobbering_user_values() {
 
     // User value preserved; a defaulted top-level section was added.
     let merged = std::fs::read_to_string(config_path(&t)).unwrap();
-    let yaml: serde_yml::Value = serde_yml::from_str(&merged).unwrap();
+    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&merged).unwrap();
     assert_eq!(
         yaml["validator"]["enabled"].as_bool(),
         Some(false),

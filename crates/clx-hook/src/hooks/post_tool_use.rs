@@ -194,7 +194,7 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
 /// is a runtime env check instead.
 ///
 /// GATED TO DEBUG BUILDS: the override is honored ONLY when `debug_assertions`
-/// is on, so shipped release binaries (`--release`, no debug_assertions) NEVER
+/// is on, so shipped release binaries (`--release`, no `debug_assertions`) NEVER
 /// read the env var and behave byte-for-byte as before. This matters because
 /// the bucket timestamp affects `tool_events` dedup cardinality, which
 /// `turns_since_last_auto_summary` counts — so an override honored in release
