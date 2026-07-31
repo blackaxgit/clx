@@ -40,6 +40,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # keyring's `linux-native-sync-persistent` feature pulls in
+      # dbus-secret-service -> libdbus-sys, whose build script hard-fails
+      # without the system `dbus-1.pc`. ubuntu-latest ships libssl-dev but not
+      # libdbus-1-dev, so every Linux job that compiles the workspace needs
+      # this. macOS/Windows use the native Keychain/Credential Manager and
+      # never enter this code path.
+      - name: Install Linux system dependencies (libdbus for keyring)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Install Rust stable (with rustfmt + clippy components)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -74,6 +83,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # See the `check` job: libdbus-sys needs the system dbus dev package.
+      # Guarded on Linux - the macOS leg of this matrix must not run apt.
+      - name: Install Linux system dependencies (libdbus for keyring)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -102,6 +117,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      # See the `check` job: libdbus-sys needs the system dbus dev package.
+      # Guarded on Linux - the macOS leg of this matrix must not run apt.
+      - name: Install Linux system dependencies (libdbus for keyring)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
