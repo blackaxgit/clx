@@ -146,7 +146,7 @@ jobs:
       # This creates a cryptographically-verifiable attestation that this tarball was built
       # by this workflow, at this commit, with no external intervention.
       - name: Generate build provenance attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.TARBALL_STEM }}.tar.gz
           # Note: GitHub's default keyless Sigstore signing (OIDC) is used.
