@@ -164,6 +164,7 @@ pub fn cmd_credentials(cli: &Cli, action: &CredentialsAction) -> Result<()> {
                                 let kind = match pc {
                                     ProviderConfig::Ollama(_) => "ollama",
                                     ProviderConfig::AzureOpenai(_) => "azure_openai",
+                                    ProviderConfig::OpenRouter(_) => "open_router",
                                 };
                                 format!(" ({kind})")
                             })

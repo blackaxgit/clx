@@ -330,3 +330,39 @@ If the release includes provider-fallback changes, validate the fallback path:
    (cooldown active). Ollama serves both calls.
 6. Wait 31 seconds, repeat. Primary is re-tried (cooldown expired).
 7. Restore the correct deployment name in `llm.chat.model`.
+
+---
+
+## OpenRouter provider
+
+`OpenRouter` (openrouter.ai) is a generic OpenAI-compatible **chat-only** L1
+backend — same `ProviderConfig`/`LlmClient` plumbing as Azure, routed purely
+through config (no code change needed to switch to it). Minimal example:
+
+```yaml
+providers:
+  openrouter:
+    kind: open_router
+    endpoint: https://openrouter.ai/api
+    api_key_env: OPENROUTER_API_KEY
+llm:
+  chat: { provider: openrouter, model: anthropic/claude-3.5-sonnet }
+  embeddings: { provider: ollama-local, model: qwen3-embedding:0.6b }
+```
+
+Notes:
+- `endpoint` defaults to `https://openrouter.ai/api` if omitted; it is
+  normalized to `.../api/v1/chat/completions` and `.../api/v1/models`
+  regardless of a trailing `/`, `/api`, or `/api/v1`.
+- `model` is sent verbatim to `OpenRouter` (e.g. `openai/gpt-4o-mini`,
+  `meta-llama/llama-3.1-8b-instruct:free`) — no slug parsing.
+- `OpenRouter` is **chat-only**: routing it under `llm.embeddings` (primary or
+  `fallback`) is rejected at config-resolution time with an actionable error,
+  before any network call.
+- `llm.chat.fallback` works the same way it does for Azure — e.g. fall back
+  to `ollama-local` if the `openrouter` provider is unavailable.
+- A custom OpenRouter-compatible gateway host can be allowed via the
+  `CLX_ALLOW_OPENROUTER_HOSTS` env var (comma-separated hostnames); every
+  other host is rejected at construction time (SSRF pinning), and any
+  allowed host is still redacted from logs/errors/`clx health` output the
+  same way `openrouter.ai` itself is.

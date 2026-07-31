@@ -97,6 +97,9 @@ async fn check_providers(config: &clx_core::config::Config) -> (Vec<ProviderRow>
             ProviderConfig::AzureOpenai(a) => {
                 ("azure_openai".to_owned(), redact_secrets(&a.endpoint))
             }
+            ProviderConfig::OpenRouter(o) => {
+                ("open_router".to_owned(), redact_secrets(&o.endpoint))
+            }
         };
 
         let (healthy, error) = match config.create_llm_client_by_name(&name) {
@@ -446,9 +449,11 @@ fn classify_capability_route(
             host: o.host.clone(),
             model: route.model.clone(),
         },
-        Some(ProviderConfig::AzureOpenai(_)) => RouteProbe::Remote {
-            provider: route.provider.clone(),
-        },
+        Some(ProviderConfig::AzureOpenai(_) | ProviderConfig::OpenRouter(_)) => {
+            RouteProbe::Remote {
+                provider: route.provider.clone(),
+            }
+        }
         None => RouteProbe::Unresolved,
     }
 }
@@ -1622,6 +1627,41 @@ mod tests {
     /// structs.
     fn config_from_yaml(yaml: &str) -> Config {
         serde_yml::from_str::<Config>(yaml).expect("valid Config YAML")
+    }
+
+    /// AC13 health-render regression: an `OpenRouter` provider's endpoint
+    /// host must appear redacted (not raw) in the `ProviderRow` that `clx
+    /// health` renders/serializes. No `api_key_env` is configured, so
+    /// `create_llm_client_by_name` fails on credential resolution BEFORE
+    /// `OpenRouterBackend::new` (and therefore before any network call) —
+    /// `check_providers` still computes and redacts the endpoint
+    /// independently of whether the client construction succeeds.
+    #[tokio::test]
+    async fn check_providers_redacts_openrouter_endpoint_host() {
+        let cfg = config_from_yaml(
+            r#"
+providers:
+  openrouter:
+    kind: open_router
+    endpoint: "https://openrouter.ai/api"
+"#,
+        );
+        let (rows, _routing) = check_providers(&cfg).await;
+        let row = rows
+            .iter()
+            .find(|r| r.name == "openrouter")
+            .expect("openrouter provider row present");
+        assert_eq!(row.kind, "open_router");
+        assert!(
+            !row.endpoint.contains("openrouter.ai"),
+            "AC13 REGRESSION: raw OpenRouter endpoint host in ProviderRow: {}",
+            row.endpoint
+        );
+        assert!(
+            row.endpoint.contains("***OPENROUTER-HOST-REDACTED***"),
+            "expected the OpenRouter host-redaction marker: {}",
+            row.endpoint
+        );
     }
 
     /// Finding #2: embeddings routed to a remote (Azure) provider must NOT

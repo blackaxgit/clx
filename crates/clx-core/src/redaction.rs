@@ -27,6 +27,58 @@ const AZURE_HOST_SUFFIXES: &[&str] = &[
 /// Replacement token used when an Azure/OpenAI tenant host is scrubbed.
 const AZURE_HOST_REDACTED: &str = "***AZURE-HOST-REDACTED***";
 
+/// Host-suffix pattern for the `OpenRouter` (openrouter.ai) gateway (C1/AC13).
+/// Unlike the Azure suffixes above (which target per-tenant subdomains), this
+/// is a single fixed vendor apex + wildcard-subdomain suffix — `OpenRouter`
+/// hosts are still provider infrastructure in the same disclosure class as
+/// the Azure tenant host (an operator's `OpenRouter` endpoint/gateway choice
+/// should not leak into logs verbatim).
+const OPENROUTER_HOST_SUFFIXES: &[&str] = &[".openrouter.ai"];
+
+/// Bare apex form of the `OpenRouter` host (the suffix list above only
+/// matches subdomains, e.g. `gateway.openrouter.ai`; the apex `openrouter.ai`
+/// itself needs an exact/suffix-with-leading-dot-stripped check).
+const OPENROUTER_APEX_HOST: &str = "openrouter.ai";
+
+/// Replacement token used when an `OpenRouter`/generic-LLM-gateway host is
+/// scrubbed. Distinct from [`AZURE_HOST_REDACTED`] so redacted output still
+/// identifies which class of host was scrubbed (useful when debugging a
+/// redacted log line).
+const OPENROUTER_HOST_REDACTED: &str = "***OPENROUTER-HOST-REDACTED***";
+
+/// Name of the env var carrying a comma-separated list of additional
+/// operator-configured `OpenRouter`-compatible gateway hosts to scrub (mirrors
+/// `OpenRouterBackend`'s own `CLX_ALLOW_OPENROUTER_HOSTS` allowlist — C1/AC13:
+/// a custom gateway host an operator opted into via that override must be
+/// scrubbed from logs/errors just like the built-in `openrouter.ai` suffix).
+const CLX_ALLOW_OPENROUTER_HOSTS_ENV: &str = "CLX_ALLOW_OPENROUTER_HOSTS";
+
+/// Return `true` if `authority_lower` (an already-lowercased host, optionally
+/// with a trailing path/port stripped by the caller) matches the built-in
+/// `OpenRouter` suffix list OR a host listed in `CLX_ALLOW_OPENROUTER_HOSTS`.
+///
+/// Reads the env var on every call (mirrors `OpenRouterBackend::is_host_allowed`
+/// — this is a low-frequency path: redaction runs on error/log text, not a hot
+/// loop) so tests can set/unset the override without needing to thread state
+/// through `redact_secrets`'s public signature.
+#[must_use]
+fn is_openrouter_host(authority_lower: &str) -> bool {
+    if authority_lower == OPENROUTER_APEX_HOST
+        || OPENROUTER_HOST_SUFFIXES
+            .iter()
+            .any(|suf| authority_lower.ends_with(suf))
+    {
+        return true;
+    }
+    std::env::var(CLX_ALLOW_OPENROUTER_HOSTS_ENV).is_ok_and(|allowlist| {
+        allowlist
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|h| h.eq_ignore_ascii_case(authority_lower))
+    })
+}
+
 /// Scrub Azure/OpenAI tenant hostnames from `text`.
 ///
 /// Finds URL-like tokens (`https?://`) and replaces the authority component
@@ -168,6 +220,113 @@ fn redact_azure_hosts(text: &str) -> String {
     result
 }
 
+/// Scrub `OpenRouter`/generic-LLM-gateway hostnames from `text` (C1/AC13).
+///
+/// Mirrors [`redact_azure_hosts`] exactly (two passes: scheme-qualified URL
+/// authorities, then bare hostname tokens using the same delimiter set) but
+/// matches against [`is_openrouter_host`] — the built-in `openrouter.ai` +
+/// `*.openrouter.ai` suffix plus any host listed in `CLX_ALLOW_OPENROUTER_HOSTS`
+/// — and substitutes [`OPENROUTER_HOST_REDACTED`] instead of the Azure marker.
+///
+/// Intentionally a separate function (not a generalization of
+/// `redact_azure_hosts` parameterized by suffix list) so the existing Azure
+/// tests that call `redact_azure_hosts` directly keep asserting Azure-only
+/// behavior, unchanged — this function is purely additive.
+#[must_use]
+fn redact_openrouter_hosts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // P1-3: ASCII-only lowering — see the identical comment on
+    // `redact_azure_hosts`'s `lower` for the offset-desync hazard this avoids.
+    let lower = text.to_ascii_lowercase();
+    let mut cursor = 0usize;
+
+    // Pass 1: URL-bearing tokens (`https?://authority/...`).
+    while cursor < text.len() {
+        let scheme_pos = {
+            let mut found = None;
+            let search_from = cursor;
+            for scheme in &["https://", "http://"] {
+                if let Some(idx) = lower[search_from..].find(scheme) {
+                    let abs = search_from + idx;
+                    found = match found {
+                        None => Some((abs, scheme.len())),
+                        Some((prev, _)) if abs < prev => Some((abs, scheme.len())),
+                        other => other,
+                    };
+                }
+            }
+            found
+        };
+
+        let Some((scheme_start, scheme_len)) = scheme_pos else {
+            out.push_str(&text[cursor..]);
+            break;
+        };
+
+        out.push_str(&text[cursor..scheme_start]);
+
+        let authority_start = scheme_start + scheme_len;
+        let authority_end = text[authority_start..]
+            .find(['/', '?', '#', ' ', '"', '\'', '\n', '\r'])
+            .map_or(text.len(), |i| authority_start + i);
+
+        let authority = &text[authority_start..authority_end];
+        let authority_lower = authority.to_lowercase();
+
+        if is_openrouter_host(&authority_lower) {
+            out.push_str(&text[scheme_start..authority_start]);
+            out.push_str(OPENROUTER_HOST_REDACTED);
+        } else {
+            out.push_str(&text[scheme_start..authority_end]);
+        }
+
+        cursor = authority_end;
+    }
+
+    // Pass 2: bare hostname tokens (no scheme prefix). Same delimiter set as
+    // `redact_azure_hosts` pass 2 (T6) — reqwest/url error strings embed hosts
+    // with `:`, `;`, `<>`, `=&`, `?`, `\` around them.
+    let mut result = String::with_capacity(out.len());
+    let mut pos = 0usize;
+    while pos < out.len() {
+        let token_start = pos;
+        let token_end = out[pos..]
+            .find([
+                ' ', '\t', '\n', '\r', '"', '\'', ',', '}', '{', '[', ']', '(', ')', ':', ';', '<',
+                '>', '=', '&', '?', '\\',
+            ])
+            .map_or(out.len(), |i| pos + i);
+
+        if token_start == token_end {
+            let ch = out[pos..]
+                .chars()
+                .next()
+                .expect("pos < out.len() guarantees a char");
+            result.push(ch);
+            pos += ch.len_utf8();
+            continue;
+        }
+
+        let token = &out[token_start..token_end];
+        // Skip tokens already redacted by this pass or by the Azure pass
+        // (which runs first in `redact_secrets`).
+        if !token.contains(OPENROUTER_HOST_REDACTED) && !token.contains(AZURE_HOST_REDACTED) {
+            let token_lower = token.to_lowercase();
+            let authority_part = token_lower.split('/').next().unwrap_or("");
+            if is_openrouter_host(authority_part) {
+                result.push_str(OPENROUTER_HOST_REDACTED);
+                pos = token_end;
+                continue;
+            }
+        }
+
+        result.push_str(token);
+        pos = token_end;
+    }
+
+    result
+}
+
 /// Redact known secret patterns from text before logging.
 ///
 /// Uses simple prefix-based matching (no regex dependency). Catches common API key
@@ -189,6 +348,30 @@ pub fn redact_secrets(text: &str) -> String {
     } else {
         text
     };
+
+    // C1/AC13: OpenRouter/generic-LLM-gateway host redaction — additive,
+    // separate pass from the Azure one above (see `redact_openrouter_hosts`
+    // doc comment for why it's not folded into `redact_azure_hosts`). Gated
+    // the same way: skip the scan entirely unless the text plausibly
+    // contains a URL, the OpenRouter apex/subdomain substring, or a host from
+    // the `CLX_ALLOW_OPENROUTER_HOSTS` override.
+    let openrouter_text_owned;
+    let text: &str = if text.contains("://")
+        || text.to_ascii_lowercase().contains(OPENROUTER_APEX_HOST)
+        || std::env::var(CLX_ALLOW_OPENROUTER_HOSTS_ENV).is_ok_and(|allowlist| {
+            let lower_text = text.to_ascii_lowercase();
+            allowlist
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .any(|h| lower_text.contains(&h.to_ascii_lowercase()))
+        }) {
+        openrouter_text_owned = redact_openrouter_hosts(text);
+        &openrouter_text_owned
+    } else {
+        text
+    };
+
     let mut redacted = text.to_string();
 
     // -------------------------------------------------------------------------
@@ -559,6 +742,7 @@ pub fn redact_json_value(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // =========================================================================
     // Prefix-based redaction
@@ -1309,5 +1493,132 @@ mod tests {
             );
             assert!(redacted.contains("***REDACTED***"), "got: {redacted}");
         }
+    }
+
+    // =========================================================================
+    // AC13 — OpenRouter/generic-LLM-gateway host redaction (WP4)
+    //
+    // Mirrors the B6-2/T6 Azure host-redaction test shape above, but targets
+    // the new `redact_openrouter_hosts` pass: the built-in `openrouter.ai` +
+    // `*.openrouter.ai` suffix, and a `CLX_ALLOW_OPENROUTER_HOSTS`-configured
+    // operator gateway host. Env-touching tests are `#[serial]` (a distinct
+    // key from the azure-hosts / openrouter-backend serial groups since this
+    // suite lives in a different test binary).
+    // =========================================================================
+
+    #[test]
+    fn ac13_redact_secrets_scrubs_openrouter_apex_host_in_url() {
+        let text = "error calling https://openrouter.ai/api/v1/chat/completions: unauthorized";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("openrouter.ai"),
+            "AC13 REGRESSION: openrouter.ai apex host leaked through redact_secrets: {result}"
+        );
+        assert!(
+            result.contains("***OPENROUTER-HOST-REDACTED***"),
+            "redacted token must appear in output: {result}"
+        );
+    }
+
+    #[test]
+    fn ac13_redact_secrets_scrubs_openrouter_subdomain_in_url() {
+        let text = "connection to https://gateway.openrouter.ai/api/v1/models failed";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("gateway.openrouter.ai"),
+            "AC13 REGRESSION: *.openrouter.ai subdomain leaked through redact_secrets: {result}"
+        );
+        assert!(
+            result.contains("***OPENROUTER-HOST-REDACTED***"),
+            "redacted token must appear in output: {result}"
+        );
+    }
+
+    #[test]
+    fn ac13_redact_secrets_scrubs_bare_openrouter_hostname() {
+        // OpenRouter error bodies can embed the host without a scheme, same
+        // shape as the Azure bare-hostname case (T6).
+        let text = "host openrouter.ai returned 503; retry later";
+        let result = redact_secrets(text);
+        assert!(
+            !result.contains("openrouter.ai"),
+            "AC13 REGRESSION: bare openrouter.ai hostname leaked: {result}"
+        );
+    }
+
+    #[test]
+    #[serial(env_openrouter_hosts_redaction)]
+    fn ac13_redact_secrets_scrubs_clx_allow_openrouter_hosts_override() {
+        // SAFETY: `#[serial]` guarantees no concurrent env access from other
+        // tests in this key group within this test binary.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CLX_ALLOW_OPENROUTER_HOSTS", "my-gateway.internal.example");
+        }
+        let text = "proxying via https://my-gateway.internal.example/api/v1/chat/completions";
+        let result = redact_secrets(text);
+        // SAFETY: same serial group as the set_var above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CLX_ALLOW_OPENROUTER_HOSTS");
+        }
+        assert!(
+            !result.contains("my-gateway.internal.example"),
+            "AC13 REGRESSION: CLX_ALLOW_OPENROUTER_HOSTS-configured host leaked: {result}"
+        );
+        assert!(
+            result.contains("***OPENROUTER-HOST-REDACTED***"),
+            "redacted token must appear in output: {result}"
+        );
+    }
+
+    #[test]
+    #[serial(env_openrouter_hosts_redaction)]
+    fn ac13_redact_secrets_does_not_scrub_unlisted_host_without_override() {
+        // SAFETY: `#[serial]` guarantees no concurrent env access in this group.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CLX_ALLOW_OPENROUTER_HOSTS");
+        }
+        let text = "endpoint https://some-other-llm-gateway.example.com/v1/chat";
+        let result = redact_secrets(text);
+        assert_eq!(
+            result, text,
+            "AC13: a non-openrouter, non-allowlisted host must not be over-redacted: {result}"
+        );
+    }
+
+    /// AC13 non-regression: unrelated safe URLs (Ollama localhost, plain
+    /// `OpenAI` API) must not be over-redacted by the new `OpenRouter` pass —
+    /// mirrors the existing Azure over-redaction guard above.
+    #[test]
+    fn ac13_does_not_over_redact_unrelated_urls() {
+        let safe_texts = [
+            "see https://docs.example.com/guide for more info",
+            "ollama at http://127.0.0.1:11434/api/tags",
+            "endpoint https://api.openai.com/v1/chat/completions",
+        ];
+        for text in &safe_texts {
+            let result = redact_secrets(text);
+            assert_eq!(
+                result, *text,
+                "AC13: safe URL was over-redacted by the OpenRouter pass: input={text:?} output={result:?}"
+            );
+        }
+    }
+
+    /// AC5 host-redaction portion (deferred from WP2, now passable): an
+    /// `OpenRouter`-shaped error body embedding the endpoint host, run
+    /// through `redact_secrets` directly (the backend-level exercise of this
+    /// same contract lives in `llm::openrouter::tests`), must not leak the
+    /// host.
+    #[test]
+    fn ac5_redact_secrets_scrubs_openrouter_host_in_error_body() {
+        let body = r#"{"error":{"message":"upstream failure at https://openrouter.ai/api/v1/chat/completions"}}"#;
+        let result = redact_secrets(body);
+        assert!(
+            !result.contains("openrouter.ai"),
+            "AC5 REGRESSION: openrouter.ai host leaked in error body redaction: {result}"
+        );
     }
 }
