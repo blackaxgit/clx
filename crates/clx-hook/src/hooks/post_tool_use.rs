@@ -67,7 +67,7 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
         };
         let target = aggregator::derive_target(tool_name, &tool_input_value);
         let summary = redacted_summary_for_persistence(tool_name, &tool_input_value, outcome);
-        let now_unix = chrono::Utc::now().timestamp();
+        let now_unix = tool_events_bucket_now_unix();
         let ev = ToolEvent::new(
             input.session_id.clone(),
             tool_name,
@@ -184,6 +184,29 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
     }
 
     Ok(())
+}
+
+/// Test-only determinism seam for the `tool_events` analytics bucket
+/// timestamp.
+///
+/// The e2e harness (`clx-hook/tests/memory_hooks_e2e.rs`) spawns the
+/// compiled `clx-hook` release binary as a subprocess, so a `#[cfg(test)]`
+/// seam cannot reach it — this is a runtime env check instead, honored in
+/// every build (including release).
+///
+/// SAFE BY SCOPE: this affects ONLY the 60-second dedup bucket timestamp
+/// passed into `ToolEvent::new` below. `tool_events` is non-security
+/// analytics (a UI-facing "what did the agent touch" aggregation) — this
+/// value never reaches policy/redaction/security decisions, the learning
+/// event retention TTL, or snapshot timestamps, all of which keep calling
+/// `chrono::Utc::now()` directly. When `CLX_TEST_FAKE_NOW_UNIX` is unset,
+/// unparsable, or the process is not under test, behavior is byte-for-byte
+/// identical to the previous `chrono::Utc::now().timestamp()` call.
+fn tool_events_bucket_now_unix() -> i64 {
+    std::env::var("CLX_TEST_FAKE_NOW_UNIX")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp())
 }
 
 /// Build the redacted summary that is persisted into the `tool_events` row.

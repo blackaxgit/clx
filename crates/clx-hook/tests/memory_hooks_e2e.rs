@@ -58,6 +58,16 @@ impl Sandbox {
     /// Run the `clx-hook` binary with this sandbox as `HOME`, piping `input`
     /// on stdin. Returns `(stdout, stderr)`.
     fn run_hook(&self, input: &str) -> (String, String) {
+        self.run_hook_with_env(input, &[])
+    }
+
+    /// Same as [`Self::run_hook`], but with additional environment
+    /// variables stamped onto the spawned `clx-hook` child. Used to pass
+    /// the `CLX_TEST_FAKE_NOW_UNIX` clock seam (see
+    /// `post_tool_use::tool_events_bucket_now_unix`) so multi-invocation
+    /// tests can pin the `tool_events` dedup bucket deterministically
+    /// instead of racing real wall-clock 60s bucket boundaries.
+    fn run_hook_with_env(&self, input: &str, extra_env: &[(&str, &str)]) -> (String, String) {
         let binary = env!("CARGO_BIN_EXE_clx-hook");
         // `harden_command` sets HOME, CLX_LOG=error, and
         // CLX_MODEL_FETCH_DRYRUN=1. The last one guarantees that even if
@@ -65,7 +75,11 @@ impl Sandbox {
         // writes a few-byte stub instead of the 2.1 GB model: the recall
         // pipeline stays RRF-only and the sandbox HOME never grows.
         let mut command = Command::new(binary);
-        let mut child = support::harden_command(&mut command, &self.home)
+        let command = support::harden_command(&mut command, &self.home);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -292,8 +306,16 @@ fn post_tool_use_aggregates_mutator_edits_with_dedup() {
             "new_string": "bb",
         }),
     );
-    sb.run_hook(&env);
-    sb.run_hook(&env);
+    // Pin the `tool_events` dedup bucket via the CLX_TEST_FAKE_NOW_UNIX
+    // clock seam (crates/clx-hook/src/hooks/post_tool_use.rs). Without
+    // this, the two subprocess invocations of the real clx-hook binary
+    // race real wall-clock 60s bucket boundaries: if they straddle a
+    // boundary, the edits land in different buckets and the assertion
+    // below flakes (2 rows instead of 1). Both calls use the SAME fixed
+    // timestamp so they deterministically share a bucket.
+    let fake_now = [("CLX_TEST_FAKE_NOW_UNIX", "1700000000")];
+    sb.run_hook_with_env(&env, &fake_now);
+    sb.run_hook_with_env(&env, &fake_now);
 
     let db = sb.open_db();
     let rows = db.recent_tool_events_for_session("agg-sess", 10).unwrap();
