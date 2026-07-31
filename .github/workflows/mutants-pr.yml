@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload missed.txt artifact
         if: always() && steps.diff.outputs.lines != '0'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutants-pr-missed
           path: target/mutants/

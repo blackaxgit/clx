@@ -156,7 +156,7 @@ jobs:
       # Each matrix leg uploads to a uniquely named artifact to avoid collisions.
       # Includes: tarball, checksum, and SBOM.
       - name: Upload release artifacts (tarball, checksum, SBOM, attestation)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clx-${{ matrix.arch }}-apple-darwin
           path: |
