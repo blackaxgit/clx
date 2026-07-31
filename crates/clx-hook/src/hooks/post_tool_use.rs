@@ -67,7 +67,7 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
         };
         let target = aggregator::derive_target(tool_name, &tool_input_value);
         let summary = redacted_summary_for_persistence(tool_name, &tool_input_value, outcome);
-        let now_unix = chrono::Utc::now().timestamp();
+        let now_unix = tool_events_bucket_now_unix();
         let ev = ToolEvent::new(
             input.session_id.clone(),
             tool_name,
@@ -184,6 +184,32 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
     }
 
     Ok(())
+}
+
+/// Debug-only determinism seam for the `tool_events` dedup bucket timestamp.
+///
+/// The e2e harness (`clx-hook/tests/memory_hooks_e2e.rs`) spawns the compiled
+/// `clx-hook` binary (built by `cargo test` in the DEBUG profile via
+/// `CARGO_BIN_EXE_clx-hook`), so a `#[cfg(test)]` seam cannot reach it — this
+/// is a runtime env check instead.
+///
+/// GATED TO DEBUG BUILDS: the override is honored ONLY when `debug_assertions`
+/// is on, so shipped release binaries (`--release`, no debug_assertions) NEVER
+/// read the env var and behave byte-for-byte as before. This matters because
+/// the bucket timestamp affects `tool_events` dedup cardinality, which
+/// `turns_since_last_auto_summary` counts — so an override honored in release
+/// could transitively perturb auto-summary decisions. The debug gate removes
+/// that path from production entirely. When unset/unparsable/release, behavior
+/// is identical to the previous `chrono::Utc::now().timestamp()` call.
+fn tool_events_bucket_now_unix() -> i64 {
+    if cfg!(debug_assertions)
+        && let Some(n) = std::env::var("CLX_TEST_FAKE_NOW_UNIX")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+    {
+        return n;
+    }
+    chrono::Utc::now().timestamp()
 }
 
 /// Build the redacted summary that is persisted into the `tool_events` row.
