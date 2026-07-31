@@ -186,27 +186,30 @@ pub(crate) async fn handle_post_tool_use(input: HostNeutralInput, host: &dyn Hos
     Ok(())
 }
 
-/// Test-only determinism seam for the `tool_events` analytics bucket
-/// timestamp.
+/// Debug-only determinism seam for the `tool_events` dedup bucket timestamp.
 ///
-/// The e2e harness (`clx-hook/tests/memory_hooks_e2e.rs`) spawns the
-/// compiled `clx-hook` release binary as a subprocess, so a `#[cfg(test)]`
-/// seam cannot reach it — this is a runtime env check instead, honored in
-/// every build (including release).
+/// The e2e harness (`clx-hook/tests/memory_hooks_e2e.rs`) spawns the compiled
+/// `clx-hook` binary (built by `cargo test` in the DEBUG profile via
+/// `CARGO_BIN_EXE_clx-hook`), so a `#[cfg(test)]` seam cannot reach it — this
+/// is a runtime env check instead.
 ///
-/// SAFE BY SCOPE: this affects ONLY the 60-second dedup bucket timestamp
-/// passed into `ToolEvent::new` below. `tool_events` is non-security
-/// analytics (a UI-facing "what did the agent touch" aggregation) — this
-/// value never reaches policy/redaction/security decisions, the learning
-/// event retention TTL, or snapshot timestamps, all of which keep calling
-/// `chrono::Utc::now()` directly. When `CLX_TEST_FAKE_NOW_UNIX` is unset,
-/// unparsable, or the process is not under test, behavior is byte-for-byte
-/// identical to the previous `chrono::Utc::now().timestamp()` call.
+/// GATED TO DEBUG BUILDS: the override is honored ONLY when `debug_assertions`
+/// is on, so shipped release binaries (`--release`, no debug_assertions) NEVER
+/// read the env var and behave byte-for-byte as before. This matters because
+/// the bucket timestamp affects `tool_events` dedup cardinality, which
+/// `turns_since_last_auto_summary` counts — so an override honored in release
+/// could transitively perturb auto-summary decisions. The debug gate removes
+/// that path from production entirely. When unset/unparsable/release, behavior
+/// is identical to the previous `chrono::Utc::now().timestamp()` call.
 fn tool_events_bucket_now_unix() -> i64 {
-    std::env::var("CLX_TEST_FAKE_NOW_UNIX")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp())
+    if cfg!(debug_assertions)
+        && let Some(n) = std::env::var("CLX_TEST_FAKE_NOW_UNIX")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+    {
+        return n;
+    }
+    chrono::Utc::now().timestamp()
 }
 
 /// Build the redacted summary that is persisted into the `tool_events` row.
