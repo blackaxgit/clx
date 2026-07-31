@@ -1181,7 +1181,7 @@ fn test_handle_tools_call_missing_name_returns_invalid_params() {
 fn test_read_bounded_line_normal() {
     // Arrange — a simple line well within the size limit
     let data = b"hello world\n";
-    let mut reader = BufReader::new(data.as_ref());
+    let mut reader = BufReader::new(data.as_slice());
     let mut buf = String::new();
 
     // Act
