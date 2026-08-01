@@ -55,7 +55,7 @@ reqwest = { version = "0.13", features = ["json"] }
 # Utilities
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
-colored = "2"
+colored = "3"
 
 # Secure storage.
 # keyring 3.x made the OS-native stores opt-in (2.x enabled them by default);
