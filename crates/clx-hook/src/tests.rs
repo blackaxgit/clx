@@ -669,6 +669,51 @@ fn test_load_project_rules_returns_content_when_claude_md_exists() {
 }
 
 #[test]
+fn test_load_project_rules_skips_directory_at_claude_md_path() {
+    // A directory (not a file) sitting at cwd/CLAUDE.md must be rejected by
+    // the bounded-read guard (`NotRegularFile`) and silently skipped as a
+    // project-rules source -- never panics, never treats directory entries
+    // as rule text.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("CLAUDE.md")).unwrap();
+    let cwd = dir.path().to_str().unwrap();
+
+    let result = load_project_rules(cwd, &crate::host::ClaudeHost);
+
+    // Whatever the overall outcome (None, or Some sourced only from an
+    // unrelated global CLAUDE.md on this machine -- same ambiguity the test
+    // above already accepts), the PROJECT section specifically must be
+    // absent: a directory must never be read as project rules.
+    if let Some(rules) = result {
+        assert!(
+            !rules.contains(&format!("Project Rules ({cwd})")),
+            "a directory at CLAUDE.md must not be read as project rules, got: {rules}"
+        );
+    }
+}
+
+#[test]
+fn test_load_project_rules_skips_oversized_claude_md() {
+    // A CLAUDE.md larger than the 4 MiB cap must be rejected (`TooLarge`)
+    // and skipped as a source, never partially read into the rules text.
+    let dir = tempfile::tempdir().unwrap();
+    let claude_md = dir.path().join("CLAUDE.md");
+    let mut content = String::from("# Rules [STRICT]\nOversized should be skipped.\n");
+    content.push_str(&"x".repeat(4 * 1024 * 1024 + 1));
+    std::fs::write(&claude_md, content).unwrap();
+    let cwd = dir.path().to_str().unwrap();
+
+    let result = load_project_rules(cwd, &crate::host::ClaudeHost);
+
+    if let Some(rules) = result {
+        assert!(
+            !rules.contains("Oversized should be skipped"),
+            "an oversized CLAUDE.md must be capped/skipped, not read in full, got: {rules}"
+        );
+    }
+}
+
+#[test]
 fn test_extract_critical_rules_extracts_only_critical_lines() {
     // Arrange
     let content = "\

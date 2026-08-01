@@ -254,12 +254,76 @@ fn persistent_zero_byte_read_still_errors_after_retries() {
 fn absent_file_is_legitimate_empty_store_and_writable() {
     // Fresh install (no credentials.age): empty store, zero prompts, and a
     // subsequent set works (distinct from the zero-byte corruption case).
+    // This is also the highest-value regression pin for the new bounded-read
+    // guard's `NotFound` mapping: it must still yield an empty map, not an
+    // error.
     let tmp = tempfile::tempdir().unwrap();
     let b = file_backend(tmp.path());
     assert_eq!(b.list_keys().unwrap(), Vec::<String>::new());
     assert_eq!(b.get("clx:global:anything").unwrap(), None);
     b.set("clx:global:fresh", "ok").unwrap();
     assert_eq!(b.get("clx:global:fresh").unwrap().as_deref(), Some("ok"));
+}
+
+// =========================================================================
+// 5b. Bounded-read guards on credentials.age: a directory or an oversized
+//     file at the path is a HARD error, never mistaken for an empty store
+//     (the bounded_read module's NotRegularFile / TooLarge -> load_map).
+// =========================================================================
+
+#[test]
+fn directory_at_credentials_path_is_a_hard_error_not_an_empty_store() {
+    // If a directory ever ends up at `credentials.age` (misconfiguration, a
+    // botched migration, a malicious symlink swap), `get` must refuse to
+    // read it rather than silently treating it as "no credentials yet" --
+    // the latter would let a subsequent `set` overwrite it and destroy
+    // whatever was actually there.
+    let tmp = tempfile::tempdir().unwrap();
+    let b = file_backend(tmp.path());
+    // Trigger key-file + dir creation, then replace the data file with a
+    // directory.
+    b.set("clx:global:seed", "x").unwrap();
+    let cred = tmp.path().join("credentials.age");
+    std::fs::remove_file(&cred).unwrap();
+    std::fs::create_dir(&cred).unwrap();
+
+    let err = b
+        .get("clx:global:seed")
+        .expect_err("a directory at credentials.age must be a hard error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a regular file"),
+        "expected a not-a-regular-file error, got: {msg}"
+    );
+
+    // Must NOT have been treated as empty: a `set` must not proceed to
+    // overwrite the directory in a way that fabricates an empty store.
+    let set_err = b
+        .set("clx:global:new", "y")
+        .expect_err("set must not overwrite a directory as if it were an empty store");
+    assert!(format!("{set_err}").contains("not a regular file"));
+}
+
+#[test]
+fn oversized_credentials_file_is_a_hard_error_not_an_empty_store() {
+    // A credentials.age far larger than any legitimate age-encrypted map
+    // must be rejected outright, never treated as an empty store.
+    let tmp = tempfile::tempdir().unwrap();
+    let b = file_backend(tmp.path());
+    b.set("clx:global:seed", "x").unwrap();
+    let cred = tmp.path().join("credentials.age");
+    // 16 MiB cap + 1 byte.
+    let oversized = vec![0u8; 16 * 1024 * 1024 + 1];
+    std::fs::write(&cred, &oversized).unwrap();
+
+    let err = b
+        .get("clx:global:seed")
+        .expect_err("an oversized credentials.age must be a hard error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("exceeding"),
+        "expected a too-large error, got: {msg}"
+    );
 }
 
 #[test]

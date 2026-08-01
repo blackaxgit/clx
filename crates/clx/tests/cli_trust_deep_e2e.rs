@@ -534,3 +534,50 @@ fn config_trust_remove_ambiguous_prefix_is_clean_error() {
         .failure()
         .stderr(predicate::str::contains("ambiguous"));
 }
+
+// ===========================================================================
+// config-trust add: bounded-read guards (not-a-regular-file, oversized) --
+// `handle_config_trust_add` must hard-error rather than trust a directory
+// or an oversized file, and the error must name the actual reason.
+// ===========================================================================
+
+#[test]
+fn config_trust_add_rejects_directory_at_config_path() {
+    // `canonicalize` succeeds on a directory just as readily as a file, so
+    // the bounded-read guard (not the canonicalize step) must be what
+    // catches this: a directory dropped at the config path must never be
+    // "trusted" as if it were readable YAML.
+    let t = tmp();
+    let proj = home_path(&t, "work/.clx");
+    std::fs::create_dir_all(&proj).unwrap();
+    let dir_as_config = proj.join("config.yaml");
+    std::fs::create_dir(&dir_as_config).unwrap();
+
+    clx(&t)
+        .args(["config-trust", "add"])
+        .arg(&dir_as_config)
+        .arg("-y")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a regular file"));
+}
+
+#[test]
+fn config_trust_add_rejects_oversized_config() {
+    // A config file over the 4 MiB cap must be a hard, actionable error --
+    // never truncated-and-hashed, never silently accepted.
+    let t = tmp();
+    let proj = home_path(&t, "work/.clx");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cfg = proj.join("config.yaml");
+    let oversized = vec![b'a'; 4 * 1024 * 1024 + 1];
+    std::fs::write(&cfg, &oversized).unwrap();
+
+    clx(&t)
+        .args(["config-trust", "add"])
+        .arg(&cfg)
+        .arg("-y")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exceeding"));
+}
