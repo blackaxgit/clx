@@ -37,7 +37,7 @@ toml = { workspace = true }
 
 # Per-project config trust (file-hash allowlist, §3.11). sha2/hex are already
 # in the transitive graph; pin direct versions so we own the API surface.
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Inter-process advisory file lock for the credential store read-modify-write
