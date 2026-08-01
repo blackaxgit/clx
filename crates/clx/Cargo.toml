@@ -31,7 +31,7 @@ chrono.workspace = true
 reqwest.workspace = true
 rpassword.workspace = true
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # D2 reranker: shared with clx-core via re-export; the CLI also calls
 # fastembed directly for `clx model fetch` so it can stream progress.
