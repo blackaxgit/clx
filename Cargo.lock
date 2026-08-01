@@ -930,7 +930,7 @@ dependencies = [
  "rstest",
  "rusqlite",
  "secrecy",
- "security-framework 2.11.1",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -64,7 +64,7 @@ fastembed = "5"
 # dependency tree, no duplicate Security.framework binding). macOS-gated so
 # non-macOS builds never pull these.
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "2.11"
+security-framework = "3.7"
 core-foundation = "0.9"
 
 # `bounded_read` opens untrusted-path files with O_NONBLOCK on Unix so the
