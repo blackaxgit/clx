@@ -39,7 +39,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # Progress indicators
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Error handling
 thiserror = "1.0"
