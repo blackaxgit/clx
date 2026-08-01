@@ -388,7 +388,13 @@ mod imp {
         match keychain.find_generic_password(service, account) {
             Ok((_pw, item)) => {
                 debug_assert_eq!(decide_access(true), AccessDecision::Relax);
-                let raw = item.as_CFTypeRef().cast_mut();
+                // core-foundation 0.10 / security-framework 3.x: use the
+                // typed `as_concrete_TypeRef()` (returns `SecKeychainItemRef`)
+                // instead of the untyped `as_CFTypeRef().cast_mut()` path that
+                // broke when TCFType's CFTypeRef conversion was reorganized,
+                // then `.cast()` back to the `*mut c_void` that the FFI helper
+                // `apply_any_app_access` expects.
+                let raw = item.as_concrete_TypeRef().cast();
                 apply_any_app_access(raw, service)?;
                 Ok(AccessDecision::Relax)
             }

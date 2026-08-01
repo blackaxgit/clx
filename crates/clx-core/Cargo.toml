@@ -60,12 +60,13 @@ fastembed = "5"
 # unstable identity, so macOS re-prompts on every launch. We use the
 # maintained `security-framework` crate to (re)apply a permissive
 # "any application" SecAccess on the CLX credential items so reads never
-# prompt. Pinned at the 2.x line that `keyring v2` already locks (single
-# dependency tree, no duplicate Security.framework binding). macOS-gated so
-# non-macOS builds never pull these.
+# prompt. Aligned with keyring 3.x on security-framework 3.x +
+# core-foundation 0.10 (single dependency tree, no duplicate
+# Security.framework binding). macOS-gated so non-macOS builds never pull
+# these.
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "2.11"
-core-foundation = "0.9"
+security-framework = "3.7.0"
+core-foundation = "0.10.1"
 
 # `bounded_read` opens untrusted-path files with O_NONBLOCK on Unix so the
 # open() call itself cannot hang on a FIFO with no writer attached (a plain
